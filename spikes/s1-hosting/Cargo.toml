@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["guest", "host"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[profile.release]
+# Thin LTO drops one of the two same-signature host imports at final link
+# (rustc wasm32 quirk); spike measures hosting overhead, not guest codegen.
+lto = false

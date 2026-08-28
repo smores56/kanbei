@@ -1,0 +1,3 @@
+[target.wasm32-wasip1]
+# rust-lld drops same-signature wasm imports without this (see docs/spikes/s1-report.md)
+rustflags = ["-C", "link-arg=--allow-undefined"]

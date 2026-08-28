@@ -1,0 +1,13 @@
+build-guest:
+	cargo build -p kb-guest --target wasm32-wasip1 --release
+
+bench:
+	just build-guest
+	cargo run -p kb-host --release -- cold
+	cargo run -p kb-host --release -- compile
+	cargo run -p kb-host --release -- roundtrip sync
+	cargo run -p kb-host --release -- roundtrip async
+	cargo run -p kb-host --release -- fuel 100000
+	cargo run -p kb-host --release -- epoch
+	cargo run -p kb-host --release -- limits 8
+	cargo run -p kb-host --release -- respawn 100000

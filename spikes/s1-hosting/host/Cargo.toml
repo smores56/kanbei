@@ -1,0 +1,10 @@
+[package]
+name = "kb-host"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+wasmtime = { version = "48", features = ["async"] }
+wasmtime-wasi = "48"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
