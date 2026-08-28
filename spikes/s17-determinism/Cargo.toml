@@ -1,0 +1,11 @@
+[package]
+name = "kb-s17-determinism"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+blake3 = "1"
+luaur = { version = "0.1.8", default-features = false, features = ["send"] }
+wasmtime = "48"
+wasmtime-wasi = "48"

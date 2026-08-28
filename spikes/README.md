@@ -15,4 +15,4 @@ implementation, never merged into M1+ crates. Each spike produces a report in
 | S4 | Snapshot-closure growth + manifest materialization + prune | Kernel review | complete — `docs/spikes/s4-report.md` |
 | S5 | Rebuild throughput/memory (1–10 GB streams, 5M-event session) | Kernel review | complete — `docs/spikes/s5-report.md` |
 | S6 | Version-pinned reconstruction across a kernel-upgrade fixture | Kernel review | complete — `docs/spikes/s6-report.md` |
-| S17 | Luau/Wasmtime cross-version determinism | M1 manifest freeze | pending |
+| S17 | Luau/Wasmtime cross-version determinism | M1 manifest freeze | complete — `docs/spikes/s17-report.md` |

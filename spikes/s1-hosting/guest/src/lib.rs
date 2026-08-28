@@ -72,6 +72,23 @@ pub extern "C" fn kb_compile(ptr: *const u8, len: usize) -> i32 {
     }
 }
 
+/// Compile and copy the serialized bytecode into `out` (cap bytes). Returns the
+/// bytecode length, or a negative code. Used by the S17 determinism spike.
+#[unsafe(no_mangle)]
+pub extern "C" fn kb_compile_out(ptr: *const u8, len: usize, out: *mut u8, cap: usize) -> i32 {
+    let Some(s) = src(ptr, len) else { return -1 };
+    match luaur::compile(s) {
+        Ok(bc) => {
+            if bc.len() > cap {
+                return -3;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(bc.as_ptr(), out, bc.len()) };
+            bc.len() as i32
+        }
+        Err(_) => -2,
+    }
+}
+
 /// Compile + run Luau source. Host functions are exposed to the script.
 #[unsafe(no_mangle)]
 pub extern "C" fn kb_run(ptr: *const u8, len: usize) -> i32 {
