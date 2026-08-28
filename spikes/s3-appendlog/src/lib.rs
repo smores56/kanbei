@@ -327,3 +327,48 @@ pub fn export(path: &Path) -> std::io::Result<u64> {
     assert_eq!(n, rec.events);
     Ok(n)
 }
+
+/// Streaming variant: yields one frame at a time, keeping only one frame's
+/// events in memory (rebuild path — S5). Verifies the chain and digests.
+pub fn for_each_frame<F>(path: &Path, mut f: F) -> Result<Recovered, RecoveryError>
+where
+    F: FnMut(FrameInfo) -> std::io::Result<()>,
+{
+    let (boundaries, truncated) = scan_frames(path)?;
+    let mut file = File::open(path).map_err(|e| RecoveryError::Corruption { frame: 0, at: 0, reason: format!("open: {e}") })?;
+    let mut prev: [u8; 32] = new_prev();
+    let mut events = 0u64;
+    let mut last_seq = 0u64;
+    for (frame_idx, (start, len)) in boundaries.iter().enumerate() {
+        let mut buf = vec![0u8; *len as usize];
+        let got = read_at(&mut file, *start, &mut buf).map_err(|e| RecoveryError::Corruption { frame: frame_idx as u64, at: *start, reason: format!("read: {e}") })?;
+        if got as u64 != *len {
+            return Err(RecoveryError::Corruption { frame: frame_idx as u64, at: *start, reason: "short read".into() });
+        }
+        let decoded = zstd::stream::decode_all(&buf[..]).map_err(|e| RecoveryError::Corruption { frame: frame_idx as u64, at: *start, reason: format!("zstd: {e}") })?;
+        let text = String::from_utf8(decoded).map_err(|e| RecoveryError::Corruption { frame: frame_idx as u64, at: *start, reason: format!("utf8: {e}") })?;
+        let mut lines = text.lines();
+        let meta_line = lines.next().unwrap_or_default();
+        let frame_events: Vec<String> = lines.map(|l| l.to_string()).collect();
+        let meta: Meta = serde_json::from_str(meta_line).map_err(|e| RecoveryError::Corruption { frame: frame_idx as u64, at: *start, reason: format!("meta: {e}") })?;
+        if meta.schema != SCHEMA {
+            return Err(RecoveryError::Corruption { frame: frame_idx as u64, at: *start, reason: format!("schema {} != {SCHEMA}", meta.schema) });
+        }
+        let canonical = canonical(&meta_without_digest(&meta), &frame_events);
+        let got_digest = hex(blake3::hash(&canonical).as_bytes());
+        if got_digest != meta.digest {
+            return Err(RecoveryError::Corruption { frame: frame_idx as u64, at: *start, reason: format!("digest {got_digest} != {}", meta.digest) });
+        }
+        if meta.prev != hex(&prev) {
+            return Err(RecoveryError::Corruption { frame: frame_idx as u64, at: *start, reason: format!("chain: prev {} != {}", meta.prev, hex(&prev)) });
+        }
+        if meta.count as usize != frame_events.len() {
+            return Err(RecoveryError::Corruption { frame: frame_idx as u64, at: *start, reason: "count mismatch".into() });
+        }
+        prev = *blake3::hash(&canonical).as_bytes();
+        f(FrameInfo { meta, events: frame_events }).map_err(|e| RecoveryError::Corruption { frame: frame_idx as u64, at: *start, reason: format!("consumer: {e}") })?;
+        events += 1;
+        last_seq = *start;
+    }
+    Ok(Recovered { events, frames: boundaries.len() as u64, truncated, last_seq })
+}

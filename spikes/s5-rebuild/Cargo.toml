@@ -1,0 +1,9 @@
+[package]
+name = "kb-s5-rebuild"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+kb-s3-appendlog = { path = "../s3-appendlog" }
+rusqlite = { version = "0.37", features = ["bundled"] }

@@ -13,6 +13,6 @@ implementation, never merged into M1+ crates. Each spike produces a report in
 | S2 | Session-actor throughput under mixed command/outcome + wake chain + chunk commits | Kernel review | complete — `docs/spikes/s2-report.md` |
 | S3 | AppendLog framing: append latency vs JSONL, chain verify, torn-tail drill, zstd frame-size sweep, kill -9 durability profiles, dirsync cost | Kernel review (format freeze) | complete — `docs/spikes/s3-report.md` |
 | S4 | Snapshot-closure growth + manifest materialization + prune | Kernel review | complete — `docs/spikes/s4-report.md` |
-| S5 | Rebuild throughput/memory (1–10 GB streams, 5M-event session) | Kernel review | pending |
+| S5 | Rebuild throughput/memory (1–10 GB streams, 5M-event session) | Kernel review | complete — `docs/spikes/s5-report.md` |
 | S6 | Version-pinned reconstruction across a kernel-upgrade fixture | Kernel review | pending |
 | S17 | Luau/Wasmtime cross-version determinism | M1 manifest freeze | pending |
