@@ -1,0 +1,10 @@
+[package]
+name = "kb-s2-actor"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+crossbeam-channel = "0.5"
+rusqlite = { version = "0.37", features = ["bundled"] }
+zstd = "0.13"
