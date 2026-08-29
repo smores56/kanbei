@@ -1,0 +1,23 @@
+[package]
+name = "kanbei-testkit"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+kanbei-core.workspace = true
+kanbei-log.workspace = true
+kanbei-objects.workspace = true
+kanbei-session.workspace = true
+kanbei-snapshot.workspace = true
+kanbei-projection.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true
+rusqlite.workspace = true
+
+[[bin]]
+name = "crash-child"
+path = "src/bin/crash_child.rs"

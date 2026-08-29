@@ -1,0 +1,9 @@
+[package]
+name = "kanbei-objects"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+kanbei-core.workspace = true
+thiserror.workspace = true

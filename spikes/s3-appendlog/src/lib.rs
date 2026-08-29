@@ -123,6 +123,9 @@ impl LogWriter {
     }
 
     /// Append one frame containing `events` (never split across frames).
+    // clippy 1.98 warns on `% 10 == 0`; this spike predates the lint and is
+    // frozen — suppress rather than rewrite
+    #[allow(clippy::manual_is_multiple_of)]
     pub fn append_frame(&mut self, events: &[String], profile: Profile) -> std::io::Result<FramePlan> {
         let first = self.seq;
         self.seq += events.len() as u64;
