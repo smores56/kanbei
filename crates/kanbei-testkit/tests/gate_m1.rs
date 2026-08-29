@@ -6,8 +6,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use kanbei_core::digest::Digest;
 use kanbei_core::queue::DurabilityQueue;
@@ -17,6 +17,9 @@ use kanbei_core::registry::{
 use kanbei_log::{FrameInfo, Profile, for_each_frame, hex, new_prev};
 use kanbei_objects::ObjectStore;
 use kanbei_projection::{rebuild, reconstruct};
+use kanbei_scopes::epoch::CompositionStore;
+use kanbei_scopes::registry::ContributionRegistry;
+use kanbei_services::ServiceRegistry;
 use kanbei_session::{NewEvent, Session, SessionConfig};
 use kanbei_snapshot::{ExecutionManifest, verify_closure};
 use kanbei_testkit::collect_envelopes;
@@ -100,12 +103,6 @@ fn assert_report_eq(a: &Report, b: &Report) {
         assert_eq!(sa.opaque, sb.opaque);
         assert_eq!(sa.opaque_reason, sb.opaque_reason);
     }
-}
-
-fn manifest_with_state(head: Digest) -> ExecutionManifest {
-    let mut m = ExecutionManifest::bootstrap();
-    m.state_head = Some(head);
-    m
 }
 
 fn walk(dir: &Path) -> Vec<String> {
@@ -323,14 +320,34 @@ fn acceptance_consistency_4_snapshot_closure_verifies() {
 
     let (store, queue) = open_store(&dir);
     assert_eq!(verify_closure(&store, &closure).unwrap(), closure.len() as u64);
-    // no crash here: the only unreferenced object is the live final-state
+    // no crash here: the only unreferenced objects are the live final-state
     // manifest — R-08 materializes the post-manifest at the last commit, and
     // no successor envelope references it yet (legitimate, not crash garbage)
+    // — plus the epoch-composition object the schema-2 manifests pin (R-01:
+    // the composition digest is a manifest field, not an envelope ref)
     let on_disk = store.scan().unwrap();
-    let orphans: Vec<Digest> = on_disk.iter().filter(|d| !closure.contains(d)).copied().collect();
+    let mut orphans: Vec<Digest> =
+        on_disk.iter().filter(|d| !closure.contains(d)).copied().collect();
     let final_head = Digest::new(b"state-55");
-    let final_manifest = Digest::new(&manifest_with_state(final_head).to_bytes());
-    assert_eq!(orphans, vec![final_manifest], "only the live manifest may be unreferenced");
+    let final_manifest = on_disk
+        .iter()
+        .filter_map(|d| {
+            let m: ExecutionManifest = serde_json::from_slice(&store.get(d).unwrap()).ok()?;
+            (m.state_head == Some(final_head)).then_some(*d)
+        })
+        .next()
+        .expect("the live final manifest exists in the store");
+    let mut expected = vec![
+        final_manifest,
+        CompositionStore::new(&ContributionRegistry::new(Arc::new(Mutex::new(
+            ServiceRegistry::new(),
+        ))))
+        .current()
+        .digest,
+    ];
+    expected.sort();
+    orphans.sort();
+    assert_eq!(orphans, expected, "only the live manifest + composition may be unreferenced");
 
     // manifest dedup: bootstrap + 1 (identical state-v1 manifests) + 5
     // (distinct) = 7 manifest objects
@@ -364,12 +381,22 @@ fn acceptance_consistency_3_canonical_fact() {
     assert_eq!(k.count, 10);
 
     // canonical facts on disk: bootstrap + 10 state manifests + 20 objects
+    // + the epoch-composition object (schema-2 manifests pin it, R-01)
     let scan = store.scan().unwrap();
-    assert_eq!(scan.len(), 31);
+    assert_eq!(scan.len(), 32);
 
     // snapshot chain: envelope k's pre-event snapshot is the post-manifest
-    // pinned by commit k-1 (bootstrap for the first) — re-derive and compare
+    // pinned by commit k-1 (bootstrap for the first) — the schema-2
+    // manifests, located by the state head they pin (R-08)
     let bootstrap = Digest::new(&ExecutionManifest::bootstrap().to_bytes());
+    let manifests: Vec<(Digest, ExecutionManifest)> = scan
+        .iter()
+        .filter_map(|d| {
+            serde_json::from_slice::<ExecutionManifest>(&store.get(d).unwrap())
+                .ok()
+                .map(|m| (*d, m))
+        })
+        .collect();
     let envelopes = collect_envelopes(&dir).unwrap();
     assert_eq!(envelopes.len(), 10);
     for (idx, env) in envelopes.iter().enumerate() {
@@ -378,7 +405,11 @@ fn acceptance_consistency_3_canonical_fact() {
             bootstrap
         } else {
             let head = Digest::new(format!("state-{}", k - 1).as_bytes());
-            Digest::new(&manifest_with_state(head).to_bytes())
+            manifests
+                .iter()
+                .find(|(_, m)| m.state_head == Some(head))
+                .map(|(d, _)| *d)
+                .unwrap_or_else(|| panic!("no manifest pins state head {head}"))
         };
         assert_eq!(env.snapshot, Some(expected), "envelope seq {k}");
     }

@@ -1,8 +1,9 @@
-//! kanbei-testkit — the M1 crash-injection harness and property-test framework
+//! kanbei-testkit — the crash-injection harness and property-test framework
 //! (architecture.md R-21/H-06: "Crash-injection harness and property-test
-//! framework are explicit M1 deliverables"). Provides the deterministic
-//! `crash-child` binary driver, the recovery invariant checker, and a tiny
-//! seeded PRNG; the gate suites live in `tests/`.
+//! framework are explicit M1 deliverables"; M2 extends it with the module
+//! seam crash points). Provides the deterministic `crash-child` binary driver
+//! (M1 + M2 modes), the recovery invariant checkers, and a tiny seeded PRNG;
+//! the gate suites live in `tests/`.
 
 pub mod rng;
 
@@ -28,6 +29,12 @@ pub const ENV_EVENTS: &str = "KANBEI_CRASH_EVENTS";
 pub const ENV_OBJECTS: &str = "KANBEI_CRASH_OBJECTS";
 pub const ENV_PROFILE: &str = "KANBEI_CRASH_PROFILE";
 pub const ENV_STATE_EVERY: &str = "KANBEI_CRASH_STATE_EVERY";
+/// "m1" (default) keeps the M1 protocol byte-identical; "m2" runs the module
+/// flow (dispatch/head points).
+pub const ENV_MODE: &str = "KANBEI_CRASH_MODE";
+/// M2 child flow selection: "head" (module_state_cas only) or a string
+/// containing "dispatch" (effect_dispatch first, then the head updates).
+pub const ENV_M2_FLOW: &str = "KANBEI_CRASH_M2_FLOW";
 
 /// Canonical env-var spelling of a fault point (the child parses it back).
 pub fn fault_point_name(point: FaultPoint) -> &'static str {
@@ -36,6 +43,12 @@ pub fn fault_point_name(point: FaultPoint) -> &'static str {
         FaultPoint::AfterObjectInstall => "AfterObjectInstall",
         FaultPoint::BeforeFrameAppend => "BeforeFrameAppend",
         FaultPoint::AfterFrameAppend => "AfterFrameAppend",
+        FaultPoint::BeforeEffectDispatch => "BeforeEffectDispatch",
+        FaultPoint::AfterEffectDispatch => "AfterEffectDispatch",
+        FaultPoint::BeforeConfigActivation => "BeforeConfigActivation",
+        FaultPoint::AfterConfigActivation => "AfterConfigActivation",
+        FaultPoint::BeforeHeadUpdate => "BeforeHeadUpdate",
+        FaultPoint::AfterHeadUpdate => "AfterHeadUpdate",
     }
 }
 
@@ -45,6 +58,12 @@ pub fn parse_fault_point(s: &str) -> Option<FaultPoint> {
         "AfterObjectInstall" => Some(FaultPoint::AfterObjectInstall),
         "BeforeFrameAppend" => Some(FaultPoint::BeforeFrameAppend),
         "AfterFrameAppend" => Some(FaultPoint::AfterFrameAppend),
+        "BeforeEffectDispatch" => Some(FaultPoint::BeforeEffectDispatch),
+        "AfterEffectDispatch" => Some(FaultPoint::AfterEffectDispatch),
+        "BeforeConfigActivation" => Some(FaultPoint::BeforeConfigActivation),
+        "AfterConfigActivation" => Some(FaultPoint::AfterConfigActivation),
+        "BeforeHeadUpdate" => Some(FaultPoint::BeforeHeadUpdate),
+        "AfterHeadUpdate" => Some(FaultPoint::AfterHeadUpdate),
         _ => None,
     }
 }
@@ -93,6 +112,32 @@ pub fn spawn_crash_child(
         .env(ENV_STATE_EVERY, state_every.to_string())
         .stdout(std::process::Stdio::piped());
     cmd.spawn().expect("testkit: failed to spawn crash-child")
+}
+
+/// Spawn the M2-mode crash-test child: opens a session with a config module
+/// (publishing `svc.greet`), commits `events` plain events acking each, then
+/// runs the M2 flow — `effect_dispatch` when `flow` contains "dispatch", then
+/// two `module_state_cas` updates — aborting at `point` once armed. Config
+/// points arm before open (they fire during open's `activate_config`); the
+/// dispatch/head points arm after the `after_acks`-th commit.
+pub fn spawn_m2_crash_child(
+    dir: &Path,
+    point: Option<FaultPoint>,
+    after_acks: u64,
+    events: u64,
+    flow: &str,
+) -> Child {
+    let mut cmd = Command::new(crash_child_exe());
+    cmd.env(ENV_DIR, dir)
+        .env(ENV_MODE, "m2")
+        .env(ENV_POINT, point.map(fault_point_name).unwrap_or("none"))
+        .env(ENV_AFTER_ACKS, after_acks.to_string())
+        .env(ENV_EVENTS, events.to_string())
+        .env(ENV_PROFILE, Profile::Fast.name())
+        .env(ENV_STATE_EVERY, "1")
+        .env(ENV_M2_FLOW, flow)
+        .stdout(std::process::Stdio::piped());
+    cmd.spawn().expect("testkit: failed to spawn crash-child (m2)")
 }
 
 /// Read the child's stdout to EOF and return the largest `acked=<n>` seen
@@ -212,6 +257,100 @@ pub fn verify_recovery(dir: &Path, acked: u64) -> Result<Recovered, String> {
         let _ = q.shutdown();
     }
     Ok(recovered)
+}
+
+/// The M2 crash-recovery invariant checker: [`verify_recovery`] (log
+/// invariants, no dangling refs, reopen + append) PLUS the M2 composition
+/// invariants:
+///   1. the reopened session's composition epoch is consistent with the log's
+///      `composition_changed` events — `count - 1 <= epoch <= count + 1`
+///      (on reopen the composition is rebuilt from a fresh registry at epoch
+///      0; a crash between the in-memory publish and the event commit leaves
+///      the log one event short of the in-memory epoch, so the count bounds
+///      the epoch within ±1);
+///   2. every `composition_changed` event's refs (package + composition
+///      digests) exist in the object store — the closure is valid (R-10);
+///   3. the reopened session is usable: one more commit lands.
+pub fn verify_m2_recovery(dir: &Path, acked: u64) -> Result<(), String> {
+    verify_recovery(dir, acked)?;
+
+    let envelopes = collect_envelopes(dir)?;
+    let comp_changed: Vec<&Envelope> = envelopes
+        .iter()
+        .filter(|e| e.kind == "composition_changed")
+        .collect();
+    let count = comp_changed.len() as u64;
+
+    // 2 — closure: every composition_changed ref exists in the object store
+    let queue = Arc::new(DurabilityQueue::start("kb-testkit-m2-verify"));
+    let store = ObjectStore::open(&dir.join("objects"), Arc::clone(&queue))
+        .map_err(|e| format!("m2: open object store: {e}"))?;
+    for env in &comp_changed {
+        for d in &env.refs {
+            if !store.exists(d) {
+                return Err(format!(
+                    "m2: composition_changed seq {}: dangling ref {d}",
+                    env.seq
+                ));
+            }
+        }
+    }
+    drop(store);
+    if let Ok(q) = Arc::try_unwrap(queue) {
+        let _ = q.shutdown();
+    }
+
+    // 1 + 3 — reopen: epoch consistency, then one more commit
+    let mut session = Session::open(SessionConfig {
+        dir: dir.to_path_buf(),
+        ..Default::default()
+    })
+    .map_err(|e| format!("m2 reopen: {e}"))?;
+    let epoch = session.composition().epoch;
+    if epoch < count.saturating_sub(1) || epoch > count + 1 {
+        return Err(format!(
+            "m2: reopened epoch {epoch} inconsistent with {count} composition_changed events \
+             (expected {}..={})",
+            count.saturating_sub(1),
+            count + 1
+        ));
+    }
+    session
+        .commit(
+            vec![NewEvent {
+                kind: "test_event".into(),
+                payload_schema: 1,
+                payload: serde_json::json!({"m2": true}),
+                objects: vec![],
+                refs: vec![],
+            }],
+            None,
+        )
+        .map_err(|e| format!("m2 post-recovery commit: {e}"))?;
+    session.close().map_err(|e| format!("m2 close: {e}"))?;
+    Ok(())
+}
+
+/// Relative file listing of the session dir (directories get a trailing `/`),
+/// sorted. Used by the gate for the ephemeral-scope assertion (nothing beyond
+/// log.zst / objects/ / state/) and the read-only privacy scan.
+pub fn session_dir_layout(dir: &Path) -> Vec<String> {
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            let rel = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+            if p.is_dir() {
+                out.push(format!("{rel}/"));
+                walk(&p, base, out);
+            } else {
+                out.push(rel);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
 }
 
 /// Referenced digests (refs ∪ snapshots) of every envelope in the log — the

@@ -5,12 +5,18 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+kanbei-capabilities.workspace = true
 kanbei-core.workspace = true
 kanbei-log.workspace = true
+kanbei-modules.workspace = true
 kanbei-objects.workspace = true
+kanbei-policy.workspace = true
+kanbei-projection.workspace = true
+kanbei-scopes.workspace = true
+kanbei-services.workspace = true
 kanbei-session.workspace = true
 kanbei-snapshot.workspace = true
-kanbei-projection.workspace = true
+kanbei-vm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

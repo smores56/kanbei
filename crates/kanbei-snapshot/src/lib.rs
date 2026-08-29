@@ -9,11 +9,22 @@ use std::collections::HashSet;
 
 use kanbei_core::digest::Digest;
 use kanbei_core::envelope::ENVELOPE_SCHEMA;
+use kanbei_core::id::Id128;
 use kanbei_objects::{ObjectError, ObjectStore};
 use serde::{Deserialize, Serialize};
 
-/// Manifest schema version (M1: 1).
-pub const MANIFEST_SCHEMA: u32 = 1;
+/// Manifest schema version (M2: 2 — module pins + composition digest).
+pub const MANIFEST_SCHEMA: u32 = 2;
+
+/// One active module generation pin: stable module id, generation, package
+/// digest, and the scope it was activated in (M2: "/" — root scope only).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ModulePin {
+    pub module_id: Id128,
+    pub generation: u64,
+    pub package: Digest,
+    pub scope: String,
+}
 
 /// Execution-snapshot manifest: environment pins + version fields.
 /// Field order is the canonical JSON layout (derive order).
@@ -24,14 +35,18 @@ pub struct ExecutionManifest {
     pub kernel_schema: u32,
     /// Event-envelope schema version.
     pub envelope_schema: u32,
-    /// Module ABI version; None until M2 (no modules).
+    /// Module ABI version (M2: 1).
     pub module_abi: Option<u32>,
-    /// Wasm engine digest; None until M2.
+    /// Wasm engine digest; Some when the session loaded the guest wasm (M2).
     pub engine_digest: Option<Digest>,
-    /// Toolchain manifest digest; field present from M1 (S17).
+    /// Toolchain manifest digest; M2 sessions do not track a toolchain yet.
     pub toolchain_digest: Option<Digest>,
     /// Module state head; None until M2, populated by session state changes.
     pub state_head: Option<Digest>,
+    /// Active module-generation pins (M2), sorted by module_id.
+    pub modules: Vec<ModulePin>,
+    /// Epoch composition digest (R-01); None until M2.
+    pub composition: Option<Digest>,
     /// Memory claim root; M4 — always None in M1.
     pub memory_root: Option<Digest>,
     /// Tool-registry snapshot digest; None until M2.
@@ -54,10 +69,12 @@ impl ExecutionManifest {
             schema: MANIFEST_SCHEMA,
             kernel_schema: 1,
             envelope_schema: ENVELOPE_SCHEMA,
-            module_abi: None,
+            module_abi: Some(1),
             engine_digest: None,
             toolchain_digest: None,
             state_head: None,
+            modules: Vec::new(),
+            composition: None,
             memory_root: None,
             tool_registry: None,
             projection: None,

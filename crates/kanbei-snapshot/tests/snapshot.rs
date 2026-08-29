@@ -131,11 +131,14 @@ fn verify_closure_corrupt_object() {
 #[test]
 fn bootstrap_shape() {
     let m = ExecutionManifest::bootstrap();
+    assert_eq!(m.schema, 2);
     assert_eq!(m.schema, MANIFEST_SCHEMA);
     assert_eq!(m.kernel_schema, 1);
     assert_eq!(m.envelope_schema, ENVELOPE_SCHEMA);
-    assert_eq!(m.module_abi, None);
+    assert_eq!(m.module_abi, Some(1));
     assert_eq!(m.state_head, None);
+    assert_eq!(m.modules, Vec::new());
+    assert_eq!(m.composition, None);
     assert_eq!(m.engine_digest, None);
     assert_eq!(m.toolchain_digest, None);
     assert_eq!(m.memory_root, None);
@@ -168,6 +171,8 @@ fn json_contains_version_fields() {
         "\"engine_digest\"",
         "\"toolchain_digest\"",
         "\"state_head\"",
+        "\"modules\"",
+        "\"composition\"",
         "\"schema_versions\"",
     ] {
         assert!(json.contains(key), "manifest JSON missing {key}: {json}");

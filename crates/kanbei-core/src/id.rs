@@ -95,7 +95,7 @@ impl<'de> Deserialize<'de> for Id128 {
 /// Known brand prefixes, longest-first so a prefix match is unambiguous.
 /// (All current brands are the same length; order is still significant if a
 /// brand ever becomes a prefix of another.)
-pub const BRANDS: &[&str] = &["ses_", "br_", "ev_"];
+pub const BRANDS: &[&str] = &["ses_", "br_", "ev_", "mod_", "gen_"];
 
 /// An [`Id128`] with its object class named by a [`BRANDS`] prefix.
 /// Text form is `{brand}{id}`, e.g. `ses_` + 21 base58 chars.

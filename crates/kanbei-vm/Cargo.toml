@@ -1,0 +1,13 @@
+[package]
+name = "kanbei-vm"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+kanbei-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+wasmtime = "48"
+wasmtime-wasi = "48"
