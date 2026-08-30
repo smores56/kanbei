@@ -72,7 +72,10 @@ fn unittest(repo: &std::path::Path, module: &str) -> bool {
     run_in(repo, &[&python_path(), "-m", "unittest", module]).0
 }
 
+// M7 dogfooding instrument: 180s scaled-unattended hour + spend breaker + usage check.
+// Ignored from the default gate (runs with `cargo nextest run --workspace --run-ignored all`).
 #[test]
+#[ignore]
 fn dogfooding_battery_thresholds_hold() {
     let root = fresh_root("battery");
     let report = run_battery(&root.0, Duration::from_secs(180));
@@ -88,7 +91,10 @@ fn dogfooding_battery_thresholds_hold() {
     );
 }
 
+// M7 dogfooding instrument: full battery (SIGKILL matrix + per-task success criteria).
+// Ignored from the default gate (runs with `cargo nextest run --workspace --run-ignored all`).
 #[test]
+#[ignore]
 fn battery_task_success_criteria() {
     let root = fresh_root("criteria");
     let report = run_battery(&root.0, Duration::from_secs(60));
