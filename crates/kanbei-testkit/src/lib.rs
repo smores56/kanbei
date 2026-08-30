@@ -6,6 +6,8 @@
 //! the gate suites live in `tests/`.
 
 pub mod rng;
+pub mod dogfood;
+pub mod fixture;
 
 use std::collections::HashSet;
 use std::io::Read;

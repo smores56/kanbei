@@ -120,6 +120,7 @@ fn main() {
         "m4" => run_m4(dir, after_acks),
         "m5" => run_m5(dir, after_acks),
         "m6" => run_m6(dir, after_acks),
+        "m7" => run_m7(),
         other => {
             eprintln!("crash-child: unknown {ENV_MODE}={other:?}");
             exit(2);
@@ -916,5 +917,79 @@ fn run_m6(dir: String, after_acks: u64) {
         }
     }
     ack("done".into());
+    exit(0);
+}
+
+/// The M7 dogfooding interrupted-task child (KANBEI_DF_* env; contract in
+/// dogfood.rs): opens the battery session, runs the full task-6 plan in one
+/// wake, acking `ready <k>` (1-based step index) immediately before each
+/// command is dispatched and `complete` when the run finishes. The parent
+/// SIGKILLs at a chosen window; the child never exits early by itself.
+fn run_m7() {
+    use kanbei_scheduler::{
+        CognitionProvider, StepCommand, StepContext, StepError, StepResult, TerminalOutcome,
+        Trigger, TriggerKind,
+    };
+    use kanbei_testkit::dogfood::{battery_session, task6_plan};
+
+    let dir = std::env::var("KANBEI_DF_DIR").expect("KANBEI_DF_DIR");
+    let repo = std::env::var("KANBEI_DF_REPO").expect("KANBEI_DF_REPO");
+    let session_id = std::env::var("KANBEI_DF_SESSION")
+        .expect("KANBEI_DF_SESSION")
+        .parse::<Id128>()
+        .expect("session id");
+    let project = std::env::var("KANBEI_DF_PROJECT")
+        .expect("KANBEI_DF_PROJECT")
+        .parse::<Id128>()
+        .expect("project id");
+
+    struct AckingProvider {
+        commands: std::collections::VecDeque<StepCommand>,
+        next: usize,
+    }
+    impl CognitionProvider for AckingProvider {
+        fn step(
+            &mut self,
+            _context: &StepContext,
+            _trigger: &Trigger,
+            _last: Option<&StepResult>,
+        ) -> Result<StepCommand, StepError> {
+            let k = self.next;
+            self.next += 1;
+            ack(format!("ready {k}"));
+            self.commands
+                .pop_front()
+                .ok_or(StepError::Invalid("no more commands".into()))
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    let mut session = battery_session(
+        std::path::Path::new(&dir),
+        std::path::Path::new(&repo),
+        session_id,
+        project,
+        Vec::new(),
+    );
+    session.observe_trigger(Trigger {
+        kind: TriggerKind::NewCausalEvent,
+        referent: None,
+    });
+    let run = session.accept_wake().unwrap().expect("wake accepted");
+    let trigger = run.trigger.clone();
+    let run_id = run.run_id;
+    session.run_start(run_id).unwrap();
+    let mut provider = AckingProvider {
+        commands: task6_plan().into(),
+        next: 1,
+    };
+    let _outcome: TerminalOutcome = session
+        .cognition_loop(run_id, trigger.clone(), &mut provider, |s| {
+            s.project_context(run_id, &trigger)
+        })
+        .unwrap();
+    ack("complete".into());
     exit(0);
 }
