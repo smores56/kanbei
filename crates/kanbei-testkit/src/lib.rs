@@ -35,6 +35,9 @@ pub const ENV_MODE: &str = "KANBEI_CRASH_MODE";
 /// M2 child flow selection: "head" (module_state_cas only) or a string
 /// containing "dispatch" (effect_dispatch first, then the head updates).
 pub const ENV_M2_FLOW: &str = "KANBEI_CRASH_M2_FLOW";
+/// M3 child flow selection: "spine" (full wake→run→model→tool→outcome) or
+/// "wake" (wake acceptance only — exercises the wake points).
+pub const ENV_M3_FLOW: &str = "KANBEI_CRASH_M3_FLOW";
 
 /// Canonical env-var spelling of a fault point (the child parses it back).
 pub fn fault_point_name(point: FaultPoint) -> &'static str {
@@ -49,6 +52,20 @@ pub fn fault_point_name(point: FaultPoint) -> &'static str {
         FaultPoint::AfterConfigActivation => "AfterConfigActivation",
         FaultPoint::BeforeHeadUpdate => "BeforeHeadUpdate",
         FaultPoint::AfterHeadUpdate => "AfterHeadUpdate",
+        FaultPoint::BeforeWakeAccept => "BeforeWakeAccept",
+        FaultPoint::AfterWakeAccept => "AfterWakeAccept",
+        FaultPoint::BeforeRunStart => "BeforeRunStart",
+        FaultPoint::AfterRunStart => "AfterRunStart",
+        FaultPoint::BeforeModelCall => "BeforeModelCall",
+        FaultPoint::AfterModelCall => "AfterModelCall",
+        FaultPoint::BeforeToolIntentCommit => "BeforeToolIntentCommit",
+        FaultPoint::AfterToolIntentCommit => "AfterToolIntentCommit",
+        FaultPoint::BeforeToolDispatch => "BeforeToolDispatch",
+        FaultPoint::AfterToolDispatch => "AfterToolDispatch",
+        FaultPoint::BeforeToolOutcomeCommit => "BeforeToolOutcomeCommit",
+        FaultPoint::AfterToolOutcomeCommit => "AfterToolOutcomeCommit",
+        FaultPoint::BeforeRunOutcome => "BeforeRunOutcome",
+        FaultPoint::AfterRunOutcome => "AfterRunOutcome",
     }
 }
 
@@ -64,6 +81,20 @@ pub fn parse_fault_point(s: &str) -> Option<FaultPoint> {
         "AfterConfigActivation" => Some(FaultPoint::AfterConfigActivation),
         "BeforeHeadUpdate" => Some(FaultPoint::BeforeHeadUpdate),
         "AfterHeadUpdate" => Some(FaultPoint::AfterHeadUpdate),
+        "BeforeWakeAccept" => Some(FaultPoint::BeforeWakeAccept),
+        "AfterWakeAccept" => Some(FaultPoint::AfterWakeAccept),
+        "BeforeRunStart" => Some(FaultPoint::BeforeRunStart),
+        "AfterRunStart" => Some(FaultPoint::AfterRunStart),
+        "BeforeModelCall" => Some(FaultPoint::BeforeModelCall),
+        "AfterModelCall" => Some(FaultPoint::AfterModelCall),
+        "BeforeToolIntentCommit" => Some(FaultPoint::BeforeToolIntentCommit),
+        "AfterToolIntentCommit" => Some(FaultPoint::AfterToolIntentCommit),
+        "BeforeToolDispatch" => Some(FaultPoint::BeforeToolDispatch),
+        "AfterToolDispatch" => Some(FaultPoint::AfterToolDispatch),
+        "BeforeToolOutcomeCommit" => Some(FaultPoint::BeforeToolOutcomeCommit),
+        "AfterToolOutcomeCommit" => Some(FaultPoint::AfterToolOutcomeCommit),
+        "BeforeRunOutcome" => Some(FaultPoint::BeforeRunOutcome),
+        "AfterRunOutcome" => Some(FaultPoint::AfterRunOutcome),
         _ => None,
     }
 }
@@ -183,6 +214,17 @@ pub fn collect_envelopes(dir: &Path) -> Result<Vec<Envelope>, String> {
 ///   6. usable recovery: reopening the session continues at `R + 1` and one
 ///      more commit lands.
 pub fn verify_recovery(dir: &Path, acked: u64) -> Result<Recovered, String> {
+    verify_recovery_tolerant(dir, acked, 0)
+}
+
+/// [`verify_recovery`] with `reopen_extra` additional events expected to be
+/// committed by the session at reopen (M3: `intent_classified` facts — B-05
+/// — advance next_seq past R+1).
+pub fn verify_recovery_tolerant(
+    dir: &Path,
+    acked: u64,
+    reopen_extra: u64,
+) -> Result<Recovered, String> {
     let log_path = dir.join("log.zst");
 
     // 1 — never Corruption from our fault points
@@ -236,8 +278,12 @@ pub fn verify_recovery(dir: &Path, acked: u64) -> Result<Recovered, String> {
         ..Default::default()
     })
     .map_err(|e| format!("reopen: {e}"))?;
-    if session.next_seq() != r + 1 {
-        return Err(format!("next_seq {} != R+1 {}", session.next_seq(), r + 1));
+    if session.next_seq() != r + 1 + reopen_extra {
+        return Err(format!(
+            "next_seq {} != R+1+{reopen_extra} {}",
+            session.next_seq(),
+            r + 1 + reopen_extra
+        ));
     }
     session
         .commit(
@@ -389,4 +435,133 @@ mod tests {
         }
         assert_eq!(r.next_usize(0), 0);
     }
+}
+
+/// Spawn the M3-mode crash-test child: opens a session with a fake provider,
+/// commits `after_acks` plain events, then runs the agent spine (wake accept,
+/// run start, model call, run outcome — plus a tool call in the "spine" flow)
+/// aborting at `point` once armed.
+pub fn spawn_m3_crash_child(dir: &Path, point: Option<FaultPoint>, after_acks: u64) -> Child {
+    let mut cmd = Command::new(crash_child_exe());
+    cmd.env(ENV_DIR, dir)
+        .env(ENV_MODE, "m3")
+        .env(ENV_POINT, point.map(fault_point_name).unwrap_or("none"))
+        .env(ENV_AFTER_ACKS, after_acks.to_string())
+        .env(ENV_EVENTS, after_acks.to_string())
+        .env(ENV_PROFILE, Profile::Fast.name())
+        .env(ENV_STATE_EVERY, "1")
+        .stdout(std::process::Stdio::piped());
+    cmd.spawn().expect("testkit: failed to spawn crash-child (m3)")
+}
+
+/// The M3 crash-recovery invariant checker: [`verify_recovery`] plus the M3
+/// spine invariants:
+///   1. every committed `tool_intent` event has a matching `tool_outcome` by
+///      call_id — OR is explicitly classified by an `intent_classified`
+///      event committed at recovery (B-05: committed-intent-without-outcome
+///      is the sufficient condition for interrupted/ambiguous);
+///   2. every `model_call` intent has a matching `model_outcome` by seq
+///      pairing (intent then outcome, no cross-pairing);
+///   3. the reopened session's `classify_pending_intents` is idempotent —
+///      reopening twice commits no duplicate classification.
+pub fn verify_m3_recovery(dir: &Path, acked: u64) -> Result<(), String> {
+    let envelopes0 = collect_envelopes(dir)?;
+    // Expected classification facts at reopen: committed tool intents without
+    // a matching outcome (B-05) — exactly the pending set.
+    let mut pending0: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut outcomes0: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in &envelopes0 {
+        match e.kind.as_str() {
+            "tool_outcome" => {
+                if let Some(c) = e.payload.get("call_id").and_then(|c| c.as_str()) {
+                    outcomes0.insert(c.to_string());
+                }
+            }
+            "tool_intent" => {
+                if let Some(c) = e.payload.get("call_id").and_then(|c| c.as_str()) {
+                    pending0.insert(c.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    let expected_classified = pending0.difference(&outcomes0).count() as u64;
+    verify_recovery_tolerant(dir, acked, expected_classified)?;
+
+    let envelopes = collect_envelopes(dir)?;
+    let mut committed_outcomes: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut classified: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut intents: Vec<(String, String)> = Vec::new();
+    let mut model_calls: Vec<u64> = Vec::new();
+    let mut model_outcomes = 0u64;
+    for e in &envelopes {
+        match e.kind.as_str() {
+            "tool_outcome" => {
+                if let Some(call) = e.payload.get("call_id").and_then(|c| c.as_str()) {
+                    committed_outcomes.insert(call.to_string());
+                }
+            }
+            "intent_classified" => {
+                if let Some(call) = e.payload.get("call_id").and_then(|c| c.as_str()) {
+                    classified.insert(call.to_string());
+                }
+            }
+            "tool_intent" => {
+                if let (Some(call), Some(tool)) = (
+                    e.payload.get("call_id").and_then(|c| c.as_str()),
+                    e.payload.get("tool").and_then(|t| t.as_str()),
+                ) {
+                    intents.push((call.to_string(), tool.to_string()));
+                }
+            }
+            "model_call" => model_calls.push(e.seq),
+            "model_outcome" => model_outcomes += 1,
+            _ => {}
+        }
+    }
+    // 1 — every intent resolves: outcome OR explicit classification.
+    for (call_id, _tool) in &intents {
+        if !committed_outcomes.contains(call_id) && !classified.contains(call_id) {
+            return Err(format!(
+                "m3: tool intent {call_id} has neither outcome nor classification"
+            ));
+        }
+    }
+    // 2 — model intents pair with outcomes (a crash mid-call leaves an
+    // unpaired intent; the classification hook records it).
+    if model_calls.len() < model_outcomes as usize {
+        return Err(format!(
+            "m3: {} model outcomes for {} model calls",
+            model_outcomes,
+            model_calls.len()
+        ));
+    }
+
+    // 3 — reopen idempotence: classification facts are committed once.
+    let mut session = Session::open(SessionConfig {
+        dir: dir.to_path_buf(),
+        ..Default::default()
+    })
+    .map_err(|e| format!("m3: reopen: {e}"))?;
+    let classified_again = session
+        .classify_pending_intents()
+        .map_err(|e| format!("m3: reclassify: {e}"))?;
+    if classified_again != 0 {
+        return Err(format!("m3: classification not idempotent: {classified_again} new facts"));
+    }
+    session
+        .commit(
+            vec![NewEvent {
+                kind: "test_event".into(),
+                payload_schema: 1,
+                payload: serde_json::json!({"post": "m3-recovery"}),
+                objects: vec![],
+                refs: vec![],
+            }],
+            None,
+        )
+        .map_err(|e| format!("m3: post-recovery commit: {e}"))?;
+    session.close().map_err(|e| format!("m3: close: {e}"))?;
+    Ok(())
 }

@@ -245,6 +245,15 @@ pub struct ToolOutcome {
     pub retained: Option<bool>,
 }
 
+/// A tool intent parked in the session's bounded approval queue (R-17/H-05):
+/// the committed intent plus the approval intent whose digest gates it. On
+/// overflow the oldest entry is evicted and resolves `Interrupted`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalParked {
+    pub intent: ToolIntent,
+    pub approval: ApprovalIntent,
+}
+
 // ---------- approval binding (R-16/D-12) ----------
 
 /// Build the approval intent for a tool call: binds tool ModuleId+generation,
@@ -725,15 +734,10 @@ pub fn run_cmd(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+    // Unreachable: the loop returns on exit or timeout; keep the signature
+    // honest for the compiler.
     #[allow(unreachable_code)]
-    loop {
-        break Ok(ProcessResult {
-            exit: -1,
-            stdout: String::new(),
-            stderr: String::new(),
-            timed_out: false,
-        });
-    }
+    Err(ProcessErr::Timeout)
 }
 
 #[cfg(unix)]

@@ -30,8 +30,8 @@ use kanbei_modules::{ModuleOrigin, PackageManifest};
 use kanbei_services::{ScopePath, ServiceKey};
 use kanbei_session::{FaultInjector, FaultPoint, NewEvent, Session, SessionConfig};
 use kanbei_testkit::{
-    ENV_AFTER_ACKS, ENV_DIR, ENV_EVENTS, ENV_M2_FLOW, ENV_MODE, ENV_OBJECTS, ENV_POINT, ENV_PROFILE,
-    ENV_STATE_EVERY, parse_fault_point,
+    ENV_AFTER_ACKS, ENV_DIR, ENV_EVENTS, ENV_M2_FLOW, ENV_M3_FLOW, ENV_MODE, ENV_OBJECTS,
+    ENV_POINT, ENV_PROFILE, ENV_STATE_EVERY, parse_fault_point,
 };
 use kanbei_vm::VmConfig;
 use serde_json::json;
@@ -90,6 +90,7 @@ fn main() {
     match mode.as_str() {
         "m1" => run_m1(dir, point, after_acks, events, objects, profile, state_every),
         "m2" => run_m2(dir, point, after_acks, events, profile),
+        "m3" => run_m3(dir, point, after_acks),
         other => {
             eprintln!("crash-child: unknown {ENV_MODE}={other:?}");
             exit(2);
@@ -265,6 +266,235 @@ fn run_m2(dir: String, point: Option<FaultPoint>, after_acks: u64, events: u64, 
                 ack(format!("cas_error={e}"));
                 exit(2);
             }
+        }
+    }
+    ack("done".into());
+    exit(0);
+}
+
+/// The M3 flow: open a session with a fake provider, arm after `after_acks`
+/// plain commits, then run the agent spine — wake accept, run start, model
+/// call, tool call, run outcome — aborting at `point` once armed.
+fn run_m3(dir: String, point: Option<FaultPoint>, after_acks: u64) {
+    use kanbei_capabilities::{Grant, GrantScope, Principal, TrustClass};
+    use kanbei_provider::{CompletionResponse, FakeEngine, FinishReason, ProviderConfig, Usage};
+    use kanbei_scheduler::{
+        Budgets, BreakerFloors, TerminalOutcome,
+        Trigger, TriggerKind,
+    };
+    use std::sync::Arc;
+
+    let flow = std::env::var(ENV_M3_FLOW).unwrap_or_else(|_| "spine".into());
+    let injector = Arc::new(AbortInjector { point, armed: AtomicBool::new(false) });
+    let arm_handle = Arc::clone(&injector);
+    // Wake/run points arm after the AFTER_ACKS commits; the spine runs then.
+    // Points that fire during open (none in M3) would arm before open.
+    let arm_after_open = matches!(
+        point,
+        Some(
+            FaultPoint::BeforeWakeAccept
+                | FaultPoint::AfterWakeAccept
+                | FaultPoint::BeforeRunStart
+                | FaultPoint::AfterRunStart
+                | FaultPoint::BeforeModelCall
+                | FaultPoint::AfterModelCall
+                | FaultPoint::BeforeToolIntentCommit
+                | FaultPoint::AfterToolIntentCommit
+                | FaultPoint::BeforeToolDispatch
+                | FaultPoint::AfterToolDispatch
+                | FaultPoint::BeforeToolOutcomeCommit
+                | FaultPoint::AfterToolOutcomeCommit
+                | FaultPoint::BeforeRunOutcome
+                | FaultPoint::AfterRunOutcome
+        )
+    );
+
+    // Grant everything to generation 0 (the spine principal) so tool calls
+    // dispatch without parking in the approval queue.
+    let session_id = Id128::generate();
+    let mut broker = kanbei_capabilities::Broker::new();
+    broker
+        .add_template(kanbei_capabilities::PolicyTemplate {
+            trust_class: TrustClass::Builtin,
+            allow: vec![kanbei_capabilities::Capability::new(
+                "fs.read".into(),
+                vec!["call".into()],
+            )],
+            deny: vec![],
+            require_approval: vec![],
+            version: 1,
+            monotonic: true,
+        })
+        .unwrap();
+    let mut grant = Grant {
+        grant_digest: kanbei_core::digest::Digest::new(b"placeholder"),
+        principal: Principal { session: session_id, generation: 0, run: None },
+        module_generation: 0,
+        capability: kanbei_capabilities::Capability::new("fs.read".into(), vec!["call".into()]),
+        scope: GrantScope::Session,
+        expiry: None,
+        budget: None,
+        purpose: Some("crash-test".into()),
+        policy_version: 1,
+    };
+    grant.grant_digest = grant.derive_digest();
+    broker.add_grant(grant).unwrap();
+
+    let fake = FakeEngine::new(
+        ProviderConfig {
+            provider: "fake".into(),
+            model: "test".into(),
+            base_url: "http://localhost:0/v1".into(),
+            key: kanbei_provider::KeySource::Env("KANBEI_TEST_KEY".into()),
+            temperature: None,
+            max_tokens: Some(10),
+            timeout: std::time::Duration::from_secs(5),
+        },
+        vec![CompletionResponse {
+            content: Some("hello".into()),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: Usage { input_tokens: 3, output_tokens: 2 },
+        }],
+    );
+
+    let mut session = match Session::open(SessionConfig {
+        dir: PathBuf::from(&dir),
+        stream: "crash-m3".into(),
+        profile: Profile::Fast,
+        fault: Some(injector),
+        provider: Some(kanbei_provider::ProviderConfig {
+            provider: "fake".into(),
+            model: "test".into(),
+            base_url: "http://localhost:0/v1".into(),
+            key: kanbei_provider::KeySource::Env("KANBEI_TEST_KEY".into()),
+            temperature: None,
+            max_tokens: Some(10),
+            timeout: std::time::Duration::from_secs(5),
+        }),
+        provider_engine: Some(Box::new(fake)),
+        budgets: Budgets { deadline_secs: Some(60), ..Default::default() },
+        breaker_floors: BreakerFloors::default(),
+        broker,
+        session_id: Some(session_id),
+        ..Default::default()
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            ack(format!("commit_error=open: {e}"));
+            exit(2);
+        }
+    };
+
+    // AFTER_ACKS plain commits (M1 event shape) with the injector disarmed.
+    for i in 1..=after_acks {
+        let ev = NewEvent {
+            kind: "test_event".into(),
+            payload_schema: 1,
+            payload: json!({"i": i}),
+            objects: vec![],
+            refs: vec![],
+        };
+        match session.commit(vec![ev], None) {
+            Ok(rec) => {
+                if rec.last_seq == after_acks && arm_after_open {
+                    arm_handle.armed.store(true, Ordering::SeqCst);
+                }
+                ack(format!("acked={}", rec.last_seq));
+            }
+            Err(e) => {
+                ack(format!("commit_error={e}"));
+                exit(2);
+            }
+        }
+    }
+    if after_acks == 0 {
+        arm_handle.armed.store(true, Ordering::SeqCst);
+    }
+
+    if flow == "wake" {
+        // Wake acceptance only: exercises Before/AfterWakeAccept.
+        let accepted = session.observe_trigger(Trigger {
+            kind: TriggerKind::NewCausalEvent,
+            referent: None,
+        });
+        let _ = accepted;
+        match session.accept_wake() {
+            Ok(_) => ack(format!("acked={}", session.next_seq() - 1)),
+            Err(e) => {
+                ack(format!("wake_error={e}"));
+                exit(2);
+            }
+        }
+        ack("done".into());
+        exit(0);
+    }
+
+    // Spine: wake → run start → model call → tool call → run outcome,
+    // acking after every commit so the ack-coverage invariant tracks each
+    // frame (each crash point fires inside its owning commit, leaving the
+    // in-flight frame as the only unacked events).
+    session.observe_trigger(Trigger { kind: TriggerKind::NewCausalEvent, referent: None });
+    let run = match session.accept_wake() {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            ack("wake_error=denied".into());
+            exit(2);
+        }
+        Err(e) => {
+            ack(format!("wake_error={e}"));
+            exit(2);
+        }
+    };
+    ack(format!("acked={}", session.next_seq() - 1));
+    if let Err(e) = session.run_start(run.run_id) {
+        ack(format!("run_start_error={e}"));
+        exit(2);
+    }
+    ack(format!("acked={}", session.next_seq() - 1));
+
+    // Model call: intent + outcome commit in one frame.
+    let messages = vec![kanbei_provider::Message {
+        role: kanbei_provider::Role::User,
+        content: "hello".into(),
+        tool_call_id: None,
+    }];
+    match session.model_call(run.run_id, messages, vec![], "hello") {
+        Ok(_) => ack(format!("acked={}", session.next_seq() - 1)),
+        Err(e) => {
+            ack(format!("model_error={e}"));
+            exit(2);
+        }
+    }
+
+    // Tool call: intent commit, then outcome commit (separate frames).
+    let principal = Principal { session: session_id, generation: 0, run: Some(0) };
+    let outcome = match session.tool_call(
+        run.run_id,
+        principal,
+        "fs.read",
+        json!({"path": "README.md"}),
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            ack(format!("tool_error={e}"));
+            exit(2);
+        }
+    };
+    ack(format!("acked={}", session.next_seq() - 1));
+    if let Err(e) = session.commit_tool_outcome(&outcome) {
+        ack(format!("outcome_error={e}"));
+        exit(2);
+    }
+    ack(format!("acked={}", session.next_seq() - 1));
+
+    // Run outcome.
+    let usage = session.scheduler_usage(run.run_id);
+    match session.run_outcome(run.run_id, TerminalOutcome::CompletedGoal, usage, &[]) {
+        Ok(_) => ack(format!("acked={}", session.next_seq() - 1)),
+        Err(e) => {
+            ack(format!("run_outcome_error={e}"));
+            exit(2);
         }
     }
     ack("done".into());

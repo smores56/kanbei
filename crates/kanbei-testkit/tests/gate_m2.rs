@@ -629,7 +629,22 @@ fn acceptance_crash_m2_points() {
                 FaultPoint::BeforeObjectInstall
                 | FaultPoint::AfterObjectInstall
                 | FaultPoint::BeforeFrameAppend
-                | FaultPoint::AfterFrameAppend => false,
+                | FaultPoint::AfterFrameAppend
+                // M3 spine points never fire in the M2 child
+                | FaultPoint::BeforeWakeAccept
+                | FaultPoint::AfterWakeAccept
+                | FaultPoint::BeforeRunStart
+                | FaultPoint::AfterRunStart
+                | FaultPoint::BeforeModelCall
+                | FaultPoint::AfterModelCall
+                | FaultPoint::BeforeToolIntentCommit
+                | FaultPoint::AfterToolIntentCommit
+                | FaultPoint::BeforeToolDispatch
+                | FaultPoint::AfterToolDispatch
+                | FaultPoint::BeforeToolOutcomeCommit
+                | FaultPoint::AfterToolOutcomeCommit
+                | FaultPoint::BeforeRunOutcome
+                | FaultPoint::AfterRunOutcome => false,
             };
             if fires {
                 assert_eq!(

@@ -97,6 +97,27 @@ pub struct SessionConfig {
     /// guest wasm is not built (`Vm::load` → `NotBuilt`), modules are
     /// disabled (a `config` then opens in safe mode).
     pub engine: Option<kanbei_vm::VmConfig>,
+    // --- M3 agent spine ---
+    /// Provider gateway config; None = no model calls (storage-only session).
+    pub provider: Option<kanbei_provider::ProviderConfig>,
+    /// The provider engine; None = build [`kanbei_provider::HttpEngine`]
+    /// from `provider` (tests inject the fake engine).
+    pub provider_engine: Option<Box<dyn kanbei_provider::ProviderEngine>>,
+    /// Scheduler budgets (deadline/tokens/tools/children).
+    pub budgets: kanbei_scheduler::Budgets,
+    /// Kernel breaker floors (R-17/E-02).
+    pub breaker_floors: kanbei_scheduler::BreakerFloors,
+    /// Native tool execution limits.
+    pub tool_limits: kanbei_tools::ExecLimits,
+    /// Tool execution root (fs tools never escape it).
+    pub fs_root: PathBuf,
+    /// Capability broker (grants/templates); default = empty (default-deny).
+    pub broker: kanbei_capabilities::Broker,
+    /// Approval queue bound with eviction (R-17/H-05); 0 = no approvals.
+    pub approval_bound: usize,
+    /// The session's own identity (caller principal for kernel-originated
+    /// tool calls, R-14); None = generate at open.
+    pub session_id: Option<Id128>,
 }
 
 impl Default for SessionConfig {
@@ -112,6 +133,15 @@ impl Default for SessionConfig {
             max_state_bytes: 1024 * 1024,
             policy: Arc::new(StoreAllPolicy),
             engine: None,
+            provider: None,
+            provider_engine: None,
+            budgets: kanbei_scheduler::Budgets::default(),
+            breaker_floors: kanbei_scheduler::BreakerFloors::default(),
+            tool_limits: kanbei_tools::ExecLimits::default(),
+            fs_root: PathBuf::from("."),
+            broker: kanbei_capabilities::Broker::new(),
+            approval_bound: 64,
+            session_id: None,
         }
     }
 }
@@ -133,6 +163,21 @@ pub enum FaultPoint {
     AfterConfigActivation,
     BeforeHeadUpdate,
     AfterHeadUpdate,
+    // --- M3 agent spine points ---
+    BeforeWakeAccept,
+    AfterWakeAccept,
+    BeforeRunStart,
+    AfterRunStart,
+    BeforeModelCall,
+    AfterModelCall,
+    BeforeToolIntentCommit,
+    AfterToolIntentCommit,
+    BeforeToolDispatch,
+    AfterToolDispatch,
+    BeforeToolOutcomeCommit,
+    AfterToolOutcomeCommit,
+    BeforeRunOutcome,
+    AfterRunOutcome,
 }
 
 pub trait FaultInjector: Send + Sync {
@@ -204,6 +249,18 @@ pub struct Session {
     policy: RetentionGate,
     modules: Option<ModuleManager>,
     vm_engine_digest: Option<Digest>,
+    // --- M3 agent spine ---
+    scheduler: kanbei_scheduler::Scheduler,
+    provider: Option<Box<dyn kanbei_provider::ProviderEngine>>,
+    provider_config: Option<kanbei_provider::ProviderConfig>,
+    tool_registry: kanbei_tools::ToolRegistry,
+    native_tools: kanbei_tools::NativeTools,
+    broker: kanbei_capabilities::Broker,
+    /// Bounded pending-approval queue (oldest evicted on overflow).
+    approvals: std::collections::VecDeque<kanbei_tools::ApprovalParked>,
+    approval_bound: usize,
+    fs_root: PathBuf,
+    session_id: Id128,
 }
 
 impl Session {
@@ -223,7 +280,7 @@ impl Session {
     /// activated atomically; on any failure the module subsystem is dropped
     /// and a canonical `safe_mode_activated` event is committed — the session
     /// remains usable with storage only (R-01/C-02).
-    pub fn open(cfg: SessionConfig) -> Result<Self, SessionError> {
+    pub fn open(mut cfg: SessionConfig) -> Result<Self, SessionError> {
         std::fs::create_dir_all(&cfg.dir)?;
         let log_path = cfg.dir.join("log.zst");
         let recovered = recover_or_fresh(&log_path)?;
@@ -302,6 +359,20 @@ impl Session {
             }
         };
 
+        let provider_engine = cfg.provider_engine.take().or_else(|| {
+            cfg.provider.as_ref().map(|p| {
+                Box::new(kanbei_provider::HttpEngine::new(p.clone()))
+                    as Box<dyn kanbei_provider::ProviderEngine>
+            })
+        });
+        let broker = std::mem::take(&mut cfg.broker);
+        let fs_root = cfg.fs_root.clone();
+        let tool_limits = cfg.tool_limits;
+        let approval_bound = cfg.approval_bound;
+        let budgets = cfg.budgets;
+        let breaker_floors = cfg.breaker_floors;
+        let provider_config = cfg.provider.clone();
+        let session_id = cfg.session_id.unwrap_or_else(Id128::generate);
         let config_manifest = cfg.config.clone();
         let mut session = Self {
             log,
@@ -318,6 +389,19 @@ impl Session {
             policy,
             modules,
             vm_engine_digest,
+            scheduler: kanbei_scheduler::Scheduler::new(budgets, breaker_floors),
+            provider: provider_engine,
+            provider_config,
+            tool_registry: kanbei_tools::ToolRegistry::builtin(),
+            native_tools: kanbei_tools::NativeTools {
+                limits: tool_limits,
+                ..Default::default()
+            },
+            broker,
+            approvals: std::collections::VecDeque::new(),
+            approval_bound,
+            fs_root,
+            session_id,
         };
 
         // Root config module: atomic activation; failure → safe mode.
@@ -338,6 +422,10 @@ impl Session {
                 None,
             )?;
         }
+
+        // M3: classify committed intents without outcomes (B-05) before any
+        // new work — recovery facts exist before the session is usable.
+        session.classify_pending_intents()?;
         Ok(session)
     }
 
@@ -882,6 +970,12 @@ impl Session {
         self.current_snapshot
     }
 
+    /// The session's own identity (caller principal for kernel-originated
+    /// tool calls, R-14/D-02).
+    pub fn session_id(&self) -> Id128 {
+        self.session_id
+    }
+
     /// Flush, then stop the durability worker and join it. Drops the module
     /// subsystem (and with it the wasm watchdog) first, releasing its queue
     /// clones before the queue's final Arc is unwrapped. Fails while any
@@ -900,7 +994,7 @@ impl Session {
         Ok(())
     }
 
-    fn fault(&self, point: FaultPoint) {
+    pub(crate) fn fault(&self, point: FaultPoint) {
         if let Some(f) = &self.cfg.fault {
             f.inject(point);
         }
@@ -943,6 +1037,8 @@ pub enum SessionError {
     ConfigActivation(String),
     #[error("effect dispatch failed: {0}")]
     Effect(String),
+    #[error(transparent)]
+    Scheduler(#[from] kanbei_scheduler::SchedulerError),
 }
 
 // ---------- helpers ----------
@@ -970,3 +1066,7 @@ fn shutdown_queue(queue: Arc<DurabilityQueue>) {
         let _ = queue.shutdown();
     }
 }
+
+// M3 agent spine: run lifecycle, model/tool commit paths, approvals, breakers,
+// and interrupted/ambiguous classification (spine.rs).
+mod spine;

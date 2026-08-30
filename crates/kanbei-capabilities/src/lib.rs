@@ -468,8 +468,14 @@ impl Broker {
         Ok(())
     }
 
+    /// Grant-set version: the grant count, used by dispatch-time
+    /// re-verification (R-16/D-11/C-10) to detect revocation.
+    pub fn grants_version(&self) -> u64 {
+        self.grants.len() as u64
+    }
+
     /// Highest version across registered templates; 0 when none are present.
-    fn policy_version(&self) -> u64 {
+    pub fn policy_version(&self) -> u64 {
         self.templates.iter().map(|t| t.version).max().unwrap_or(0)
     }
 

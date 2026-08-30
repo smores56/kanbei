@@ -219,11 +219,24 @@ pub struct ModelCallSpec {
 /// The generic replaceable cognition seam: `step(context, trigger)` is a
 /// bounded orchestration body; the kernel checks the wake deadline/budget at
 /// every host-command boundary.
+/// The result of the previous host command, fed back into the next step so
+/// the orchestration body can react (R-18/E-01: one bounded step per
+/// accepted wake; the loop lives in the session actor).
+#[derive(Debug, Clone)]
+pub enum StepResult {
+    Model(serde_json::Value),
+    Tool(serde_json::Value),
+    Memory(serde_json::Value),
+    Child(serde_json::Value),
+    Scheduled,
+}
+
 pub trait CognitionProvider {
     fn step(
         &mut self,
         context: &StepContext,
         trigger: &Trigger,
+        last: Option<&StepResult>,
     ) -> Result<StepCommand, StepError>;
     fn as_any(&self) -> &dyn std::any::Any;
 }
@@ -239,9 +252,11 @@ pub struct StepContext {
     pub budget: Budgets,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum StepError {
+    #[error("step unavailable: {0}")]
     Unavailable(String),
+    #[error("invalid step: {0}")]
     Invalid(String),
 }
 
@@ -649,6 +664,15 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Current accumulated usage of the active run (zeros when none).
+    pub fn current_usage(&self, run_id: RunId) -> RunUsage {
+        self.active
+            .as_ref()
+            .filter(|(id, _, _)| *id == run_id)
+            .map(|(_, _, usage)| *usage)
+            .unwrap_or(RunUsage { tokens: 0, tools: 0, children: 0, started_at_secs: 0 })
+    }
+
     pub fn record_usage(&mut self, run_id: RunId, usage: RunUsage) -> SchedulerResult<()> {
         let (_id, _, cur) = self
             .active
@@ -667,6 +691,10 @@ impl Scheduler {
 
     pub fn budgets(&self) -> Budgets {
         self.budgets
+    }
+
+    pub fn set_budgets(&mut self, b: Budgets) {
+        self.budgets = b;
     }
 
     pub fn completed_outcomes(&self) -> &[(RunId, TerminalOutcome)] {
