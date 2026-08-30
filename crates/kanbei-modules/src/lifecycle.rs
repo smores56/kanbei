@@ -501,6 +501,35 @@ impl ModuleManager {
 
     /// `(module_id, generation, package digest)` for the execution-snapshot
     /// manifest's module pins (the session lane uses it), in module_id order.
+    /// The contributions a generation staged via `contribution_publish`
+    /// (the session's activation-delta source for non-service contributions,
+    /// M5 UI/theme).
+    pub fn published_contributions(&self, generation: u64) -> Vec<kanbei_scopes::contrib::Contribution> {
+        self.host.published_contributions(generation)
+    }
+
+    /// The live generation that mounted a UI component, if any.
+    pub fn ui_generation(&self, component: &str) -> Option<u64> {
+        self.host.ui_generation(component)
+    }
+
+    /// Direct kernel-side call of a generation's `kb_hot` (the kernel side of
+    /// `service_call`; used by the UI host). Generation must be live.
+    pub fn call_generation(&self, generation: u64, args: &str) -> Result<String, ModuleError> {
+        let instance = self
+            .instances
+            .lock()
+            .expect("instances lock poisoned")
+            .get(&generation)
+            .cloned()
+            .ok_or_else(|| ModuleError::Call(format!("generation {generation} is not live")))?;
+        instance
+            .lock()
+            .expect("instance lock poisoned")
+            .call_json("kb_hot", args)
+            .map_err(|e| ModuleError::Call(format!("generation {generation} failed: {e}")))
+    }
+
     pub fn snapshot(&self) -> Vec<(Id128, u64, Digest)> {
         let tables = self.tables.lock().expect("lifecycle tables lock poisoned");
         let mut out: Vec<_> = tables
@@ -554,6 +583,7 @@ impl ModuleManager {
             self.tokens.write().expect("tokens lock poisoned").remove(&token);
         }
         self.instances.lock().expect("instances lock poisoned").remove(&generation);
+        self.host.drop_generation_contributions(generation);
         tables.packages.remove(&generation);
         if tables.current.get(&module_id) == Some(&generation) {
             tables.current.remove(&module_id);
@@ -586,6 +616,8 @@ pub enum ModuleError {
     NotActivated { module_id: Id128 },
     #[error("activation failed: {0}")]
     Activation(String),
+    #[error("generation call failed: {0}")]
+    Call(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }

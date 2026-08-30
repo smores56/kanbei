@@ -1104,6 +1104,7 @@ dependencies = [
  "kanbei-capabilities",
  "kanbei-core",
  "kanbei-objects",
+ "kanbei-scopes",
  "kanbei-services",
  "kanbei-snapshot",
  "kanbei-vm",

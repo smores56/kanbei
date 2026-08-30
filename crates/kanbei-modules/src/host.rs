@@ -19,6 +19,8 @@
 //! | 4 | `check` | `{"resource": <string>, "verbs": [<string>]}` | `{"allowed":true}` |
 //! | 5 | `require_approval` | `{"resource": <string>, "verbs": [<string>]}` | `{"intent": <ApprovalIntent>}` |
 //! | 6 | `service_publish` | `{"key": <ServiceKey>, "version": <u32>, "deps": [<ServiceDependency>]}` | `"ok"` |
+//! | 7 | `contribution_publish` | `{"kind": "ui"|"theme", ...}` | `"ok"` |
+//! | 6 | `service_publish` | `{"key": <ServiceKey>, "version": <u32>, "deps": [<ServiceDependency>]}` | `"ok"` |
 //!
 //! M2 keeps state bytes as the compact JSON encoding of the value the module
 //! wrote. `service_call` is synchronous and shallow: one hop to the provider
@@ -37,6 +39,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use kanbei_capabilities::{ApprovalIntent, Broker, Capability, GrantScope, Principal};
 use kanbei_core::id::Id128;
+use kanbei_scopes::contrib::{Contribution, ContributionKind, ThemeContribution, UiMountContribution};
 use kanbei_services::{
     ReplaceIntent, ScopePath, ServiceContract, ServiceDependency, ServiceError, ServiceKey,
     ServiceProvider, ServiceRegistry,
@@ -90,6 +93,13 @@ pub struct ModuleHost {
     /// session lane will drain it into canonical log facts later.
     log: Mutex<Vec<String>>,
     rejected_stale_effects: Arc<AtomicU64>,
+    /// Contributions published per generation via `contribution_publish`
+    /// (M5 UI/theme mounts). Kept out of the live registry until the session
+    /// stages + OCC-publishes them atomically (the activation delta).
+    contributions: Mutex<HashMap<u64, Vec<Contribution>>>,
+    /// UI component name → generation that mounted it (stale generations are
+    /// removed on disposal, so a displaced mount cannot be resolved).
+    ui_components: Mutex<HashMap<String, u64>>,
 }
 
 impl ModuleHost {
@@ -113,6 +123,8 @@ impl ModuleHost {
             broker: Mutex::new(Broker::new()),
             log: Mutex::new(Vec::new()),
             rejected_stale_effects,
+            contributions: Mutex::new(HashMap::new()),
+            ui_components: Mutex::new(HashMap::new()),
         }
     }
 
@@ -405,6 +417,102 @@ impl ModuleHost {
         result.map_err(|e| format!("service_publish: {e}"))?;
         Ok("ok".into())
     }
+
+    /// M5 contribution publishing (the standard contribution contract):
+    /// a generation stages UI mounts / theme overlays during activation.
+    /// Contributions are recorded per generation and only enter the live
+    /// composition when the session validates and atomically publishes the
+    /// activation delta (staged via OCC, R-26/C-09).
+    ///
+    /// Payloads:
+    /// - `{"kind":"ui","name":<string>,"component":<string>}`
+    /// - `{"kind":"theme","name":<string>,"overlay":<object>}`
+    fn op_contribution_publish(&self, info: &TokenInfo, payload: &str) -> Result<String, String> {
+        let v: Value = serde_json::from_str(payload)
+            .map_err(|e| format!("contribution_publish: invalid payload: {e}"))?;
+        let kind = v
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "contribution_publish: payload must carry a \"kind\"".to_string())?;
+        let name = || {
+            v.get("name")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .ok_or_else(|| "contribution_publish: payload must carry a \"name\"".to_string())
+        };
+        let contribution = match kind {
+            "ui" => {
+                let name = name()?;
+                let component = v
+                    .get("component")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| {
+                        "contribution_publish: ui mount must carry a \"component\"".to_string()
+                    })?;
+                self.ui_components
+                    .lock()
+                    .expect("ui components lock poisoned")
+                    .insert(component.clone(), info.generation);
+                Contribution {
+                    scope: info.scope.clone(),
+                    kind: ContributionKind::UiMount(UiMountContribution { name, component }),
+                }
+            }
+            "theme" => {
+                let name = name()?;
+                let overlay = v.get("overlay").cloned().ok_or_else(|| {
+                    "contribution_publish: theme must carry an \"overlay\"".to_string()
+                })?;
+                Contribution {
+                    scope: info.scope.clone(),
+                    kind: ContributionKind::Theme(ThemeContribution { name, overlay }),
+                }
+            }
+            other => return Err(format!("contribution_publish: unknown kind {other:?}")),
+        };
+        self.contributions
+            .lock()
+            .expect("contributions lock poisoned")
+            .entry(info.generation)
+            .or_default()
+            .push(contribution);
+        Ok("ok".into())
+    }
+
+    /// The contributions a generation staged via `contribution_publish`
+    /// (session activation-delta collection).
+    pub(crate) fn published_contributions(&self, generation: u64) -> Vec<Contribution> {
+        self.contributions
+            .lock()
+            .expect("contributions lock poisoned")
+            .get(&generation)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The generation that mounted a UI component (session UI host
+    /// resolution).
+    pub(crate) fn ui_generation(&self, component: &str) -> Option<u64> {
+        self.ui_components
+            .lock()
+            .expect("ui components lock poisoned")
+            .get(component)
+            .copied()
+    }
+
+    /// Forget a generation's staged contributions (disposal, R-02/C-03:
+    /// displaced generations cannot act).
+    pub(crate) fn drop_generation_contributions(&self, generation: u64) {
+        self.contributions
+            .lock()
+            .expect("contributions lock poisoned")
+            .remove(&generation);
+        self.ui_components
+            .lock()
+            .expect("ui components lock poisoned")
+            .retain(|_, g| *g != generation);
+    }
 }
 
 fn verbs_field(v: &Value) -> Result<Vec<String>, String> {
@@ -465,6 +573,7 @@ impl Host for ModuleHost {
             4 => self.op_check(&info, payload),
             5 => self.op_require_approval(&info, payload),
             6 => self.op_service_publish(&info, payload),
+            7 => self.op_contribution_publish(&info, payload),
             other => Err(format!("unknown host op {other}")),
         }
     }

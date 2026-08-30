@@ -10,6 +10,7 @@ kanbei-vm.workspace = true
 kanbei-objects.workspace = true
 kanbei-snapshot.workspace = true
 kanbei-capabilities.workspace = true
+kanbei-scopes.workspace = true
 kanbei-services.workspace = true
 serde.workspace = true
 serde_json.workspace = true
