@@ -806,6 +806,8 @@ pub struct BatteryReport {
     pub unattended_spend: f64,
     pub unattended_hourly_usd: f64,
     pub spend_trip: Option<(u64, u64, bool)>,
+    /// (objects on disk, referenced, orphans) for the task-1 session dir.
+    pub usage: (u64, u64, u64),
 }
 
 fn task_done(
@@ -1061,6 +1063,25 @@ pub fn run_spend_scenario(root: &Path) -> (Option<(u64, u64, bool)>, SessionFact
 
 // ---------- thresholds ----------
 
+/// The manual GC-growth usage check (architecture.md line 610: a manual
+/// usage check before the dogfooding gate compensates deferred GC): object
+/// store size vs the referenced closure — orphans are allowed (never
+/// dangling), but unbounded orphan growth would flag compaction needs.
+/// Returns (objects_on_disk, referenced, orphans).
+pub fn usage_check(dir: &Path) -> (u64, u64, u64) {
+    let store = kanbei_objects::ObjectStore::open(
+        &dir.join("objects"),
+        std::sync::Arc::new(DurabilityQueue::start("kb-df-usage")),
+    )
+    .unwrap();
+    let on_disk = store.scan().unwrap().len() as u64;
+    let referenced = crate::referenced_digests(dir).unwrap().len() as u64;
+    let (orphans, _) = store
+        .prune_scan(&crate::referenced_digests(dir).unwrap())
+        .unwrap();
+    (on_disk, referenced, orphans)
+}
+
 /// The battery, complete: tasks 1-5 (+ task 5's part B), the interrupted
 /// matrix, the unattended scaled hour, and the spend scenario. Threshold
 /// evaluation (instrument sections 1-3) is separate so the gate test can
@@ -1276,6 +1297,7 @@ pub fn run_battery(root: &Path, unattended: Duration) -> BatteryReport {
         run_unattended(root, unattended);
     let (spend_trip, _spend_facts) = run_spend_scenario(root);
 
+    let usage = usage_check(&root.join("t1"));
     BatteryReport {
         tasks,
         interrupted,
@@ -1284,6 +1306,7 @@ pub fn run_battery(root: &Path, unattended: Duration) -> BatteryReport {
         unattended_spend,
         unattended_hourly_usd,
         spend_trip,
+        usage,
     }
 }
 
@@ -1327,6 +1350,10 @@ pub fn format_report(report: &BatteryReport) -> String {
     ));
     let total: f64 = report.tasks.iter().map(|t| t.cost_usd).sum();
     s.push_str(&format!("battery spend: ${:.4}\n", total));
+    s.push_str(&format!(
+        "usage check (t1 dir): {} objects on disk, {} referenced, {} orphans\n",
+        report.usage.0, report.usage.1, report.usage.2
+    ));
     match &report.spend_trip {
         Some((v, th, denied)) => {
             s.push_str(&format!(

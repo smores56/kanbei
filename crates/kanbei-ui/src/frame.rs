@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn banner_and_degraded_overlays() {
         let t = tree();
-        let mut f = FocusModel::new();
+        let f = FocusModel::new();
         let theme = Theme::default_theme();
         let mut c = ctx(&t, &f, "idle", &theme);
         c.size = (10, 40);

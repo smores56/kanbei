@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn pty_write_read_round_trip() {
-        let (mut master, slave) = openpty().unwrap();
+        let (master, slave) = openpty().unwrap();
         let mut term = TermiosTerminal::open(slave).unwrap();
         term.enter_raw().unwrap();
         term.write(b"hello").unwrap();

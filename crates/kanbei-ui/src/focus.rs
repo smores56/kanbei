@@ -230,7 +230,7 @@ mod tests {
         f.move_focus(&t, FocusDirection::Next);
         assert_eq!(f.focused.as_deref(), Some("b"));
         // caret only renders on the focused input
-        assert_eq!(f.caret_for(&t.node("input").unwrap()), 0);
+        assert_eq!(f.caret_for(t.node("input").unwrap()), 0);
         f.move_focus(&t, FocusDirection::Prev);
         assert_eq!(f.focused.as_deref(), Some("input"));
     }
