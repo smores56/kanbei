@@ -16,4 +16,6 @@ pub use id::{
     UUID_BYTES,
 };
 pub use queue::{DurabilityQueue, SyncOp};
-pub use registry::{KindStat, Registry, RegistryError, Report, Upcaster};
+pub use registry::{
+    DescriptorError, KindStat, Registry, RegistryError, Report, UpcastDescriptor, Upcaster,
+};

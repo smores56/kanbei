@@ -181,12 +181,21 @@ fn account_event(env: &Envelope, registry: &Registry, store: &ObjectStore, rep: 
     let stat = rep.kinds.entry(env.kind.clone()).or_default();
     stat.schema = env.payload_schema;
     stat.count += 1;
+    if stat.descriptor_package.is_none() {
+        stat.descriptor_package = registry
+            .descriptor_package(&env.kind, env.payload_schema)
+            .map(String::from);
+    }
     match registry.upcast(&env.kind, env.payload_schema, &env.payload) {
         Ok(Some(_)) => stat.upcasted += 1,
         Ok(None) => {
             stat.opaque += 1;
             stat.opaque_reason.get_or_insert_with(|| {
-                format!("no upcaster for kind '{}' schema {}", env.kind, env.payload_schema)
+                registry
+                    .missing_package_reason(&env.kind, env.payload_schema)
+                    .unwrap_or_else(|| {
+                        format!("no upcaster for kind '{}' schema {}", env.kind, env.payload_schema)
+                    })
             });
         }
         Err(e) => {
