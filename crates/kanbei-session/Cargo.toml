@@ -37,3 +37,7 @@ kanbei-scopes.workspace = true
 kanbei-services.workspace = true
 kanbei-snapshot.workspace = true
 kanbei-vm.workspace = true
+
+[[bin]]
+name = "workbench"
+path = "src/bin/workbench.rs"
