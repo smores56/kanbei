@@ -24,6 +24,7 @@ members = [
     "crates/kanbei-scheduler",
     "crates/kanbei-tools",
     "crates/kanbei-ui",
+    "crates/kanbei-workspace",
 ]
 # kanbei-guest builds only for wasm32-wasip1 with special link args; exclude it
 # from implicit `--workspace` selection (build explicitly with
@@ -51,6 +52,7 @@ default-members = [
     "crates/kanbei-scheduler",
     "crates/kanbei-tools",
     "crates/kanbei-ui",
+    "crates/kanbei-workspace",
 ]
 
 [workspace.package]
@@ -80,6 +82,7 @@ kanbei-provider = { path = "crates/kanbei-provider" }
 kanbei-scheduler = { path = "crates/kanbei-scheduler" }
 kanbei-tools = { path = "crates/kanbei-tools" }
 kanbei-ui = { path = "crates/kanbei-ui" }
+kanbei-workspace = { path = "crates/kanbei-workspace" }
 
 blake3 = "1"
 bs58 = "0.5"

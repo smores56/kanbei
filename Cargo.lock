@@ -1241,6 +1241,7 @@ dependencies = [
  "kanbei-tools",
  "kanbei-ui",
  "kanbei-vm",
+ "kanbei-workspace",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -1323,6 +1324,17 @@ dependencies = [
  "thiserror 2.0.20",
  "wasmtime",
  "wasmtime-wasi",
+]
+
+[[package]]
+name = "kanbei-workspace"
+version = "0.1.0"
+dependencies = [
+ "kanbei-core",
+ "kanbei-objects",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

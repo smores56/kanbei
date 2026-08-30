@@ -24,6 +24,7 @@ kanbei-telemetry = { workspace = true, optional = true }
 kanbei-tools.workspace = true
 kanbei-ui.workspace = true
 kanbei-vm.workspace = true
+kanbei-workspace.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

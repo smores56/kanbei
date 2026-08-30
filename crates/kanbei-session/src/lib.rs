@@ -2538,6 +2538,8 @@ pub enum SessionError {
     CompactionViolation(String),
     #[error(transparent)]
     Gc(#[from] kanbei_gc::GcError),
+    #[error(transparent)]
+    Workspace(#[from] kanbei_workspace::WorkspaceError),
 }
 
 // ---------- helpers ----------
@@ -2576,3 +2578,7 @@ mod spine;
 // M8 wave 2: canonical-object GC (root capture, writer pins, quarantine +
 // grace sweep) over the session and memory stores (gc.rs).
 mod gc;
+
+// M9 wave 4: content-addressed working-tree snapshots and restore over
+// kanbei-workspace (workspace.rs).
+mod workspace;
