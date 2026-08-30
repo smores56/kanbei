@@ -131,7 +131,7 @@ fn verify_closure_corrupt_object() {
 #[test]
 fn bootstrap_shape() {
     let m = ExecutionManifest::bootstrap();
-    assert_eq!(m.schema, 2);
+    assert_eq!(m.schema, 3);
     assert_eq!(m.schema, MANIFEST_SCHEMA);
     assert_eq!(m.kernel_schema, 1);
     assert_eq!(m.envelope_schema, ENVELOPE_SCHEMA);
@@ -144,6 +144,8 @@ fn bootstrap_shape() {
     assert_eq!(m.memory_root, None);
     assert_eq!(m.tool_registry, None);
     assert_eq!(m.projection, None);
+    assert_eq!(m.provider_config, None);
+    assert_eq!(m.scheduler_policy, None);
     assert_eq!(m.provider, None);
     assert_eq!(m.policy, None);
     assert_eq!(m.schema_versions, vec![1]);

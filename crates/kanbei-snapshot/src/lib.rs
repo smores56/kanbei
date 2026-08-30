@@ -13,8 +13,9 @@ use kanbei_core::id::Id128;
 use kanbei_objects::{ObjectError, ObjectStore};
 use serde::{Deserialize, Serialize};
 
-/// Manifest schema version (M2: 2 — module pins + composition digest).
-pub const MANIFEST_SCHEMA: u32 = 2;
+/// Manifest schema version (M3: 3 — tool-registry/provider/scheduler pins;
+/// 2 — module pins + composition digest).
+pub const MANIFEST_SCHEMA: u32 = 3;
 
 /// One active module generation pin: stable module id, generation, package
 /// digest, and the scope it was activated in (M2: "/" — root scope only).
@@ -49,13 +50,24 @@ pub struct ExecutionManifest {
     pub composition: Option<Digest>,
     /// Memory claim root; M4 — always None in M1.
     pub memory_root: Option<Digest>,
-    /// Tool-registry snapshot digest; None until M2.
+    /// Tool-registry snapshot digest; None until M3 (schema 3 pin).
+    #[serde(default)]
     pub tool_registry: Option<Digest>,
     /// Projection version/watermark; None in M1.
+    #[serde(default)]
     pub projection: Option<u64>,
-    /// Cognition scheduler/provider; None until M3.
+    /// Provider config digest (provider/model/key-source fingerprint, never
+    /// the key); None until M3.
+    #[serde(default)]
+    pub provider_config: Option<Digest>,
+    /// Scheduler policy name (R-09/E-09 canonical surface); None until M3.
+    #[serde(default)]
+    pub scheduler_policy: Option<String>,
+    /// Cognition scheduler/provider version; None until M3.
+    #[serde(default)]
     pub provider: Option<u64>,
     /// Retention-policy version; None until M2.
+    #[serde(default)]
     pub policy: Option<u64>,
     /// Payload schemas known at pin time.
     pub schema_versions: Vec<u32>,
@@ -78,6 +90,8 @@ impl ExecutionManifest {
             memory_root: None,
             tool_registry: None,
             projection: None,
+            provider_config: None,
+            scheduler_policy: None,
             provider: None,
             policy: None,
             schema_versions: vec![1],

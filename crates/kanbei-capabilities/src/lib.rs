@@ -34,6 +34,7 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kanbei_core::{Digest, Id128};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
@@ -48,7 +49,7 @@ pub type Resource = String;
 /// Caller principal (R-14/D-02): every invocation carries the initiating
 /// principal. `generation` is the caller module's generation; `run` is the
 /// session run it originated in, if any.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Principal {
     pub session: Id128,
     pub generation: u64,

@@ -227,7 +227,7 @@ fn activate_config_publishes_service_and_composition() {
     let manifest_digest = session.current_snapshot().expect("state change pins a manifest");
     let bytes = session.store().get(&manifest_digest).unwrap();
     let manifest: ExecutionManifest = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(manifest.schema, 2);
+    assert_eq!(manifest.schema, 3);
     assert_eq!(manifest.module_abi, Some(1));
     assert_eq!(manifest.modules.len(), 1);
     assert_eq!(manifest.modules[0].module_id, id);
@@ -684,7 +684,7 @@ fn committed_manifests_are_schema_2() {
             continue; // packages, compositions, state snapshots — not manifests
         };
         manifests += 1;
-        assert_eq!(m.schema, 2, "manifest {digest} must be schema 2");
+        assert_eq!(m.schema, 3, "manifest {digest} must be schema 3");
         assert_eq!(m.module_abi, Some(1));
         // genesis (bootstrap) carries no pins; every later manifest pins the
         // single active module and a composition digest
