@@ -1708,6 +1708,26 @@ impl Session {
         found.ok_or_else(|| SessionError::InvalidInput(format!("no event at seq {seq}")))
     }
 
+    /// Resolve an event payload that may be object-promoted (`{"$object":
+    /// "blake3:..."}` markers; §7 — large intents/outcomes live in the
+    /// store). Recovery scans must read the resolved payload or promoted
+    /// records are invisible: a promoted `tool_intent` would be dropped
+    /// from B-05 classification entirely.
+    fn resolved_payload(&self, env: &Envelope) -> serde_json::Value {
+        let Some(marker) = env.payload.get("$object").and_then(|o| o.as_str()) else {
+            return env.payload.clone();
+        };
+        match marker.parse::<Digest>() {
+            Ok(digest) => self
+                .store
+                .get(&digest)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_else(|| env.payload.clone()),
+            Err(_) => env.payload.clone(),
+        }
+    }
+
     /// Scan the committed log for intent-kind events without their
     /// outcome-kind event (B-05/M6): `model_call`→`model_outcome`,
     /// `tool_intent`→`tool_outcome` (paired by call_id, with
@@ -1727,11 +1747,12 @@ impl Session {
                 let Ok(env) = Envelope::from_line(line) else {
                     continue;
                 };
+                let payload = self.resolved_payload(&env);
                 match env.kind.as_str() {
                     "tool_intent" => {
                         if let (Some(call), Some(tool)) = (
-                            env.payload.get("call_id").and_then(|c| c.as_str()),
-                            env.payload.get("tool").and_then(|t| t.as_str()),
+                            payload.get("call_id").and_then(|c| c.as_str()),
+                            payload.get("tool").and_then(|t| t.as_str()),
                         ) {
                             intents.push(PendingIntent {
                                 seq: env.seq,
@@ -1754,7 +1775,7 @@ impl Session {
                         });
                     }
                     "tool_outcome" | "intent_classified" => {
-                        if let Some(call) = env.payload.get("call_id").and_then(|c| c.as_str()) {
+                        if let Some(call) = payload.get("call_id").and_then(|c| c.as_str()) {
                             resolved_calls.insert(call.to_string());
                         }
                     }
@@ -1789,9 +1810,10 @@ impl Session {
                 let Ok(env) = Envelope::from_line(line) else {
                     continue;
                 };
+                let payload = self.resolved_payload(&env);
                 match env.kind.as_str() {
                     "tool_intent" => {
-                        if let Some(call) = env.payload.get("call_id").and_then(|c| c.as_str()) {
+                        if let Some(call) = payload.get("call_id").and_then(|c| c.as_str()) {
                             by_call.entry(call.to_string()).or_insert_with(|| {
                                 (
                                     QuiescedIntent {
@@ -1806,7 +1828,7 @@ impl Session {
                     }
                     "intent_classified" => {
                         if let (Some(call), Some(class)) = (
-                            env.payload.get("call_id").and_then(|c| c.as_str()),
+                            payload.get("call_id").and_then(|c| c.as_str()),
                             env.payload.get("classification").and_then(|c| c.as_str()),
                         ) && let Some(entry) = by_call.get_mut(call)
                         {
