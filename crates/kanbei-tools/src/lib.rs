@@ -174,16 +174,16 @@ impl ToolRegistry {
     /// Canonical serialization for records/approvals: schema JSON sorted by
     /// name.
     pub fn canonical_json(&self) -> Value {
-        let arr: Vec<Value> = self
-            .schemas
-            .values()
-            .map(canonical_schema_json)
-            .collect();
+        let arr: Vec<Value> = self.schemas.values().map(canonical_schema_json).collect();
         json!(arr)
     }
 
     pub fn digest(&self) -> Digest {
-        Digest::new(serde_json::to_string(&self.canonical_json()).unwrap_or_default().as_bytes())
+        Digest::new(
+            serde_json::to_string(&self.canonical_json())
+                .unwrap_or_default()
+                .as_bytes(),
+        )
     }
 }
 
@@ -202,6 +202,10 @@ pub struct ToolIntent {
     /// Approved approval-intent digest, if the tool was approved.
     pub approval: Option<Digest>,
     pub origin_snapshot: Option<Digest>,
+    /// Event seq of the committed tool_intent event (B-05 provenance for
+    /// memory proposals); None for pre-M4 records.
+    #[serde(default)]
+    pub intent_event: Option<u64>,
 }
 
 /// Canonical action digest: the committed intent's identity (used by the
@@ -284,7 +288,7 @@ pub fn approval_for(
 }
 
 /// Process-tool cwd/env fingerprint (R-16/D-12): canonical join of cwd +
-    /// sorted env pairs.
+/// sorted env pairs.
 pub fn cwd_env_fingerprint(cwd: &str, env: &BTreeMap<String, String>) -> String {
     let mut parts: Vec<String> = vec![format!("cwd={cwd}")];
     parts.extend(env.iter().map(|(k, v)| format!("{k}={v}")));
@@ -361,7 +365,10 @@ pub struct TodoStore {
 
 impl TodoStore {
     pub fn list(&self) -> Vec<(String, String)> {
-        self.items.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.items
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     pub fn update(&mut self, key: &str, status: &str) {
@@ -386,12 +393,14 @@ pub fn execute_tool(
         "fs.read" => {
             let path = str_arg(&args, "path")?;
             let p = resolve(fs_root, &path)?;
-            let meta = std::fs::metadata(&p).map_err(|e| ToolError::Io(name.into(), e.to_string()))?;
+            let meta =
+                std::fs::metadata(&p).map_err(|e| ToolError::Io(name.into(), e.to_string()))?;
             if !meta.is_file() {
                 return Err(ToolError::InvalidArgs(name.into(), "not a file".into()));
             }
             let mut buf = Vec::new();
-            let f = std::fs::File::open(&p).map_err(|e| ToolError::Io(name.into(), e.to_string()))?;
+            let f =
+                std::fs::File::open(&p).map_err(|e| ToolError::Io(name.into(), e.to_string()))?;
             f.take((tools.limits.max_read_bytes + 1) as u64)
                 .read_to_end(&mut buf)
                 .map_err(|e| ToolError::Io(name.into(), e.to_string()))?;
@@ -404,7 +413,10 @@ pub fn execute_tool(
         "fs.search" => {
             let root = str_arg(&args, "root")?;
             let query = str_arg(&args, "query")?;
-            let max = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+            let max = args
+                .get("max_results")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100) as usize;
             let p = resolve(fs_root, &root)?;
             let mut matches = Vec::new();
             walk(&p, &query, max, &mut matches)
@@ -458,7 +470,11 @@ pub fn execute_tool(
                 .get("max_output")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(tools.limits.max_process_output as u64) as usize;
-            let sub = if name == "git.status" { "status" } else { "diff" };
+            let sub = if name == "git.status" {
+                "status"
+            } else {
+                "diff"
+            };
             let out = run_git(&p, &[sub], max, tools.limits.max_process_timeout_ms)
                 .map_err(|e| ToolError::Io(name.into(), e.to_string()))?;
             Ok(json!({"output": out}))
@@ -606,8 +622,7 @@ fn run_git(repo: &Path, args: &[&str], max_out: usize, timeout_ms: u64) -> Resul
     cmd.env_clear();
     cmd.env("GIT_PAGER", "cat");
     cmd.stdin(Stdio::null());
-    let out = run_cmd(&mut cmd, timeout_ms, max_out)
-        .map_err(|e| format!("git {args:?}: {e}"))?;
+    let out = run_cmd(&mut cmd, timeout_ms, max_out).map_err(|e| format!("git {args:?}: {e}"))?;
     if out.timed_out {
         return Err("git timed out".into());
     }
@@ -702,10 +717,19 @@ pub fn run_cmd(
     });
 
     loop {
-        if let Some(status) = child.try_wait().map_err(|e| ProcessErr::Io(e.to_string()))? {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| ProcessErr::Io(e.to_string()))?
+        {
             let exit = status.code().unwrap_or(-1);
-            let out = out_reader.take().map(|h| h.join().unwrap_or_default()).unwrap_or_default();
-            let err = err_reader.take().map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+            let out = out_reader
+                .take()
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
+            let err = err_reader
+                .take()
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
             if out.len() > max_out || err.len() > max_out {
                 return Err(ProcessErr::OutputLimit);
             }
@@ -723,8 +747,14 @@ pub fn run_cmd(
             }
             let _ = child.kill();
             let _ = child.wait();
-            let out = out_reader.take().map(|h| h.join().unwrap_or_default()).unwrap_or_default();
-            let err = err_reader.take().map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+            let out = out_reader
+                .take()
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
+            let err = err_reader
+                .take()
+                .map(|h| h.join().unwrap_or_default())
+                .unwrap_or_default();
             return Ok(ProcessResult {
                 exit: -1,
                 stdout: String::from_utf8_lossy(&out).to_string(),
@@ -861,16 +891,34 @@ mod tests {
         std::fs::write(root.join("README.md"), b"").unwrap();
         let mut t = tools();
         let reg = registry();
-        let r = execute_tool(&mut t, &reg, "fs.search", &json!({"root": ".", "query": "main"}), &root).unwrap();
+        let r = execute_tool(
+            &mut t,
+            &reg,
+            "fs.search",
+            &json!({"root": ".", "query": "main"}),
+            &root,
+        )
+        .unwrap();
         let matches = r["matches"].as_array().unwrap();
-        assert!(matches.iter().any(|m| m.as_str().unwrap().ends_with("main.rs")));
+        assert!(
+            matches
+                .iter()
+                .any(|m| m.as_str().unwrap().ends_with("main.rs"))
+        );
     }
 
     #[test]
     fn todo_state_roundtrip() {
         let mut t = tools();
         let reg = registry();
-        let u = execute_tool(&mut t, &reg, "todo.update", &json!({"key": "k1", "status": "done"}), Path::new("/")).unwrap();
+        let u = execute_tool(
+            &mut t,
+            &reg,
+            "todo.update",
+            &json!({"key": "k1", "status": "done"}),
+            Path::new("/"),
+        )
+        .unwrap();
         assert_eq!(u["ok"], true);
         let l = execute_tool(&mut t, &reg, "todo.list", &json!({}), Path::new("/")).unwrap();
         assert_eq!(l["items"][0]["status"], "done");
@@ -880,7 +928,14 @@ mod tests {
     fn memory_tools_explicitly_unavailable() {
         let mut t = tools();
         let reg = registry();
-        let err = execute_tool(&mut t, &reg, "memory.query", &json!({"query": "x"}), Path::new("/")).unwrap_err();
+        let err = execute_tool(
+            &mut t,
+            &reg,
+            "memory.query",
+            &json!({"query": "x"}),
+            Path::new("/"),
+        )
+        .unwrap_err();
         assert!(matches!(err, ToolError::Unavailable(_, _)));
     }
 
@@ -948,12 +1003,19 @@ mod tests {
         let v = json!({"b": 1, "a": {"d": 2, "c": 3}});
         let c = canonicalize(v);
         assert_eq!(c, json!({"a": {"c": 3, "d": 2}, "b": 1}));
-        assert_eq!(serde_json::to_string(&c).unwrap(), r#"{"a":{"c":3,"d":2},"b":1}"#);
+        assert_eq!(
+            serde_json::to_string(&c).unwrap(),
+            r#"{"a":{"c":3,"d":2},"b":1}"#
+        );
     }
 
     #[test]
     fn approval_digest_binding() {
-        let p = Principal { session: Id128::generate(), generation: 1, run: Some(7) };
+        let p = Principal {
+            session: Id128::generate(),
+            generation: 1,
+            run: Some(7),
+        };
         let a1 = approval_for(
             &p,
             "fs.write",
@@ -976,7 +1038,10 @@ mod tests {
             &p,
             "process.exec",
             &json!({"argv": ["rm", "-rf", "/"]}),
-            Some(cwd_env_fingerprint("/repo", &BTreeMap::from([("A".into(), "1".into())]))),
+            Some(cwd_env_fingerprint(
+                "/repo",
+                &BTreeMap::from([("A".into(), "1".into())]),
+            )),
             kanbei_capabilities::GrantScope::Session,
             Some(1_700_000_000),
         );
@@ -985,7 +1050,10 @@ mod tests {
             &p,
             "process.exec",
             &json!({"argv": ["rm", "-rf", "/"]}),
-            Some(cwd_env_fingerprint("/repo", &BTreeMap::from([("A".into(), "2".into())]))),
+            Some(cwd_env_fingerprint(
+                "/repo",
+                &BTreeMap::from([("A".into(), "2".into())]),
+            )),
             kanbei_capabilities::GrantScope::Session,
             Some(1_700_000_000),
         );
@@ -994,7 +1062,11 @@ mod tests {
 
     #[test]
     fn tool_action_digest_stable() {
-        let p = Principal { session: Id128::generate(), generation: 1, run: None };
+        let p = Principal {
+            session: Id128::generate(),
+            generation: 1,
+            run: None,
+        };
         let i1 = ToolIntent {
             call_id: tool_call_id(),
             run_id: Id128::generate(),
@@ -1003,6 +1075,7 @@ mod tests {
             args: json!({"path": "/a", "z": 1, "a": 2}),
             approval: None,
             origin_snapshot: None,
+            intent_event: None,
         };
         let i2 = ToolIntent {
             call_id: tool_call_id(),
@@ -1012,6 +1085,7 @@ mod tests {
             args: json!({"a": 2, "z": 1, "path": "/a"}),
             approval: None,
             origin_snapshot: None,
+            intent_event: None,
         };
         assert_eq!(tool_action_digest(&i1), tool_action_digest(&i2));
     }
@@ -1021,15 +1095,27 @@ mod tests {
         let intent = ToolIntent {
             call_id: tool_call_id(),
             run_id: Id128::generate(),
-            principal: Principal { session: Id128::generate(), generation: 0, run: Some(1) },
+            principal: Principal {
+                session: Id128::generate(),
+                generation: 0,
+                run: Some(1),
+            },
             tool: "fs.read".into(),
             args: json!({"path": "/a"}),
             approval: None,
             origin_snapshot: Some(Digest::new(b"s")),
+            intent_event: Some(7),
         };
         let back: ToolIntent =
             serde_json::from_str(&serde_json::to_string(&intent).unwrap()).unwrap();
         assert_eq!(back, intent);
+        // Pre-M4 records have no intent_event field; serde(default) → None.
+        let json = serde_json::to_string(&intent).unwrap();
+        let pre_m4 = json.replace(",\"intent_event\":7", "");
+        assert!(!pre_m4.contains("intent_event"));
+        let back: ToolIntent = serde_json::from_str(&pre_m4).unwrap();
+        assert_eq!(back.intent_event, None);
+        assert_eq!(back.call_id, intent.call_id);
         let outcome = ToolOutcome {
             call_id: intent.call_id,
             tool: "fs.read".into(),

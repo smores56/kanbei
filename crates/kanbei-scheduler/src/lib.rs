@@ -153,7 +153,12 @@ pub struct Budgets {
 
 impl Default for Budgets {
     fn default() -> Self {
-        Self { deadline_secs: Some(120), tokens: Some(100_000), tools: Some(64), children: Some(8) }
+        Self {
+            deadline_secs: Some(120),
+            tokens: Some(100_000),
+            tools: Some(64),
+            children: Some(8),
+        }
     }
 }
 
@@ -163,6 +168,24 @@ pub struct RunUsage {
     pub tools: u64,
     pub children: u64,
     pub started_at_secs: u64,
+}
+
+/// A spawned child run (R-09 child tool): tracked separately from the single
+/// active parent run. Children are bounded by the caller — the session clamps
+/// budgets before spawning (the kernel clamp) — and the scheduler records
+/// them as given. The parent's `children` usage counter is NOT bumped here:
+/// the session does that through [`Scheduler::record_usage`] so the canonical
+/// record exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildRun {
+    pub run_id: RunId,
+    pub parent: RunId,
+    /// Always [`RunKind::Child`].
+    pub kind: RunKind,
+    pub budgets: Budgets,
+    /// Wall clock at spawn, for the deadline check.
+    pub started_at_secs: u64,
+    pub usage: RunUsage,
 }
 
 // ---------- circuit breakers ----------
@@ -201,11 +224,23 @@ impl Default for BreakerFloors {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StepCommand {
     ModelCall(ModelCallSpec),
-    ToolIntent { tool: String, arguments: serde_json::Value },
-    MemoryQuery { query: String },
-    MemoryPropose { claim: serde_json::Value },
-    ChildSpawn { spec: serde_json::Value },
-    ScheduleWake { kind: TriggerKind, after_secs: u64 },
+    ToolIntent {
+        tool: String,
+        arguments: serde_json::Value,
+    },
+    MemoryQuery {
+        query: String,
+    },
+    MemoryPropose {
+        claim: serde_json::Value,
+    },
+    ChildSpawn {
+        spec: serde_json::Value,
+    },
+    ScheduleWake {
+        kind: TriggerKind,
+        after_secs: u64,
+    },
     Finish(TerminalOutcome),
 }
 
@@ -244,12 +279,19 @@ pub trait CognitionProvider {
 /// Frozen immutable projection handed to a step (R-18/E-01). M4 fills the
 /// typed staged pipeline; M3 carries the rendered context plus the event
 /// selection it came from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepContext {
     pub rendered: String,
     pub rendered_hash: Digest,
     pub selected_events: Vec<u64>,
     pub budget: Budgets,
+    /// Staged-projection digest (M4); None for the M3 render seam.
+    #[serde(default)]
+    pub projection_digest: Option<Digest>,
+    /// Pinned memory-root digests of the run's scopes (M4): [lifetime,
+    /// project] when pinned, empty otherwise.
+    #[serde(default)]
+    pub memory_roots: Vec<Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -372,6 +414,8 @@ pub struct Scheduler {
     /// Spend within the current window (window start secs -> tokens).
     spend: (u64, u64),
     runs: HashMap<RunId, RunKind>,
+    /// Child runs spawned by the active parent (R-09 child tool).
+    children: HashMap<RunId, ChildRun>,
     outcomes: Vec<(RunId, TerminalOutcome)>,
     budgets: Budgets,
 }
@@ -391,6 +435,7 @@ impl Scheduler {
             action_window: HashMap::new(),
             spend: (now, 0),
             runs: HashMap::new(),
+            children: HashMap::new(),
             outcomes: Vec::new(),
             budgets,
         }
@@ -482,7 +527,7 @@ impl Scheduler {
                     kind: RunKind::CognitionStep,
                     trigger_kind: TriggerKind::Timer,
                     reason: DenialReason::PolicyRejected,
-                })
+                });
             }
         };
         // Requeue the losers for later.
@@ -493,16 +538,23 @@ impl Scheduler {
         self.pending.extend(all);
 
         let kind = batch.kind;
-        let trigger_kind = batch.triggers.first().map(|t| t.kind).unwrap_or(TriggerKind::Timer);
-        let digests: Vec<Digest> =
-            batch.triggers.iter().filter_map(|t| t.referent).collect();
+        let trigger_kind = batch
+            .triggers
+            .first()
+            .map(|t| t.kind)
+            .unwrap_or(TriggerKind::Timer);
+        let digests: Vec<Digest> = batch.triggers.iter().filter_map(|t| t.referent).collect();
         let run_id = RunId::generate();
-        self.active = Some((run_id, kind, RunUsage {
-            tokens: 0,
-            tools: 0,
-            children: 0,
-            started_at_secs: now_secs(),
-        }));
+        self.active = Some((
+            run_id,
+            kind,
+            RunUsage {
+                tokens: 0,
+                tools: 0,
+                children: 0,
+                started_at_secs: now_secs(),
+            },
+        ));
         self.runs.insert(run_id, kind);
         WakeDecision::Accepted(WakeAcceptance {
             run_id,
@@ -513,6 +565,18 @@ impl Scheduler {
     }
 
     pub fn run_start(&mut self, run_id: RunId) -> SchedulerResult<RunStart> {
+        // Child runs start straight from the child map — no wake acceptance
+        // involved (the child was spawned, not woken).
+        if let Some(child) = self.children.get(&run_id) {
+            return Ok(RunStart {
+                run_id,
+                kind: RunKind::Child,
+                deadline: child
+                    .budgets
+                    .deadline_secs
+                    .map(|d| child.started_at_secs + d),
+            });
+        }
         let (id, kind, _) = self
             .active
             .as_ref()
@@ -541,6 +605,19 @@ impl Scheduler {
         usage: RunUsage,
         action_digests: &[Digest],
     ) -> SchedulerResult<(RunOutcome, Option<BreakerTrip>)> {
+        // Child runs: drop the entry and return without any breaker
+        // interaction — breakers are cognition/responder concerns, and the
+        // parent's budgets bound the child through the session's clamp.
+        if self.children.remove(&run_id).is_some() {
+            return Ok((
+                RunOutcome {
+                    run_id,
+                    outcome,
+                    reason: None,
+                },
+                None,
+            ));
+        }
         let (id, _kind, _) = match self.active {
             Some((id, kind, _)) if id == run_id => (id, kind, ()),
             _ => return Err(SchedulerError::NotActiveRun(run_id)),
@@ -553,7 +630,11 @@ impl Scheduler {
         let budget_ok = self.budgets.tokens.is_none_or(|b| usage.tokens <= b)
             && self.budgets.tools.is_none_or(|b| usage.tools <= b)
             && self.budgets.children.is_none_or(|b| usage.children <= b);
-        let final_outcome = if budget_ok { outcome } else { TerminalOutcome::Blocked };
+        let final_outcome = if budget_ok {
+            outcome
+        } else {
+            TerminalOutcome::Blocked
+        };
 
         // spend breaker
         if now - self.spend.0 > self.floors.spend_window_secs {
@@ -586,7 +667,12 @@ impl Scheduler {
             }
             TerminalOutcome::NoProgress | TerminalOutcome::Waiting => {
                 if self.last_causal_event.is_none()
-                    || self.outcomes.iter().rev().any(|(_, o)| matches!(o, TerminalOutcome::Progress | TerminalOutcome::CompletedGoal))
+                    || self.outcomes.iter().rev().any(|(_, o)| {
+                        matches!(
+                            o,
+                            TerminalOutcome::Progress | TerminalOutcome::CompletedGoal
+                        )
+                    })
                 {
                     self.no_progress_run += 1;
                 }
@@ -645,6 +731,23 @@ impl Scheduler {
 
     /// Check the wake deadline/budget at a host-command boundary (R-18/E-01).
     pub fn check_boundary(&self, run_id: RunId) -> SchedulerResult<()> {
+        // Child runs enforce their own budgets (the caller clamped them at
+        // spawn); the parent's budget is the session's boundary.
+        if let Some(child) = self.children.get(&run_id) {
+            if let Some(deadline) = child.budgets.deadline_secs
+                && now_secs() > child.started_at_secs + deadline
+            {
+                return Err(SchedulerError::BudgetExhausted(format!(
+                    "child {run_id}: deadline"
+                )));
+            }
+            if child.budgets.tokens.is_some_and(|b| child.usage.tokens > b) {
+                return Err(SchedulerError::BudgetExhausted(format!(
+                    "child {run_id}: tokens"
+                )));
+            }
+            return Ok(());
+        }
         let (_id, _, usage) = self
             .active
             .as_ref()
@@ -666,14 +769,28 @@ impl Scheduler {
 
     /// Current accumulated usage of the active run (zeros when none).
     pub fn current_usage(&self, run_id: RunId) -> RunUsage {
+        if let Some(child) = self.children.get(&run_id) {
+            return child.usage;
+        }
         self.active
             .as_ref()
             .filter(|(id, _, _)| *id == run_id)
             .map(|(_, _, usage)| *usage)
-            .unwrap_or(RunUsage { tokens: 0, tools: 0, children: 0, started_at_secs: 0 })
+            .unwrap_or(RunUsage {
+                tokens: 0,
+                tools: 0,
+                children: 0,
+                started_at_secs: 0,
+            })
     }
 
     pub fn record_usage(&mut self, run_id: RunId, usage: RunUsage) -> SchedulerResult<()> {
+        if let Some(child) = self.children.get_mut(&run_id) {
+            child.usage.tokens += usage.tokens;
+            child.usage.tools += usage.tools;
+            child.usage.children += usage.children;
+            return Ok(());
+        }
         let (_id, _, cur) = self
             .active
             .as_mut()
@@ -685,8 +802,47 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Spawn a child run under the active parent (R-09 child tool). The
+    /// caller clamps `budgets` first (the kernel clamp is the session's job);
+    /// the scheduler records them as given. The parent's `children` usage
+    /// counter is NOT bumped here — the session does it via `record_usage` so
+    /// the canonical record exists (documented on [`ChildRun`]).
+    pub fn spawn_child(&mut self, parent: RunId, budgets: Budgets) -> SchedulerResult<RunId> {
+        self.active
+            .as_ref()
+            .filter(|(id, _, _)| *id == parent)
+            .ok_or(SchedulerError::NotActiveRun(parent))?;
+        let run_id = RunId::generate();
+        let now = now_secs();
+        self.children.insert(
+            run_id,
+            ChildRun {
+                run_id,
+                parent,
+                kind: RunKind::Child,
+                budgets,
+                started_at_secs: now,
+                usage: RunUsage {
+                    tokens: 0,
+                    tools: 0,
+                    children: 0,
+                    started_at_secs: now,
+                },
+            },
+        );
+        Ok(run_id)
+    }
+
+    /// The child run's record, if `run_id` is a live child.
+    pub fn child(&self, run_id: RunId) -> Option<&ChildRun> {
+        self.children.get(&run_id)
+    }
+
     pub fn run_kind(&self, run_id: RunId) -> Option<RunKind> {
-        self.runs.get(&run_id).copied()
+        self.runs
+            .get(&run_id)
+            .copied()
+            .or_else(|| self.children.get(&run_id).map(|c| c.kind))
     }
 
     pub fn budgets(&self) -> Budgets {
@@ -703,7 +859,10 @@ impl Scheduler {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -711,7 +870,10 @@ mod tests {
     use super::*;
 
     fn trigger(kind: TriggerKind) -> Trigger {
-        Trigger { kind, referent: None }
+        Trigger {
+            kind,
+            referent: None,
+        }
     }
 
     #[test]
@@ -727,7 +889,12 @@ mod tests {
                     .record_outcome(
                         a.run_id,
                         TerminalOutcome::CompletedGoal,
-                        RunUsage { tokens: 10, tools: 1, children: 0, started_at_secs: 0 },
+                        RunUsage {
+                            tokens: 10,
+                            tools: 1,
+                            children: 0,
+                            started_at_secs: 0,
+                        },
                         &[],
                     )
                     .unwrap();
@@ -761,7 +928,10 @@ mod tests {
 
     #[test]
     fn consecutive_failed_trips_breaker_and_pauses() {
-        let floors = BreakerFloors { consecutive_failed: 2, ..Default::default() };
+        let floors = BreakerFloors {
+            consecutive_failed: 2,
+            ..Default::default()
+        };
         let mut s = Scheduler::new(Budgets::default(), floors);
         for _ in 0..2 {
             s.observe(trigger(TriggerKind::NewCausalEvent));
@@ -773,7 +943,12 @@ mod tests {
                 .record_outcome(
                     a.run_id,
                     TerminalOutcome::Failed(FailureKind::Provider),
-                    RunUsage { tokens: 0, tools: 0, children: 0, started_at_secs: 0 },
+                    RunUsage {
+                        tokens: 0,
+                        tools: 0,
+                        children: 0,
+                        started_at_secs: 0,
+                    },
                     &[],
                 )
                 .unwrap();
@@ -783,10 +958,7 @@ mod tests {
         }
         assert!(s.is_paused());
         match s.accept_wake(false) {
-            WakeDecision::Denied(d) => assert!(matches!(
-                d.reason,
-                DenialReason::BreakerTripped(_)
-            )),
+            WakeDecision::Denied(d) => assert!(matches!(d.reason, DenialReason::BreakerTripped(_))),
             other => panic!("expected breaker denial, got {other:?}"),
         }
         s.resume().unwrap();
@@ -795,7 +967,10 @@ mod tests {
 
     #[test]
     fn budget_exhaustion_blocks_run() {
-        let budgets = Budgets { tokens: Some(5), ..Default::default() };
+        let budgets = Budgets {
+            tokens: Some(5),
+            ..Default::default()
+        };
         let mut s = Scheduler::new(budgets, BreakerFloors::default());
         s.observe(trigger(TriggerKind::NewCausalEvent));
         let a = match s.accept_wake(false) {
@@ -806,7 +981,12 @@ mod tests {
             .record_outcome(
                 a.run_id,
                 TerminalOutcome::Progress,
-                RunUsage { tokens: 100, tools: 0, children: 0, started_at_secs: 0 },
+                RunUsage {
+                    tokens: 100,
+                    tools: 0,
+                    children: 0,
+                    started_at_secs: 0,
+                },
                 &[],
             )
             .unwrap();
@@ -815,22 +995,37 @@ mod tests {
 
     #[test]
     fn boundary_check_enforces_deadline_and_budget() {
-        let budgets = Budgets { tokens: Some(5), deadline_secs: None, ..Default::default() };
+        let budgets = Budgets {
+            tokens: Some(5),
+            deadline_secs: None,
+            ..Default::default()
+        };
         let mut s = Scheduler::new(budgets, BreakerFloors::default());
         s.observe(trigger(TriggerKind::NewCausalEvent));
         let a = match s.accept_wake(false) {
             WakeDecision::Accepted(a) => a,
             other => panic!("expected accepted, got {other:?}"),
         };
-        s.record_usage(a.run_id, RunUsage { tokens: 5, tools: 0, children: 0, started_at_secs: 0 })
-            .unwrap();
+        s.record_usage(
+            a.run_id,
+            RunUsage {
+                tokens: 5,
+                tools: 0,
+                children: 0,
+                started_at_secs: 0,
+            },
+        )
+        .unwrap();
         let err = s.check_boundary(a.run_id).unwrap_err();
         assert!(matches!(err, SchedulerError::BudgetExhausted(_)));
     }
 
     #[test]
     fn identical_action_breaker_fires() {
-        let floors = BreakerFloors { identical_action: 2, ..Default::default() };
+        let floors = BreakerFloors {
+            identical_action: 2,
+            ..Default::default()
+        };
         let mut s = Scheduler::new(Budgets::default(), floors);
         let d = Digest::new(b"same-action");
         for _ in 0..2 {
@@ -843,7 +1038,12 @@ mod tests {
                 .record_outcome(
                     a.run_id,
                     TerminalOutcome::NoProgress,
-                    RunUsage { tokens: 0, tools: 0, children: 0, started_at_secs: 0 },
+                    RunUsage {
+                        tokens: 0,
+                        tools: 0,
+                        children: 0,
+                        started_at_secs: 0,
+                    },
                     &[d],
                 )
                 .unwrap();
@@ -858,7 +1058,10 @@ mod tests {
 
     #[test]
     fn causal_events_reset_no_progress() {
-        let floors = BreakerFloors { no_progress_without_causal: 2, ..Default::default() };
+        let floors = BreakerFloors {
+            no_progress_without_causal: 2,
+            ..Default::default()
+        };
         let mut s = Scheduler::new(Budgets::default(), floors);
         for i in 0..2 {
             s.observe(trigger(TriggerKind::NewCausalEvent));
@@ -871,12 +1074,166 @@ mod tests {
                 .record_outcome(
                     a.run_id,
                     TerminalOutcome::NoProgress,
-                    RunUsage { tokens: 0, tools: 0, children: 0, started_at_secs: 0 },
+                    RunUsage {
+                        tokens: 0,
+                        tools: 0,
+                        children: 0,
+                        started_at_secs: 0,
+                    },
                     &[],
                 )
                 .unwrap();
             assert!(trip.is_none(), "causal events must reset the breaker");
         }
         assert!(!s.is_paused());
+    }
+
+    /// Accepts a wake and returns the accepted run id (helper).
+    fn accept(s: &mut Scheduler) -> RunId {
+        s.observe(trigger(TriggerKind::NewCausalEvent));
+        match s.accept_wake(false) {
+            WakeDecision::Accepted(a) => a.run_id,
+            other => panic!("expected accepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_child_requires_active_parent() {
+        let mut s = Scheduler::new(Budgets::default(), BreakerFloors::default());
+        let ghost = RunId::generate();
+        // No active run at all.
+        assert_eq!(
+            s.spawn_child(ghost, Budgets::default()).unwrap_err(),
+            SchedulerError::NotActiveRun(ghost)
+        );
+        // Active run present, but not the named parent.
+        let parent = accept(&mut s);
+        assert_eq!(
+            s.spawn_child(ghost, Budgets::default()).unwrap_err(),
+            SchedulerError::NotActiveRun(ghost)
+        );
+        // Correct parent spawns; the active run is untouched.
+        let child = s.spawn_child(parent, Budgets::default()).unwrap();
+        assert_eq!(s.active_run(), Some(parent));
+        assert!(s.child(child).is_some());
+    }
+
+    #[test]
+    fn child_run_start_outcome_roundtrip() {
+        let mut s = Scheduler::new(Budgets::default(), BreakerFloors::default());
+        let parent = accept(&mut s);
+        let child = s.spawn_child(parent, Budgets::default()).unwrap();
+
+        // run_kind resolves children (and the active run).
+        assert_eq!(s.run_kind(child), Some(RunKind::Child));
+        assert_eq!(s.run_kind(parent), Some(RunKind::CognitionStep));
+
+        let start = s.run_start(child).unwrap();
+        assert_eq!(start.run_id, child);
+        assert_eq!(start.kind, RunKind::Child);
+        assert!(
+            start.deadline.is_some(),
+            "child deadline derives from its budgets"
+        );
+
+        let (record, trip) = s
+            .record_outcome(
+                child,
+                TerminalOutcome::CompletedGoal,
+                RunUsage {
+                    tokens: 3,
+                    tools: 1,
+                    children: 0,
+                    started_at_secs: 0,
+                },
+                &[],
+            )
+            .unwrap();
+        assert_eq!(record.outcome, TerminalOutcome::CompletedGoal);
+        assert!(trip.is_none(), "children never trip breakers");
+        assert!(s.child(child).is_none(), "outcome removes the child");
+        assert_eq!(s.run_kind(child), None);
+        // The parent run is unaffected.
+        assert_eq!(s.run_kind(parent), Some(RunKind::CognitionStep));
+    }
+
+    #[test]
+    fn child_boundary_enforces_deadline_and_tokens() {
+        let mut s = Scheduler::new(Budgets::default(), BreakerFloors::default());
+        let parent = accept(&mut s);
+        let budgets = Budgets {
+            deadline_secs: Some(10),
+            tokens: Some(5),
+            ..Default::default()
+        };
+        let child = s.spawn_child(parent, budgets).unwrap();
+
+        // At exactly the token budget the boundary still passes (child rule:
+        // over-budget errors).
+        s.record_usage(
+            child,
+            RunUsage {
+                tokens: 5,
+                tools: 0,
+                children: 0,
+                started_at_secs: 0,
+            },
+        )
+        .unwrap();
+        assert!(s.check_boundary(child).is_ok());
+
+        // Over the token budget → error naming the child and constraint.
+        s.record_usage(
+            child,
+            RunUsage {
+                tokens: 1,
+                tools: 0,
+                children: 0,
+                started_at_secs: 0,
+            },
+        )
+        .unwrap();
+        let err = s.check_boundary(child).unwrap_err();
+        assert!(matches!(err, SchedulerError::BudgetExhausted(m) if m.contains("tokens")));
+
+        // Past the deadline → deadline error (independent of tokens).
+        s.children.get_mut(&child).unwrap().started_at_secs -= 1_000;
+        let err = s.check_boundary(child).unwrap_err();
+        assert!(matches!(err, SchedulerError::BudgetExhausted(m) if m.contains("deadline")));
+        // A fresh child (no deadline elapsed, within budget) passes.
+        let fresh = s.spawn_child(parent, budgets).unwrap();
+        assert!(s.check_boundary(fresh).is_ok());
+    }
+
+    #[test]
+    fn child_record_usage_accumulates() {
+        let mut s = Scheduler::new(Budgets::default(), BreakerFloors::default());
+        let parent = accept(&mut s);
+        let child = s.spawn_child(parent, Budgets::default()).unwrap();
+        s.record_usage(
+            child,
+            RunUsage {
+                tokens: 2,
+                tools: 1,
+                children: 0,
+                started_at_secs: 0,
+            },
+        )
+        .unwrap();
+        s.record_usage(
+            child,
+            RunUsage {
+                tokens: 3,
+                tools: 1,
+                children: 0,
+                started_at_secs: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(s.current_usage(child).tokens, 5);
+        assert_eq!(s.current_usage(child).tools, 2);
+        assert_eq!(s.child(child).unwrap().usage.tokens, 5);
+        // Unknown id: zeros, as before.
+        assert_eq!(s.current_usage(RunId::generate()).tokens, 0);
     }
 }

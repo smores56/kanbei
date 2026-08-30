@@ -1040,6 +1040,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kanbei-context"
+version = "0.1.0"
+dependencies = [
+ "kanbei-core",
+ "kanbei-memory",
+ "kanbei-provider",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "kanbei-core"
 version = "0.1.0"
 dependencies = [
@@ -1070,6 +1082,19 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "zstd",
+]
+
+[[package]]
+name = "kanbei-memory"
+version = "0.1.0"
+dependencies = [
+ "kanbei-capabilities",
+ "kanbei-core",
+ "kanbei-log",
+ "kanbei-objects",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1131,6 +1156,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kanbei-retrieval"
+version = "0.1.0"
+dependencies = [
+ "kanbei-capabilities",
+ "kanbei-context",
+ "kanbei-core",
+ "kanbei-memory",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "kanbei-scheduler"
 version = "0.1.0"
 dependencies = [
@@ -1167,12 +1206,15 @@ name = "kanbei-session"
 version = "0.1.0"
 dependencies = [
  "kanbei-capabilities",
+ "kanbei-context",
  "kanbei-core",
  "kanbei-log",
+ "kanbei-memory",
  "kanbei-modules",
  "kanbei-objects",
  "kanbei-policy",
  "kanbei-provider",
+ "kanbei-retrieval",
  "kanbei-scheduler",
  "kanbei-scopes",
  "kanbei-services",
@@ -1202,11 +1244,13 @@ dependencies = [
  "kanbei-capabilities",
  "kanbei-core",
  "kanbei-log",
+ "kanbei-memory",
  "kanbei-modules",
  "kanbei-objects",
  "kanbei-policy",
  "kanbei-projection",
  "kanbei-provider",
+ "kanbei-retrieval",
  "kanbei-scheduler",
  "kanbei-scopes",
  "kanbei-services",

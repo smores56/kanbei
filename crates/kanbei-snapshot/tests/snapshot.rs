@@ -10,7 +10,7 @@ use kanbei_core::digest::Digest;
 use kanbei_core::envelope::ENVELOPE_SCHEMA;
 use kanbei_core::queue::DurabilityQueue;
 use kanbei_objects::{ObjectError, ObjectStore};
-use kanbei_snapshot::{pin, verify_closure, ExecutionManifest, MANIFEST_SCHEMA};
+use kanbei_snapshot::{ExecutionManifest, MANIFEST_SCHEMA, pin, verify_closure};
 
 /// Temp store with a named tag; caller must shutdown the returned queue.
 fn store(tag: &str) -> (PathBuf, ObjectStore, Arc<DurabilityQueue>) {
@@ -118,7 +118,11 @@ fn verify_closure_corrupt_object() {
     fs::write(store.path_for(&d), b"garbage").unwrap();
     let refs = HashSet::from([d]);
     match verify_closure(&store, &refs) {
-        Err(ObjectError::Corruption { digest, expected, actual }) => {
+        Err(ObjectError::Corruption {
+            digest,
+            expected,
+            actual,
+        }) => {
             assert_eq!(digest, d);
             assert_eq!(expected, d);
             assert_ne!(actual, expected);
@@ -131,7 +135,7 @@ fn verify_closure_corrupt_object() {
 #[test]
 fn bootstrap_shape() {
     let m = ExecutionManifest::bootstrap();
-    assert_eq!(m.schema, 3);
+    assert_eq!(m.schema, 4);
     assert_eq!(m.schema, MANIFEST_SCHEMA);
     assert_eq!(m.kernel_schema, 1);
     assert_eq!(m.envelope_schema, ENVELOPE_SCHEMA);
@@ -142,6 +146,7 @@ fn bootstrap_shape() {
     assert_eq!(m.engine_digest, None);
     assert_eq!(m.toolchain_digest, None);
     assert_eq!(m.memory_root, None);
+    assert_eq!(m.project_memory_root, None);
     assert_eq!(m.tool_registry, None);
     assert_eq!(m.projection, None);
     assert_eq!(m.provider_config, None);
@@ -149,6 +154,26 @@ fn bootstrap_shape() {
     assert_eq!(m.provider, None);
     assert_eq!(m.policy, None);
     assert_eq!(m.schema_versions, vec![1]);
+}
+
+#[test]
+fn project_memory_root_roundtrips_and_pre_m4_deserializes() {
+    let project_root = Digest::new(b"project-root");
+    let mut m = ExecutionManifest::bootstrap();
+    m.project_memory_root = Some(project_root);
+    let json = serde_json::to_string(&m).unwrap();
+    assert!(json.contains("\"project_memory_root\""));
+    let back: ExecutionManifest = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, m);
+    assert_eq!(back.project_memory_root, Some(project_root));
+
+    // Schema-3 manifests (no field) still deserialize via serde default.
+    let pre_m4 = json.replace(&format!(",\"project_memory_root\":\"{project_root}\""), "");
+    assert!(!pre_m4.contains("project_memory_root"));
+    let back: ExecutionManifest = serde_json::from_str(&pre_m4).unwrap();
+    assert_eq!(back.schema, MANIFEST_SCHEMA);
+    assert_eq!(back.project_memory_root, None);
+    assert_eq!(back.memory_root, m.memory_root);
 }
 
 #[test]
@@ -175,6 +200,7 @@ fn json_contains_version_fields() {
         "\"state_head\"",
         "\"modules\"",
         "\"composition\"",
+        "\"project_memory_root\"",
         "\"schema_versions\"",
     ] {
         assert!(json.contains(key), "manifest JSON missing {key}: {json}");

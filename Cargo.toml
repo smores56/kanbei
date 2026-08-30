@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/kanbei-core",
     "crates/kanbei-log",
+    "crates/kanbei-memory",
     "crates/kanbei-objects",
     "crates/kanbei-session",
     "crates/kanbei-snapshot",
@@ -11,7 +12,9 @@ members = [
     "crates/kanbei-guest",
     "crates/kanbei-vm",
     "crates/kanbei-capabilities",
+    "crates/kanbei-context",
     "crates/kanbei-policy",
+    "crates/kanbei-retrieval",
     "crates/kanbei-services",
     "crates/kanbei-modules",
     "crates/kanbei-scopes",
@@ -25,6 +28,7 @@ members = [
 default-members = [
     "crates/kanbei-core",
     "crates/kanbei-log",
+    "crates/kanbei-memory",
     "crates/kanbei-objects",
     "crates/kanbei-session",
     "crates/kanbei-snapshot",
@@ -32,7 +36,9 @@ default-members = [
     "crates/kanbei-testkit",
     "crates/kanbei-vm",
     "crates/kanbei-capabilities",
+    "crates/kanbei-context",
     "crates/kanbei-policy",
+    "crates/kanbei-retrieval",
     "crates/kanbei-services",
     "crates/kanbei-modules",
     "crates/kanbei-scopes",
@@ -49,13 +55,16 @@ publish = false
 [workspace.dependencies]
 kanbei-core = { path = "crates/kanbei-core" }
 kanbei-log = { path = "crates/kanbei-log" }
+kanbei-memory = { path = "crates/kanbei-memory" }
 kanbei-objects = { path = "crates/kanbei-objects" }
 kanbei-session = { path = "crates/kanbei-session" }
 kanbei-snapshot = { path = "crates/kanbei-snapshot" }
 kanbei-projection = { path = "crates/kanbei-projection" }
 kanbei-vm = { path = "crates/kanbei-vm" }
 kanbei-capabilities = { path = "crates/kanbei-capabilities" }
+kanbei-context = { path = "crates/kanbei-context" }
 kanbei-policy = { path = "crates/kanbei-policy" }
+kanbei-retrieval = { path = "crates/kanbei-retrieval" }
 kanbei-services = { path = "crates/kanbei-services" }
 kanbei-modules = { path = "crates/kanbei-modules" }
 kanbei-scopes = { path = "crates/kanbei-scopes" }

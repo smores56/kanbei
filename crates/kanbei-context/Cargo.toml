@@ -1,0 +1,15 @@
+[package]
+name = "kanbei-context"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+kanbei-core.workspace = true
+kanbei-memory.workspace = true
+kanbei-provider.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]

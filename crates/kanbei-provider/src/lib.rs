@@ -112,7 +112,11 @@ pub enum ProviderError {
     #[error("provider {provider}: {message}")]
     Transport { provider: String, message: String },
     #[error("provider {provider}: HTTP {status} {body}")]
-    Http { provider: String, status: u16, body: String },
+    Http {
+        provider: String,
+        status: u16,
+        body: String,
+    },
     #[error("provider {provider}: malformed response {message}")]
     Malformed { provider: String, message: String },
     #[error("provider {provider}: missing API key (source {name})")]
@@ -151,7 +155,10 @@ impl HttpEngine {
 impl ProviderEngine for HttpEngine {
     fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         let key = resolve_key(&self.cfg)?;
-        let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/chat/completions",
+            self.cfg.base_url.trim_end_matches('/')
+        );
         let mut body = json!({
             "model": req.model,
             "messages": req.messages.iter().map(|m| {
@@ -183,29 +190,32 @@ impl ProviderEngine for HttpEngine {
                 .timeout_global(Some(self.cfg.timeout))
                 .build(),
         );
-        let mut resp =
-            match agent.post(&url).header("Authorization", &format!("Bearer {key}")).send_json(&body) {
-                Ok(r) => r,
-                Err(ureq::Error::Timeout(_)) => {
-                    return Err(ProviderError::Timeout {
-                        provider: self.cfg.provider.clone(),
-                        secs: self.cfg.timeout.as_secs(),
-                    })
-                }
-                Err(ureq::Error::StatusCode(code)) => {
-                    return Err(ProviderError::Http {
-                        provider: self.cfg.provider.clone(),
-                        status: code,
-                        body: String::new(),
-                    })
-                }
-                Err(e) => {
-                    return Err(ProviderError::Transport {
-                        provider: self.cfg.provider.clone(),
-                        message: e.to_string(),
-                    })
-                }
-            };
+        let mut resp = match agent
+            .post(&url)
+            .header("Authorization", &format!("Bearer {key}"))
+            .send_json(&body)
+        {
+            Ok(r) => r,
+            Err(ureq::Error::Timeout(_)) => {
+                return Err(ProviderError::Timeout {
+                    provider: self.cfg.provider.clone(),
+                    secs: self.cfg.timeout.as_secs(),
+                });
+            }
+            Err(ureq::Error::StatusCode(code)) => {
+                return Err(ProviderError::Http {
+                    provider: self.cfg.provider.clone(),
+                    status: code,
+                    body: String::new(),
+                });
+            }
+            Err(e) => {
+                return Err(ProviderError::Transport {
+                    provider: self.cfg.provider.clone(),
+                    message: e.to_string(),
+                });
+            }
+        };
         let status = resp.status();
         let text = resp
             .body_mut()
@@ -270,7 +280,11 @@ pub fn parse_openai_response(
                         .and_then(|a| a.as_str())
                         .and_then(|s| serde_json::from_str::<Value>(s).ok())
                         .unwrap_or(Value::Null);
-                    Some(ToolCall { id, name, arguments: args })
+                    Some(ToolCall {
+                        id,
+                        name,
+                        arguments: args,
+                    })
                 })
                 .collect::<Vec<_>>()
         })
@@ -283,13 +297,21 @@ pub fn parse_openai_response(
     };
     let usage = v.get("usage").map(|u| Usage {
         input_tokens: u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
-        output_tokens: u.get("completion_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+        output_tokens: u
+            .get("completion_tokens")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0),
     });
     let usage = usage.ok_or_else(|| ProviderError::Malformed {
         provider: provider.into(),
         message: "missing usage".into(),
     })?;
-    Ok(CompletionResponse { content, tool_calls, finish_reason: finish, usage })
+    Ok(CompletionResponse {
+        content,
+        tool_calls,
+        finish_reason: finish,
+        usage,
+    })
 }
 
 // ---------- deterministic fake engine (gate/tests) ----------
@@ -341,16 +363,32 @@ impl ProviderEngine for FakeEngine {
 
 // ---------- canonical records ----------
 
-/// Model-call cache plan: M3 uses no provider-side caching (the cache-aware
-/// projection lands in M4); the field exists so records stay schema-stable.
+/// Model-call cache plan: whether the provider may serve this call from a
+/// cache and, if so, under which stable-prefix digest (architecture.md:141).
+/// M3 records used `None`; M4 projection lowering (kanbei-context `lower`)
+/// selects `StablePrefix`. Serialized lowercase; the old PascalCase variant
+/// names still deserialize (backward compat).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CachePlan {
+    /// No provider-side caching for this call.
+    #[serde(alias = "None")]
     None,
+    /// Serve the cached stable prefix when the digest matches (the lowering
+    /// digest over the prefix fragments' ids, content hashes, dep hashes).
+    StablePrefix { digest: Digest },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CacheOutcome {
+    #[serde(alias = "Miss")]
     Miss,
+    /// The provider served the cached stable prefix.
+    Hit,
+    /// A previously cached prefix was invalidated (e.g. stable-segment
+    /// promotion); the reason is recorded.
+    Invalidated { reason: String },
 }
 
 /// The canonical `model_call` event payload (architecture.md:141): what
@@ -373,6 +411,11 @@ pub struct ModelCallRecord {
     pub params: Value,
     pub cache_plan: CachePlan,
     pub cache_outcome: CacheOutcome,
+    /// Pinned project/lifetime memory-root digests at call time (R-11: model
+    /// calls pin exact memory roots); [lifetime, project], empty when
+    /// unpinned.
+    #[serde(default)]
+    pub memory_roots: Vec<Digest>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub finish_reason: FinishReason,
@@ -422,10 +465,13 @@ impl fmt::Debug for ProviderConfig {
             .field("provider", &self.provider)
             .field("model", &self.model)
             .field("base_url", &self.base_url)
-            .field("key", &match &self.key {
-                KeySource::Env(name) => format!("env:{name}"),
-                KeySource::Inline(_) => "inline:redacted".to_string(),
-            })
+            .field(
+                "key",
+                &match &self.key {
+                    KeySource::Env(name) => format!("env:{name}"),
+                    KeySource::Inline(_) => "inline:redacted".to_string(),
+                },
+            )
             .field("temperature", &self.temperature)
             .field("max_tokens", &self.max_tokens)
             .field("timeout", &self.timeout)
@@ -481,7 +527,13 @@ mod tests {
         let r = parse_openai_response("fake", v).unwrap();
         assert_eq!(r.content.as_deref(), Some("hello"));
         assert!(r.tool_calls.is_empty());
-        assert_eq!(r.usage, Usage { input_tokens: 10, output_tokens: 3 });
+        assert_eq!(
+            r.usage,
+            Usage {
+                input_tokens: 10,
+                output_tokens: 3
+            }
+        );
         assert_eq!(r.finish_reason, FinishReason::Stop);
     }
 
@@ -523,12 +575,19 @@ mod tests {
                 content: Some("hi".into()),
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
-                usage: Usage { input_tokens: 1, output_tokens: 1 },
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
             }],
         );
         let req = CompletionRequest {
             model: "test-model".into(),
-            messages: vec![Message { role: Role::User, content: "x".into(), tool_call_id: None }],
+            messages: vec![Message {
+                role: Role::User,
+                content: "x".into(),
+                tool_call_id: None,
+            }],
             tools: vec![],
             temperature: None,
             max_tokens: None,
@@ -546,9 +605,11 @@ mod tests {
         let (s2, d2) = render_context(&[(0u64, "user_message".into(), &payload)], 1000).unwrap();
         assert_eq!(s1, s2);
         assert_eq!(d1, d2);
-        let (short, _) =
-            render_context(&[(0u64, "a".into(), &payload), (1u64, "b".into(), &payload)], 60)
-                .unwrap();
+        let (short, _) = render_context(
+            &[(0u64, "a".into(), &payload), (1u64, "b".into(), &payload)],
+            60,
+        )
+        .unwrap();
         assert!(short.contains("\"kind\":\"a\""));
         assert!(!short.contains("\"kind\":\"b\""));
     }
@@ -565,6 +626,7 @@ mod tests {
             params: json!({"temperature": 0.2}),
             cache_plan: CachePlan::None,
             cache_outcome: CacheOutcome::Miss,
+            memory_roots: vec![Digest::new(b"lifetime"), Digest::new(b"project")],
             input_tokens: 5,
             output_tokens: 2,
             finish_reason: FinishReason::Stop,
@@ -572,6 +634,10 @@ mod tests {
         let s = serde_json::to_string(&rec).unwrap();
         let back: ModelCallRecord = serde_json::from_str(&s).unwrap();
         assert_eq!(back, rec);
+        // Pre-M4 records have no memory_roots field; serde(default) → empty.
+        let old = r#"{"provider":"fake","model":"m","projection_hashes":[],"module_hashes":[],"selected_events":[],"rendered_hash":"blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262","params":{},"cache_plan":"None","cache_outcome":"Miss","input_tokens":0,"output_tokens":0,"finish_reason":"Stop"}"#;
+        let back: ModelCallRecord = serde_json::from_str(old).unwrap();
+        assert!(back.memory_roots.is_empty());
         let e = EgressEntry {
             provider: "fake".into(),
             sensitivity_classes: vec!["call".into()],
@@ -581,5 +647,39 @@ mod tests {
         };
         let back: EgressEntry = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back, e);
+    }
+
+    #[test]
+    fn cache_plan_outcome_variants_roundtrip_and_backward_compat() {
+        let rec = ModelCallRecord {
+            provider: "fake".into(),
+            model: "m".into(),
+            projection_hashes: vec![Digest::new(b"proj")],
+            module_hashes: vec![],
+            selected_events: vec![1, 2, 3],
+            rendered_hash: Digest::new(b"ctx"),
+            params: json!({"temperature": 0.2}),
+            cache_plan: CachePlan::StablePrefix {
+                digest: Digest::new(b"prefix"),
+            },
+            cache_outcome: CacheOutcome::Invalidated {
+                reason: "promotion".into(),
+            },
+            memory_roots: vec![Digest::new(b"lifetime")],
+            input_tokens: 5,
+            output_tokens: 2,
+            finish_reason: FinishReason::Stop,
+        };
+        let s = serde_json::to_string(&rec).unwrap();
+        let back: ModelCallRecord = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, rec);
+        assert!(s.contains("\"stableprefix\""));
+        assert!(s.contains("\"invalidated\""));
+        // Pre-M4 records serialized the PascalCase variant names; they must
+        // still deserialize unchanged.
+        let old = r#"{"provider":"fake","model":"m","projection_hashes":[],"module_hashes":[],"selected_events":[],"rendered_hash":"blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262","params":{},"cache_plan":"None","cache_outcome":"Miss","input_tokens":0,"output_tokens":0,"finish_reason":"Stop"}"#;
+        let back: ModelCallRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(back.cache_plan, CachePlan::None);
+        assert_eq!(back.cache_outcome, CacheOutcome::Miss);
     }
 }

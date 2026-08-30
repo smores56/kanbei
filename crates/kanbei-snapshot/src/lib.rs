@@ -13,9 +13,10 @@ use kanbei_core::id::Id128;
 use kanbei_objects::{ObjectError, ObjectStore};
 use serde::{Deserialize, Serialize};
 
-/// Manifest schema version (M3: 3 — tool-registry/provider/scheduler pins;
-/// 2 — module pins + composition digest).
-pub const MANIFEST_SCHEMA: u32 = 3;
+/// Manifest schema version (M4: 4 — project memory root; M3: 3 —
+/// tool-registry/provider/scheduler pins; 2 — module pins + composition
+/// digest).
+pub const MANIFEST_SCHEMA: u32 = 4;
 
 /// One active module generation pin: stable module id, generation, package
 /// digest, and the scope it was activated in (M2: "/" — root scope only).
@@ -50,6 +51,10 @@ pub struct ExecutionManifest {
     pub composition: Option<Digest>,
     /// Memory claim root; M4 — always None in M1.
     pub memory_root: Option<Digest>,
+    /// Project-scoped memory claim root (M4); lifetime root stays in
+    /// memory_root. None when the session has no project binding.
+    #[serde(default)]
+    pub project_memory_root: Option<Digest>,
     /// Tool-registry snapshot digest; None until M3 (schema 3 pin).
     #[serde(default)]
     pub tool_registry: Option<Digest>,
@@ -88,6 +93,7 @@ impl ExecutionManifest {
             modules: Vec::new(),
             composition: None,
             memory_root: None,
+            project_memory_root: None,
             tool_registry: None,
             projection: None,
             provider_config: None,
