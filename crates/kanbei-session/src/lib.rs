@@ -117,9 +117,14 @@ pub struct SessionConfig {
     // --- M3 agent spine ---
     /// Provider gateway config; None = no model calls (storage-only session).
     pub provider: Option<kanbei_provider::ProviderConfig>,
-    /// The provider engine; None = build [`kanbei_provider::HttpEngine`]
-    /// from `provider` (tests inject the fake engine).
+    /// The provider engine; None = build the wire-protocol engine from
+    /// `provider` via [`kanbei_provider::engine_for`] (driven by `protocol`;
+    /// tests inject the fake engine).
     pub provider_engine: Option<Box<dyn kanbei_provider::ProviderEngine>>,
+    /// Provider wire protocol (M9 wave 3): OpenAI-compatible Chat
+    /// Completions by default (`HttpEngine`); `Anthropic` selects the
+    /// Messages API engine.
+    pub protocol: kanbei_provider::WireProtocol,
     /// Scheduler budgets (deadline/tokens/tools/children).
     pub budgets: kanbei_scheduler::Budgets,
     /// Kernel breaker floors (R-17/E-02).
@@ -173,6 +178,7 @@ impl Default for SessionConfig {
             engine: None,
             provider: None,
             provider_engine: None,
+            protocol: kanbei_provider::WireProtocol::OpenAI,
             budgets: kanbei_scheduler::Budgets::default(),
             breaker_floors: kanbei_scheduler::BreakerFloors::default(),
             tool_limits: kanbei_tools::ExecLimits::default(),
@@ -610,10 +616,9 @@ impl Session {
         };
 
         let provider_engine = cfg.provider_engine.take().or_else(|| {
-            cfg.provider.as_ref().map(|p| {
-                Box::new(kanbei_provider::HttpEngine::new(p.clone()))
-                    as Box<dyn kanbei_provider::ProviderEngine>
-            })
+            cfg.provider
+                .as_ref()
+                .map(|p| kanbei_provider::engine_for(p, cfg.protocol))
         });
         let broker = std::mem::take(&mut cfg.broker);
         let fs_root = cfg.fs_root.clone();
@@ -2326,6 +2331,11 @@ impl Session {
     /// built or safe mode).
     pub fn modules(&self) -> Option<&ModuleManager> {
         self.modules.as_ref()
+    }
+
+    /// The bound provider engine; None = storage-only session.
+    pub fn provider_engine(&self) -> Option<&dyn kanbei_provider::ProviderEngine> {
+        self.provider.as_deref()
     }
 
     /// The current epoch composition (R-01: EpochId = its digest).

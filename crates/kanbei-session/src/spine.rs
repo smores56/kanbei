@@ -345,6 +345,7 @@ impl Session {
                 Some((prev, artifacts)) if *prev == provider => Some(artifacts.clone()),
                 _ => None,
             },
+            tool_calls: Vec::new(),
         };
         let response = engine
             .complete(&request)

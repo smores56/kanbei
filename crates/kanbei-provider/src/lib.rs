@@ -1,6 +1,8 @@
-//! Provider gateway (R-19 tier 2 native built-in): one provider engine,
-//! normalized lifecycle, model-call records, egress entries, and credential
-//! custody (R-28/D-06: key injected at call time only, never canonical).
+//! Provider gateway (R-19 tier 2 native built-in): two provider wire
+//! protocols (OpenAI-compatible Chat Completions + Anthropic Messages API,
+//! M9 wave 3), normalized lifecycle, model-call records, egress entries, and
+//! credential custody (R-28/D-06: key injected at call time only, never
+//! canonical).
 
 use std::fmt;
 use std::time::Duration;
@@ -54,12 +56,29 @@ pub struct ProviderConfig {
     pub provider: String,
     /// Wire model name.
     pub model: String,
-    /// OpenAI-compatible base URL (e.g. `https://api.openai.com/v1`).
+    /// Provider base URL. The OpenAI-compatible protocol appends
+    /// `/chat/completions` (e.g. `https://api.openai.com/v1`); the Anthropic
+    /// protocol treats this as the API root and appends `/v1/messages`
+    /// (e.g. `https://api.anthropic.com`).
     pub base_url: String,
     pub key: KeySource,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
     pub timeout: Duration,
+}
+
+/// Provider wire protocol (M9 wave 3): which vendor API shape the engine
+/// speaks. Serialized lowercase; configs without the field default to the
+/// OpenAI-compatible shape (backward compat).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WireProtocol {
+    /// OpenAI-compatible `/chat/completions` ([`HttpEngine`]) — the default.
+    #[serde(alias = "openai")]
+    OpenAI,
+    /// Anthropic Messages API `/v1/messages` ([`AnthropicEngine`]).
+    #[serde(alias = "anthropic")]
+    Anthropic,
 }
 
 // ---------- wire types ----------
@@ -110,6 +129,12 @@ pub struct CompletionRequest {
     pub tools: Vec<Value>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// Assistant tool calls from previous turns, in conversation order. The
+    /// OpenAI engine ignores them; the Anthropic engine replays them as
+    /// `tool_use` blocks on the last assistant turn (the API requires
+    /// `tool_use` before `tool_result`). M9 wave 3.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
     /// R-18/E-07: opaque reasoning artifacts replayed from the previous
     /// same-provider call (base64, verbatim; never sent cross-provider).
     #[serde(default)]
@@ -134,8 +159,10 @@ pub struct CompletionResponse {
 
 // ---------- engine seam ----------
 
-/// One provider engine. The gateway owns the single wire protocol; the seam
-/// keeps the gate deterministic (FakeEngine) without an HTTP round trip.
+/// One provider engine. The gateway owns the wire protocols
+/// (OpenAI-compatible Chat Completions + Anthropic Messages API, M9 wave 3);
+/// the seam keeps the gate deterministic (FakeEngine) without an HTTP round
+/// trip.
 pub trait ProviderEngine: Send + Sync {
     fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ProviderError>;
     /// Provider identity recorded in egress entries.
@@ -177,7 +204,8 @@ pub fn resolve_key(cfg: &ProviderConfig) -> Result<String, ProviderError> {
 
 // ---------- OpenAI-compatible HTTP engine ----------
 
-/// The one real engine: OpenAI-compatible `/chat/completions` over HTTPS.
+/// The OpenAI-compatible engine: `/chat/completions` over HTTPS (the default
+/// wire protocol).
 pub struct HttpEngine {
     cfg: ProviderConfig,
 }
@@ -352,6 +380,315 @@ pub fn parse_openai_response(
         discontinuity: None,
         opaque_artifacts: None,
     })
+}
+
+// ---------- Anthropic Messages API engine (M9 wave 3) ----------
+
+/// The Anthropic Messages API engine (M9 wave 3): a second provider wire
+/// protocol behind the same [`ProviderEngine`] seam (architecture.md:700).
+/// `base_url` is the API root (e.g. `https://api.anthropic.com`), NOT a
+/// `/v1` path — this engine appends `/v1/messages`.
+pub struct AnthropicEngine {
+    cfg: ProviderConfig,
+}
+
+impl AnthropicEngine {
+    pub fn new(cfg: ProviderConfig) -> Self {
+        Self { cfg }
+    }
+}
+
+/// The Messages API requires `max_tokens`; the fallback chain is
+/// request → config → this default.
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 1024;
+
+impl ProviderEngine for AnthropicEngine {
+    fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ProviderError> {
+        let key = resolve_key(&self.cfg)?;
+        let url = format!("{}/v1/messages", self.cfg.base_url.trim_end_matches('/'));
+        let body = anthropic_body(&self.cfg, req)?;
+        let agent = ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(self.cfg.timeout))
+                .build(),
+        );
+        let mut resp = match agent
+            .post(&url)
+            .header("x-api-key", &key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .send_json(&body)
+        {
+            Ok(r) => r,
+            Err(ureq::Error::Timeout(_)) => {
+                return Err(ProviderError::Timeout {
+                    provider: self.cfg.provider.clone(),
+                    secs: self.cfg.timeout.as_secs(),
+                });
+            }
+            Err(ureq::Error::StatusCode(code)) => {
+                return Err(ProviderError::Http {
+                    provider: self.cfg.provider.clone(),
+                    status: code,
+                    body: String::new(),
+                });
+            }
+            Err(e) => {
+                return Err(ProviderError::Transport {
+                    provider: self.cfg.provider.clone(),
+                    message: e.to_string(),
+                });
+            }
+        };
+        let status = resp.status();
+        let text = resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| ProviderError::Malformed {
+                provider: self.cfg.provider.clone(),
+                message: e.to_string(),
+            })?;
+        if status != 200 {
+            return Err(ProviderError::Http {
+                provider: self.cfg.provider.clone(),
+                status: status.into(),
+                body: text,
+            });
+        }
+        let v: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Malformed {
+            provider: self.cfg.provider.clone(),
+            message: e.to_string(),
+        })?;
+        parse_anthropic_response(&self.cfg.provider, v)
+    }
+
+    fn identity(&self) -> &str {
+        &self.cfg.provider
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Build the Messages API request body from the canonical request. System
+/// messages fold into the top-level `system` field (joined with "\n\n");
+/// tool results fold into user turns (`tool_result` blocks — Anthropic has
+/// no separate tool role); the request's tool calls replay as `tool_use`
+/// blocks on the last assistant turn (the API requires `tool_use` before
+/// `tool_result`). Turn order is preserved.
+fn anthropic_body(
+    cfg: &ProviderConfig,
+    req: &CompletionRequest,
+) -> Result<Value, ProviderError> {
+    let max_tokens = req
+        .max_tokens
+        .or(cfg.max_tokens)
+        .unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS);
+    let system = req
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::System)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut body = serde_json::Map::new();
+    body.insert("model".into(), json!(req.model));
+    body.insert("max_tokens".into(), json!(max_tokens));
+    if let Some(t) = req.temperature {
+        body.insert("temperature".into(), json!(t));
+    }
+    if !system.is_empty() {
+        body.insert("system".into(), json!(system));
+    }
+    let mut messages: Vec<Value> = Vec::new();
+    let mut last_assistant: Option<usize> = None;
+    for m in req.messages.iter().filter(|m| m.role != Role::System) {
+        match m.role {
+            Role::Assistant => {
+                last_assistant = Some(messages.len());
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": m.content}],
+                }));
+            }
+            Role::Tool => {
+                messages.push(json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": m.tool_call_id,
+                        "content": m.content,
+                    }],
+                }));
+            }
+            _ => {
+                messages.push(json!({
+                    "role": "user",
+                    "content": if m.tool_call_id.is_some() {
+                        Value::Array(vec![json!({"type": "text", "text": m.content})])
+                    } else {
+                        json!(m.content)
+                    },
+                }));
+            }
+        }
+    }
+    if !req.tool_calls.is_empty()
+        && let Some(i) = last_assistant
+    {
+        let tool_uses = req
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                json!({
+                    "type": "tool_use",
+                    "id": tc.id,
+                    "name": tc.name,
+                    "input": tc.arguments,
+                })
+            })
+            .collect::<Vec<_>>();
+        if let Some(arr) = messages[i].get_mut("content").and_then(|c| c.as_array_mut()) {
+            arr.extend(tool_uses);
+        }
+    }
+    body.insert("messages".into(), json!(messages));
+    if !req.tools.is_empty() {
+        body.insert(
+            "tools".into(),
+            json!(anthropic_tools(&cfg.provider, &req.tools)?),
+        );
+    }
+    Ok(Value::Object(body))
+}
+
+/// Map the canonical (OpenAI-shaped) tool schemas to the Anthropic `tools`
+/// shape: each `{"type":"function","function":{name,description,parameters}}`
+/// becomes `{name, description, input_schema: parameters}`. Unknown shapes
+/// are Malformed with the tool index.
+fn anthropic_tools(provider: &str, tools: &[Value]) -> Result<Vec<Value>, ProviderError> {
+    tools
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let obj = t.as_object().ok_or_else(|| ProviderError::Malformed {
+                provider: provider.into(),
+                message: format!("tools[{i}]: not an object"),
+            })?;
+            let kind = obj.get("type").and_then(|t| t.as_str());
+            if kind.is_some() && kind != Some("function") {
+                return Err(ProviderError::Malformed {
+                    provider: provider.into(),
+                    message: format!("tools[{i}]: unknown tool type {kind:?}"),
+                });
+            }
+            let name = t
+                .pointer("/function/name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| ProviderError::Malformed {
+                    provider: provider.into(),
+                    message: format!("tools[{i}]: missing function.name"),
+                })?;
+            let mut out = serde_json::Map::new();
+            out.insert("name".into(), json!(name));
+            if let Some(d) = t.pointer("/function/description").and_then(|d| d.as_str()) {
+                out.insert("description".into(), json!(d));
+            }
+            out.insert(
+                "input_schema".into(),
+                t.pointer("/function/parameters")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            Ok(Value::Object(out))
+        })
+        .collect()
+}
+
+/// Parse an Anthropic Messages API body into the canonical response shape.
+/// Text blocks join with "\n" in block order; `tool_use` blocks map 1:1 to
+/// tool calls (Anthropic `input` arrives as a JSON object, unlike OpenAI's
+/// string arguments). `stop_reason` maps `tool_use` → ToolCalls and
+/// `max_tokens` → Length; Anthropic has no content-filter equivalent.
+pub fn parse_anthropic_response(
+    provider: &str,
+    v: Value,
+) -> Result<CompletionResponse, ProviderError> {
+    let blocks = v.get("content").ok_or_else(|| ProviderError::Malformed {
+        provider: provider.into(),
+        message: "missing content".into(),
+    })?;
+    let blocks = blocks.as_array().ok_or_else(|| ProviderError::Malformed {
+        provider: provider.into(),
+        message: "content is not an array".into(),
+    })?;
+    let text = blocks
+        .iter()
+        .filter_map(|b| {
+            if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                b.get("text").and_then(|t| t.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = if text.is_empty() { None } else { Some(text) };
+    let tool_calls = blocks
+        .iter()
+        .filter_map(|b| {
+            if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                return None;
+            }
+            let id = b.get("id")?.as_str()?.to_string();
+            let name = b.get("name")?.as_str()?.to_string();
+            let arguments = b.get("input").cloned().unwrap_or(Value::Null);
+            Some(ToolCall {
+                id,
+                name,
+                arguments,
+            })
+        })
+        .collect::<Vec<_>>();
+    let finish = match v.get("stop_reason").and_then(|s| s.as_str()) {
+        Some("tool_use") => FinishReason::ToolCalls,
+        Some("max_tokens") => FinishReason::Length,
+        _ => FinishReason::Stop,
+    };
+    let usage = v.get("usage").ok_or_else(|| ProviderError::Malformed {
+        provider: provider.into(),
+        message: "missing usage".into(),
+    })?;
+    Ok(CompletionResponse {
+        content,
+        tool_calls,
+        finish_reason: finish,
+        usage: Usage {
+            input_tokens: usage
+                .get("input_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("output_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0),
+        },
+        // The Anthropic wire format carries no discontinuity/artifact fields
+        // (R-18/E-07: opaque artifacts are provider-specific extensions).
+        discontinuity: None,
+        opaque_artifacts: None,
+    })
+}
+
+/// Build the engine for a protocol: OpenAI → [`HttpEngine`], Anthropic →
+/// [`AnthropicEngine`]. The session calls this when no engine was injected
+/// (M9 wave 3: `SessionConfig.protocol` drives the choice).
+pub fn engine_for(cfg: &ProviderConfig, protocol: WireProtocol) -> Box<dyn ProviderEngine> {
+    match protocol {
+        WireProtocol::OpenAI => Box::new(HttpEngine::new(cfg.clone())),
+        WireProtocol::Anthropic => Box::new(AnthropicEngine::new(cfg.clone())),
+    }
 }
 
 // ---------- deterministic fake engine (gate/tests) ----------
@@ -635,6 +972,7 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            tool_calls: vec![],
             opaque_artifacts: None,
         };
         let r = engine.complete(&req).unwrap();
@@ -726,5 +1064,397 @@ mod tests {
         let back: ModelCallRecord = serde_json::from_str(old).unwrap();
         assert_eq!(back.cache_plan, CachePlan::None);
         assert_eq!(back.cache_outcome, CacheOutcome::Miss);
+    }
+
+    // ---------- M9 wave 3: Anthropic Messages API ----------
+
+    #[test]
+    fn wire_protocol_serde_lowercase() {
+        assert_eq!(
+            serde_json::from_str::<WireProtocol>("\"openai\"").unwrap(),
+            WireProtocol::OpenAI
+        );
+        assert_eq!(
+            serde_json::from_str::<WireProtocol>("\"anthropic\"").unwrap(),
+            WireProtocol::Anthropic
+        );
+        assert_eq!(
+            serde_json::to_string(&WireProtocol::Anthropic).unwrap(),
+            "\"anthropic\""
+        );
+    }
+
+    #[test]
+    fn anthropic_body_system_folds_and_order_preserved() {
+        let body = anthropic_body(
+            &cfg(),
+            &CompletionRequest {
+                model: "claude".into(),
+                messages: vec![
+                    Message {
+                        role: Role::System,
+                        content: "sys1".into(),
+                        tool_call_id: None,
+                    },
+                    Message {
+                        role: Role::User,
+                        content: "u1".into(),
+                        tool_call_id: None,
+                    },
+                    Message {
+                        role: Role::System,
+                        content: "sys2".into(),
+                        tool_call_id: None,
+                    },
+                    Message {
+                        role: Role::User,
+                        content: "u2".into(),
+                        tool_call_id: None,
+                    },
+                ],
+                tools: vec![],
+                temperature: Some(0.5),
+                max_tokens: None,
+                tool_calls: vec![],
+                opaque_artifacts: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(body["model"], "claude");
+        assert_eq!(body["system"], "sys1\n\nsys2");
+        assert_eq!(body["temperature"], 0.5);
+        // System turns fold away; user turns keep their order.
+        assert_eq!(
+            body["messages"],
+            json!([
+                {"role": "user", "content": "u1"},
+                {"role": "user", "content": "u2"},
+            ])
+        );
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn anthropic_body_tool_result_folding() {
+        let body = anthropic_body(
+            &cfg(),
+            &CompletionRequest {
+                model: "claude".into(),
+                messages: vec![
+                    Message {
+                        role: Role::User,
+                        content: "read /a".into(),
+                        tool_call_id: None,
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        content: "ok".into(),
+                        tool_call_id: None,
+                    },
+                    Message {
+                        role: Role::Tool,
+                        content: "content-of-a".into(),
+                        tool_call_id: Some("tc1".into()),
+                    },
+                ],
+                tools: vec![],
+                temperature: None,
+                max_tokens: None,
+                tool_calls: vec![],
+                opaque_artifacts: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            body["messages"][1],
+            json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})
+        );
+        assert_eq!(
+            body["messages"][2],
+            json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tc1",
+                    "content": "content-of-a",
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_body_assistant_tool_use_blocks() {
+        let body = anthropic_body(
+            &cfg(),
+            &CompletionRequest {
+                model: "claude".into(),
+                messages: vec![
+                    Message {
+                        role: Role::Assistant,
+                        content: "calling".into(),
+                        tool_call_id: None,
+                    },
+                    Message {
+                        role: Role::Tool,
+                        content: "out".into(),
+                        tool_call_id: Some("tc1".into()),
+                    },
+                ],
+                tools: vec![],
+                temperature: None,
+                max_tokens: None,
+                tool_calls: vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "fs_read".into(),
+                    arguments: json!({"path": "/a"}),
+                }],
+                opaque_artifacts: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            body["messages"][0],
+            json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "calling"},
+                    {"type": "tool_use", "id": "tc1", "name": "fs_read", "input": {"path": "/a"}},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_body_tools_mapping_and_malformed() {
+        let body = anthropic_body(
+            &cfg(),
+            &CompletionRequest {
+                model: "claude".into(),
+                messages: vec![],
+                tools: vec![json!({
+                    "type": "function",
+                    "function": {
+                        "name": "fs_read",
+                        "description": "Read a file",
+                        "parameters": {"type": "object"},
+                    },
+                })],
+                temperature: None,
+                max_tokens: None,
+                tool_calls: vec![],
+                opaque_artifacts: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            body["tools"],
+            json!([
+                {"name": "fs_read", "description": "Read a file", "input_schema": {"type": "object"}},
+            ])
+        );
+        let err = anthropic_body(
+            &cfg(),
+            &CompletionRequest {
+                model: "claude".into(),
+                messages: vec![],
+                tools: vec![json!({"type": "webhook", "function": {"name": "x"}})],
+                temperature: None,
+                max_tokens: None,
+                tool_calls: vec![],
+                opaque_artifacts: None,
+            },
+        )
+        .unwrap_err();
+        match err {
+            ProviderError::Malformed { message, .. } => {
+                assert!(message.contains("tools[0]"));
+            }
+            _ => panic!("expected Malformed, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_body_max_tokens_fallback_chain() {
+        let req = |max_tokens| CompletionRequest {
+            model: "claude".into(),
+            messages: vec![],
+            tools: vec![],
+            temperature: None,
+            max_tokens,
+            tool_calls: vec![],
+            opaque_artifacts: None,
+        };
+        let bare = ProviderConfig {
+            max_tokens: None,
+            ..cfg()
+        };
+        let configured = ProviderConfig {
+            max_tokens: Some(500),
+            ..cfg()
+        };
+        assert_eq!(anthropic_body(&bare, &req(None)).unwrap()["max_tokens"], 1024);
+        assert_eq!(anthropic_body(&configured, &req(None)).unwrap()["max_tokens"], 500);
+        assert_eq!(
+            anthropic_body(&configured, &req(Some(900))).unwrap()["max_tokens"],
+            900
+        );
+    }
+
+    #[test]
+    fn parse_anthropic_text_and_tool_use() {
+        let v = json!({
+            "content": [
+                {"type": "text", "text": "first"},
+                {"type": "tool_use", "id": "tc1", "name": "fs_read", "input": {"path": "/a"}},
+                {"type": "text", "text": "second"},
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 3},
+        });
+        let r = parse_anthropic_response("fake", v).unwrap();
+        assert_eq!(r.content.as_deref(), Some("first\nsecond"));
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0].id, "tc1");
+        assert_eq!(r.tool_calls[0].name, "fs_read");
+        assert_eq!(r.tool_calls[0].arguments, json!({"path": "/a"}));
+        assert_eq!(r.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(
+            r.usage,
+            Usage {
+                input_tokens: 10,
+                output_tokens: 3
+            }
+        );
+    }
+
+    #[test]
+    fn parse_anthropic_stop_reasons_and_usage() {
+        let length = parse_anthropic_response(
+            "fake",
+            json!({
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            }),
+        )
+        .unwrap();
+        assert_eq!(length.finish_reason, FinishReason::Length);
+        let stop = parse_anthropic_response(
+            "fake",
+            json!({
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 2},
+            }),
+        )
+        .unwrap();
+        assert_eq!(stop.finish_reason, FinishReason::Stop);
+        assert_eq!(stop.content.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn parse_anthropic_malformed() {
+        let missing_content =
+            parse_anthropic_response("fake", json!({"usage": {"input_tokens": 1}})).unwrap_err();
+        assert!(
+            matches!(missing_content, ProviderError::Malformed { ref message, .. } if message.contains("content"))
+        );
+        let missing_usage = parse_anthropic_response(
+            "fake",
+            json!({"content": [{"type": "text", "text": "hi"}]}),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(missing_usage, ProviderError::Malformed { ref message, .. } if message.contains("usage"))
+        );
+    }
+
+    #[test]
+    fn anthropic_request_response_roundtrip() {
+        let req = CompletionRequest {
+            model: "claude".into(),
+            messages: vec![
+                Message {
+                    role: Role::System,
+                    content: "sys".into(),
+                    tool_call_id: None,
+                },
+                Message {
+                    role: Role::User,
+                    content: "read /a".into(),
+                    tool_call_id: None,
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: "calling".into(),
+                    tool_call_id: None,
+                },
+                Message {
+                    role: Role::Tool,
+                    content: "body-of-a".into(),
+                    tool_call_id: Some("tc1".into()),
+                },
+            ],
+            tools: vec![json!({
+                "type": "function",
+                "function": {"name": "fs_read", "description": "Read", "parameters": {"type": "object"}},
+            })],
+            temperature: Some(0.2),
+            max_tokens: None,
+            tool_calls: vec![ToolCall {
+                id: "tc1".into(),
+                name: "fs_read".into(),
+                arguments: json!({"path": "/a"}),
+            }],
+            opaque_artifacts: None,
+        };
+        let body = anthropic_body(
+            &ProviderConfig {
+                max_tokens: None,
+                ..cfg()
+            },
+            &req,
+        )
+        .unwrap();
+        assert_eq!(body["model"], "claude");
+        assert_eq!(body["max_tokens"], 1024);
+        assert_eq!(body["system"], "sys");
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(
+            body["tools"],
+            json!([
+                {"name": "fs_read", "description": "Read", "input_schema": {"type": "object"}},
+            ])
+        );
+        // The inverse: a response echoing the request's tool call parses back
+        // to the same tool call list.
+        let v = json!({
+            "content": [
+                {"type": "text", "text": "done"},
+                {"type": "tool_use", "id": "tc1", "name": "fs_read", "input": {"path": "/a"}},
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 7, "output_tokens": 2},
+        });
+        let r = parse_anthropic_response("fake", v).unwrap();
+        assert_eq!(r.content.as_deref(), Some("done"));
+        assert_eq!(r.tool_calls, req.tool_calls);
+        assert_eq!(r.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(
+            r.usage,
+            Usage {
+                input_tokens: 7,
+                output_tokens: 2
+            }
+        );
+    }
+
+    #[test]
+    fn engine_for_selects_protocol() {
+        let http = engine_for(&cfg(), WireProtocol::OpenAI);
+        assert!(http.as_any().downcast_ref::<HttpEngine>().is_some());
+        let anthropic = engine_for(&cfg(), WireProtocol::Anthropic);
+        assert!(anthropic.as_any().downcast_ref::<AnthropicEngine>().is_some());
+        assert_eq!(anthropic.identity(), "fake");
     }
 }

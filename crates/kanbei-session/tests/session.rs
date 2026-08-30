@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use kanbei_core::digest::Digest;
 use kanbei_core::envelope::{Envelope, ENVELOPE_SCHEMA};
 use kanbei_log::for_each_frame;
+use kanbei_provider::{AnthropicEngine, HttpEngine, KeySource, ProviderConfig, WireProtocol};
 use kanbei_session::{
     FaultInjector, FaultPoint, NewEvent, Session, SessionConfig, SessionError,
 };
@@ -384,4 +385,57 @@ fn seq_continuity_enforced() {
         env.validate().unwrap();
     }
     session.close().unwrap();
+}
+
+// ---------- M9 wave 3: provider wire protocol selection ----------
+
+fn provider_config() -> ProviderConfig {
+    ProviderConfig {
+        provider: "fake".into(),
+        model: "test".into(),
+        base_url: "http://localhost:0/v1".into(),
+        key: KeySource::Env("KANBEI_TEST_KEY".into()),
+        temperature: None,
+        max_tokens: Some(10),
+        timeout: std::time::Duration::from_secs(5),
+    }
+}
+
+/// The protocol discriminator on SessionConfig drives the engine built from
+/// `provider`: the default (OpenAI) builds HttpEngine, explicit Anthropic
+/// builds AnthropicEngine. No network and no key resolution at open.
+#[test]
+fn provider_protocol_selects_wire_engine() {
+    let openai_dir = TempDir::new("protocol-openai");
+    let openai = Session::open(SessionConfig {
+        dir: openai_dir.path().to_path_buf(),
+        provider: Some(provider_config()),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(
+        openai
+            .provider_engine()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<HttpEngine>()
+            .is_some()
+    );
+
+    let anthropic_dir = TempDir::new("protocol-anthropic");
+    let anthropic = Session::open(SessionConfig {
+        dir: anthropic_dir.path().to_path_buf(),
+        provider: Some(provider_config()),
+        protocol: WireProtocol::Anthropic,
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(
+        anthropic
+            .provider_engine()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<AnthropicEngine>()
+            .is_some()
+    );
 }
