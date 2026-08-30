@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kanbei_core::queue::DurabilityQueue;
-use kanbei_core::registry::{upcast_tool_result_v1_to_v2, upcast_user_message_v1_to_v2};
+use kanbei_core::registry::{
+    upcast_tool_result_v1_to_v2, upcast_user_message_v1_to_v2, upcast_user_message_v2_to_v3,
+};
 use kanbei_core::{Digest, Envelope, ENVELOPE_SCHEMA, Registry};
 use kanbei_log::{AppendLog, Profile, RecoveryError};
 use kanbei_objects::ObjectStore;
@@ -385,6 +387,84 @@ fn invalid_envelope_is_invalid_input_naming_seq() {
 
 fn upcast_boom(_: &Value) -> Result<Value, String> {
     Err("boom".into())
+}
+
+#[test]
+fn reconstruction_mixed_schemas_upcast_through_chain() {
+    let dir = tmp_dir("chain");
+    let queue = Arc::new(DurabilityQueue::start("kb-proj-chain-queue"));
+    let log_path = dir.join("events.log.zst");
+    let mut reg = Registry::new();
+    reg.register("user_message", 1, upcast_user_message_v1_to_v2)
+        .unwrap();
+    reg.register("user_message", 2, upcast_user_message_v2_to_v3)
+        .unwrap();
+    // v2 -> v3 is idempotent on v3 payloads, so v3 records stay upcasted
+    reg.register("user_message", 3, upcast_user_message_v2_to_v3)
+        .unwrap();
+    let mut log = AppendLog::open(&log_path, "demo", Arc::clone(&queue)).unwrap();
+    log.append(
+        &[
+            Envelope {
+                env: ENVELOPE_SCHEMA,
+                seq: 1,
+                evt: "e1".into(),
+                kind: "user_message".into(),
+                payload_schema: 1,
+                payload: json!({"text": "hello"}),
+                refs: vec![],
+                snapshot: None,
+            },
+            Envelope {
+                env: ENVELOPE_SCHEMA,
+                seq: 2,
+                evt: "e2".into(),
+                kind: "user_message".into(),
+                payload_schema: 3,
+                payload: json!({"text": "hi", "role": "user", "channel": "default"}),
+                refs: vec![],
+                snapshot: None,
+            },
+            Envelope {
+                env: ENVELOPE_SCHEMA,
+                seq: 3,
+                evt: "e3".into(),
+                kind: "future_kind".into(),
+                payload_schema: 9,
+                payload: json!({"mystery": 42}),
+                refs: vec![],
+                snapshot: None,
+            },
+        ],
+        Profile::Fast,
+    )
+    .unwrap();
+    drop(log);
+
+    let store = ObjectStore::open(&dir.join("objects"), Arc::clone(&queue)).unwrap();
+    let rep = reconstruct(&log_path, &reg, &store).unwrap();
+    assert_eq!(rep.events, 3);
+    assert_eq!(rep.kinds.len(), 2);
+
+    // the v1 record upcasts v1 -> v2 -> v3 to the v3 shape, the v3 record
+    // upcasts in place: 2/2 upcasted, nothing opaque
+    let um = &rep.kinds["user_message"];
+    assert_eq!((um.schema, um.count, um.upcasted, um.opaque), (3, 2, 2, 0));
+    assert!(um.opaque_reason.is_none());
+
+    let fk = &rep.kinds["future_kind"];
+    assert_eq!((fk.schema, fk.count, fk.upcasted, fk.opaque), (9, 1, 0, 1));
+    assert_eq!(
+        fk.opaque_reason.as_deref(),
+        Some("no upcaster for kind 'future_kind' schema 9")
+    );
+
+    assert!(rep.missing_objects.is_empty());
+    assert!(rep.upcast_errors.is_empty());
+
+    drop(store);
+    shutdown(queue);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
