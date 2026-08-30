@@ -238,12 +238,12 @@ impl SemanticTree {
     /// The node the input line renders for: the focused input, else the first
     /// input, else `None` (the kernel shows an empty prompt).
     pub fn input_node(&self, focused: Option<&str>) -> Option<&Node> {
-        if let Some(id) = focused {
-            if let Some(n) = self.node(id) {
-                if n.kind == NodeKind::Input && !n.disabled {
-                    return Some(n);
-                }
-            }
+        if let Some(id) = focused
+            && let Some(n) = self.node(id)
+            && n.kind == NodeKind::Input
+            && !n.disabled
+        {
+            return Some(n);
         }
         self.nodes()
             .into_iter()

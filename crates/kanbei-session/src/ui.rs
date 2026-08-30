@@ -91,7 +91,7 @@ pub struct UiHost {
 }
 
 /// What one `ui_handle_input` pass did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UiOutcome {
     pub intents_applied: usize,
     pub denied: u64,
@@ -99,19 +99,6 @@ pub struct UiOutcome {
     pub staleness: Option<String>,
     pub safe_mode: bool,
     pub repaint: bool,
-}
-
-impl Default for UiOutcome {
-    fn default() -> Self {
-        UiOutcome {
-            intents_applied: 0,
-            denied: 0,
-            degraded: false,
-            staleness: None,
-            safe_mode: false,
-            repaint: false,
-        }
-    }
 }
 
 impl UiHost {
@@ -625,12 +612,8 @@ impl Session {
     }
 
     fn ui_render_module_tree_inner(&mut self) -> Option<SemanticTree> {
-        let Some(host) = self.ui_host.as_mut() else {
-            return None;
-        };
-        let Some(manager) = self.modules.as_ref() else {
-            return None;
-        };
+        let host = self.ui_host.as_mut()?;
+        let manager = self.modules.as_ref()?;
         let payload = json!({ "entry": "ui_render", "state": host.state });
         let out = match manager.call_generation(host.generation, &payload.to_string()) {
             Ok(out) => out,
@@ -732,7 +715,7 @@ impl Session {
         }
         let repaint = resized || host.last_frame.is_none();
         self.ui_render_frame()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
         let (frame, diff) = {
             let host = self.ui_host.as_ref().expect("ui host present");
             (host.last_frame.clone().expect("frame rendered"), host.last_diff.clone())
@@ -748,7 +731,7 @@ impl Session {
             let host = self.ui_host.as_mut().expect("ui host present");
             host.safe_mode = true;
             host.last_error = Some(format!("kernel render fault: {e}"));
-            let fallback_tree = fallback::FallbackUi::new(&format!("kernel render fault: {e}")).tree();
+            let fallback_tree = fallback::FallbackUi::new(format!("kernel render fault: {e}")).tree();
             host.last_tree = Some(fallback_tree);
             let size = host.size;
             let ctx = RenderContext {
@@ -760,7 +743,7 @@ impl Session {
                 staleness: host.staleness.as_deref(),
                 degraded: false,
             };
-            let output = render(&ctx).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let output = render(&ctx).map_err(|e| io::Error::other(e.to_string()))?;
             host.last_frame = Some(output.frame);
             host.last_diff = FrameDiff::default();
             paint_full(

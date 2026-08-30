@@ -360,6 +360,25 @@ pub struct PinnedRoots {
     pub project: Option<Digest>,
 }
 
+/// The M6 wave 4 bundle-export report: what an [`Session::export_bundle`]
+/// produced. `missing` lists every referenced manifest or closure object that
+/// was unreadable/absent — `verified` is exactly `missing.is_empty()`. The
+/// report is written to `closure.json` even when partial (R-06 honest
+/// availability).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExportReport {
+    pub frames: u64,
+    pub envelopes: u64,
+    pub manifests: usize,
+    pub objects: usize,
+    pub missing: Vec<Digest>,
+    /// Kernel-embedded build-time identity pins (engine/toolchain digests) —
+    /// never store objects, recorded so a verifier knows the closure is
+    /// complete without them.
+    pub identity_pins: Vec<Digest>,
+    pub verified: bool,
+}
+
 /// One committed intent-kind event awaiting its outcome-kind event (B-05/M6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingIntent {
@@ -1477,6 +1496,139 @@ impl Session {
         ranges
     }
 
+    /// M6 wave 4 bundle export: a portable, read-only snapshot of the
+    /// session's canonical state — the plain JSONL log (`session.log.jsonl`),
+    /// the raw frame file (`session.log.zst`), every referenced execution
+    /// manifest (`manifests/<digest>.json`), every closure object of those
+    /// manifests minus the kernel-embedded identity pins
+    /// (`objects/<digest>.bin`), and the report itself (`closure.json`).
+    /// Missing objects never fail the export — they are reported in
+    /// `missing` and `verified` is false (R-06: honest partial availability).
+    pub fn export_bundle(&mut self, dir: &Path) -> Result<ExportReport, SessionError> {
+        use std::io::Write as _;
+        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir.join("manifests"))?;
+        std::fs::create_dir_all(dir.join("objects"))?;
+
+        // Plain JSONL log export (the session's own framing is dropped; the
+        // raw frame copy below preserves it verbatim). Read-only — a torn
+        // tail is never truncated here.
+        let mut out = io::BufWriter::new(std::fs::File::create(dir.join("session.log.jsonl"))?);
+        let mut n = 0u64;
+        let mut first_err: Option<io::Error> = None;
+        let rec = kanbei_log::for_each_frame(&self.log_path, |info| {
+            for e in &info.events {
+                if first_err.is_some() {
+                    return;
+                }
+                match writeln!(out, "{e}") {
+                    Ok(()) => n += 1,
+                    Err(e) => first_err = Some(e),
+                }
+            }
+        })?;
+        if let Some(e) = first_err {
+            return Err(e.into());
+        }
+        out.flush()?;
+        debug_assert_eq!(n, rec.events);
+        std::fs::copy(&self.log_path, dir.join("session.log.zst"))?;
+
+        // The manifest set: every distinct snapshot the log pins, every
+        // checkpoint's own payload snapshot, and the live current snapshot.
+        let mut manifest_digests: std::collections::BTreeSet<Digest> =
+            std::collections::BTreeSet::new();
+        kanbei_log::for_each_frame(&self.log_path, |info| {
+            for line in &info.events {
+                let Ok(env) = Envelope::from_line(line) else {
+                    continue;
+                };
+                if let Some(snap) = env.snapshot {
+                    manifest_digests.insert(snap);
+                }
+                if env.kind == "checkpoint_created"
+                    && let Some(snap) = env
+                        .payload
+                        .get("snapshot")
+                        .and_then(|s| s.as_str())
+                        .and_then(|s| s.parse().ok())
+                {
+                    manifest_digests.insert(snap);
+                }
+            }
+        })?;
+        if let Some(snap) = self.current_snapshot {
+            manifest_digests.insert(snap);
+        }
+
+        let mut missing: Vec<Digest> = Vec::new();
+        let mut identity_pins: std::collections::BTreeSet<Digest> =
+            std::collections::BTreeSet::new();
+        let mut exported_objects: std::collections::BTreeSet<Digest> =
+            std::collections::BTreeSet::new();
+        let mut manifests = 0usize;
+        for digest in &manifest_digests {
+            let bytes = match self.store.get(digest) {
+                Ok(bytes) => bytes,
+                // An unreadable referenced manifest is reported, never fatal
+                // (the closure is unknowable without it).
+                Err(_) => {
+                    missing.push(*digest);
+                    continue;
+                }
+            };
+            std::fs::write(dir.join("manifests").join(format!("{digest}.json")), &bytes)?;
+            manifests += 1;
+            let manifest: ExecutionManifest = match serde_json::from_slice(&bytes) {
+                Ok(manifest) => manifest,
+                // Unreadable manifest bytes are copied as-is (honest bytes)
+                // but reported — the closure cannot be derived.
+                Err(_) => {
+                    missing.push(*digest);
+                    continue;
+                }
+            };
+            let mut closure = kanbei_snapshot::manifest_closure(&manifest);
+            // Engine/toolchain digests are kernel-embedded build-time
+            // identity pins, not store objects — excluded from the closure,
+            // recorded in the report (mirror of continue_from).
+            for pin in [manifest.engine_digest, manifest.toolchain_digest]
+                .into_iter()
+                .flatten()
+            {
+                closure.remove(&pin);
+                identity_pins.insert(pin);
+            }
+            for d in closure {
+                if self.store.exists(&d) {
+                    let bytes = self.store.get(&d)?;
+                    std::fs::write(dir.join("objects").join(format!("{d}.bin")), &bytes)?;
+                    exported_objects.insert(d);
+                } else {
+                    missing.push(d);
+                }
+            }
+        }
+        missing.sort_unstable();
+        missing.dedup();
+        let report = ExportReport {
+            frames: rec.frames,
+            envelopes: n,
+            manifests,
+            objects: exported_objects.len(),
+            missing,
+            identity_pins: identity_pins.into_iter().collect(),
+            verified: false,
+        };
+        let verified = report.missing.is_empty();
+        let report = ExportReport { verified, ..report };
+        std::fs::write(
+            dir.join("closure.json"),
+            serde_json::to_vec_pretty(&report).expect("export report serialization cannot fail"),
+        )?;
+        Ok(report)
+    }
+
     /// The post-event execution manifest for `state_head` and the committed
     /// payload schemas — the exact byte layout commit step 5 pins (and
     /// [`Session::create_checkpoint`] pre-computes for its payload).
@@ -1656,10 +1808,9 @@ impl Session {
                         if let (Some(call), Some(class)) = (
                             env.payload.get("call_id").and_then(|c| c.as_str()),
                             env.payload.get("classification").and_then(|c| c.as_str()),
-                        ) {
-                            if let Some(entry) = by_call.get_mut(call) {
-                                entry.1 = Some(class.to_string());
-                            }
+                        ) && let Some(entry) = by_call.get_mut(call)
+                        {
+                            entry.1 = Some(class.to_string());
                         }
                     }
                     _ => {}
@@ -2118,6 +2269,16 @@ impl Session {
     /// tool calls, R-14/D-02).
     pub fn session_id(&self) -> Id128 {
         self.session_id
+    }
+    /// The current branch id (M6): the last committed `branch_transition`'s
+    /// branch, or a fresh id on a branchless session.
+    pub fn branch(&self) -> BranchId {
+        self.branch
+    }
+    /// Committed branch records, chronological (rebuilt from the log at
+    /// open — the log is the authority for branch identity).
+    pub fn branch_records(&self) -> &[BranchRecord] {
+        &self.branch_records
     }
 
     /// The lifetime-scope memory actor (R-11).

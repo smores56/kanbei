@@ -19,6 +19,7 @@ use kanbei_core::queue::DurabilityQueue;
 use kanbei_log::{Profile, Recovered};
 use kanbei_objects::ObjectStore;
 use kanbei_session::{FaultPoint, NewEvent, Session, SessionConfig};
+use serde_json::json;
 
 // ---------- crash-child contract (env vars shared with src/bin/crash_child.rs) ----------
 
@@ -647,6 +648,22 @@ pub fn spawn_m5_crash_child(dir: &Path, point: FaultPoint, after_acks: u64) -> s
         .expect("testkit: failed to spawn crash-child (m5)")
 }
 
+/// Spawn the M6-mode crash-test child: opens a storage-only session, commits
+/// `after_acks` plain events, then runs the checkpoint → continue_from →
+/// new-branch-commit flow — aborting at `point` once armed. `point=none`
+/// completes cleanly.
+pub fn spawn_m6_crash_child(dir: &Path, point: Option<FaultPoint>, after_acks: u64) -> std::process::Child {
+    let mut cmd = Command::new(crash_child_exe());
+    cmd.env(ENV_DIR, dir)
+        .env(ENV_MODE, "m6")
+        .env(ENV_POINT, point.map(fault_point_name).unwrap_or("none"))
+        .env(ENV_AFTER_ACKS, after_acks.to_string())
+        .env(ENV_PROFILE, Profile::Fast.name())
+        .stdout(std::process::Stdio::piped());
+    cmd.spawn()
+        .expect("testkit: failed to spawn crash-child (m6)")
+}
+
 /// The M4 crash-recovery invariant checker: reopens the crashed session with
 /// its own identity/binding (recovered from the log — never env), then
 /// checks:
@@ -1076,6 +1093,201 @@ pub fn verify_m5_recovery(dir: &Path, acked: u64) -> Result<usize, String> {
         return Err("m5: reopen submit did not commit a canonical user_message".to_string());
     }
     checks += 1;
+
+    Ok(checks)
+}
+
+/// Reopen the crashed session for an M6 branch-state check (same shape as
+/// the other verifiers' reopens: fresh identity, storage-only config).
+fn reopen_m6(dir: &Path) -> Result<Session, String> {
+    Session::open(SessionConfig {
+        dir: dir.to_path_buf(),
+        stream: "crash-m6-verify".into(),
+        ..Default::default()
+    })
+    .map_err(|e| format!("m6: reopen: {e}"))
+}
+
+/// The M6 crash-recovery invariant checker: [`verify_recovery_tolerant`]
+/// plus the M6 branch invariants:
+///   1. every envelope parses and at most one `branch_transition` exists;
+///   2. when a transition exists: its payload parses (branch/from_branch/
+///      frontier_seq/quiesce with cancelled+ambiguous arrays/follow/
+///      config_choice), the `checkpoint_created` event it references exists
+///      at frontier_seq, and the reopened session rebuilt the branch state —
+///      current branch == the transition's branch, branch_records with the
+///      same frontier/transition, on_path consistent (frontier on-path,
+///      transition off-path, transition+1 on-path), path_ranges correct;
+///   3. when no transition exists: the reopened session has no branch
+///      records and still commits normally;
+///   4. reopening twice is idempotent (same rebuilt branch state).
+///      `reopen_extra` is forwarded to [`verify_recovery_tolerant`] (events
+///      the reopen commits — 0 for the m6 driver). Returns the number of
+///      checks run.
+pub fn verify_m6_recovery(dir: &Path, acked: u64, reopen_extra: u64) -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1 — M1 invariants: contiguous seqs, ack coverage, no dangling refs,
+    // usable reopen (no torn frames; recovery truncation works).
+    let _recovered = verify_recovery_tolerant(dir, acked, reopen_extra)?;
+    checks += 1;
+
+    // 2 — envelope scan: every envelope parses (collect_envelopes fails on
+    // any other outcome); at most one branch_transition, and when present its
+    // payload parses and the referenced checkpoint exists at frontier_seq.
+    let envelopes = collect_envelopes(dir)?;
+    let transitions: Vec<&Envelope> = envelopes
+        .iter()
+        .filter(|e| e.kind == "branch_transition")
+        .collect();
+    if transitions.len() > 1 {
+        return Err(format!(
+            "m6: {} branch_transition events, expected at most 1",
+            transitions.len()
+        ));
+    }
+    checks += 1;
+    if let Some(transition) = transitions.first() {
+        let payload = &transition.payload;
+        let branch = payload.get("branch").and_then(|b| b.as_str());
+        let from = payload.get("from_branch").and_then(|f| f.as_str());
+        let frontier = payload.get("frontier_seq").and_then(|f| f.as_u64());
+        let checkpoint_event = payload.get("checkpoint_event").and_then(|c| c.as_str());
+        // follow is either the string "FollowHead" or the PinnedAt object.
+        let follow = payload.get("follow").filter(|f| !f.is_null());
+        let config_choice = payload.get("config_choice").and_then(|c| c.as_object());
+        let quiesce = payload.get("quiesce").and_then(|q| q.as_object());
+        if branch.is_none()
+            || from.is_none()
+            || frontier.is_none()
+            || checkpoint_event.is_none()
+            || follow.is_none()
+            || config_choice.is_none()
+        {
+            return Err(format!(
+                "m6: branch_transition at seq {} misses required fields",
+                transition.seq
+            ));
+        }
+        let quiesce = quiesce.ok_or_else(|| {
+            format!(
+                "m6: branch_transition at seq {} misses quiesce",
+                transition.seq
+            )
+        })?;
+        if quiesce.get("cancelled").and_then(|c| c.as_array()).is_none()
+            || quiesce.get("ambiguous").and_then(|a| a.as_array()).is_none()
+        {
+            return Err(format!(
+                "m6: branch_transition at seq {} has malformed quiesce",
+                transition.seq
+            ));
+        }
+        let frontier = frontier.expect("frontier checked above");
+        let checkpoint = envelopes.iter().find(|e| e.seq == frontier).ok_or_else(|| {
+            format!("m6: transition references checkpoint at seq {frontier}, not in the log")
+        })?;
+        if checkpoint.kind != "checkpoint_created" {
+            return Err(format!(
+                "m6: event at frontier {frontier} is {}, not checkpoint_created",
+                checkpoint.kind
+            ));
+        }
+        if checkpoint.evt != checkpoint_event.expect("checkpoint_event checked above") {
+            return Err("m6: transition references a different checkpoint event id".to_string());
+        }
+        checks += 1;
+
+        // 3 — branch state rebuild: reopen and assert the transition's branch
+        // is current, the record matches, and the path filter is consistent.
+        let session = reopen_m6(dir)?;
+        if session.branch().to_string() != branch.expect("branch checked above") {
+            return Err(format!(
+                "m6: reopened branch {} != transition branch {}",
+                session.branch(),
+                branch.expect("branch checked above")
+            ));
+        }
+        let records = session.branch_records();
+        if records.len() != 1 {
+            return Err(format!(
+                "m6: expected 1 branch record on reopen, got {}",
+                records.len()
+            ));
+        }
+        if records[0].frontier_seq != frontier || records[0].transition_seq != transition.seq {
+            return Err(format!(
+                "m6: rebuilt record frontier {} / transition {} != log frontier {frontier} / transition {}",
+                records[0].frontier_seq, records[0].transition_seq, transition.seq
+            ));
+        }
+        if !session.on_path(frontier)
+            || session.on_path(transition.seq)
+            || !session.on_path(transition.seq + 1)
+        {
+            return Err("m6: on_path inconsistent with the transition".to_string());
+        }
+        if session.path_ranges() != vec![(1, frontier), (transition.seq + 1, u64::MAX)] {
+            return Err(format!(
+                "m6: path_ranges {:?} != [(1, {frontier}), ({}, MAX)]",
+                session.path_ranges(),
+                transition.seq + 1
+            ));
+        }
+        checks += 1;
+
+        // 4 — idempotent reopen: the same rebuilt branch state.
+        let again = reopen_m6(dir)?;
+        if again.branch_records() != records || again.branch().to_string() != session.branch().to_string() {
+            return Err("m6: idempotent reopen changed the branch state".to_string());
+        }
+        checks += 1;
+        session
+            .close()
+            .map_err(|e| format!("m6: branch reopen close: {e}"))?;
+        again
+            .close()
+            .map_err(|e| format!("m6: idempotent reopen close: {e}"))?;
+    } else {
+        // 3 — no transition: the reopened session has no branch records and
+        // still commits normally.
+        let mut session = reopen_m6(dir)?;
+        if !session.branch_records().is_empty() {
+            return Err(format!(
+                "m6: {} branch records without a transition",
+                session.branch_records().len()
+            ));
+        }
+        let receipt = session
+            .commit(
+                vec![NewEvent {
+                    kind: "user_message".into(),
+                    payload_schema: 1,
+                    payload: json!({"text": "post-recovery"}),
+                    objects: vec![],
+                    refs: vec![],
+                }],
+                None,
+            )
+            .map_err(|e| format!("m6: post-recovery commit: {e}"))?;
+        if !session.on_path(receipt.last_seq) {
+            return Err("m6: post-recovery commit is off-path".to_string());
+        }
+        checks += 1;
+
+        // 4 — idempotent reopen.
+        let again = reopen_m6(dir)?;
+        if !again.branch_records().is_empty() {
+            return Err("m6: idempotent reopen gained branch records".to_string());
+        }
+        checks += 1;
+        session
+            .close()
+            .map_err(|e| format!("m6: no-branch reopen close: {e}"))?;
+        again
+            .close()
+            .map_err(|e| format!("m6: no-branch idempotent close: {e}"))?;
+    }
 
     Ok(checks)
 }

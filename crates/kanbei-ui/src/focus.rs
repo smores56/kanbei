@@ -44,7 +44,7 @@ impl FocusModel {
 
     /// Restore the invariants against the current tree: focus names a
     /// focusable, non-disabled node; caret is clamped to the focused input's
-    /// content length; viewport_top is non-negative.
+    /// content length.
     pub fn revalidate(&mut self, tree: &SemanticTree) {
         match &self.focused {
             Some(id) if tree.is_focusable(id) => {}
@@ -60,7 +60,6 @@ impl FocusModel {
                 self.caret = 0;
             }
         }
-        self.viewport_top = self.viewport_top.max(0);
     }
 
     /// Move focus through the focusable ring. Left/Right move the caret when
@@ -69,15 +68,15 @@ impl FocusModel {
         self.revalidate(tree);
         match dir {
             FocusDirection::Left | FocusDirection::Right => {
-                if let Some(node) = self.focused_node(tree) {
-                    if node.kind == crate::NodeKind::Input {
-                        let len = node.content.chars().count();
+                if let Some(node) = self.focused_node(tree)
+                    && node.kind == crate::NodeKind::Input
+                {
+                    let len = node.content.chars().count();
                         match dir {
                             FocusDirection::Left => self.caret = self.caret.saturating_sub(1),
                             FocusDirection::Right => self.caret = (self.caret + 1).min(len),
                             _ => unreachable!(),
                         }
-                    }
                 }
             }
             FocusDirection::Next | FocusDirection::Down => {

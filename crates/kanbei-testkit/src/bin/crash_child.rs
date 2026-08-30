@@ -119,6 +119,7 @@ fn main() {
         "m3" => run_m3(dir, point, after_acks),
         "m4" => run_m4(dir, after_acks),
         "m5" => run_m5(dir, after_acks),
+        "m6" => run_m6(dir, after_acks),
         other => {
             eprintln!("crash-child: unknown {ENV_MODE}={other:?}");
             exit(2);
@@ -821,6 +822,98 @@ fn run_m5(dir: String, after_acks: u64) {
     if let Err(e) = session.ui_render_frame() {
         ack(format!("ui_error=render: {e}"));
         exit(2);
+    }
+    ack("done".into());
+    exit(0);
+}
+
+/// The M6 flow: open a storage-only session (no config/modules — checkpoints
+/// and branches need none), commit `after_acks` plain events disarmed, arm,
+/// then create a checkpoint, branch from it (`continue_from` — no active run,
+/// so the quiesce is empty), and commit one `user_message` on the new branch
+/// — aborting at the configured M6 point once armed. `point=none` completes
+/// with "done".
+fn run_m6(dir: String, after_acks: u64) {
+    let session_injector = Arc::new(AbortInjector {
+        point: parse_fault_point(&std::env::var(ENV_POINT).unwrap_or_else(|_| "none".into())),
+        armed: AtomicBool::new(false),
+    });
+    let arm = Arc::clone(&session_injector);
+    let mut session = match Session::open(SessionConfig {
+        dir: PathBuf::from(&dir),
+        stream: "crash-m6".into(),
+        profile: Profile::Fast,
+        fault: Some(session_injector),
+        ..Default::default()
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            ack(format!("commit_error=open: {e}"));
+            exit(2);
+        }
+    };
+
+    // AFTER_ACKS plain commits with the injector disarmed; arm after the
+    // after_acks-th commit returns (the checkpoint flow runs after setup).
+    for i in 1..=after_acks {
+        let ev = NewEvent {
+            kind: "test_event".into(),
+            payload_schema: 1,
+            payload: json!({"i": i}),
+            objects: vec![],
+            refs: vec![],
+        };
+        match session.commit(vec![ev], None) {
+            Ok(rec) => {
+                if i == after_acks {
+                    arm.armed.store(true, Ordering::SeqCst);
+                }
+                ack(format!("acked={}", rec.last_seq));
+            }
+            Err(e) => {
+                ack(format!("commit_error={e}"));
+                exit(2);
+            }
+        }
+    }
+    if after_acks == 0 {
+        arm.armed.store(true, Ordering::SeqCst);
+    }
+
+    // Checkpoint (Before/AfterCheckpointCommit and the session-head-advance
+    // points fire inside its commit).
+    let checkpoint = match session.create_checkpoint(None) {
+        Ok(c) => c,
+        Err(e) => {
+            ack(format!("checkpoint_error={e}"));
+            exit(2);
+        }
+    };
+    ack(format!("acked={}", session.next_seq() - 1));
+
+    // Branch (Before/AfterBranchTransition fire inside its commit).
+    match session.continue_from(&checkpoint) {
+        Ok(_) => ack(format!("acked={}", session.next_seq() - 1)),
+        Err(e) => {
+            ack(format!("branch_error={e}"));
+            exit(2);
+        }
+    }
+
+    // One canonical event on the new branch.
+    let ev = NewEvent {
+        kind: "user_message".into(),
+        payload_schema: 1,
+        payload: json!({"text": "on the new branch"}),
+        objects: vec![],
+        refs: vec![],
+    };
+    match session.commit(vec![ev], None) {
+        Ok(rec) => ack(format!("acked={}", rec.last_seq)),
+        Err(e) => {
+            ack(format!("commit_error={e}"));
+            exit(2);
+        }
     }
     ack("done".into());
     exit(0);

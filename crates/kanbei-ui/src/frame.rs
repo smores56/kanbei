@@ -214,10 +214,10 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
         None => 0,
     };
     let caret = (caret + 2).min(input_text.chars().count().saturating_sub(1));
-    if let Some(ch) = input_text.chars().nth(caret) {
-        if ch != ' ' {
-            frame.set(input_row as u16, caret as u16, ch, "selected");
-        }
+    if let Some(ch) = input_text.chars().nth(caret)
+        && ch != ' '
+    {
+        frame.set(input_row as u16, caret as u16, ch, "selected");
     }
 
     Ok(RenderOutput {

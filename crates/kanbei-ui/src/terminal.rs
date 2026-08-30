@@ -189,10 +189,10 @@ impl Terminal for TestTerminal {
     }
 
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        if let Some(n) = self.fail_after {
-            if self.writes >= n {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected write failure"));
-            }
+        if let Some(n) = self.fail_after
+            && self.writes >= n
+        {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected write failure"));
         }
         self.writes += 1;
         self.bytes.extend_from_slice(bytes);

@@ -47,11 +47,8 @@ impl InputDecoder {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<InputEvent> {
         self.pending.extend_from_slice(bytes);
         let mut out = Vec::new();
-        loop {
-            match self.next_event() {
-                Some(e) => out.push(e),
-                None => break,
-            }
+        while let Some(e) = self.next_event() {
+            out.push(e);
         }
         out
     }
