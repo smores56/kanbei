@@ -1276,6 +1276,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kanbei-ui"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "kanbei-vm"
 version = "0.1.0"
 dependencies = [
