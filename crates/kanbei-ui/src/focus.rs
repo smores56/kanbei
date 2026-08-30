@@ -80,7 +80,7 @@ impl FocusModel {
                     }
                 }
             }
-            FocusDirection::Next | FocusDirection::Up => {
+            FocusDirection::Next | FocusDirection::Down => {
                 let ring = tree.focusable();
                 if ring.is_empty() {
                     self.focused = None;
@@ -95,7 +95,7 @@ impl FocusModel {
                 self.focused = Some(ring[next].id.clone());
                 self.caret = 0;
             }
-            FocusDirection::Prev | FocusDirection::Down => {
+            FocusDirection::Prev | FocusDirection::Up => {
                 let ring = tree.focusable();
                 if ring.is_empty() {
                     self.focused = None;

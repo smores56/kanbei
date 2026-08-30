@@ -19,6 +19,7 @@ kanbei-scheduler.workspace = true
 kanbei-scopes.workspace = true
 kanbei-tools.workspace = true
 kanbei-services.workspace = true
+kanbei-ui.workspace = true
 kanbei-session.workspace = true
 kanbei-snapshot.workspace = true
 kanbei-vm.workspace = true

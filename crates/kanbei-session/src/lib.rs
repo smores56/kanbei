@@ -73,6 +73,9 @@ use kanbei_vm::{GuestError, Host, Vm};
 use serde_json::json;
 use thiserror::Error;
 
+mod ui;
+pub use ui::{UiHost, UiIntent, UiOutcome, UI_INTENT_RESOURCE};
+
 /// The bounded recent-event ring size: the trajectory render covers the
 /// full canonical history, but the CONTENT is these most-recent events.
 const RECENT_RING: usize = 64;
@@ -201,6 +204,11 @@ pub enum FaultPoint {
     // --- M4 memory proposal points ---
     BeforeMemoryProposal,
     AfterMemoryProposal,
+    // --- M5 semantic workbench points ---
+    BeforeUiReduce,
+    AfterUiReduce,
+    BeforeUiRender,
+    AfterUiRender,
 }
 
 pub trait FaultInjector: Send + Sync {
@@ -296,6 +304,9 @@ pub struct Session {
     policy: RetentionGate,
     modules: Option<ModuleManager>,
     vm_engine_digest: Option<Digest>,
+    // --- M5 semantic workbench ---
+    /// The bound UI host (None until the built-in UI is activated).
+    ui_host: Option<UiHost>,
     // --- M3 agent spine ---
     scheduler: kanbei_scheduler::Scheduler,
     provider: Option<Box<dyn kanbei_provider::ProviderEngine>>,
@@ -622,6 +633,7 @@ impl Session {
             policy,
             modules,
             vm_engine_digest,
+            ui_host: None,
             scheduler: kanbei_scheduler::Scheduler::new(budgets, breaker_floors),
             provider: provider_engine,
             provider_config,
@@ -931,6 +943,14 @@ impl Session {
     /// fails after the in-memory publish, the module is deactivated too and
     /// the in-memory composition is ahead of the log — M2 documents this
     /// divergence: the log is the authority at restart.
+    /// Mark the UI stale (R-27 fault class 1: composition failure → the
+    /// last-valid UI with a staleness banner). No-op without a bound UI.
+    fn ui_mark_stale(&mut self, reason: &str) {
+        if let Some(host) = self.ui_host.as_mut() {
+            host.staleness = Some(reason.to_string());
+        }
+    }
+
     pub fn activate_config(
         &mut self,
         manifest: PackageManifest,
@@ -980,14 +1000,23 @@ impl Session {
                 }),
             })
             .collect();
+        // M5: non-service contributions staged via `contribution_publish`
+        // (UI mounts, theme overlays) join the same atomic publish.
+        staged
+            .contributions
+            .extend(manager.published_contributions(generation.generation));
         // 6 — validate against the current composition; on conflict roll back.
         if let Err(e) = self.registry.validate(&staged.contributions) {
+            let reason = e.to_string();
             let _ = manager.deactivate(manifest.module_id);
+            self.ui_mark_stale(&reason);
             return Err(e.into());
         }
         // 7 — OCC publish; stale → roll back.
         if let Err(e) = self.composition.publish(&staged, &mut self.registry) {
+            let reason = e.to_string();
             let _ = manager.deactivate(manifest.module_id);
+            self.ui_mark_stale(&reason);
             return Err(e.into());
         }
         self.fault(FaultPoint::AfterConfigActivation);
@@ -1026,6 +1055,7 @@ impl Session {
             if let Some(m) = self.modules.as_mut() {
                 let _ = m.deactivate(manifest.module_id);
             }
+            self.ui_mark_stale(&e.to_string());
             return Err(e);
         }
         Ok(ConfigActivation {
@@ -1274,6 +1304,10 @@ impl Session {
     }
 
     /// The current epoch composition (R-01: EpochId = its digest).
+    pub fn broker(&self) -> &kanbei_capabilities::Broker {
+        &self.broker
+    }
+
     pub fn composition(&self) -> &Composition {
         self.composition.current()
     }

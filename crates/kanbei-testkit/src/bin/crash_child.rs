@@ -118,6 +118,7 @@ fn main() {
         "m2" => run_m2(dir, point, after_acks, events, profile),
         "m3" => run_m3(dir, point, after_acks),
         "m4" => run_m4(dir, after_acks),
+        "m5" => run_m5(dir, after_acks),
         other => {
             eprintln!("crash-child: unknown {ENV_MODE}={other:?}");
             exit(2);
@@ -730,6 +731,95 @@ fn run_m4(dir: String, after_acks: u64) {
         exit(2);
     }
     ack(format!("acked={}", session.next_seq() - 1));
+    ack("done".into());
+    exit(0);
+}
+
+/// The M5 flow: open a session (modules enabled), activate the built-in UI
+/// (an atomic composition publish), feed input through the kernel boundary
+/// (char reduce + enter → canonical `user_message`), render a frame —
+/// aborting at the configured UI point once armed. `point=none` completes
+/// with "done".
+fn run_m5(dir: String, after_acks: u64) {
+    use kanbei_scheduler::Budgets;
+    use kanbei_vm::VmConfig;
+    let session_injector = Arc::new(AbortInjector {
+        point: parse_fault_point(&std::env::var(ENV_POINT).unwrap_or_else(|_| "none".into())),
+        armed: AtomicBool::new(false),
+    });
+    let arm = Arc::clone(&session_injector);
+    let mut session = match Session::open(SessionConfig {
+        dir: PathBuf::from(&dir),
+        stream: "crash-m5".into(),
+        profile: Profile::Fast,
+        fault: Some(session_injector),
+        budgets: Budgets {
+            deadline_secs: Some(60),
+            ..Default::default()
+        },
+        engine: Some(VmConfig {
+            fuel_per_call: u64::MAX,
+            epoch_deadline: u64::MAX / 2,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            ack(format!("commit_error=open: {e}"));
+            exit(2);
+        }
+    };
+
+    // AFTER_ACKS plain commits with the injector disarmed; arm after the
+    // after_acks-th commit returns (the UI flow runs after setup).
+    for i in 1..=after_acks {
+        let ev = NewEvent {
+            kind: "test_event".into(),
+            payload_schema: 1,
+            payload: json!({"i": i}),
+            objects: vec![],
+            refs: vec![],
+        };
+        match session.commit(vec![ev], None) {
+            Ok(rec) => {
+                if i == after_acks {
+                    arm.armed.store(true, Ordering::SeqCst);
+                }
+                ack(format!("acked={}", rec.last_seq));
+            }
+            Err(e) => {
+                ack(format!("commit_error={e}"));
+                exit(2);
+            }
+        }
+    }
+    if after_acks == 0 {
+        arm.armed.store(true, Ordering::SeqCst);
+    }
+
+    // Activate the built-in UI (composition_changed; ack after the commit).
+    match session.activate_builtin_ui() {
+        Ok(_epoch) => ack(format!("acked={}", session.next_seq() - 1)),
+        Err(e) => {
+            ack(format!("ui_error=activate: {e}"));
+            exit(2);
+        }
+    }
+
+    // Type + submit through the kernel boundary: reduces (crash points),
+    // then a canonical user_message on enter (acked).
+    if let Err(e) = session.ui_handle_input(b"hello\n") {
+        ack(format!("ui_error=input: {e}"));
+        exit(2);
+    }
+    ack(format!("acked={}", session.next_seq() - 1));
+
+    // Render a frame (Before/AfterUiRender points).
+    if let Err(e) = session.ui_render_frame() {
+        ack(format!("ui_error=render: {e}"));
+        exit(2);
+    }
     ack("done".into());
     exit(0);
 }

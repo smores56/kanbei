@@ -76,6 +76,11 @@ end
 function __ctx.service_publish(key, version, deps)
   return kb_host_call(6, '{"key":' .. tostring(key) .. ',"version":' .. tostring(version) .. ',"deps":' .. tostring(deps or "[]") .. '}')
 end
+-- M5: stage a contribution (UI mount / theme overlay); payload is the full
+-- contribution JSON object (see kanbei-modules host op 7).
+function __ctx.contribution_publish(payload)
+  return kb_host_call(7, tostring(payload))
+end
 if type(kb_on_activate) ~= "function" then
   kb_host_call(0, '{"msg":"activation: module source does not define kb_on_activate(ctx)"}')
   error("kb_on_activate is not a function")

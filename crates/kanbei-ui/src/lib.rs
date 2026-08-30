@@ -16,6 +16,7 @@
 //! and terminal restoration stays reliable ([`terminal::TerminalGuard`]).
 
 pub mod accessibility;
+pub mod builtin;
 pub mod diff;
 pub mod fallback;
 pub mod focus;
@@ -25,6 +26,7 @@ pub mod terminal;
 pub mod theme;
 pub mod tree;
 
+pub use builtin::{BUILTIN_UI_COMPONENT, BUILTIN_UI_NAME, BUILTIN_UI_SOURCE};
 pub use diff::{CellEdit, FrameDiff};
 pub use focus::{FocusDirection, FocusModel, KeyClassifier, ReservedAction};
 pub use frame::{RenderContext, RenderError, RenderOutput, TerminalFrame};

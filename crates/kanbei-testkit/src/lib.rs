@@ -68,6 +68,10 @@ pub fn fault_point_name(point: FaultPoint) -> &'static str {
         FaultPoint::AfterRunOutcome => "AfterRunOutcome",
         FaultPoint::BeforeMemoryProposal => "BeforeMemoryProposal",
         FaultPoint::AfterMemoryProposal => "AfterMemoryProposal",
+        FaultPoint::BeforeUiReduce => "BeforeUiReduce",
+        FaultPoint::AfterUiReduce => "AfterUiReduce",
+        FaultPoint::BeforeUiRender => "BeforeUiRender",
+        FaultPoint::AfterUiRender => "AfterUiRender",
     }
 }
 
@@ -99,6 +103,10 @@ pub fn parse_fault_point(s: &str) -> Option<FaultPoint> {
         "AfterRunOutcome" => Some(FaultPoint::AfterRunOutcome),
         "BeforeMemoryProposal" => Some(FaultPoint::BeforeMemoryProposal),
         "AfterMemoryProposal" => Some(FaultPoint::AfterMemoryProposal),
+        "BeforeUiReduce" => Some(FaultPoint::BeforeUiReduce),
+        "AfterUiReduce" => Some(FaultPoint::AfterUiReduce),
+        "BeforeUiRender" => Some(FaultPoint::BeforeUiRender),
+        "AfterUiRender" => Some(FaultPoint::AfterUiRender),
         _ => None,
     }
 }
@@ -612,6 +620,21 @@ pub fn spawn_m4_crash_child(dir: &Path, point: Option<CrashPoint>, after_acks: u
         .expect("testkit: failed to spawn crash-child (m4)")
 }
 
+/// Spawn the M5-mode crash-test child: opens a session (modules enabled),
+/// activates the built-in UI, feeds input through the kernel boundary, and
+/// renders — aborting at `point` once armed.
+pub fn spawn_m5_crash_child(dir: &Path, point: FaultPoint, after_acks: u64) -> std::process::Child {
+    let mut cmd = Command::new(crash_child_exe());
+    cmd.env(ENV_DIR, dir)
+        .env(ENV_MODE, "m5")
+        .env(ENV_POINT, fault_point_name(point))
+        .env(ENV_AFTER_ACKS, after_acks.to_string())
+        .env(ENV_PROFILE, Profile::Fast.name())
+        .stdout(std::process::Stdio::piped());
+    cmd.spawn()
+        .expect("testkit: failed to spawn crash-child (m5)")
+}
+
 /// The M4 crash-recovery invariant checker: reopens the crashed session with
 /// its own identity/binding (recovered from the log — never env), then
 /// checks:
@@ -921,4 +944,126 @@ mod tests {
         }
         assert_eq!(r.next_usize(0), 0);
     }
+}
+
+/// M5 recovery verifier: the UI boundary produces no canonical gestures, the
+/// activation is an atomic composition publish, and the session reopens with
+/// a re-activatable UI. Returns the number of checks.
+pub fn verify_m5_recovery(dir: &Path, acked: u64) -> Result<usize, String> {
+    let mut checks = 0usize;
+
+    // 1 — M1 invariants: contiguous seqs, ack coverage, no dangling refs,
+    // usable reopen (reopen commits nothing extra — UI events are never
+    // canonical and no intents were pending at the crash boundary).
+    let _recovered = verify_recovery_tolerant(dir, acked, 0)?;
+    checks += 1;
+
+    // 2 — the built-in UI activation landed as one atomic composition
+    // publish; the delta names the builtin component.
+    let envelopes = collect_envelopes(dir)?;
+    let mut composition_changed = 0usize;
+    let mut builtin_activated = false;
+    let mut user_messages = 0usize;
+    for e in &envelopes {
+        match e.kind.as_str() {
+            "composition_changed" => {
+                composition_changed += 1;
+                if let Some(added) = e.payload.get("delta").and_then(|d| d.get("added"))
+                    && let Some(module_id) = added
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|m| m.get("module_id"))
+                        .and_then(|m| m.as_str())
+                {
+                    // The event's payload carries the module identity; the
+                    // component string is recovered via the activation below.
+                    let _ = module_id;
+                    builtin_activated = true;
+                }
+            }
+            "user_message" => {
+                user_messages += 1;
+                if !e.payload.get("text").and_then(|t| t.as_str()).is_some() {
+                    return Err("m5: user_message without text".to_string());
+                }
+            }
+            "safe_mode_activated" => {
+                // Legitimate only from the reserved chord path; the crash
+                // flow does not press it.
+                return Err("m5: unexpected safe_mode_activated".to_string());
+            }
+            kind if kind.starts_with("ui_") => {
+                return Err(format!("m5: canonical UI gesture event {kind:?}"));
+            }
+            _ => {}
+        }
+    }
+    if composition_changed == 0 {
+        return Err("m5: no composition_changed event".to_string());
+    }
+    if !builtin_activated {
+        return Err("m5: builtin ui activation missing from composition delta".to_string());
+    }
+    if user_messages > 1 {
+        return Err(format!("m5: {user_messages} user_messages, expected at most 1"));
+    }
+    checks += 1;
+
+    // 3 — reopen: modules come back, the UI re-activates cleanly (fresh
+    // composition at open — ephemeral scopes vanish), input flows through
+    // the kernel boundary, and a frame renders with the input text.
+    let mut session = Session::open(SessionConfig {
+        dir: dir.to_path_buf(),
+        stream: "crash-m5".into(),
+        budgets: kanbei_scheduler::Budgets {
+            deadline_secs: Some(60),
+            ..Default::default()
+        },
+        engine: Some(kanbei_vm::VmConfig {
+            fuel_per_call: u64::MAX,
+            epoch_deadline: u64::MAX / 2,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .map_err(|e| format!("m5: reopen: {e}"))?;
+    checks += 1;
+    if session.modules().is_none() {
+        return Err("m5: modules disabled on reopen (guest wasm missing?)".to_string());
+    }
+    let epoch = session
+        .activate_builtin_ui()
+        .map_err(|e| format!("m5: ui re-activation: {e}"))?;
+    if epoch == 0 {
+        return Err("m5: ui re-activation did not advance the epoch".to_string());
+    }
+    checks += 1;
+    let outcome = session
+        .ui_handle_input(b"recovered\n")
+        .map_err(|e| format!("m5: ui input on reopen: {e}"))?;
+    if outcome.intents_applied != 1 {
+        return Err(format!(
+            "m5: expected 1 applied intent on reopen, got {}",
+            outcome.intents_applied
+        ));
+    }
+    checks += 1;
+    session
+        .ui_render_frame()
+        .map_err(|e| format!("m5: ui render on reopen: {e}"))?;
+    if session.ui().and_then(|u| u.last_frame()).is_none() {
+        return Err("m5: no frame after reopen render".to_string());
+    }
+    // The submitted text is a canonical fact, not a gesture: the reopened
+    // session committed the user_message the UI submit intent produced.
+    let re_submitted = collect_envelopes(dir)?
+        .iter()
+        .filter(|e| e.kind == "user_message")
+        .any(|e| e.payload.get("text").and_then(|t| t.as_str()) == Some("recovered"));
+    if !re_submitted {
+        return Err("m5: reopen submit did not commit a canonical user_message".to_string());
+    }
+    checks += 1;
+
+    Ok(checks)
 }

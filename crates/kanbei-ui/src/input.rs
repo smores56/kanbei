@@ -81,7 +81,7 @@ impl InputDecoder {
                     self.pending.remove(0);
                     InputEvent::Backspace
                 }
-                0x0d => {
+                0x0d | 0x0a => {
                     self.pending.remove(0);
                     InputEvent::Enter
                 }
@@ -105,7 +105,9 @@ impl InputDecoder {
                 self.pending.remove(0);
                 Some(InputEvent::Tab)
             }
-            0x0d => {
+            0x0d | 0x0a => {
+                // CR and LF both submit (raw terminals deliver CR; tests and
+                // pastes may deliver LF or CRLF — normalize).
                 self.pending.remove(0);
                 Some(InputEvent::Enter)
             }
@@ -338,11 +340,12 @@ mod tests {
     #[test]
     fn controls() {
         assert_eq!(
-            decode(b"\x03\x0c\x18\x0d\x08\x7f\x01"),
+            decode(b"\x03\x0c\x18\x0d\x0a\x08\x7f\x01"),
             vec![
                 InputEvent::CtrlC,
                 InputEvent::CtrlL,
                 InputEvent::CtrlX,
+                InputEvent::Enter,
                 InputEvent::Enter,
                 InputEvent::Backspace,
                 InputEvent::Backspace,
