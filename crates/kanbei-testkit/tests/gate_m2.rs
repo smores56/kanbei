@@ -647,7 +647,12 @@ fn acceptance_crash_m2_points() {
                 | FaultPoint::AfterRunOutcome
                 // M4 memory points never fire in the M2 child
                 | FaultPoint::BeforeMemoryProposal
-                | FaultPoint::AfterMemoryProposal => false,
+                | FaultPoint::AfterMemoryProposal
+                // M5 UI points never fire in the M2 child
+                | FaultPoint::BeforeUiReduce
+                | FaultPoint::AfterUiReduce
+                | FaultPoint::BeforeUiRender
+                | FaultPoint::AfterUiRender => false,
             };
             if fires {
                 assert_eq!(
