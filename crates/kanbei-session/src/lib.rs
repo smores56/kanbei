@@ -323,8 +323,8 @@ pub struct QuiesceRecord {
 }
 
 /// One committed branch (M6): its frontier and its `branch_transition` event.
-/// `follow`/`config_choice` are opaque to wave 1 (always null; wave 2 fills
-/// the memory-follow policy and the config choice the transition recorded).
+/// `follow` is the memory-follow policy the transition recorded and
+/// `config_choice` the config choice at the branch point (wave 2).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BranchRecord {
     pub id: BranchId,
@@ -334,9 +334,22 @@ pub struct BranchRecord {
     /// The seq of the `branch_transition` event itself (== next_seq of the
     /// new branch's first event).
     pub transition_seq: u64,
-    pub follow: serde_json::Value,
-    pub config_choice: serde_json::Value,
+    pub follow: kanbei_memory::MemoryFollowPolicy,
+    pub config_choice: ConfigChoiceRecord,
     pub quiesce: QuiesceRecord,
+}
+
+/// The config choice a `branch_transition` recorded (M6 wave 2): which
+/// config was live at the branch point (`current`), which config the
+/// checkpoint manifest pinned (`historical` — its `provider_config` digest),
+/// and the live epoch composition. Module-state/config restoration is out of
+/// scope (architecture.md §M6) — the record is the deliverable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConfigChoiceRecord {
+    pub mode: String,
+    pub current: Option<Digest>,
+    pub historical: Option<Digest>,
+    pub composition: Option<Digest>,
 }
 
 /// The memory roots pinned by the checkpoint a branch continues from (M6;
@@ -423,6 +436,10 @@ pub struct Session {
     /// Committed branch records, chronological (rebuilt from the log on
     /// open — the log is the authority for branch identity).
     branch_records: Vec<BranchRecord>,
+    /// The live config manifest's package digest (== the canonical content
+    /// digest `install_package` computes); None when no config activated
+    /// (storage-only sessions). The config-choice record's `current` field.
+    config_digest: Option<Digest>,
     /// The memory roots pinned by the checkpoint this branch continues from
     /// (wave 2 consumes them).
     pinned_roots: Option<PinnedRoots>,
@@ -739,11 +756,36 @@ impl Session {
                     .get("follow")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
+                // Wave-1 transitions recorded follow/config_choice as null;
+                // null follow means the branch could not pin (FollowHead) and
+                // a null choice is the empty record.
+                let follow = if follow.is_null() {
+                    kanbei_memory::MemoryFollowPolicy::FollowHead
+                } else {
+                    serde_json::from_value(follow)
+                        .unwrap_or(kanbei_memory::MemoryFollowPolicy::FollowHead)
+                };
                 let config_choice = env
                     .payload
                     .get("config_choice")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
+                let config_choice = if config_choice.is_null() {
+                    ConfigChoiceRecord {
+                        mode: String::new(),
+                        current: None,
+                        historical: None,
+                        composition: None,
+                    }
+                } else {
+                    serde_json::from_value(config_choice)
+                        .unwrap_or(ConfigChoiceRecord {
+                            mode: String::new(),
+                            current: None,
+                            historical: None,
+                            composition: None,
+                        })
+                };
                 let quiesce = env
                     .payload
                     .get("quiesce")
@@ -806,6 +848,7 @@ impl Session {
             compacted,
             branch,
             branch_records,
+            config_digest: None,
             pinned_roots: None,
             memory_fault,
             child_provider,
@@ -1030,6 +1073,12 @@ impl Session {
                 // (R-10); install dedups when the publish already pinned them
                 let comp_bytes = self.composition.current().to_canonical_bytes();
                 self.store.install(&comp_bytes)?;
+                // the tool-registry/provider-config objects the manifest pins
+                // (M6 wave 2) — installed before the pin, same as the
+                // composition object.
+                for bytes in self.manifest_config_objects() {
+                    self.store.install(&bytes)?;
+                }
                 let (digest, _deduped) = kanbei_snapshot::pin(&mut self.store, &manifest)?;
                 self.current_snapshot = Some(digest);
                 Some(digest)
@@ -1171,16 +1220,20 @@ impl Session {
         let manifest: ExecutionManifest = serde_json::from_slice(&bytes).map_err(|e| {
             SessionError::Snapshot(format!("checkpoint snapshot {snapshot} is not a manifest: {e}"))
         })?;
-        let mut closure: std::collections::HashSet<Digest> =
-            manifest.modules.iter().map(|m| m.package).collect();
-        if let Some(c) = manifest.composition {
-            closure.insert(c);
+        // Full closure walk (M6 wave 2): every digest field the manifest
+        // pins must resolve in the session store — modules' packages,
+        // composition, memory roots, and the tool-registry/provider-config
+        // objects (all installed before the pin). The engine/toolchain
+        // digests are kernel-embedded build-time artifacts (the guest wasm
+        // is a kanbei-vm `include_bytes!` constant that never enters the
+        // object store), so they are the only digest fields excepted from
+        // the store verification.
+        let mut closure = kanbei_snapshot::manifest_closure(&manifest);
+        if let Some(d) = manifest.engine_digest {
+            closure.remove(&d);
         }
-        if let Some(r) = manifest.memory_root {
-            closure.insert(r);
-        }
-        if let Some(r) = manifest.project_memory_root {
-            closure.insert(r);
+        if let Some(d) = manifest.toolchain_digest {
+            closure.remove(&d);
         }
         kanbei_snapshot::verify_closure(&self.store, &closure)
             .map_err(|e| SessionError::Snapshot(format!("checkpoint snapshot closure failed: {e}")))?;
@@ -1194,6 +1247,36 @@ impl Session {
             .get("project_memory_root")
             .and_then(|r| r.as_str())
             .and_then(|r| r.parse().ok());
+
+        // The follow policy before the transition commits: the checkpoint's
+        // pinned roots must be roots the memory actors know — a corrupted
+        // checkpoint event is rejected explicitly, with no branch. A
+        // checkpoint without a pinned lifetime root cannot pin (the policy's
+        // lifetime_root is required) → FollowHead.
+        let follow = match memory_root {
+            Some(lifetime_root) => {
+                if !self.memory_lifetime.contains_root(&lifetime_root) {
+                    return Err(SessionError::InvalidInput(format!(
+                        "checkpoint pins memory root {lifetime_root} unknown to the lifetime actor"
+                    )));
+                }
+                if let Some(project_root) = project_memory_root
+                    && !self
+                        .memory_project
+                        .as_ref()
+                        .is_some_and(|a| a.contains_root(&project_root))
+                {
+                    return Err(SessionError::InvalidInput(format!(
+                        "checkpoint pins project memory root {project_root} unknown to the project actor"
+                    )));
+                }
+                kanbei_memory::MemoryFollowPolicy::PinnedAt {
+                    lifetime_root,
+                    project_root: project_memory_root,
+                }
+            }
+            None => kanbei_memory::MemoryFollowPolicy::FollowHead,
+        };
 
         // Quiesce BEFORE the transition commits: an active run is cancelled
         // (its `run_outcome Failed(Quiesced)` records the termination), then
@@ -1244,6 +1327,18 @@ impl Session {
         let quiesce = QuiesceRecord { cancelled, ambiguous };
 
         let new_branch = BranchId::generate();
+        // The config choice at the branch point: the live config manifest
+        // digest (the package digest `activate_config` retained — the
+        // canonical content digest), the checkpoint manifest's
+        // `provider_config` pin (the historical choice), and the live epoch
+        // composition. Config restoration is out of scope — the record is
+        // the deliverable.
+        let config_choice = ConfigChoiceRecord {
+            mode: "Current".into(),
+            current: self.config_digest,
+            historical: manifest.provider_config,
+            composition: Some(self.composition.current().digest),
+        };
         self.fault(FaultPoint::BeforeBranchTransition);
         let receipt = self.commit(
             vec![NewEvent {
@@ -1255,11 +1350,10 @@ impl Session {
                     "frontier_seq": checkpoint.seq,
                     "checkpoint_event": env.evt,
                     "checkpoint_snapshot": snapshot.to_string(),
-                    // wave 2 fills the memory-follow policy and the config
-                    // choice; the fields exist now so the payload shape is
-                    // frozen.
-                    "follow": serde_json::Value::Null,
-                    "config_choice": serde_json::Value::Null,
+                    "follow": serde_json::to_value(&follow)
+                        .expect("follow serialization cannot fail"),
+                    "config_choice": serde_json::to_value(&config_choice)
+                        .expect("config choice serialization cannot fail"),
                     "quiesce": serde_json::to_value(&quiesce)
                         .expect("quiesce serialization cannot fail"),
                     "memory_root": memory_root.map(|d| d.to_string()),
@@ -1276,8 +1370,8 @@ impl Session {
             from: Some(self.branch),
             frontier_seq: checkpoint.seq,
             transition_seq: receipt.last_seq,
-            follow: serde_json::Value::Null,
-            config_choice: serde_json::Value::Null,
+            follow,
+            config_choice,
             quiesce,
         };
         self.branch = new_branch;
@@ -1289,6 +1383,64 @@ impl Session {
             project: project_memory_root,
         });
         Ok(record)
+    }
+
+    /// Switch the memory-follow policy (M6 wave 2): `FollowHead` releases the
+    /// pinned roots (the projection resolves against the live actor heads
+    /// again); `PinnedAt` pins the projection to the given roots — which must
+    /// be roots the memory actors committed ([`MemoryRootActor::contains_root`]),
+    /// else `InvalidInput` and no event. Commits one canonical
+    /// `memory_follow_changed` record event (schema 1, `state_head` None).
+    pub fn memory_follow(&mut self, policy: kanbei_memory::MemoryFollowPolicy) -> Result<(), SessionError> {
+        match &policy {
+            kanbei_memory::MemoryFollowPolicy::FollowHead => {}
+            kanbei_memory::MemoryFollowPolicy::PinnedAt {
+                lifetime_root,
+                project_root,
+            } => {
+                if !self.memory_lifetime.contains_root(lifetime_root) {
+                    return Err(SessionError::InvalidInput(format!(
+                        "pinned lifetime root {lifetime_root} is not a committed root"
+                    )));
+                }
+                if let Some(project_root) = project_root
+                    && !self
+                        .memory_project
+                        .as_ref()
+                        .is_some_and(|a| a.contains_root(project_root))
+                {
+                    return Err(SessionError::InvalidInput(format!(
+                        "pinned project root {project_root} is not a committed root"
+                    )));
+                }
+            }
+        }
+        let at = self.next_seq;
+        self.commit(
+            vec![NewEvent {
+                kind: "memory_follow_changed".into(),
+                payload_schema: 1,
+                payload: json!({
+                    "policy": serde_json::to_value(&policy)
+                        .expect("follow policy serialization cannot fail"),
+                    "at": at,
+                }),
+                objects: Vec::new(),
+                refs: Vec::new(),
+            }],
+            None,
+        )?;
+        self.pinned_roots = match policy {
+            kanbei_memory::MemoryFollowPolicy::FollowHead => None,
+            kanbei_memory::MemoryFollowPolicy::PinnedAt {
+                lifetime_root,
+                project_root,
+            } => Some(PinnedRoots {
+                lifetime: lifetime_root,
+                project: project_root,
+            }),
+        };
+        Ok(())
     }
 
     /// Whether `seq` is on the current branch's path: false exactly for the
@@ -1350,12 +1502,35 @@ impl Session {
         // roots at commit time.
         manifest.memory_root = self.memory_lifetime.head();
         manifest.project_memory_root = self.memory_project.as_ref().and_then(|a| a.head());
+        // M6 wave 2: the tool-registry and provider-config pins are content
+        // digests over the canonical bytes; the caller installs those bytes
+        // before pinning (closure-valid, R-10). The scheduler policy name is
+        // the canonical R-09/E-09 surface. `provider`/`policy`/`projection`
+        // versions stay None — no versioned surfaces exist yet.
+        manifest.tool_registry = Some(Digest::new(&self.tool_registry.to_canonical_bytes()));
+        manifest.provider_config = self
+            .provider_config
+            .as_ref()
+            .map(|cfg| Digest::new(&cfg.to_canonical_bytes()));
+        manifest.scheduler_policy = Some(self.scheduler.policy_name().to_string());
         let mut schema_versions = payload_schemas.to_vec();
         schema_versions.push(kanbei_snapshot::MANIFEST_SCHEMA);
         schema_versions.sort_unstable();
         schema_versions.dedup();
         manifest.schema_versions = schema_versions;
         manifest
+    }
+
+    /// The canonical config-object bytes the manifest's `tool_registry` and
+    /// `provider_config` digests reference — installed into the session store
+    /// before the manifest is pinned so the snapshot closure verifies from
+    /// the session store alone (R-10; content addressing dedups).
+    fn manifest_config_objects(&self) -> Vec<Vec<u8>> {
+        let mut objects = vec![self.tool_registry.to_canonical_bytes()];
+        if let Some(cfg) = &self.provider_config {
+            objects.push(cfg.to_canonical_bytes());
+        }
+        objects
     }
 
     /// The envelope at `seq`, scanning the log (M6 checkpoint validation).
@@ -1628,6 +1803,7 @@ impl Session {
             self.ui_mark_stale(&e.to_string());
             return Err(e);
         }
+        self.config_digest = Some(package);
         Ok(ConfigActivation {
             module_id: manifest.module_id,
             generation: generation.generation,

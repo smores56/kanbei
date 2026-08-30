@@ -181,6 +181,22 @@ impl MemoryRootActor {
         self.head_transition
     }
 
+    /// Whether `root` is a root this actor committed (M6 pinned-at
+    /// validation): every committed root is an ancestor of the current head
+    /// (transitions only advance parent links), so the head fold's manifest
+    /// history is the complete root set. `false` for an unknown digest; a
+    /// corrupt/unreadable store also resolves to `false` (the caller rejects
+    /// the pin explicitly).
+    pub fn contains_root(&self, root: &Digest) -> bool {
+        let Some(head) = self.head else {
+            return false;
+        };
+        match self.fold(Some(head)) {
+            Ok(fold) => fold.history.contains(root),
+            Err(_) => false,
+        }
+    }
+
     /// Proposes a root-selection transition. Validation order: scope match,
     /// idempotency, origin verification, CAS, refs-to-committed objects,
     /// acyclicity, then the manifest digest check and commit.

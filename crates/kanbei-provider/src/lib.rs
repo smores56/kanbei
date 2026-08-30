@@ -23,6 +23,30 @@ pub enum KeySource {
     Inline(String),
 }
 
+impl ProviderConfig {
+    /// Canonical content-addressed bytes for the execution-snapshot
+    /// manifest's `provider_config` pin: provider/model/base-url plus a
+    /// key-source fingerprint — the key itself is never serialized (the
+    /// egress redaction rules, R-15/R-28). The bytes are installed as an
+    /// object before the manifest is pinned (closure-valid).
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        let key_source = match &self.key {
+            KeySource::Env(name) => format!("env:{name}"),
+            KeySource::Inline(_) => "inline:redacted".to_string(),
+        };
+        serde_json::to_vec(&json!({
+            "provider": self.provider,
+            "model": self.model,
+            "base_url": self.base_url,
+            "key_source": key_source,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "timeout_secs": self.timeout.as_secs(),
+        }))
+        .expect("provider config serialization cannot fail")
+    }
+}
+
 /// One normalized provider configuration.
 #[derive(Clone)]
 pub struct ProviderConfig {

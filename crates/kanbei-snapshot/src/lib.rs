@@ -121,6 +121,32 @@ pub fn pin(store: &mut ObjectStore, m: &ExecutionManifest) -> Result<(Digest, bo
     Ok((digest, deduped))
 }
 
+/// The complete referenced digest set of a manifest — every digest field the
+/// pinned manifest's closure must contain: `engine_digest`, `toolchain_digest`,
+/// `state_head`, `composition`, `memory_root`, `project_memory_root`,
+/// `tool_registry`, `provider_config`, and every `modules[].package` (M6
+/// wave 2 full closure walk; the wave-1 manual set covered only packages +
+/// composition + memory roots).
+pub fn manifest_closure(m: &ExecutionManifest) -> HashSet<Digest> {
+    let mut refs: HashSet<Digest> = m.modules.iter().map(|pin| pin.package).collect();
+    for d in [
+        m.engine_digest,
+        m.toolchain_digest,
+        m.state_head,
+        m.composition,
+        m.memory_root,
+        m.project_memory_root,
+        m.tool_registry,
+        m.provider_config,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        refs.insert(d);
+    }
+    refs
+}
+
 /// Verify closure: every referenced object exists with a valid hash
 /// (missing → `ObjectError::Missing`, damaged → `ObjectError::Corruption`;
 /// never silent). Returns the count of verified objects.

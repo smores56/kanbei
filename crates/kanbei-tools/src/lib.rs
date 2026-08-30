@@ -178,12 +178,17 @@ impl ToolRegistry {
         json!(arr)
     }
 
+    /// The content-addressed bytes: the canonical JSON (sorted schemas) as a
+    /// JSON array. The execution-snapshot manifest's `tool_registry` pin is
+    /// the digest over these bytes, and the bytes are installed as an object
+    /// before the manifest is pinned (closure-valid, R-10).
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(&self.canonical_json())
+            .expect("tool registry serialization cannot fail")
+    }
+
     pub fn digest(&self) -> Digest {
-        Digest::new(
-            serde_json::to_string(&self.canonical_json())
-                .unwrap_or_default()
-                .as_bytes(),
-        )
+        Digest::new(&self.to_canonical_bytes())
     }
 }
 

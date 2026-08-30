@@ -39,6 +39,20 @@ impl MemoryScope {
     }
 }
 
+/// How a branched session follows memory after `continue_from` (M6 wave 2):
+/// either the live actor heads, or the checkpoint-pinned roots (the
+/// projection then folds the pinned roots — the historical claim set at the
+/// checkpoint frontier). Externally tagged serde: the payload records the
+/// variant name.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum MemoryFollowPolicy {
+    FollowHead,
+    PinnedAt {
+        lifetime_root: Digest,
+        project_root: Option<Digest>,
+    },
+}
+
 /// The provenance of one claim or edge: the originating session/event plus,
 /// for promotions, the source claim digests and a bounded evidence excerpt.
 /// The excerpt cap is enforced at construction ([`ClaimProvenance::new_promotion`]).

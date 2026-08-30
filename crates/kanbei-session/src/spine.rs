@@ -349,13 +349,26 @@ impl Session {
                 CachePlan::None => CacheOutcome::Miss,
                 CachePlan::StablePrefix { digest } => match &self.last_cache {
                     Some((Some(prev), prev_roots)) if *prev == digest => {
-                        let live: Vec<Digest> = [
-                            self.memory_lifetime.head(),
-                            self.memory_project.as_ref().and_then(|a| a.head()),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .collect();
+                        // M6 pinned-at follow: the roots the projection was
+                        // built against are the pinned roots, not the live
+                        // heads — a pinned projection is stable across actor
+                        // transitions and the cache stays valid while the
+                        // pinned roots are unchanged.
+                        let live: Vec<Digest> = match &self.pinned_roots {
+                            // same order as project_context's memory_roots:
+                            // lifetime first, then the project root.
+                            Some(p) => [Some(p.lifetime), p.project]
+                                .into_iter()
+                                .flatten()
+                                .collect(),
+                            None => [
+                                self.memory_lifetime.head(),
+                                self.memory_project.as_ref().and_then(|a| a.head()),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .collect(),
+                        };
                         if live == *prev_roots {
                             CacheOutcome::Hit
                         } else {
@@ -795,9 +808,14 @@ impl Session {
             Vec::new()
         };
 
-        // Memory folds.
-        let lifetime_head = self.memory_lifetime.head();
-        let lifetime_fold = match lifetime_head {
+        // Memory folds. M6 pinned-at follow: with pinned roots the folds
+        // resolve against the checkpoint-era roots (folding the pinned root
+        // yields the historical claim set); otherwise the live actor heads.
+        let lifetime_root = match &self.pinned_roots {
+            Some(p) => Some(p.lifetime),
+            None => self.memory_lifetime.head(),
+        };
+        let lifetime_fold = match lifetime_root {
             Some(root) => Some(
                 self.memory_lifetime
                     .fold(Some(root))
@@ -805,12 +823,15 @@ impl Session {
             ),
             None => None,
         };
-        let project_head = self.memory_project.as_ref().and_then(|a| a.head());
-        let project_fold = match project_head {
+        let project_root = match &self.pinned_roots {
+            Some(p) => p.project,
+            None => self.memory_project.as_ref().and_then(|a| a.head()),
+        };
+        let project_fold = match project_root {
             Some(root) => Some(
                 self.memory_project
                     .as_ref()
-                    .expect("project head implies actor")
+                    .expect("project root implies actor")
                     .fold(Some(root))
                     .map_err(SessionError::Memory)?,
             ),
@@ -893,13 +914,13 @@ impl Session {
         // Scope-stable memory fragments: lifetime always when non-empty,
         // project when bound (the child's memory.query scope resolution is
         // what attenuates — the fragments themselves are shared).
-        let lifetime = match (&lifetime_head, &lifetime_fold) {
+        let lifetime = match (&lifetime_root, &lifetime_fold) {
             (Some(root), Some(fold)) if !fold.claims.is_empty() => {
                 Some(render_memory_source(*root, fold))
             }
             _ => None,
         };
-        let project = match (&project_head, &project_fold) {
+        let project = match (&project_root, &project_fold) {
             (Some(root), Some(fold)) if !fold.claims.is_empty() => {
                 Some(render_memory_source(*root, fold))
             }
@@ -949,7 +970,7 @@ impl Session {
         let vpc = run_pipeline(input, &read, &default_stages(), &ValidatorStage::new(read))
             .map_err(SessionError::Context)?;
         let lowering = lower(&vpc, true).map_err(SessionError::Context)?;
-        let memory_roots: Vec<Digest> = [lifetime_head, project_head]
+        let memory_roots: Vec<Digest> = [lifetime_root, project_root]
             .into_iter()
             .flatten()
             .collect();
@@ -1113,9 +1134,15 @@ impl Session {
             .get("max_results")
             .and_then(|m| m.as_u64())
             .unwrap_or(16);
-        // Reconcile the disposable index from the live folds.
+        // Reconcile the disposable index from the folds — the pinned roots
+        // when the branch follows PinnedAt (the checkpoint-era claim set),
+        // else the live heads.
         let mut index_inputs: Vec<ScopeIndexInput> = Vec::new();
-        if let Some(root) = self.memory_lifetime.head() {
+        let lifetime_root = match &self.pinned_roots {
+            Some(p) => Some(p.lifetime),
+            None => self.memory_lifetime.head(),
+        };
+        if let Some(root) = lifetime_root {
             let fold = self
                 .memory_lifetime
                 .fold(Some(root))
@@ -1126,8 +1153,12 @@ impl Session {
                 fold,
             });
         }
+        let project_root = match &self.pinned_roots {
+            Some(p) => p.project,
+            None => self.memory_project.as_ref().and_then(|a| a.head()),
+        };
         if let Some(actor) = self.memory_project.as_ref()
-            && let Some(root) = actor.head()
+            && let Some(root) = project_root
         {
             let fold = actor.fold(Some(root)).map_err(SessionError::Memory)?;
             index_inputs.push(ScopeIndexInput {

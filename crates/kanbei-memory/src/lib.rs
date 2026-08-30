@@ -37,9 +37,9 @@ pub use error::MemoryError;
 pub use registry::{PROJECT_ENTRY_SCHEMA, ProjectEntry, ProjectRegistry};
 pub use types::{
     Claim, ClaimEdge, ClaimProvenance, EdgeKind, IdempotencyKey, MEMORY_CLAIM_SCHEMA,
-    MEMORY_EDGE_SCHEMA, MEMORY_ROOT_SCHEMA, MEMORY_TRANSITION_SCHEMA, MemoryScope,
-    MemoryTransition, PROMOTION_EXCERPT_MAX, RootFold, RootManifest, TransitionKind,
-    ValidationStatus, derive_validation_status,
+    MEMORY_EDGE_SCHEMA, MEMORY_ROOT_SCHEMA, MEMORY_TRANSITION_SCHEMA, MemoryFollowPolicy,
+    MemoryScope, MemoryTransition, PROMOTION_EXCERPT_MAX, RootFold, RootManifest,
+    TransitionKind, ValidationStatus, derive_validation_status,
 };
 
 /// The canonical AppendLog stream name for every scope's transition log.

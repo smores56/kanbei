@@ -10,7 +10,10 @@ use kanbei_core::digest::Digest;
 use kanbei_core::envelope::ENVELOPE_SCHEMA;
 use kanbei_core::queue::DurabilityQueue;
 use kanbei_objects::{ObjectError, ObjectStore};
-use kanbei_snapshot::{ExecutionManifest, MANIFEST_SCHEMA, pin, verify_closure};
+use kanbei_core::id::Id128;
+use kanbei_snapshot::{
+    ExecutionManifest, MANIFEST_SCHEMA, ModulePin, manifest_closure, pin, verify_closure,
+};
 
 /// Temp store with a named tag; caller must shutdown the returned queue.
 fn store(tag: &str) -> (PathBuf, ObjectStore, Arc<DurabilityQueue>) {
@@ -130,6 +133,53 @@ fn verify_closure_corrupt_object() {
         other => panic!("expected Corruption, got {other:?}"),
     }
     shutdown(&dir, store, queue);
+}
+
+#[test]
+fn manifest_closure_covers_all_digest_fields() {
+    let mut m = ExecutionManifest::bootstrap();
+    m.engine_digest = Some(Digest::new(b"engine"));
+    m.toolchain_digest = Some(Digest::new(b"toolchain"));
+    m.state_head = Some(Digest::new(b"state"));
+    m.composition = Some(Digest::new(b"composition"));
+    m.memory_root = Some(Digest::new(b"memory"));
+    m.project_memory_root = Some(Digest::new(b"project-memory"));
+    m.tool_registry = Some(Digest::new(b"tools"));
+    m.provider_config = Some(Digest::new(b"provider"));
+    m.modules = vec![
+        ModulePin {
+            module_id: Id128::generate(),
+            generation: 1,
+            package: Digest::new(b"package-1"),
+            scope: "/".into(),
+        },
+        ModulePin {
+            module_id: Id128::generate(),
+            generation: 2,
+            package: Digest::new(b"package-2"),
+            scope: "/".into(),
+        },
+    ];
+    let refs = manifest_closure(&m);
+    for d in [
+        m.engine_digest.unwrap(),
+        m.toolchain_digest.unwrap(),
+        m.state_head.unwrap(),
+        m.composition.unwrap(),
+        m.memory_root.unwrap(),
+        m.project_memory_root.unwrap(),
+        m.tool_registry.unwrap(),
+        m.provider_config.unwrap(),
+        m.modules[0].package,
+        m.modules[1].package,
+    ] {
+        assert!(refs.contains(&d), "closure missing {d}");
+    }
+    // No digest field escapes the closure: with every field Some the set is
+    // exactly the ten digests above.
+    assert_eq!(refs.len(), 10);
+    // A bare manifest has an empty closure.
+    assert!(manifest_closure(&ExecutionManifest::bootstrap()).is_empty());
 }
 
 #[test]

@@ -325,6 +325,8 @@ fn acceptance_consistency_4_snapshot_closure_verifies() {
     // no successor envelope references it yet (legitimate, not crash garbage)
     // — plus the epoch-composition object the schema-2 manifests pin (R-01:
     // the composition digest is a manifest field, not an envelope ref)
+    // — plus the tool-registry object the M6 wave 2 manifests pin (same
+    // manifest-field, not-envelope-ref status)
     let on_disk = store.scan().unwrap();
     let mut orphans: Vec<Digest> =
         on_disk.iter().filter(|d| !closure.contains(d)).copied().collect();
@@ -344,6 +346,7 @@ fn acceptance_consistency_4_snapshot_closure_verifies() {
         ))))
         .current()
         .digest,
+        Digest::new(&kanbei_tools::ToolRegistry::builtin().to_canonical_bytes()),
     ];
     expected.sort();
     orphans.sort();
@@ -382,8 +385,10 @@ fn acceptance_consistency_3_canonical_fact() {
 
     // canonical facts on disk: bootstrap + 10 state manifests + 20 objects
     // + the epoch-composition object (schema-2 manifests pin it, R-01)
+    // + the tool-registry object (M6 wave 2 manifests pin it; content
+    // addressing dedups it across the 10 commits)
     let scan = store.scan().unwrap();
-    assert_eq!(scan.len(), 32);
+    assert_eq!(scan.len(), 33);
 
     // snapshot chain: envelope k's pre-event snapshot is the post-manifest
     // pinned by commit k-1 (bootstrap for the first) — the schema-2
