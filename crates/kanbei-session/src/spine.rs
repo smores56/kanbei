@@ -536,20 +536,55 @@ impl Session {
     }
 
     /// Commit a tool outcome record (the committed intent's fact — R-02).
+    /// The outcome's result runs the retention gate FIRST (R-28/D-S1: tools
+    /// emit candidates; policy decides before persistence); a boundary fact
+    /// commits alongside the outcome.
     pub fn commit_tool_outcome(&mut self, outcome: &ToolOutcome) -> Result<(), SessionError> {
         self.fault(crate::FaultPoint::BeforeToolOutcomeCommit);
-        self.commit(
-            vec![NewEvent {
-                kind: "tool_outcome".into(),
+        let mut boundary: Option<kanbei_policy::BoundaryFact> = None;
+        if outcome.error.is_none() && outcome.result != Value::Null {
+            let candidate = kanbei_policy::Candidate {
+                role: kanbei_policy::CandidateRole::ToolOutput,
+                content: serde_json::to_vec(&outcome.result)
+                    .map_err(|e| SessionError::InvalidInput(format!("candidate: {e}")))?,
+                replay_relevant: self.policy.replay_relevant(
+                    kanbei_policy::CandidateRole::ToolOutput,
+                    None,
+                ),
+                sensitivity: None,
+                media: Some("application/json".into()),
+            };
+            if let Ok(admission) = self.policy.admit(candidate) {
+                boundary = self.policy.boundary_fact(&admission);
+            }
+        }
+        let mut events = Vec::new();
+        if let Some(fact) = boundary {
+            events.push(NewEvent {
+                kind: "retention_boundary".into(),
                 payload_schema: 1,
-                payload: serde_json::to_value(outcome).map_err(|e| {
-                    SessionError::InvalidInput(format!("tool outcome payload: {e}"))
-                })?,
+                payload: json!({
+                    "reason": fact.reason,
+                    "replay_relevant": fact.replay_relevant,
+                    "kind": match fact.kind {
+                        kanbei_policy::BoundaryKind::NonResumable => "non_resumable",
+                        kanbei_policy::BoundaryKind::Rejected => "rejected",
+                    },
+                }),
                 objects: Vec::new(),
                 refs: Vec::new(),
-            }],
-            None,
-        )?;
+            });
+        }
+        events.push(NewEvent {
+            kind: "tool_outcome".into(),
+            payload_schema: 1,
+            payload: serde_json::to_value(outcome).map_err(|e| {
+                SessionError::InvalidInput(format!("tool outcome payload: {e}"))
+            })?,
+            objects: Vec::new(),
+            refs: Vec::new(),
+        });
+        self.commit(events, None)?;
         self.fault(crate::FaultPoint::AfterToolOutcomeCommit);
         Ok(())
     }

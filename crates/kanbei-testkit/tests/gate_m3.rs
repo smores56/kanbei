@@ -442,3 +442,40 @@ fn m3_crash_matrix_completes_without_point() {
     assert!(acked >= 3);
     verify_m3_recovery(&dir, acked).unwrap();
 }
+
+// --- consistency 15 (review gate): the spine never touches scope state -----
+
+#[test]
+fn consistency_15_spine_leaves_scopes_intact() {
+    let dir = fresh_session_dir("scope");
+    let _guard = DirGuard(dir.clone());
+    let (mut session, _id) = spine_session(
+        &dir,
+        vec![CompletionResponse {
+            content: Some("hi".into()),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: Usage { input_tokens: 1, output_tokens: 1 },
+        }],
+    );
+    // Before: the root scope with no children.
+    assert_eq!(session.scopes().scopes().len(), 1);
+    let before_epoch = session.composition().epoch;
+    // A full spine run commits canonical run/model/tool facts.
+    let outcome = run_spine(
+        &mut session,
+        vec![
+            StepCommand::ModelCall(kanbei_scheduler::ModelCallSpec {
+                rendered_hash: kanbei_core::digest::Digest::new(b"ctx"),
+                max_tokens: None,
+            }),
+            StepCommand::Finish(TerminalOutcome::CompletedGoal),
+        ],
+    );
+    assert_eq!(outcome, TerminalOutcome::CompletedGoal);
+    // After: no scope drift, no composition change — the spine is a pure
+    // consumer of the composition, never a contributor (R-26).
+    assert_eq!(session.scopes().scopes().len(), 1);
+    assert_eq!(session.composition().epoch, before_epoch);
+    session.close().unwrap();
+}
