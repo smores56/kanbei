@@ -1065,6 +1065,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kanbei-gc"
+version = "0.1.0"
+dependencies = [
+ "kanbei-core",
+ "kanbei-log",
+ "kanbei-objects",
+ "kanbei-snapshot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "kanbei-guest"
 version = "0.1.0"
 dependencies = [
@@ -1090,6 +1103,7 @@ version = "0.1.0"
 dependencies = [
  "kanbei-capabilities",
  "kanbei-core",
+ "kanbei-gc",
  "kanbei-log",
  "kanbei-objects",
  "serde",
@@ -1209,6 +1223,7 @@ dependencies = [
  "kanbei-capabilities",
  "kanbei-context",
  "kanbei-core",
+ "kanbei-gc",
  "kanbei-log",
  "kanbei-memory",
  "kanbei-modules",

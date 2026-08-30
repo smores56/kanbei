@@ -25,6 +25,8 @@ pub enum MemoryError {
     AcyclicViolation(String),
     #[error("root mismatch: expected {expected}, actual {actual}")]
     RootMismatch { expected: Digest, actual: Digest },
+    #[error(transparent)]
+    Gc(#[from] kanbei_gc::GcError),
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }

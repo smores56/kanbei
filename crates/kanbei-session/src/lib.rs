@@ -150,6 +150,12 @@ pub struct SessionConfig {
     /// telemetry. The `otel` feature only.
     #[cfg(feature = "otel")]
     pub telemetry: Option<Telemetry>,
+    // --- M8 wave 2 GC (R-20) ---
+    /// Automatic GC at open: None = no automatic pass (the explicit
+    /// [`Session::run_gc`] stays available). When set, open runs the
+    /// quarantine pass (always) and the sweep (only when `sweep` is true),
+    /// best-effort — a GC failure never fails open.
+    pub gc: Option<kanbei_gc::GcConfig>,
 }
 
 impl Default for SessionConfig {
@@ -180,6 +186,7 @@ impl Default for SessionConfig {
             child_provider: None,
             #[cfg(feature = "otel")]
             telemetry: None,
+            gc: None,
         }
     }
 }
@@ -494,6 +501,10 @@ pub struct Session {
     /// + usage attrs; its id parents every commit span while active.
     #[cfg(feature = "otel")]
     open_run_span: Option<SpanBuilder>,
+    // --- M8 wave 2 GC (R-20): writer pins ---
+    /// Digests with an install in flight (or an external writer's in-flight
+    /// reference): GC never quarantines or sweeps them.
+    gc_pins: std::sync::Mutex<std::collections::HashSet<Digest>>,
 }
 
 impl Session {
@@ -902,7 +913,15 @@ impl Session {
             telemetry,
             #[cfg(feature = "otel")]
             open_run_span: None,
+            gc_pins: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
+
+        // M8 wave 2: best-effort automatic GC pass at open (quarantine
+        // now, sweep per config; a GC failure must never fail open — the
+        // explicit run_gc surfaces errors).
+        if let Some(gc_cfg) = session.cfg.gc.clone() {
+            session.run_auto_gc(&gc_cfg);
+        }
 
         // Root config module: atomic activation; failure → safe mode.
         if let Some(manifest) = config_manifest
@@ -1008,12 +1027,17 @@ impl Session {
 
         // step 2 — objects first: the object dirsync is enqueued before the
         // referencing frame's fsync, so the object is durable before the
-        // frame (ratification-packet §3, R-10)
+        // frame (ratification-packet §3, R-10). Every digest installed here
+        // is writer-pinned before install and unpinned on guard drop (after
+        // the append) — GC never quarantines an object a commit has in
+        // flight.
         self.fault(FaultPoint::BeforeObjectInstall);
         let mut objects: Vec<Digest> = Vec::new();
         let mut payload_schemas: Vec<u32> = Vec::new();
+        let mut pins = crate::gc::GcPinGuard::new(&self.gc_pins);
         for ev in &mut events {
             for bytes in &ev.objects {
+                pins.pin(Digest::new(bytes));
                 let digest = self.store.install(bytes)?;
                 self.fault(FaultPoint::AfterObjectInstall);
                 ev.refs.push(digest);
@@ -1032,6 +1056,7 @@ impl Session {
             let serialized = serde_json::to_string(&ev.payload)
                 .map_err(|e| SessionError::InvalidInput(format!("payload serialization: {e}")))?;
             if serialized.len() > self.cfg.inline_max {
+                pins.pin(Digest::new(serialized.as_bytes()));
                 let digest = self.store.install(serialized.as_bytes())?;
                 self.fault(FaultPoint::AfterObjectInstall);
                 ev.payload = json!({ "$object": digest.to_string() });
@@ -1122,19 +1147,26 @@ impl Session {
                 // for the manifest's composition ref to be closure-valid
                 // (R-10); install dedups when the publish already pinned them
                 let comp_bytes = self.composition.current().to_canonical_bytes();
+                pins.pin(Digest::new(&comp_bytes));
                 self.store.install(&comp_bytes)?;
                 // the tool-registry/provider-config objects the manifest pins
                 // (M6 wave 2) — installed before the pin, same as the
                 // composition object.
                 for bytes in self.manifest_config_objects() {
+                    pins.pin(Digest::new(&bytes));
                     self.store.install(&bytes)?;
                 }
+                pins.pin(Digest::new(&manifest.to_bytes()));
                 let (digest, _deduped) = kanbei_snapshot::pin(&mut self.store, &manifest)?;
                 self.current_snapshot = Some(digest);
                 Some(digest)
             }
             None => None,
         };
+        // The append + pin are complete: every installed digest is now
+        // referenced by a durable frame or the live current_snapshot — the
+        // writer pins can fall away (the guard drop also covers error paths).
+        drop(pins);
 
         let receipt = CommitReceipt {
             first_seq: plan.first_seq,
@@ -2463,6 +2495,8 @@ pub enum SessionError {
     Context(#[from] kanbei_context::ProjectionError),
     #[error("compaction violation: event references compacted fragment {0}")]
     CompactionViolation(String),
+    #[error(transparent)]
+    Gc(#[from] kanbei_gc::GcError),
 }
 
 // ---------- helpers ----------
@@ -2497,3 +2531,7 @@ fn shutdown_queue(queue: Arc<DurabilityQueue>) {
 // M3 agent spine: run lifecycle, model/tool commit paths, approvals, breakers,
 // and interrupted/ambiguous classification (spine.rs).
 mod spine;
+
+// M8 wave 2: canonical-object GC (root capture, writer pins, quarantine +
+// grace sweep) over the session and memory stores (gc.rs).
+mod gc;

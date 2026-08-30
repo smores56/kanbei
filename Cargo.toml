@@ -10,6 +10,7 @@ members = [
     "crates/kanbei-projection",
     "crates/kanbei-testkit",
     "crates/kanbei-telemetry",
+    "crates/kanbei-gc",
     "crates/kanbei-guest",
     "crates/kanbei-vm",
     "crates/kanbei-capabilities",
@@ -37,6 +38,7 @@ default-members = [
     "crates/kanbei-projection",
     "crates/kanbei-testkit",
     "crates/kanbei-telemetry",
+    "crates/kanbei-gc",
     "crates/kanbei-vm",
     "crates/kanbei-capabilities",
     "crates/kanbei-context",
@@ -64,6 +66,7 @@ kanbei-objects = { path = "crates/kanbei-objects" }
 kanbei-session = { path = "crates/kanbei-session" }
 kanbei-snapshot = { path = "crates/kanbei-snapshot" }
 kanbei-telemetry = { path = "crates/kanbei-telemetry" }
+kanbei-gc = { path = "crates/kanbei-gc" }
 kanbei-projection = { path = "crates/kanbei-projection" }
 kanbei-vm = { path = "crates/kanbei-vm" }
 kanbei-capabilities = { path = "crates/kanbei-capabilities" }

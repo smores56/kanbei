@@ -551,6 +551,35 @@ impl MemoryRootActor {
         &self.store
     }
 
+    /// M8 wave 2: automatic canonical-object GC over this scope's store —
+    /// the transition log is the reference authority (every committed root
+    /// manifest is referenced by its envelope's refs), expanded through each
+    /// manifest's claim/edge digest fields, plus the live head and fold
+    /// digests. The engine quarantines unreferenced objects, then sweeps
+    /// quarantine files past the grace age (re-validating the log against
+    /// concurrent writers from other sessions at sweep time).
+    pub fn run_gc(&mut self, config: kanbei_gc::GcConfig) -> Result<kanbei_gc::GcReport, MemoryError> {
+        let log_path = self.dir.join("transitions.jsonl.zst");
+        let fold_digests = match self.fold(self.head) {
+            Ok(fold) => fold
+                .claims
+                .iter()
+                .map(|(d, _)| *d)
+                .chain(fold.edges.iter().map(|(d, _)| *d))
+                .chain(fold.retracted.iter().map(|(d, _)| *d))
+                .chain(fold.history.iter().copied())
+                .collect(),
+            // A fold failure (pre-existing missing object) never blocks GC:
+            // the log walk already covers every committed manifest and its
+            // closure.
+            Err(_) => Vec::new(),
+        };
+        let collector = kanbei_gc::MemoryCollector::new(&log_path, self.head, fold_digests);
+        let no_pins = |_: &Digest| false;
+        kanbei_gc::GcRun::execute(&mut self.store, &collector, &no_pins, &config)
+            .map_err(MemoryError::from)
+    }
+
     /// The scope this actor owns.
     pub fn scope(&self) -> &MemoryScope {
         &self.scope

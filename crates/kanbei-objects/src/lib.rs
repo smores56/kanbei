@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use kanbei_core::digest::Digest;
 use kanbei_core::queue::{DurabilityQueue, SyncOp};
@@ -99,11 +100,15 @@ impl ObjectStore {
     }
 
     /// All object digests on disk, sorted. Entries that don't parse as a
-    /// digest (e.g. `.tmp-*` orphans from crashes) are ignored by design.
+    /// digest (e.g. `.tmp-*` orphans from crashes) are ignored by design;
+    /// directories (the `.gc/` quarantine sibling) are never objects.
     pub fn scan(&self) -> io::Result<Vec<Digest>> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
             if let Some(name) = entry.file_name().to_str()
                 && let Ok(digest) = Digest::from_hex(name)
             {
@@ -121,6 +126,111 @@ impl ObjectStore {
         let total = on_disk.len() as u64;
         let orphans = on_disk.iter().filter(|d| !referenced.contains(d)).count() as u64;
         Ok((orphans, total))
+    }
+
+    // ---------- M8 wave 2 GC: quarantine + sweep ----------
+
+    /// The quarantine directory, a sibling of the store dir: `<dir>/.gc/`.
+    /// Quarantine lives OUTSIDE the store's flat namespace so `scan()`
+    /// (and the M7 usage check over it) never sees quarantined objects.
+    fn gc_dir(&self) -> PathBuf {
+        self.dir.join(".gc")
+    }
+
+    /// Moves `digests` out of the store into quarantine (`.gc/<name>`, same
+    /// filesystem, atomic rename per object). Missing objects are ignored —
+    /// idempotent across crash/reopen. Returns the digests actually moved.
+    pub fn quarantine(&mut self, digests: &[Digest]) -> io::Result<Vec<Digest>> {
+        if digests.is_empty() {
+            return Ok(Vec::new());
+        }
+        std::fs::create_dir_all(self.gc_dir())?;
+        let mut moved = Vec::new();
+        for digest in digests {
+            let src = self.path_for(digest);
+            let dst = self.gc_dir().join(digest.to_string());
+            match std::fs::rename(&src, &dst) {
+                Ok(()) => moved.push(*digest),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(moved)
+    }
+
+    /// All quarantined digests, sorted. An absent quarantine directory is
+    /// the empty set (idempotent).
+    pub fn quarantined(&self) -> io::Result<Vec<Digest>> {
+        let mut out = Vec::new();
+        match std::fs::read_dir(self.gc_dir()) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if let Some(name) = entry.file_name().to_str()
+                        && let Ok(digest) = Digest::from_hex(name)
+                    {
+                        out.push(digest);
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Quarantined digests with their file modification times — the
+    /// quarantine timestamp IS the "last reference" grace clock (the store
+    /// tracks no per-object metadata).
+    pub fn gc_quarantine_meta(&self) -> io::Result<Vec<(Digest, SystemTime)>> {
+        let mut out = Vec::new();
+        match std::fs::read_dir(self.gc_dir()) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if let Some(name) = entry.file_name().to_str()
+                        && let Ok(digest) = Digest::from_hex(name)
+                        && let Ok(meta) = entry.metadata()
+                    {
+                        out.push((digest, meta.modified()?));
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        }
+        out.sort_by_key(|(d, _)| *d);
+        Ok(out)
+    }
+
+    /// Removes `digest` — the quarantine copy when present, else the
+    /// store-dir copy. Missing files are ignored (idempotent); returns
+    /// whether anything was removed.
+    pub fn delete(&mut self, digest: &Digest) -> io::Result<bool> {
+        for path in [self.gc_dir().join(digest.to_string()), self.path_for(digest)] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => return Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Moves the quarantine copy of `digest` back into the store dir.
+    /// No-op when the store-dir copy already exists (the install-dedup
+    /// guarantee: content addressing makes the copies equivalent) or when
+    /// no quarantine copy exists. Returns whether a file was moved.
+    pub fn restore(&mut self, digest: &Digest) -> io::Result<bool> {
+        if self.path_for(digest).exists() {
+            return Ok(false);
+        }
+        match std::fs::rename(self.gc_dir().join(digest.to_string()), self.path_for(digest)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 }
 

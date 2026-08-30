@@ -129,10 +129,28 @@ impl Session {
             .emit();
     }
 
+    /// Emit the "gc" metric: the canonical swept/restored counts of the
+    /// latest GC run (M8 wave 2). No-op without telemetry.
+    pub(crate) fn telemetry_gc(&self, report: &kanbei_gc::GcReport) {
+        let Some(t) = &self.telemetry else {
+            return;
+        };
+        let session_id = self.session_id.to_string();
+        t.metric(
+            "kanbei.gc.swept",
+            report.swept as i64,
+            &[("session_id", AttrValue::Str(session_id.clone()))],
+        );
+        t.metric(
+            "kanbei.gc.restored_or_cleaned",
+            report.restored_or_cleaned as i64,
+            &[("session_id", AttrValue::Str(session_id))],
+        );
+    }
+
     /// Emit the storage gauges (filesystem observations + canonical seq):
     /// objects count/bytes, log bytes/seq, projection bytes.
-    pub(crate) fn telemetry_storage(&self) -> Result<(), SessionError> {
-        let Some(t) = &self.telemetry else {
+    pub(crate) fn telemetry_storage(&self) -> Result<(), SessionError> {        let Some(t) = &self.telemetry else {
             return Ok(());
         };
         let session_id = self.session_id.to_string();
