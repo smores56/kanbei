@@ -19,12 +19,19 @@ kanbei-scheduler.workspace = true
 kanbei-scopes.workspace = true
 kanbei-services.workspace = true
 kanbei-snapshot.workspace = true
+kanbei-telemetry = { workspace = true, optional = true }
 kanbei-tools.workspace = true
 kanbei-ui.workspace = true
 kanbei-vm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[features]
+# M8 wave 1: optional OpenTelemetry-compatible telemetry (correlation
+# spans + storage gauges). Off by default — the default build carries no
+# telemetry fields or dependencies.
+otel = ["dep:kanbei-telemetry"]
 
 [dev-dependencies]
 serde_json.workspace = true

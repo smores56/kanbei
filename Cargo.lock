@@ -1220,6 +1220,7 @@ dependencies = [
  "kanbei-scopes",
  "kanbei-services",
  "kanbei-snapshot",
+ "kanbei-telemetry",
  "kanbei-tools",
  "kanbei-ui",
  "kanbei-vm",
@@ -1236,6 +1237,13 @@ dependencies = [
  "kanbei-objects",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "kanbei-telemetry"
+version = "0.1.0"
+dependencies = [
+ "kanbei-core",
 ]
 
 [[package]]

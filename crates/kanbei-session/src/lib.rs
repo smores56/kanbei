@@ -73,7 +73,12 @@ use kanbei_vm::{GuestError, Host, Vm};
 use serde_json::json;
 use thiserror::Error;
 
+#[cfg(feature = "otel")]
+use kanbei_telemetry::{SpanBuilder, Telemetry};
+
 mod ui;
+#[cfg(feature = "otel")]
+mod telemetry;
 pub use ui::{UiHost, UiIntent, UiOutcome, UI_INTENT_RESOURCE};
 
 /// The bounded recent-event ring size: the trajectory render covers the
@@ -140,6 +145,11 @@ pub struct SessionConfig {
     /// Factory producing a fresh CognitionProvider per spawned child run
     /// (R-09 child runs; None = child.spawn resolves to an error outcome).
     pub child_provider: Option<Box<dyn FnMut() -> Box<dyn kanbei_scheduler::CognitionProvider>>>,
+    // --- M8 wave 1 telemetry (optional; feature `otel`) ---
+    /// Optional OTel-compatible telemetry handle (M8 wave 1); None = no
+    /// telemetry. The `otel` feature only.
+    #[cfg(feature = "otel")]
+    pub telemetry: Option<Telemetry>,
 }
 
 impl Default for SessionConfig {
@@ -168,6 +178,8 @@ impl Default for SessionConfig {
             project: None,
             memory_fault: None,
             child_provider: None,
+            #[cfg(feature = "otel")]
+            telemetry: None,
         }
     }
 }
@@ -474,6 +486,14 @@ pub struct Session {
     memory_fault: Option<Arc<dyn kanbei_memory::MemoryFaultInjector>>,
     /// Child-run provider factory (R-09); None = child.spawn errors.
     child_provider: Option<Box<dyn FnMut() -> Box<dyn kanbei_scheduler::CognitionProvider>>>,
+    // --- M8 wave 1 telemetry (optional; feature `otel`) ---
+    /// The optional OTel-compatible exporter handle (M8 wave 1).
+    #[cfg(feature = "otel")]
+    telemetry: Option<Telemetry>,
+    /// The open run span, closed at run outcome with the terminal status
+    /// + usage attrs; its id parents every commit span while active.
+    #[cfg(feature = "otel")]
+    open_run_span: Option<SpanBuilder>,
 }
 
 impl Session {
@@ -592,6 +612,8 @@ impl Session {
         let breaker_floors = cfg.breaker_floors;
         let provider_config = cfg.provider.clone();
         let session_id = cfg.session_id.unwrap_or_else(Id128::generate);
+        #[cfg(feature = "otel")]
+        let telemetry = cfg.telemetry.take();
 
         // ---- M4 memory substrate wiring (R-11) ----
         // Canonical memory is load-bearing: corrupt memory state is a hard
@@ -876,6 +898,10 @@ impl Session {
             pinned_roots: None,
             memory_fault,
             child_provider,
+            #[cfg(feature = "otel")]
+            telemetry,
+            #[cfg(feature = "otel")]
+            open_run_span: None,
         };
 
         // Root config module: atomic activation; failure → safe mode.
@@ -1110,7 +1136,7 @@ impl Session {
             None => None,
         };
 
-        Ok(CommitReceipt {
+        let receipt = CommitReceipt {
             first_seq: plan.first_seq,
             last_seq: plan.last_seq,
             count: plan.count,
@@ -1118,7 +1144,10 @@ impl Session {
             objects,
             pre_snapshot,
             post_snapshot,
-        })
+        };
+        #[cfg(feature = "otel")]
+        self.telemetry_commit(&receipt);
+        Ok(receipt)
     }
 
     // ---------- M6 historical correction (branching) ----------
@@ -1192,6 +1221,8 @@ impl Session {
             Some(snapshot),
             "checkpoint manifest digest must match the pinned post-snapshot"
         );
+        #[cfg(feature = "otel")]
+        self.telemetry_checkpoint(receipt.last_seq, self.memory_lifetime.head());
         Ok(CheckpointRef {
             session_id: self.session_id,
             seq: receipt.last_seq,
@@ -1332,6 +1363,11 @@ impl Session {
                 }],
                 None,
             )?;
+            #[cfg(feature = "otel")]
+            self.telemetry_close_run(
+                kanbei_scheduler::TerminalOutcome::Failed(kanbei_scheduler::FailureKind::Quiesced),
+                usage,
+            );
         }
         let cancelled: Vec<QuiescedIntent> = self
             .scan_pending_intents()?
@@ -1406,6 +1442,8 @@ impl Session {
             lifetime,
             project: project_memory_root,
         });
+        #[cfg(feature = "otel")]
+        self.telemetry_continue_from(record.transition_seq, &record.id);
         Ok(record)
     }
 
@@ -2279,6 +2317,13 @@ impl Session {
         &self.log_path
     }
 
+    /// The optional OTel-compatible telemetry handle (M8 wave 1; feature
+    /// `otel`).
+    #[cfg(feature = "otel")]
+    pub fn telemetry(&self) -> Option<&Telemetry> {
+        self.telemetry.as_ref()
+    }
+
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }
@@ -2335,6 +2380,8 @@ impl Session {
     /// live instance keeps the host's state store (and its queue clones)
     /// alive; drop or `dispose` it first.
     pub fn close(self) -> Result<(), SessionError> {
+        #[cfg(feature = "otel")]
+        self.telemetry_flush()?;
         let Session {
             log,
             store,

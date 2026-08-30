@@ -112,6 +112,8 @@ impl Session {
     pub fn run_start(&mut self, run_id: RunId) -> Result<RunStart, SessionError> {
         self.fault(crate::FaultPoint::BeforeRunStart);
         let start = self.scheduler.run_start(run_id)?;
+        #[cfg(feature = "otel")]
+        self.telemetry_open_run(run_id);
         self.commit(
             vec![NewEvent {
                 kind: "run_start".into(),
@@ -161,6 +163,12 @@ impl Session {
             });
         }
         self.commit(events, None)?;
+        #[cfg(feature = "otel")]
+        self.telemetry_close_run(outcome, usage);
+        #[cfg(feature = "otel")]
+        self.telemetry_storage()?;
+        #[cfg(feature = "otel")]
+        self.telemetry_flush()?;
         self.fault(crate::FaultPoint::AfterRunOutcome);
         Ok(trip)
     }
@@ -221,6 +229,11 @@ impl Session {
             }],
             None,
         )?;
+        #[cfg(feature = "otel")]
+        self.telemetry_close_run(
+            TerminalOutcome::Failed(kanbei_scheduler::FailureKind::UserCancelled),
+            usage,
+        );
         Ok(Some(record))
     }
 
