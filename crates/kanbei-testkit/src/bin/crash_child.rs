@@ -401,6 +401,8 @@ fn run_m3(dir: String, point: Option<FaultPoint>, after_acks: u64) {
                 input_tokens: 3,
                 output_tokens: 2,
             },
+        discontinuity: None,
+        opaque_artifacts: None,
         }],
     );
 

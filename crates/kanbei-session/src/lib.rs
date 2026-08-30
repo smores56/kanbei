@@ -423,6 +423,10 @@ pub struct Session {
     projection_state: Option<ProjectionState>,
     /// Provider identity of the last model call (R-18/E-07 continuity).
     last_provider: Option<String>,
+    /// (provider identity, opaque artifacts base64) of the last call that
+    /// emitted artifacts (R-18/E-07 same-provider replay; kept even when an
+    /// intervening call emitted none, still paired with its provider).
+    last_opaque: Option<(String, String)>,
     /// (sent stable-prefix digest, memory roots) of the last model call.
     last_cache: Option<(Option<Digest>, Vec<Digest>)>,
     /// Bounded recent-event ring (seq, kind, payload) — the trajectory
@@ -843,6 +847,7 @@ impl Session {
             project_entry,
             projection_state: None,
             last_provider: None,
+            last_opaque: None,
             last_cache: None,
             recent_events: std::collections::VecDeque::new(),
             compacted,

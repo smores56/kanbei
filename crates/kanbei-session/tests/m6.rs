@@ -488,6 +488,8 @@ fn pinned_at_model_call_pins_checkpoint_roots() {
                     input_tokens: 5,
                     output_tokens: 5,
                 },
+                discontinuity: None,
+                opaque_artifacts: None,
             }],
         ))),
         session_id: Some(session_id),
@@ -767,5 +769,212 @@ fn continue_from_rejects_unknown_pinned_root() {
         !envs.iter().any(|e| e.kind == "branch_transition"),
         "no branch_transition may follow a rejected checkpoint"
     );
+    session.close().unwrap();
+}
+
+// --- 8. M6 wave 3: discontinuity flags + opaque artifact replay ------------
+
+/// One scripted response; the new fields default to None.
+fn scripted(
+    content: &str,
+    discontinuity: Option<&str>,
+    opaque_artifacts: Option<&str>,
+) -> kanbei_provider::CompletionResponse {
+    kanbei_provider::CompletionResponse {
+        content: Some(content.into()),
+        tool_calls: vec![],
+        finish_reason: kanbei_provider::FinishReason::Stop,
+        usage: kanbei_provider::Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+        },
+        discontinuity: discontinuity.map(|s| s.into()),
+        opaque_artifacts: opaque_artifacts.map(|s| s.into()),
+    }
+}
+
+fn probe_msg() -> Vec<kanbei_provider::Message> {
+    vec![kanbei_provider::Message {
+        role: kanbei_provider::Role::User,
+        content: "probe".into(),
+        tool_call_id: None,
+    }]
+}
+
+/// A cloneable engine handle so two sessions share one FakeEngine request
+/// log (asserting what each call actually received).
+#[derive(Clone)]
+struct SharedFake(Arc<kanbei_provider::FakeEngine>);
+
+impl kanbei_provider::ProviderEngine for SharedFake {
+    fn complete(
+        &self,
+        req: &kanbei_provider::CompletionRequest,
+    ) -> Result<kanbei_provider::CompletionResponse, kanbei_provider::ProviderError> {
+        self.0.complete(req)
+    }
+
+    fn identity(&self) -> &str {
+        self.0.identity()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self.0.as_any()
+    }
+}
+
+#[test]
+fn model_flagged_discontinuity_records_reason() {
+    let dir = TempDir::new("w3-flag");
+    let mut session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        provider: Some(fake_config("fake-a")),
+        provider_engine: Some(Box::new(kanbei_provider::FakeEngine::new(
+            fake_config("fake-a"),
+            vec![scripted("answer", Some("projection"), None)],
+        ))),
+        ..Default::default()
+    })
+    .unwrap();
+    let (run, _) = setup_run(&mut session);
+    session
+        .model_call(run, probe_msg(), Vec::new(), "rendered probe")
+        .unwrap();
+    let envs = envelopes(session.log_path());
+    let outcome = envs
+        .iter()
+        .find(|e| e.kind == "model_outcome")
+        .expect("one model outcome");
+    // the model's own flag wins over the provider-change heuristic: Broken
+    // against the CURRENT provider, with the raw flag as the reason
+    assert_eq!(
+        outcome.payload["reasoning_continuity"],
+        json!({"Broken": {"from_provider": "fake-a", "at_event": outcome.seq, "reason": "projection"}})
+    );
+    assert_eq!(outcome.payload["discontinuity"], json!("projection"));
+    session.close().unwrap();
+}
+
+#[test]
+fn same_provider_without_flag_stays_continuous() {
+    let dir = TempDir::new("w3-cont");
+    let mut session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        provider: Some(fake_config("fake-a")),
+        provider_engine: Some(Box::new(kanbei_provider::FakeEngine::new(
+            fake_config("fake-a"),
+            vec![scripted("a", None, None), scripted("b", None, None)],
+        ))),
+        ..Default::default()
+    })
+    .unwrap();
+    let (run, _) = setup_run(&mut session);
+    session
+        .model_call(run, probe_msg(), Vec::new(), "rendered")
+        .unwrap();
+    session
+        .model_call(run, probe_msg(), Vec::new(), "rendered")
+        .unwrap();
+    let envs = envelopes(session.log_path());
+    let outs: Vec<_> = envs.iter().filter(|e| e.kind == "model_outcome").collect();
+    assert_eq!(outs.len(), 2);
+    // first call breaks from "none" (no reason recorded), the second —
+    // same provider, no flag — is Continuous
+    assert_eq!(
+        outs[0].payload["reasoning_continuity"],
+        json!({"Broken": {"from_provider": "none", "at_event": outs[0].seq, "reason": null}})
+    );
+    assert_eq!(outs[1].payload["reasoning_continuity"], json!("Continuous"));
+    session.close().unwrap();
+}
+
+#[test]
+fn opaque_artifacts_replay_same_provider_only() {
+    let shared = SharedFake(Arc::new(kanbei_provider::FakeEngine::new(
+        fake_config("fake-a"),
+        vec![
+            scripted("a", None, Some("Ymxvcg==")),
+            scripted("b", None, None),
+            scripted("c", None, None),
+        ],
+    )));
+    let dir = TempDir::new("w3-art-a");
+    let mut session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        provider: Some(fake_config("fake-a")),
+        provider_engine: Some(Box::new(shared.clone())),
+        ..Default::default()
+    })
+    .unwrap();
+    let (run, _) = setup_run(&mut session);
+    session
+        .model_call(run, probe_msg(), Vec::new(), "rendered")
+        .unwrap();
+    session
+        .model_call(run, probe_msg(), Vec::new(), "rendered")
+        .unwrap();
+    // a different provider (fresh session with its own config, the gate_m4
+    // pattern) must never receive the artifacts — cross-provider transfer
+    // is prohibited (E-07, transferability default NONE)
+    let dir2 = TempDir::new("w3-art-b");
+    let mut session_b = Session::open(SessionConfig {
+        dir: dir2.path().to_path_buf(),
+        provider: Some(fake_config("fake-b")),
+        provider_engine: Some(Box::new(shared.clone())),
+        ..Default::default()
+    })
+    .unwrap();
+    let (run_b, _) = setup_run(&mut session_b);
+    session_b
+        .model_call(run_b, probe_msg(), Vec::new(), "rendered")
+        .unwrap();
+    // the outcome record carries the emitted artifacts verbatim
+    let envs = envelopes(session.log_path());
+    let outs: Vec<_> = envs.iter().filter(|e| e.kind == "model_outcome").collect();
+    assert_eq!(outs.len(), 2);
+    assert_eq!(outs[0].payload["opaque_artifacts"], json!("Ymxvcg=="));
+    assert!(outs[0].payload["discontinuity"].is_null());
+    // the shared request log: emitted on call 1, replayed on call 2 (same
+    // provider), never sent to the other provider on call 3
+    let reqs = shared.0.requests.lock().unwrap();
+    assert_eq!(reqs.len(), 3);
+    assert_eq!(reqs[0].opaque_artifacts, None);
+    assert_eq!(reqs[1].opaque_artifacts.as_deref(), Some("Ymxvcg=="));
+    assert_eq!(reqs[2].opaque_artifacts, None);
+    session.close().unwrap();
+    session_b.close().unwrap();
+}
+
+#[test]
+fn opaque_artifacts_round_trip_byte_exact() {
+    // base64 of bytes 0..=255: any re-encoding or truncation corrupts it
+    const ALL_BYTES: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==";
+    let shared = SharedFake(Arc::new(kanbei_provider::FakeEngine::new(
+        fake_config("fake-a"),
+        vec![scripted("a", None, Some(ALL_BYTES)), scripted("b", None, None)],
+    )));
+    let dir = TempDir::new("w3-exact");
+    let mut session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        provider: Some(fake_config("fake-a")),
+        provider_engine: Some(Box::new(shared.clone())),
+        ..Default::default()
+    })
+    .unwrap();
+    let (run, _) = setup_run(&mut session);
+    session
+        .model_call(run, probe_msg(), Vec::new(), "rendered")
+        .unwrap();
+    session
+        .model_call(run, probe_msg(), Vec::new(), "rendered")
+        .unwrap();
+    let envs = envelopes(session.log_path());
+    let outs: Vec<_> = envs.iter().filter(|e| e.kind == "model_outcome").collect();
+    // byte-exact in the canonical record (S9 acceptance)
+    assert_eq!(outs[0].payload["opaque_artifacts"], json!(ALL_BYTES));
+    // and byte-exact in the replay the same-provider call received
+    let reqs = shared.0.requests.lock().unwrap();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[1].opaque_artifacts.as_deref(), Some(ALL_BYTES));
     session.close().unwrap();
 }

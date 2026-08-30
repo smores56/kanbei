@@ -51,6 +51,11 @@ pub enum ReasoningContinuity {
     Broken {
         from_provider: String,
         at_event: u64,
+        /// The model's own flag when it reported its reasoning does not
+        /// follow from the projection (R-18/E-07); None on provider-change
+        /// breaks. Old records without the field deserialize as None.
+        #[serde(default)]
+        reason: Option<String>,
     },
 }
 

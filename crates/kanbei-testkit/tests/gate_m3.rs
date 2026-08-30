@@ -172,6 +172,8 @@ fn spine_commits_canonical_run_records() {
                 input_tokens: 3,
                 output_tokens: 2,
             },
+        discontinuity: None,
+        opaque_artifacts: None,
         }],
     );
     let outcome = run_spine(
@@ -352,6 +354,8 @@ fn responder_priority_cancels_background_cognition() {
                 input_tokens: 1,
                 output_tokens: 1,
             },
+        discontinuity: None,
+        opaque_artifacts: None,
         }],
     );
     // Background cognition wake accepted first.
@@ -420,6 +424,8 @@ fn budget_exhaustion_records_explicit_blocked() {
                 input_tokens: 3,
                 output_tokens: 2,
             },
+        discontinuity: None,
+        opaque_artifacts: None,
         }],
     );
     // tiny token budget — the single model call already exceeds it
@@ -524,6 +530,8 @@ fn consistency_15_spine_leaves_scopes_intact() {
                 input_tokens: 1,
                 output_tokens: 1,
             },
+        discontinuity: None,
+        opaque_artifacts: None,
         }],
     );
     // Before: the root scope with no children.

@@ -110,6 +110,10 @@ pub struct CompletionRequest {
     pub tools: Vec<Value>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// R-18/E-07: opaque reasoning artifacts replayed from the previous
+    /// same-provider call (base64, verbatim; never sent cross-provider).
+    #[serde(default)]
+    pub opaque_artifacts: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,6 +122,14 @@ pub struct CompletionResponse {
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
     pub usage: Usage,
+    /// R-18/E-07: the model's flag that its reasoning does not follow from
+    /// the projection (free-form reason, e.g. "projection").
+    #[serde(default)]
+    pub discontinuity: Option<String>,
+    /// R-18/E-07: opaque reasoning artifact bytes (base64). Stored verbatim;
+    /// the kernel never interprets them.
+    #[serde(default)]
+    pub opaque_artifacts: Option<String>,
 }
 
 // ---------- engine seam ----------
@@ -335,13 +347,19 @@ pub fn parse_openai_response(
         tool_calls,
         finish_reason: finish,
         usage,
+        // The OpenAI wire format carries no discontinuity/artifact fields
+        // (R-18/E-07: opaque artifacts are provider-specific extensions).
+        discontinuity: None,
+        opaque_artifacts: None,
     })
 }
 
 // ---------- deterministic fake engine (gate/tests) ----------
 
 /// Scripted deterministic engine for the gate: returns the next queued
-/// response, records every request for assertions. No network.
+/// response, records every request for assertions. No network. Scripted
+/// responses may carry `discontinuity`/`opaque_artifacts` (R-18/E-07); the
+/// request log captures what each call received (`requests[i].opaque_artifacts`).
 pub struct FakeEngine {
     cfg: ProviderConfig,
     responses: std::sync::Mutex<std::collections::VecDeque<CompletionResponse>>,
@@ -603,6 +621,8 @@ mod tests {
                     input_tokens: 1,
                     output_tokens: 1,
                 },
+                discontinuity: None,
+                opaque_artifacts: None,
             }],
         );
         let req = CompletionRequest {
@@ -615,6 +635,7 @@ mod tests {
             tools: vec![],
             temperature: None,
             max_tokens: None,
+            opaque_artifacts: None,
         };
         let r = engine.complete(&req).unwrap();
         assert_eq!(r.content.as_deref(), Some("hi"));

@@ -326,6 +326,12 @@ impl Session {
                 .unwrap_or_default(),
             temperature,
             max_tokens,
+            // R-18/E-07: opaque reasoning artifacts replay only to the same
+            // provider (transferability default: NONE, architecture E-07).
+            opaque_artifacts: match &self.last_opaque {
+                Some((prev, artifacts)) if *prev == provider => Some(artifacts.clone()),
+                _ => None,
+            },
         };
         let response = engine
             .complete(&request)
@@ -385,12 +391,24 @@ impl Session {
         // provider change, at this outcome event's seq (the next commit is
         // the outcome; single writer).
         let at_event = self.next_seq;
-        let continuity = match &self.last_provider {
-            Some(prev) if *prev == provider => ReasoningContinuity::Continuous,
-            _ => ReasoningContinuity::Broken {
-                from_provider: self.last_provider.clone().unwrap_or_else(|| "none".into()),
+        // R-18/E-07: the model's own discontinuity flag takes precedence over
+        // the provider-change heuristic — its reasoning does not follow from
+        // the projection even on the same provider.
+        let continuity = if let Some(flag) = &response.discontinuity {
+            ReasoningContinuity::Broken {
+                from_provider: provider.clone(),
                 at_event,
-            },
+                reason: Some(flag.clone()),
+            }
+        } else {
+            match &self.last_provider {
+                Some(prev) if *prev == provider => ReasoningContinuity::Continuous,
+                _ => ReasoningContinuity::Broken {
+                    from_provider: self.last_provider.clone().unwrap_or_else(|| "none".into()),
+                    at_event,
+                    reason: None,
+                },
+            }
         };
         let outcome = json!({
             "provider": provider_id,
@@ -404,6 +422,12 @@ impl Session {
                 .map_err(|e| SessionError::InvalidInput(format!("cache outcome: {e}")))?,
             "reasoning_continuity": serde_json::to_value(&continuity)
                 .map_err(|e| SessionError::InvalidInput(format!("continuity: {e}")))?,
+            // R-18/E-07: the opaque artifact round-trip is byte-exact — the
+            // base64 string is recorded verbatim (S9 acceptance); the raw
+            // discontinuity flag is kept for audit. Artifacts never enter
+            // the projection/context.
+            "opaque_artifacts": response.opaque_artifacts,
+            "discontinuity": response.discontinuity,
             "egress": EgressEntry {
                 provider: provider.clone(),
                 sensitivity_classes: vec!["call".into()],
@@ -435,6 +459,12 @@ impl Session {
                 .map(|p| p.memory_roots.clone())
                 .unwrap_or_default(),
         ));
+        // R-18/E-07: keep the last artifacts paired with their provider — a
+        // later same-provider call replays them even when an intervening call
+        // emitted none; cross-provider transfer stays prohibited.
+        if let Some(artifacts) = &response.opaque_artifacts {
+            self.last_opaque = Some((provider.clone(), artifacts.clone()));
+        }
         self.last_provider = Some(provider);
         self.scheduler.record_usage(
             run_id,

@@ -73,6 +73,8 @@ fn response(content: &str, input: u64, output: u64) -> CompletionResponse {
             input_tokens: input,
             output_tokens: output,
         },
+    discontinuity: None,
+    opaque_artifacts: None,
     }
 }
 
