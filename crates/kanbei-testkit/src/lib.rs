@@ -7,6 +7,7 @@
 
 pub mod rng;
 pub mod dogfood;
+pub mod probes;
 pub mod fixture;
 
 use std::collections::HashSet;
@@ -952,30 +953,6 @@ pub fn verify_m4_recovery(dir: &Path, acked: u64) -> Result<usize, String> {
     Ok(checks)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::rng::Rng;
-
-    #[test]
-    fn rng_deterministic_same_seed() {
-        let mut a = Rng::new(42);
-        let mut b = Rng::new(42);
-        for _ in 0..1000 {
-            assert_eq!(a.next_u64(), b.next_u64());
-        }
-    }
-
-    #[test]
-    fn rng_different_seeds_differ_and_bounds_hold() {
-        assert_ne!(Rng::new(1).next_u64(), Rng::new(2).next_u64());
-        let mut r = Rng::new(0x4B41_4E42_4549);
-        for _ in 0..100 {
-            assert!(r.next_usize(10) < 10);
-            assert!((0.0..1.0).contains(&r.next_f64()));
-        }
-        assert_eq!(r.next_usize(0), 0);
-    }
-}
 
 /// M5 recovery verifier: the UI boundary produces no canonical gestures, the
 /// activation is an atomic composition publish, and the session reopens with
@@ -1293,3 +1270,29 @@ pub fn verify_m6_recovery(dir: &Path, acked: u64, reopen_extra: u64) -> Result<u
 
     Ok(checks)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::rng::Rng;
+
+    #[test]
+    fn rng_deterministic_same_seed() {
+        let mut a = Rng::new(42);
+        let mut b = Rng::new(42);
+        for _ in 0..1000 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+    }
+
+    #[test]
+    fn rng_different_seeds_differ_and_bounds_hold() {
+        assert_ne!(Rng::new(1).next_u64(), Rng::new(2).next_u64());
+        let mut r = Rng::new(0x4B41_4E42_4549);
+        for _ in 0..100 {
+            assert!(r.next_usize(10) < 10);
+            assert!((0.0..1.0).contains(&r.next_f64()));
+        }
+        assert_eq!(r.next_usize(0), 0);
+    }
+}
+

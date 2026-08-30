@@ -36,7 +36,7 @@ pub fn tool_env() -> Value {
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     json!({
-        "PATH": format!("{path}"),
+        "PATH": path,
         "HOME": home,
     })
 }

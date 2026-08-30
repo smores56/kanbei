@@ -132,7 +132,6 @@ pub fn battery_session(
             tokens: Some(500_000),
             tools: Some(200),
             children: Some(0),
-            ..Default::default()
         },
         breaker_floors: BreakerFloors::default(),
         ..Default::default()
@@ -163,6 +162,7 @@ impl kanbei_scheduler::CognitionProvider for ScriptedProvider {
 
 /// Drive one accepted wake with the given plan; renders through the real
 /// projection pipeline. Returns the terminal outcome.
+#[allow(clippy::result_large_err)]
 pub fn run_wake(session: &mut Session, plan: Vec<StepCommand>) -> TerminalOutcome {
     session.observe_trigger(Trigger {
         kind: TriggerKind::NewCausalEvent,
@@ -543,12 +543,12 @@ pub fn collect_facts(dir: &Path) -> SessionFacts {
                 if let Some(id) = env.payload["call_id"].as_str() {
                     outcomed.push(id.to_string());
                 }
-                if env.payload["tool"].as_str() == Some("memory.query") {
-                    if let Some(claims) = env.payload["result"]["claims"].as_array() {
-                        for c in claims {
-                            if let Some(content) = c.get("text").and_then(|v| v.as_str()) {
-                                facts.memory_query_hits.push(content.to_string());
-                            }
+                if env.payload["tool"].as_str() == Some("memory.query")
+                    && let Some(claims) = env.payload["result"]["claims"].as_array()
+                {
+                    for c in claims {
+                        if let Some(content) = c.get("text").and_then(|v| v.as_str()) {
+                            facts.memory_query_hits.push(content.to_string());
                         }
                     }
                 }
@@ -564,10 +564,10 @@ pub fn collect_facts(dir: &Path) -> SessionFacts {
     for env in crate::collect_envelopes(dir).unwrap() {
         if env.kind == "tool_intent" {
             let payload = resolve_payload(store.as_ref(), dir, &env);
-            if let Some(id) = payload["call_id"].as_str() {
-                if !outcomed.iter().any(|o| o == id) {
-                    facts.unoutcomed_intents.push(id.to_string());
-                }
+            if let Some(id) = payload["call_id"].as_str()
+                && !outcomed.iter().any(|o| o == id)
+            {
+                facts.unoutcomed_intents.push(id.to_string());
             }
         }
     }
@@ -581,14 +581,12 @@ fn resolve_payload(store: Option<&kanbei_objects::ObjectStore>, _dir: &Path, env
     let Some(marker) = env.payload.get("$object").and_then(|o| o.as_str()) else {
         return env.payload.clone();
     };
-    if let Some(store) = store {
-        if let Ok(digest) = kanbei_core::digest::Digest::from_hex(marker) {
-            if let Ok(bytes) = store.get(&digest) {
-                if let Ok(v) = serde_json::from_slice(&bytes) {
-                    return v;
-                }
-            }
-        }
+    if let Some(store) = store
+        && let Ok(digest) = kanbei_core::digest::Digest::from_hex(marker)
+        && let Ok(bytes) = store.get(&digest)
+        && let Ok(v) = serde_json::from_slice(&bytes)
+    {
+        return v;
     }
     env.payload.clone()
 }
@@ -635,8 +633,9 @@ pub fn verify_dogfood_recovery(
     // The post-event manifest closure (M6): the checkpoint payload's digest
     // must verify against the store when a checkpoint exists.
     for env in &evs {
-        if env.kind == "checkpoint_created" {
-            if let Some(digest) = env.payload.get("manifest_digest").and_then(|d| d.as_str()) {
+        if env.kind == "checkpoint_created"
+            && let Some(digest) = env.payload.get("manifest_digest").and_then(|d| d.as_str())
+        {
                 let digest = Digest::from_hex(digest).map_err(|e| e.to_string())?;
                 let manifest_bytes = store
                     .get(&digest)
@@ -647,7 +646,6 @@ pub fn verify_dogfood_recovery(
                 kanbei_snapshot::verify_closure(&store, &refs).map_err(|e| e.to_string())?;
             }
         }
-    }
     // Reopen + append still works.
     session
         .commit(
@@ -1017,7 +1015,6 @@ pub fn run_spend_scenario(root: &Path) -> (Option<(u64, u64, bool)>, SessionFact
             tokens: Some(500_000),
             tools: Some(50),
             children: Some(0),
-            ..Default::default()
         },
         breaker_floors: BreakerFloors {
             spend_window_secs: 60,

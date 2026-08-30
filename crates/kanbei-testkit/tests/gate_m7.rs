@@ -39,7 +39,7 @@ fn fresh_root(tag: &str) -> TempRoot {
 }
 
 /// Run a command the way the battery does (cleared env + PATH/HOME).
-fn run_in(repo: &PathBuf, args: &[&str]) -> (bool, String) {
+fn run_in(repo: &std::path::Path, args: &[&str]) -> (bool, String) {
     let out = std::process::Command::new(args[0])
         .args(&args[1..])
         .current_dir(repo)
@@ -54,21 +54,21 @@ fn run_in(repo: &PathBuf, args: &[&str]) -> (bool, String) {
     )
 }
 
-fn file(repo: &PathBuf, name: &str) -> String {
+fn file(repo: &std::path::Path, name: &str) -> String {
     std::fs::read_to_string(repo.join(name)).unwrap()
 }
 
-fn git_log(repo: &PathBuf) -> Vec<String> {
+fn git_log(repo: &std::path::Path) -> Vec<String> {
     let (_, out) = run_in(repo, &["git", "log", "--oneline"]);
     out.lines().map(|l| l.to_string()).collect()
 }
 
-fn git_show_stat(repo: &PathBuf) -> String {
+fn git_show_stat(repo: &std::path::Path) -> String {
     let (_, out) = run_in(repo, &["git", "show", "--stat", "--format=%s", "HEAD"]);
     out
 }
 
-fn unittest(repo: &PathBuf, module: &str) -> bool {
+fn unittest(repo: &std::path::Path, module: &str) -> bool {
     run_in(repo, &[&python_path(), "-m", "unittest", module]).0
 }
 

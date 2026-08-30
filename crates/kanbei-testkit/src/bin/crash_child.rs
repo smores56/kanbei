@@ -985,6 +985,7 @@ fn run_m7() {
         commands: task6_plan().into(),
         next: 1,
     };
+    #[allow(clippy::result_large_err)]
     let _outcome: TerminalOutcome = session
         .cognition_loop(run_id, trigger.clone(), &mut provider, |s| {
             s.project_context(run_id, &trigger)

@@ -344,7 +344,7 @@ fn kernel_render_fault_falls_back() {
     session.ui_handle_input(b"x").unwrap();
 
     // A real pty: raw mode entered, then a failing terminal write → fallback.
-    let (mut master, slave) = openpty().unwrap();
+    let (master, slave) = openpty().unwrap();
     let mut term = TermiosTerminal::open(slave).unwrap();
     {
         let _guard = kanbei_ui::TerminalGuard::new(&mut term).unwrap();
@@ -371,7 +371,7 @@ fn kernel_render_fault_falls_back() {
 /// crash (guard dropped mid-raw).
 #[test]
 fn terminal_restoration_reliable() {
-    let (mut master, slave) = openpty().unwrap();
+    let (master, slave) = openpty().unwrap();
     {
         let mut term = TermiosTerminal::open(slave).unwrap();
         {
