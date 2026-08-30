@@ -644,7 +644,10 @@ fn acceptance_crash_m2_points() {
                 | FaultPoint::BeforeToolOutcomeCommit
                 | FaultPoint::AfterToolOutcomeCommit
                 | FaultPoint::BeforeRunOutcome
-                | FaultPoint::AfterRunOutcome => false,
+                | FaultPoint::AfterRunOutcome
+                // M4 memory points never fire in the M2 child
+                | FaultPoint::BeforeMemoryProposal
+                | FaultPoint::AfterMemoryProposal => false,
             };
             if fires {
                 assert_eq!(

@@ -6,12 +6,15 @@ publish.workspace = true
 
 [dependencies]
 kanbei-capabilities.workspace = true
+kanbei-context.workspace = true
 kanbei-core.workspace = true
 kanbei-log.workspace = true
+kanbei-memory.workspace = true
 kanbei-modules.workspace = true
 kanbei-objects.workspace = true
 kanbei-policy.workspace = true
 kanbei-provider.workspace = true
+kanbei-retrieval.workspace = true
 kanbei-scheduler.workspace = true
 kanbei-scopes.workspace = true
 kanbei-services.workspace = true
@@ -23,6 +26,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 kanbei-capabilities.workspace = true
 kanbei-core.workspace = true
 kanbei-log.workspace = true
@@ -32,4 +36,3 @@ kanbei-scopes.workspace = true
 kanbei-services.workspace = true
 kanbei-snapshot.workspace = true
 kanbei-vm.workspace = true
-serde_json.workspace = true

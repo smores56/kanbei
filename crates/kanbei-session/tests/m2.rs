@@ -17,8 +17,12 @@ use kanbei_core::id::Id128;
 use kanbei_log::for_each_frame;
 use kanbei_modules::{ModuleError, ModuleOrigin, PackageManifest};
 use kanbei_policy::builtins::PatternRedactionPolicy;
-use kanbei_policy::{Admission, Candidate, CandidateRole, PolicyError, PolicyPlugin, RetentionDecision};
-use kanbei_services::{ScopePath, ServiceContract, ServiceDependency, ServiceError, ServiceKey, ServiceProvider};
+use kanbei_policy::{
+    Admission, Candidate, CandidateRole, PolicyError, PolicyPlugin, RetentionDecision,
+};
+use kanbei_services::{
+    ScopePath, ServiceContract, ServiceDependency, ServiceError, ServiceKey, ServiceProvider,
+};
 use kanbei_session::{FaultInjector, FaultPoint, NewEvent, Session, SessionConfig, SessionError};
 use kanbei_snapshot::ExecutionManifest;
 use kanbei_vm::{GuestError, Vm, VmConfig};
@@ -104,7 +108,11 @@ fn manifest(id: Id128, source: &str, deps: Vec<ServiceDependency>) -> PackageMan
 }
 
 fn open(dir: &Path) -> Session {
-    Session::open(SessionConfig { dir: dir.to_path_buf(), ..Default::default() }).unwrap()
+    Session::open(SessionConfig {
+        dir: dir.to_path_buf(),
+        ..Default::default()
+    })
+    .unwrap()
 }
 
 fn event(kind: &str, payload: Value) -> NewEvent {
@@ -194,7 +202,9 @@ end
 /// the module pin + composition digest (schema 2).
 #[test]
 fn activate_config_publishes_service_and_composition() {
-    if !require_guest() { return };
+    if !require_guest() {
+        return;
+    };
     let dir = TempDir::new("activate");
     let id = Id128::generate();
     let m = manifest(id, PUBLISHER, vec![]);
@@ -224,10 +234,12 @@ fn activate_config_publishes_service_and_composition() {
     // digest ref is closure-valid)
     assert!(session.store().exists(&session.composition().digest));
     // the post-event manifest carries the module pin + composition (schema 2)
-    let manifest_digest = session.current_snapshot().expect("state change pins a manifest");
+    let manifest_digest = session
+        .current_snapshot()
+        .expect("state change pins a manifest");
     let bytes = session.store().get(&manifest_digest).unwrap();
     let manifest: ExecutionManifest = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(manifest.schema, 3);
+    assert_eq!(manifest.schema, 4);
     assert_eq!(manifest.module_abi, Some(1));
     assert_eq!(manifest.modules.len(), 1);
     assert_eq!(manifest.modules[0].module_id, id);
@@ -246,7 +258,10 @@ fn activate_config_publishes_service_and_composition() {
     assert_eq!(envs.len(), 1);
     assert_eq!(envs[0].kind, "composition_changed");
     assert_eq!(envs[0].payload["epoch"], 1);
-    assert_eq!(envs[0].payload["delta"]["added"][0]["module_id"], id.to_string());
+    assert_eq!(
+        envs[0].payload["delta"]["added"][0]["module_id"],
+        id.to_string()
+    );
     assert_eq!(envs[0].payload["delta"]["added"][0]["generation"], 1);
     assert_eq!(envs[0].payload["delta"]["removed"], json!([]));
     assert_eq!(envs[0].payload["scope"], "/");
@@ -257,7 +272,9 @@ fn activate_config_publishes_service_and_composition() {
 /// no composition_changed event, the failing module never registers.
 #[test]
 fn activate_config_conflict_retains_epoch() {
-    if !require_guest() { return };
+    if !require_guest() {
+        return;
+    };
     let dir = TempDir::new("conflict");
     let mut session = Session::open(SessionConfig {
         dir: dir.path().to_path_buf(),
@@ -283,8 +300,13 @@ fn activate_config_conflict_retains_epoch() {
         .publish(svc_key("greeter"), holder)
         .unwrap();
     let id = Id128::generate();
-    let err = session.activate_config(manifest(id, PUBLISHER, vec![])).unwrap_err();
-    assert!(matches!(err, SessionError::Module(ModuleError::Activation(_))), "got {err:?}");
+    let err = session
+        .activate_config(manifest(id, PUBLISHER, vec![]))
+        .unwrap_err();
+    assert!(
+        matches!(err, SessionError::Module(ModuleError::Activation(_))),
+        "got {err:?}"
+    );
     // atomic publish: epoch untouched, nothing on the log
     assert_eq!(session.composition().epoch, 0);
     let recovered = kanbei_log::recover(&dir.path().join("log.zst")).unwrap();
@@ -298,7 +320,9 @@ fn activate_config_conflict_retains_epoch() {
 /// composition_changed delta records removed + added.
 #[test]
 fn replace_module_swaps_generation_and_records_delta() {
-    if !require_guest() { return };
+    if !require_guest() {
+        return;
+    };
     let dir = TempDir::new("replace");
     let id = Id128::generate();
     let mut session = Session::open(SessionConfig {
@@ -308,13 +332,20 @@ fn replace_module_swaps_generation_and_records_delta() {
         ..Default::default()
     })
     .unwrap();
-    let outcome = session.replace_module(id, manifest(id, REPLACER, vec![])).unwrap();
+    let outcome = session
+        .replace_module(id, manifest(id, REPLACER, vec![]))
+        .unwrap();
     assert_eq!(outcome.old.generation, 1);
     assert_eq!(outcome.new.generation, 2);
     assert!(outcome.rebind.is_empty());
     // the old contract version is gone, the new one resolves
     let reg = session.modules().unwrap().services();
-    let provider = reg.lock().unwrap().resolve(&svc_key("greeter"), 2, &root()).unwrap().clone();
+    let provider = reg
+        .lock()
+        .unwrap()
+        .resolve(&svc_key("greeter"), 2, &root())
+        .unwrap()
+        .clone();
     assert_eq!(provider.module_id, id);
     assert_eq!(provider.generation, 2);
     assert!(matches!(
@@ -329,8 +360,13 @@ fn replace_module_swaps_generation_and_records_delta() {
     assert_eq!(envs[1].payload["delta"]["added"][0]["generation"], 2);
     assert_eq!(envs[1].payload["delta"]["removed"][0]["generation"], 1);
     // the stale caller generation cannot dispatch effects
-    let err = session.effect_dispatch(&svc_key("greeter"), "{}", 1).unwrap_err();
-    assert!(matches!(err, SessionError::StaleGeneration { generation: 1 }));
+    let err = session
+        .effect_dispatch(&svc_key("greeter"), "{}", 1)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        SessionError::StaleGeneration { generation: 1 }
+    ));
     // drop the generation handle before close: a live Generation keeps the
     // instance (and through it the host's state store) alive
     drop(outcome);
@@ -341,7 +377,9 @@ fn replace_module_swaps_generation_and_records_delta() {
 /// the provider generation's kb_hot; stale caller generations are rejected.
 #[test]
 fn effect_dispatch_routes_to_provider_kb_hot() {
-    if !require_guest() { return };
+    if !require_guest() {
+        return;
+    };
     let dir = TempDir::new("dispatch");
     let id_prov = Id128::generate();
     let mut session = Session::open(SessionConfig {
@@ -356,7 +394,9 @@ fn effect_dispatch_routes_to_provider_kb_hot() {
         required_version: 1,
     };
     let id_caller = Id128::generate();
-    let caller = session.activate_config(manifest(id_caller, CALLER, vec![dep])).unwrap();
+    let caller = session
+        .activate_config(manifest(id_caller, CALLER, vec![dep]))
+        .unwrap();
     assert_eq!(caller.epoch, 2);
     let result = session
         .effect_dispatch(&svc_key("greeter"), r#"{"n":42}"#, caller.generation)
@@ -365,8 +405,13 @@ fn effect_dispatch_routes_to_provider_kb_hot() {
     assert_eq!(v["from"], "greeter");
     assert_eq!(v["got"]["n"], 42);
     // a stale caller generation is rejected before any host work
-    let err = session.effect_dispatch(&svc_key("greeter"), "{}", 4242).unwrap_err();
-    assert!(matches!(err, SessionError::StaleGeneration { generation: 4242 }));
+    let err = session
+        .effect_dispatch(&svc_key("greeter"), "{}", 4242)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        SessionError::StaleGeneration { generation: 4242 }
+    ));
     session.close().unwrap();
 }
 
@@ -374,7 +419,9 @@ fn effect_dispatch_routes_to_provider_kb_hot() {
 /// generations and oversize updates fail closed.
 #[test]
 fn module_state_cas_heads_and_fail_closed() {
-    if !require_guest() { return };
+    if !require_guest() {
+        return;
+    };
     let dir = TempDir::new("head");
     let id = Id128::generate();
     let mut session = Session::open(SessionConfig {
@@ -386,22 +433,34 @@ fn module_state_cas_heads_and_fail_closed() {
     })
     .unwrap();
     let generation = session.modules().unwrap().snapshot()[0].1;
-    let h1 = session.module_state_cas("k", 1, br#"{"a":1}"#.to_vec(), generation).unwrap();
+    let h1 = session
+        .module_state_cas("k", 1, br#"{"a":1}"#.to_vec(), generation)
+        .unwrap();
     assert_eq!(h1.seq, 1);
-    let h2 = session.module_state_cas("k", 1, br#"{"a":2}"#.to_vec(), generation).unwrap();
+    let h2 = session
+        .module_state_cas("k", 1, br#"{"a":2}"#.to_vec(), generation)
+        .unwrap();
     assert_eq!(h2.seq, 2);
     assert_ne!(h1.digest, h2.digest);
     // stale generation
-    let err = session.module_state_cas("k", 1, b"x".to_vec(), 999).unwrap_err();
+    let err = session
+        .module_state_cas("k", 1, b"x".to_vec(), 999)
+        .unwrap_err();
     assert!(matches!(
         err,
         SessionError::State(kanbei_modules::StateError::StaleGeneration { generation: 999 })
     ));
     // oversize: old head stays active
-    let err = session.module_state_cas("k", 1, vec![b'x'; 100], generation).unwrap_err();
+    let err = session
+        .module_state_cas("k", 1, vec![b'x'; 100], generation)
+        .unwrap_err();
     assert!(matches!(
         err,
-        SessionError::State(kanbei_modules::StateError::Oversized { bytes: 100, limit: 64, .. })
+        SessionError::State(kanbei_modules::StateError::Oversized {
+            bytes: 100,
+            limit: 64,
+            ..
+        })
     ));
     let state = session.modules().unwrap().state();
     let (head, bytes) = state.lock().unwrap().get("k").unwrap().unwrap();
@@ -426,7 +485,12 @@ fn retain_candidate_store_all_never_touches_storage() {
             media: None,
         })
         .unwrap();
-    assert_eq!(adm, Admission::Stored { bytes: b"hello world".to_vec() });
+    assert_eq!(
+        adm,
+        Admission::Stored {
+            bytes: b"hello world".to_vec()
+        }
+    );
     // the candidate never reached storage: the log is empty and the store
     // holds only the genesis manifest
     let recovered = kanbei_log::recover(&dir.path().join("log.zst")).unwrap();
@@ -474,7 +538,9 @@ fn retain_candidate_drop_boundary_commits_fact() {
     struct DropPlugin;
     impl PolicyPlugin for DropPlugin {
         fn decide(&self, _c: &Candidate) -> Result<RetentionDecision, PolicyError> {
-            Ok(RetentionDecision::Drop { reason: "no-store".into() })
+            Ok(RetentionDecision::Drop {
+                reason: "no-store".into(),
+            })
         }
         fn name(&self) -> &'static str {
             "drop-all"
@@ -506,7 +572,9 @@ fn retain_candidate_drop_boundary_commits_fact() {
     struct RejectPlugin;
     impl PolicyPlugin for RejectPlugin {
         fn decide(&self, _c: &Candidate) -> Result<RetentionDecision, PolicyError> {
-            Ok(RetentionDecision::RejectExecution { reason: "denied".into() })
+            Ok(RetentionDecision::RejectExecution {
+                reason: "denied".into(),
+            })
         }
         fn name(&self) -> &'static str {
             "reject-all"
@@ -541,7 +609,9 @@ fn retain_candidate_drop_boundary_commits_fact() {
 /// log; the session remains usable with storage only (R-01/C-02).
 #[test]
 fn invalid_config_opens_safe_mode() {
-    if !require_guest() { return };
+    if !require_guest() {
+        return;
+    };
     let dir = TempDir::new("safe-mode");
     let id = Id128::generate();
     let mut session = Session::open(SessionConfig {
@@ -554,12 +624,19 @@ fn invalid_config_opens_safe_mode() {
     assert!(session.modules().is_none());
     assert_eq!(session.vm_engine_digest(), None);
     // the session remains usable with storage only
-    let receipt = session.commit(vec![event("post-safe", json!({"n": 1}))], None).unwrap();
+    let receipt = session
+        .commit(vec![event("post-safe", json!({"n": 1}))], None)
+        .unwrap();
     assert_eq!(receipt.first_seq, 2);
     let envs = envelopes(&dir.path().join("log.zst"));
     assert_eq!(envs.len(), 2);
     assert_eq!(envs[0].kind, "safe_mode_activated");
-    assert!(envs[0].payload["reason"].as_str().unwrap().contains("compile"));
+    assert!(
+        envs[0].payload["reason"]
+            .as_str()
+            .unwrap()
+            .contains("compile")
+    );
     session.close().unwrap();
 }
 
@@ -568,7 +645,9 @@ fn invalid_config_opens_safe_mode() {
 /// recovery stays clean.
 #[test]
 fn wasm_trap_contained_session_survives() {
-    if !require_guest() { return };
+    if !require_guest() {
+        return;
+    };
     let dir = TempDir::new("trap");
     let id_trap = Id128::generate();
     let mut session = Session::open(SessionConfig {
@@ -590,11 +669,17 @@ fn wasm_trap_contained_session_survives() {
         required_version: 1,
     };
     let id_caller = Id128::generate();
-    let caller = session.activate_config(manifest(id_caller, CALLER, vec![dep])).unwrap();
-    let err = session.effect_dispatch(&svc_key("trap"), "{}", caller.generation).unwrap_err();
+    let caller = session
+        .activate_config(manifest(id_caller, CALLER, vec![dep]))
+        .unwrap();
+    let err = session
+        .effect_dispatch(&svc_key("trap"), "{}", caller.generation)
+        .unwrap_err();
     assert!(matches!(err, SessionError::Effect(_)), "got {err:?}");
     // the session actor still commits and recovers
-    let receipt = session.commit(vec![event("post-trap", json!({"n": 1}))], None).unwrap();
+    let receipt = session
+        .commit(vec![event("post-trap", json!({"n": 1}))], None)
+        .unwrap();
     assert_eq!(receipt.first_seq, 3);
     session.close().unwrap();
     let recovered = kanbei_log::recover(&dir.path().join("log.zst")).unwrap();
@@ -608,7 +693,9 @@ fn wasm_trap_contained_session_survives() {
 /// and module_state_cas.
 #[test]
 fn m2_fault_points_recorded() {
-    if !require_guest() { return };
+    if !require_guest() {
+        return;
+    };
     let dir = TempDir::new("fault-points");
     let (recorder, points) = Recorder::new();
     let id_prov = Id128::generate();
@@ -625,9 +712,15 @@ fn m2_fault_points_recorded() {
         required_version: 1,
     };
     let id_caller = Id128::generate();
-    let caller = session.activate_config(manifest(id_caller, CALLER, vec![dep])).unwrap();
-    session.effect_dispatch(&svc_key("greeter"), "{}", caller.generation).unwrap();
-    session.module_state_cas("k", 1, br#"{}"#.to_vec(), caller.generation).unwrap();
+    let caller = session
+        .activate_config(manifest(id_caller, CALLER, vec![dep]))
+        .unwrap();
+    session
+        .effect_dispatch(&svc_key("greeter"), "{}", caller.generation)
+        .unwrap();
+    session
+        .module_state_cas("k", 1, br#"{}"#.to_vec(), caller.generation)
+        .unwrap();
     let got = points.lock().unwrap().clone();
     let m2: Vec<FaultPoint> = got
         .iter()
@@ -664,7 +757,9 @@ fn m2_fault_points_recorded() {
 /// module pins and the composition digest.
 #[test]
 fn committed_manifests_are_schema_2() {
-    if !require_guest() { return };
+    if !require_guest() {
+        return;
+    };
     let dir = TempDir::new("schema2");
     let id = Id128::generate();
     let mut session = Session::open(SessionConfig {
@@ -674,9 +769,16 @@ fn committed_manifests_are_schema_2() {
         ..Default::default()
     })
     .unwrap();
-    session.replace_module(id, manifest(id, REPLACER, vec![])).unwrap();
+    session
+        .replace_module(id, manifest(id, REPLACER, vec![]))
+        .unwrap();
     // a plain state-changing commit pins a manifest too
-    session.commit(vec![event("change", json!({"s": 1}))], Some(Digest::new(b"head"))).unwrap();
+    session
+        .commit(
+            vec![event("change", json!({"s": 1}))],
+            Some(Digest::new(b"head")),
+        )
+        .unwrap();
     let mut manifests = 0;
     for digest in session.store().scan().unwrap() {
         let bytes = session.store().get(&digest).unwrap();
@@ -684,7 +786,7 @@ fn committed_manifests_are_schema_2() {
             continue; // packages, compositions, state snapshots — not manifests
         };
         manifests += 1;
-        assert_eq!(m.schema, 3, "manifest {digest} must be schema 3");
+        assert_eq!(m.schema, 4, "manifest {digest} must be schema 4");
         assert_eq!(m.module_abi, Some(1));
         // genesis (bootstrap) carries no pins; every later manifest pins the
         // single active module and a composition digest
@@ -707,7 +809,10 @@ fn committed_manifests_are_schema_2() {
     // the latest manifest pins the live composition digest and the current
     // module generation (the replacement)
     let latest: ExecutionManifest = serde_json::from_slice(
-        &session.store().get(&session.current_snapshot().unwrap()).unwrap(),
+        &session
+            .store()
+            .get(&session.current_snapshot().unwrap())
+            .unwrap(),
     )
     .unwrap();
     assert_eq!(latest.composition, Some(session.composition().digest));

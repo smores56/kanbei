@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 //! M3 milestone gate tests (docs/architecture.md lines 629-671): the agent
 //! spine — run FSM/wake acceptance (R-09/E-09/E-10), circuit breakers
 //! (R-17/E-02), model/tool intent+outcome records with origin_snapshot
@@ -21,9 +23,7 @@ use kanbei_scheduler::{
     TerminalOutcome, Trigger, TriggerKind,
 };
 use kanbei_session::{FaultPoint, Session, SessionConfig};
-use kanbei_testkit::{
-    child_acked, collect_envelopes, spawn_m3_crash_child, verify_m3_recovery,
-};
+use kanbei_testkit::{child_acked, collect_envelopes, spawn_m3_crash_child, verify_m3_recovery};
 use kanbei_tools::OutcomeClassification;
 use serde_json::json;
 
@@ -70,7 +70,11 @@ fn spine_session(dir: &Path, responses: Vec<CompletionResponse>) -> (Session, Id
         .unwrap();
     let mut grant = Grant {
         grant_digest: kanbei_core::digest::Digest::new(b"placeholder"),
-        principal: Principal { session: session_id, generation: 0, run: None },
+        principal: Principal {
+            session: session_id,
+            generation: 0,
+            run: None,
+        },
         module_generation: 0,
         capability: Capability::new("fs.read".into(), vec!["call".into()]),
         scope: GrantScope::Session,
@@ -87,7 +91,10 @@ fn spine_session(dir: &Path, responses: Vec<CompletionResponse>) -> (Session, Id
         provider_engine: Some(Box::new(FakeEngine::new(fake_config(), responses))),
         broker,
         session_id: Some(session_id),
-        budgets: Budgets { deadline_secs: Some(60), ..Default::default() },
+        budgets: Budgets {
+            deadline_secs: Some(60),
+            ..Default::default()
+        },
         ..Default::default()
     })
     .unwrap();
@@ -105,7 +112,9 @@ impl kanbei_scheduler::CognitionProvider for ScriptedProvider {
         _trigger: &Trigger,
         _last: Option<&StepResult>,
     ) -> Result<StepCommand, StepError> {
-        self.commands.pop_front().ok_or(StepError::Invalid("no more commands".into()))
+        self.commands
+            .pop_front()
+            .ok_or(StepError::Invalid("no more commands".into()))
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -118,6 +127,8 @@ fn ctx() -> StepContext {
         rendered_hash: kanbei_core::digest::Digest::new(b"ctx"),
         selected_events: vec![],
         budget: Budgets::default(),
+        projection_digest: None,
+        memory_roots: vec![],
     }
 }
 
@@ -130,14 +141,16 @@ fn envelopes(dir: &Path) -> Vec<kanbei_core::envelope::Envelope> {
 }
 
 /// Drive a scripted spine run: wake accept → run start → loop → outcome.
-fn run_spine(
-    session: &mut Session,
-    commands: Vec<StepCommand>,
-) -> TerminalOutcome {
-    session.observe_trigger(Trigger { kind: TriggerKind::NewCausalEvent, referent: None });
+fn run_spine(session: &mut Session, commands: Vec<StepCommand>) -> TerminalOutcome {
+    session.observe_trigger(Trigger {
+        kind: TriggerKind::NewCausalEvent,
+        referent: None,
+    });
     let run = session.accept_wake().unwrap().expect("wake accepted");
     session.run_start(run.run_id).unwrap();
-    let mut provider = ScriptedProvider { commands: commands.into() };
+    let mut provider = ScriptedProvider {
+        commands: commands.into(),
+    };
     session
         .cognition_loop(run.run_id, run.trigger, &mut provider, render)
         .unwrap()
@@ -155,7 +168,10 @@ fn spine_commits_canonical_run_records() {
             content: Some("hi".into()),
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,
-            usage: Usage { input_tokens: 3, output_tokens: 2 },
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+            },
         }],
     );
     let outcome = run_spine(
@@ -190,9 +206,16 @@ fn spine_commits_canonical_run_records() {
     // model_call and model_outcome both reference the same rendered hash
     // (R-08/E-13 intent provenance)
     let rendered = evs[call].payload["rendered_hash"].as_str().unwrap();
-    assert_eq!(evs[outcome].payload["rendered_hash"].as_str().unwrap(), rendered);
+    assert_eq!(
+        evs[outcome].payload["rendered_hash"].as_str().unwrap(),
+        rendered
+    );
     // egress entry present with the origin snapshot (R-15)
-    assert!(evs[outcome].payload["egress"]["provider"].as_str().is_some());
+    assert!(
+        evs[outcome].payload["egress"]["provider"]
+            .as_str()
+            .is_some()
+    );
 }
 
 // --- acceptance: crash injection at the M3 seams (633) ----------------------
@@ -243,7 +266,10 @@ fn breaker_trips_within_budget_and_is_canonical() {
     let dir = fresh_session_dir("breaker");
     let _guard = DirGuard(dir.clone());
     // Floors low enough to trip within a few runs.
-    let floors = BreakerFloors { consecutive_failed: 2, ..Default::default() };
+    let floors = BreakerFloors {
+        consecutive_failed: 2,
+        ..Default::default()
+    };
     let session_id = Id128::generate();
     let session = Session::open(SessionConfig {
         dir: dir.to_path_buf(),
@@ -254,7 +280,10 @@ fn breaker_trips_within_budget_and_is_canonical() {
     .unwrap();
     let mut session = session;
     for _ in 0..2 {
-        session.observe_trigger(Trigger { kind: TriggerKind::NewCausalEvent, referent: None });
+        session.observe_trigger(Trigger {
+            kind: TriggerKind::NewCausalEvent,
+            referent: None,
+        });
         let run = session.accept_wake().unwrap().unwrap();
         session.run_start(run.run_id).unwrap();
         let trip = session
@@ -285,7 +314,10 @@ fn breaker_trips_within_budget_and_is_canonical() {
     );
     // Cognition is paused: further wakes are denied with the responsible
     // constraint until explicit resume.
-    session.observe_trigger(Trigger { kind: TriggerKind::NewCausalEvent, referent: None });
+    session.observe_trigger(Trigger {
+        kind: TriggerKind::NewCausalEvent,
+        referent: None,
+    });
     let denied = session.accept_wake().unwrap();
     assert!(denied.is_none(), "wakes must be denied while paused");
     let denials: Vec<&kanbei_core::envelope::Envelope> =
@@ -296,8 +328,12 @@ fn breaker_trips_within_budget_and_is_canonical() {
     let denials2: Vec<&kanbei_core::envelope::Envelope> =
         evs2.iter().filter(|e| e.kind == "wake_denied").collect();
     assert!(denials2.len() > denials.len(), "denial must be canonical");
-    assert!(denials2.last().unwrap().payload["reason"]["BreakerTripped"].is_string()
-        || denials2.last().unwrap().payload["reason"].as_str().is_some());
+    assert!(
+        denials2.last().unwrap().payload["reason"]["BreakerTripped"].is_string()
+            || denials2.last().unwrap().payload["reason"]
+                .as_str()
+                .is_some()
+    );
 }
 
 // --- differentiator: responder priority (R-09/E-10) -------------------------
@@ -312,22 +348,34 @@ fn responder_priority_cancels_background_cognition() {
             content: Some("hi".into()),
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,
-            usage: Usage { input_tokens: 1, output_tokens: 1 },
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
         }],
     );
     // Background cognition wake accepted first.
-    session.observe_trigger(Trigger { kind: TriggerKind::NewCausalEvent, referent: None });
+    session.observe_trigger(Trigger {
+        kind: TriggerKind::NewCausalEvent,
+        referent: None,
+    });
     let run = session.accept_wake().unwrap().unwrap();
     session.run_start(run.run_id).unwrap();
     // Responder wake arrives; priority cancels the in-flight cognition run.
-    let cancelled = session.cancel_active_run().unwrap().expect("cognition run cancelled");
+    let cancelled = session
+        .cancel_active_run()
+        .unwrap()
+        .expect("cognition run cancelled");
     assert_eq!(
         cancelled.outcome,
         TerminalOutcome::Failed(FailureKind::UserCancelled)
     );
     // The responder wake is then accepted (responder commands never queue
     // behind cognition).
-    session.observe_trigger(Trigger { kind: TriggerKind::UserMessage, referent: None });
+    session.observe_trigger(Trigger {
+        kind: TriggerKind::UserMessage,
+        referent: None,
+    });
     let responder = session.accept_wake().unwrap().unwrap();
     assert_eq!(responder.kind, kanbei_scheduler::RunKind::ResponderTurn);
     session.run_start(responder.run_id).unwrap();
@@ -368,26 +416,32 @@ fn budget_exhaustion_records_explicit_blocked() {
             content: Some("hi".into()),
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,
-            usage: Usage { input_tokens: 3, output_tokens: 2 },
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+            },
         }],
     );
     // tiny token budget — the single model call already exceeds it
     session.scheduler_budget_tokens_override(1);
-    session.observe_trigger(Trigger { kind: TriggerKind::NewCausalEvent, referent: None });
+    session.observe_trigger(Trigger {
+        kind: TriggerKind::NewCausalEvent,
+        referent: None,
+    });
     let run = session.accept_wake().unwrap().unwrap();
     session.run_start(run.run_id).unwrap();
     let mut provider = ScriptedProvider {
-        commands: vec![
-            StepCommand::ModelCall(kanbei_scheduler::ModelCallSpec {
-                rendered_hash: kanbei_core::digest::Digest::new(b"ctx"),
-                max_tokens: None,
-            }),
-        ]
+        commands: vec![StepCommand::ModelCall(kanbei_scheduler::ModelCallSpec {
+            rendered_hash: kanbei_core::digest::Digest::new(b"ctx"),
+            max_tokens: None,
+        })]
         .into(),
     };
     // the model call commits its intent; the outcome exceeds the budget and
     // the loop records Blocked.
-    let outcome = session.cognition_loop(run.run_id, run.trigger, &mut provider, render).unwrap();
+    let outcome = session
+        .cognition_loop(run.run_id, run.trigger, &mut provider, render)
+        .unwrap();
     assert_eq!(outcome, TerminalOutcome::Blocked);
     let evs = envelopes(&dir);
     let blocked: Vec<&kanbei_core::envelope::Envelope> = evs
@@ -409,10 +463,17 @@ fn committed_intent_without_outcome_classifies_on_reopen() {
     // commit — the crash matrix covers the abort path; here we assert the
     // classification fact itself).
     let (mut session, session_id) = spine_session(&dir, vec![]);
-    session.observe_trigger(Trigger { kind: TriggerKind::NewCausalEvent, referent: None });
+    session.observe_trigger(Trigger {
+        kind: TriggerKind::NewCausalEvent,
+        referent: None,
+    });
     let run = session.accept_wake().unwrap().unwrap();
     session.run_start(run.run_id).unwrap();
-    let principal = Principal { session: session_id, generation: 0, run: Some(0) };
+    let principal = Principal {
+        session: session_id,
+        generation: 0,
+        run: Some(0),
+    };
     let outcome = session.tool_call(run.run_id, principal, "fs.read", json!({"path": "x"}));
     // no fake engine responses left — but tool_call doesn't need the engine;
     // it dispatches fs.read which fails on a missing file → error outcome,
@@ -423,7 +484,11 @@ fn committed_intent_without_outcome_classifies_on_reopen() {
     session.close().unwrap();
 
     // Everything paired: reopening classifies nothing new.
-    let mut session = Session::open(SessionConfig { dir: dir.to_path_buf(), ..Default::default() }).unwrap();
+    let mut session = Session::open(SessionConfig {
+        dir: dir.to_path_buf(),
+        ..Default::default()
+    })
+    .unwrap();
     let classified = session.classify_pending_intents().unwrap();
     assert_eq!(classified, 0);
     session.close().unwrap();
@@ -455,7 +520,10 @@ fn consistency_15_spine_leaves_scopes_intact() {
             content: Some("hi".into()),
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,
-            usage: Usage { input_tokens: 1, output_tokens: 1 },
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
         }],
     );
     // Before: the root scope with no children.

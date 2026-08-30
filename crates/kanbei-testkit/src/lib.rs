@@ -66,6 +66,8 @@ pub fn fault_point_name(point: FaultPoint) -> &'static str {
         FaultPoint::AfterToolOutcomeCommit => "AfterToolOutcomeCommit",
         FaultPoint::BeforeRunOutcome => "BeforeRunOutcome",
         FaultPoint::AfterRunOutcome => "AfterRunOutcome",
+        FaultPoint::BeforeMemoryProposal => "BeforeMemoryProposal",
+        FaultPoint::AfterMemoryProposal => "AfterMemoryProposal",
     }
 }
 
@@ -95,7 +97,45 @@ pub fn parse_fault_point(s: &str) -> Option<FaultPoint> {
         "AfterToolOutcomeCommit" => Some(FaultPoint::AfterToolOutcomeCommit),
         "BeforeRunOutcome" => Some(FaultPoint::BeforeRunOutcome),
         "AfterRunOutcome" => Some(FaultPoint::AfterRunOutcome),
+        "BeforeMemoryProposal" => Some(FaultPoint::BeforeMemoryProposal),
+        "AfterMemoryProposal" => Some(FaultPoint::AfterMemoryProposal),
         _ => None,
+    }
+}
+
+/// Parse the four memory-actor crash points (the transition/head seams). In
+/// M4 mode the child wires a matching string into the memory injector, NOT
+/// the session injector (the module-head strings collide with the session's
+/// M2 points by design — the mode decides which injector owns them).
+pub fn parse_memory_fault_point(s: &str) -> Option<kanbei_memory::MemoryFaultPoint> {
+    match s {
+        "BeforeTransition" => Some(kanbei_memory::MemoryFaultPoint::BeforeTransition),
+        "AfterTransition" => Some(kanbei_memory::MemoryFaultPoint::AfterTransition),
+        "BeforeHeadUpdate" => Some(kanbei_memory::MemoryFaultPoint::BeforeHeadUpdate),
+        "AfterHeadUpdate" => Some(kanbei_memory::MemoryFaultPoint::AfterHeadUpdate),
+        _ => None,
+    }
+}
+
+/// One crash point for the M4 child: either a session point or a memory
+/// actor point. The canonical env spelling is [`CrashPoint::name`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashPoint {
+    Session(FaultPoint),
+    Memory(kanbei_memory::MemoryFaultPoint),
+}
+
+impl CrashPoint {
+    pub fn name(&self) -> &'static str {
+        match self {
+            CrashPoint::Session(p) => fault_point_name(*p),
+            CrashPoint::Memory(p) => match p {
+                kanbei_memory::MemoryFaultPoint::BeforeTransition => "BeforeTransition",
+                kanbei_memory::MemoryFaultPoint::AfterTransition => "AfterTransition",
+                kanbei_memory::MemoryFaultPoint::BeforeHeadUpdate => "BeforeHeadUpdate",
+                kanbei_memory::MemoryFaultPoint::AfterHeadUpdate => "AfterHeadUpdate",
+            },
+        }
     }
 }
 
@@ -168,7 +208,8 @@ pub fn spawn_m2_crash_child(
         .env(ENV_STATE_EVERY, "1")
         .env(ENV_M2_FLOW, flow)
         .stdout(std::process::Stdio::piped());
-    cmd.spawn().expect("testkit: failed to spawn crash-child (m2)")
+    cmd.spawn()
+        .expect("testkit: failed to spawn crash-child (m2)")
 }
 
 /// Read the child's stdout to EOF and return the largest `acked=<n>` seen
@@ -234,7 +275,10 @@ pub fn verify_recovery_tolerant(
     // 2 — contiguity
     let envelopes = collect_envelopes(dir)?;
     if envelopes.len() as u64 != r {
-        return Err(format!("envelope count {} != recovered.events {r}", envelopes.len()));
+        return Err(format!(
+            "envelope count {} != recovered.events {r}",
+            envelopes.len()
+        ));
     }
     for (i, env) in envelopes.iter().enumerate() {
         let expected = i as u64 + 1;
@@ -250,7 +294,9 @@ pub fn verify_recovery_tolerant(
 
     // 3 — ack coverage
     if acked > r || r > acked + 1 {
-        return Err(format!("ack coverage violated: acked={acked}, recovered={r}"));
+        return Err(format!(
+            "ack coverage violated: acked={acked}, recovered={r}"
+        ));
     }
 
     // 4 — no dangling references (fresh store on the session's object dir)
@@ -266,7 +312,10 @@ pub fn verify_recovery_tolerant(
         if let Some(snap) = env.snapshot
             && !store.exists(&snap)
         {
-            return Err(format!("event seq {}: missing snapshot manifest {snap}", env.seq));
+            return Err(format!(
+                "event seq {}: missing snapshot manifest {snap}",
+                env.seq
+            ));
         }
     }
     // 5 — orphan tolerance: extra objects are harmless; nothing to assert here
@@ -412,31 +461,6 @@ pub fn referenced_digests(dir: &Path) -> Result<HashSet<Digest>, String> {
     Ok(set)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::rng::Rng;
-
-    #[test]
-    fn rng_deterministic_same_seed() {
-        let mut a = Rng::new(42);
-        let mut b = Rng::new(42);
-        for _ in 0..1000 {
-            assert_eq!(a.next_u64(), b.next_u64());
-        }
-    }
-
-    #[test]
-    fn rng_different_seeds_differ_and_bounds_hold() {
-        assert_ne!(Rng::new(1).next_u64(), Rng::new(2).next_u64());
-        let mut r = Rng::new(0x4B41_4E42_4549);
-        for _ in 0..100 {
-            assert!(r.next_usize(10) < 10);
-            assert!((0.0..1.0).contains(&r.next_f64()));
-        }
-        assert_eq!(r.next_usize(0), 0);
-    }
-}
-
 /// Spawn the M3-mode crash-test child: opens a session with a fake provider,
 /// commits `after_acks` plain events, then runs the agent spine (wake accept,
 /// run start, model call, run outcome — plus a tool call in the "spine" flow)
@@ -451,7 +475,8 @@ pub fn spawn_m3_crash_child(dir: &Path, point: Option<FaultPoint>, after_acks: u
         .env(ENV_PROFILE, Profile::Fast.name())
         .env(ENV_STATE_EVERY, "1")
         .stdout(std::process::Stdio::piped());
-    cmd.spawn().expect("testkit: failed to spawn crash-child (m3)")
+    cmd.spawn()
+        .expect("testkit: failed to spawn crash-child (m3)")
 }
 
 /// The M3 crash-recovery invariant checker: [`verify_recovery`] plus the M3
@@ -548,7 +573,9 @@ pub fn verify_m3_recovery(dir: &Path, acked: u64) -> Result<(), String> {
         .classify_pending_intents()
         .map_err(|e| format!("m3: reclassify: {e}"))?;
     if classified_again != 0 {
-        return Err(format!("m3: classification not idempotent: {classified_again} new facts"));
+        return Err(format!(
+            "m3: classification not idempotent: {classified_again} new facts"
+        ));
     }
     session
         .commit(
@@ -564,4 +591,334 @@ pub fn verify_m3_recovery(dir: &Path, acked: u64) -> Result<(), String> {
         .map_err(|e| format!("m3: post-recovery commit: {e}"))?;
     session.close().map_err(|e| format!("m3: close: {e}"))?;
     Ok(())
+}
+
+/// Spawn the M4-mode crash-test child: opens a session with a memory
+/// substrate + project binding and an approval-requiring broker for
+/// memory.propose, commits `after_acks` plain events, then drives the
+/// propose flow (wake accept, run start, memory.propose intent, proposal,
+/// approval, transition, backlink, outcome) — aborting at `point` once armed.
+pub fn spawn_m4_crash_child(dir: &Path, point: Option<CrashPoint>, after_acks: u64) -> Child {
+    let mut cmd = Command::new(crash_child_exe());
+    cmd.env(ENV_DIR, dir)
+        .env(ENV_MODE, "m4")
+        .env(ENV_POINT, point.map(|p| p.name()).unwrap_or("none"))
+        .env(ENV_AFTER_ACKS, after_acks.to_string())
+        .env(ENV_EVENTS, after_acks.to_string())
+        .env(ENV_PROFILE, Profile::Fast.name())
+        .env(ENV_STATE_EVERY, "1")
+        .stdout(std::process::Stdio::piped());
+    cmd.spawn()
+        .expect("testkit: failed to spawn crash-child (m4)")
+}
+
+/// The M4 crash-recovery invariant checker: reopens the crashed session with
+/// its own identity/binding (recovered from the log — never env), then
+/// checks:
+///   1. the session opens Ok with the memory substrate + project bound;
+///   2. every committed memory.propose intent resolves to an outcome OR an
+///      `intent_classified` fact (B-05);
+///   3. at most one root transition exists, and the backlink count equals
+///      the transition count (a crash inside the actor leaves the backlink
+///      uncommitted — recovery re-backs it at open; idempotent by
+///      TransitionId);
+///   4. when a transition committed: the project fold contains the proposed
+///      claim, `head.json` matches the actor head (repair path), and the
+///      projection index builds over both folds;
+///   5. reopening twice more commits no duplicate backlinks;
+///   6. `classify_pending_intents` is idempotent.
+///
+/// Returns the number of checks run.
+pub fn verify_m4_recovery(dir: &Path, acked: u64) -> Result<usize, String> {
+    let mut checks = 0usize;
+    let memory_root = dir.join("memory");
+
+    // Canonical facts the verifier needs: the child's session id and project
+    // id come from the log (the harness passes only dir/point/acks).
+    let envelopes0 = collect_envelopes(dir)?;
+    let mut session_id: Option<kanbei_core::id::Id128> = None;
+    let mut project_id: Option<kanbei_core::id::Id128> = None;
+    let mut intents: Vec<(String, String)> = Vec::new();
+    let mut outcomes: HashSet<String> = HashSet::new();
+    let mut classified: HashSet<String> = HashSet::new();
+    let mut proposed_claim: Option<String> = None;
+    for e in &envelopes0 {
+        match e.kind.as_str() {
+            "project_bound" => {
+                project_id = e
+                    .payload
+                    .get("project_id")
+                    .and_then(|p| p.as_str())
+                    .and_then(|s| s.parse().ok());
+            }
+            "tool_intent" => {
+                if e.payload.get("tool").and_then(|t| t.as_str()) == Some("memory.propose")
+                    && let Some(call) = e.payload.get("call_id").and_then(|c| c.as_str())
+                {
+                    intents.push((call.to_string(), "memory.propose".into()));
+                }
+                if session_id.is_none() {
+                    session_id = e
+                        .payload
+                        .pointer("/principal/session")
+                        .and_then(|s| s.as_str())
+                        .and_then(|s| s.parse().ok());
+                }
+            }
+            "memory_proposal" => {
+                proposed_claim = e
+                    .payload
+                    .get("claim_id")
+                    .and_then(|c| c.as_str())
+                    .map(str::to_string);
+            }
+            "tool_outcome" => {
+                if let Some(call) = e.payload.get("call_id").and_then(|c| c.as_str()) {
+                    outcomes.insert(call.to_string());
+                }
+            }
+            "intent_classified" => {
+                if let Some(call) = e.payload.get("call_id").and_then(|c| c.as_str()) {
+                    classified.insert(call.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    let project_id = project_id.ok_or_else(|| "m4: no project_bound event".to_string())?;
+    let session_id =
+        session_id.ok_or_else(|| "m4: no session principal in tool_intent".to_string())?;
+
+    // 1 — reopen with the child's own identity + binding, faults off.
+    let mut broker = kanbei_capabilities::Broker::new();
+    broker
+        .add_template(kanbei_capabilities::PolicyTemplate {
+            trust_class: kanbei_capabilities::TrustClass::Builtin,
+            allow: vec![kanbei_capabilities::Capability::new(
+                "memory.propose".into(),
+                vec!["call".into()],
+            )],
+            deny: vec![],
+            require_approval: vec![kanbei_capabilities::Capability::new(
+                "memory.propose".into(),
+                vec!["call".into()],
+            )],
+            version: 1,
+            monotonic: true,
+        })
+        .map_err(|e| format!("m4: broker template: {e}"))?;
+    let session = Session::open(SessionConfig {
+        dir: dir.to_path_buf(),
+        stream: "crash-m4".into(),
+        memory_root: Some(memory_root.clone()),
+        project: Some(project_id),
+        broker,
+        session_id: Some(session_id),
+        budgets: kanbei_scheduler::Budgets {
+            deadline_secs: Some(60),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .map_err(|e| format!("m4: reopen: {e}"))?;
+    checks += 1;
+
+    // 2 — every memory.propose intent resolves: outcome OR classification
+    // (re-read the log: the reopen's open() may have committed the
+    // intent_classified facts).
+    let envelopes1 = collect_envelopes(dir)?;
+    let mut outcomes: HashSet<String> = outcomes;
+    let mut classified: HashSet<String> = classified;
+    for e in &envelopes1 {
+        match e.kind.as_str() {
+            "tool_outcome" => {
+                if let Some(call) = e.payload.get("call_id").and_then(|c| c.as_str()) {
+                    outcomes.insert(call.to_string());
+                }
+            }
+            "intent_classified" => {
+                if let Some(call) = e.payload.get("call_id").and_then(|c| c.as_str()) {
+                    classified.insert(call.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    for (call_id, tool) in &intents {
+        if !outcomes.contains(call_id) && !classified.contains(call_id) {
+            return Err(format!(
+                "m4: tool intent {call_id} ({tool}) has neither outcome nor classification"
+            ));
+        }
+    }
+    checks += 1;
+
+    // 3 — transition/backlink reconciliation: at most one transition, and
+    // exactly one backlink per committed transition after recovery.
+    let project = session
+        .memory_project()
+        .ok_or_else(|| "m4: project actor missing on reopen".to_string())?;
+    let transitions = project.transition_count();
+    if transitions > 1 {
+        return Err(format!("m4: {transitions} transitions, expected at most 1"));
+    }
+    checks += 1;
+    let backlinks1 = collect_envelopes(dir)?
+        .iter()
+        .filter(|e| e.kind == "memory_transition_backlink")
+        .count() as u64;
+    if backlinks1 != transitions {
+        return Err(format!(
+            "m4: {backlinks1} backlinks for {transitions} transitions after recovery"
+        ));
+    }
+    checks += 1;
+
+    if transitions == 1 {
+        // 4 — the committed claim is in the fold; head.json matches the
+        // actor head (the repair path when the crash hit before the head
+        // write); the projection index builds over both folds.
+        let claim_id = proposed_claim
+            .ok_or_else(|| "m4: memory_proposal missing for committed transition".to_string())?;
+        let head = project.head();
+        let fold = project
+            .fold(head)
+            .map_err(|e| format!("m4: project fold: {e}"))?;
+        if !fold
+            .claims
+            .iter()
+            .any(|(_, c)| c.claim_id.to_string() == claim_id)
+        {
+            return Err(format!("m4: fold does not contain claim {claim_id}"));
+        }
+        let head_path = memory_root.join(format!("projects/{project_id}/head.json"));
+        let head_json: serde_json::Value = std::fs::read(&head_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .ok_or_else(|| format!("m4: unreadable head.json at {}", head_path.display()))?;
+        let head_root = head_json.get("root").and_then(|r| r.as_str());
+        let expected_root = head.map(|d| d.to_string()).unwrap_or_default();
+        let expected_root = if expected_root.is_empty() {
+            "null"
+        } else {
+            expected_root.as_str()
+        };
+        if head_root != Some(expected_root) {
+            return Err(format!(
+                "m4: head.json root {head_root:?} != actor head {expected_root:?}"
+            ));
+        }
+        checks += 1;
+        let lifetime = session.memory_lifetime();
+        let lifetime_fold = lifetime
+            .fold(lifetime.head())
+            .map_err(|e| format!("m4: lifetime fold: {e}"))?;
+        let mut index = kanbei_retrieval::MemoryIndex::open(&dir.join("verify-projection.sqlite"))
+            .map_err(|e| format!("m4: index open: {e}"))?;
+        index
+            .build(
+                &[
+                    kanbei_retrieval::ScopeIndexInput {
+                        scope: kanbei_memory::MemoryScope::Lifetime,
+                        root: lifetime.head(),
+                        fold: lifetime_fold,
+                    },
+                    kanbei_retrieval::ScopeIndexInput {
+                        scope: kanbei_memory::MemoryScope::Project(project_id),
+                        root: head,
+                        fold: fold.clone(),
+                    },
+                ],
+                kanbei_retrieval::SALIENCE_VERSION,
+            )
+            .map_err(|e| format!("m4: index build: {e}"))?;
+        drop(index);
+        let _ = std::fs::remove_file(dir.join("verify-projection.sqlite"));
+        checks += 1;
+    }
+
+    // 5 — backlink idempotence: two more reopens add nothing.
+    let _ = acked;
+    session.close().map_err(|e| format!("m4: close: {e}"))?;
+    for _ in 0..2 {
+        let again = Session::open(SessionConfig {
+            dir: dir.to_path_buf(),
+            stream: "crash-m4".into(),
+            memory_root: Some(memory_root.clone()),
+            project: Some(project_id),
+            session_id: Some(session_id),
+            budgets: kanbei_scheduler::Budgets {
+                deadline_secs: Some(60),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .map_err(|e| format!("m4: idempotence reopen: {e}"))?;
+        again
+            .close()
+            .map_err(|e| format!("m4: idempotence close: {e}"))?;
+    }
+    let backlinks2 = collect_envelopes(dir)?
+        .iter()
+        .filter(|e| e.kind == "memory_transition_backlink")
+        .count() as u64;
+    if backlinks2 != backlinks1 {
+        return Err(format!(
+            "m4: backlinks grew across reopens: {backlinks1} -> {backlinks2}"
+        ));
+    }
+    checks += 1;
+
+    // 6 — classification idempotence (the reopen already classified).
+    let mut session = Session::open(SessionConfig {
+        dir: dir.to_path_buf(),
+        stream: "crash-m4".into(),
+        memory_root: Some(memory_root),
+        project: Some(project_id),
+        session_id: Some(session_id),
+        budgets: kanbei_scheduler::Budgets {
+            deadline_secs: Some(60),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .map_err(|e| format!("m4: final reopen: {e}"))?;
+    let classified_again = session
+        .classify_pending_intents()
+        .map_err(|e| format!("m4: reclassify: {e}"))?;
+    if classified_again != 0 {
+        return Err(format!(
+            "m4: classification not idempotent: {classified_again} new facts"
+        ));
+    }
+    checks += 1;
+    session
+        .close()
+        .map_err(|e| format!("m4: final close: {e}"))?;
+    Ok(checks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rng::Rng;
+
+    #[test]
+    fn rng_deterministic_same_seed() {
+        let mut a = Rng::new(42);
+        let mut b = Rng::new(42);
+        for _ in 0..1000 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+    }
+
+    #[test]
+    fn rng_different_seeds_differ_and_bounds_hold() {
+        assert_ne!(Rng::new(1).next_u64(), Rng::new(2).next_u64());
+        let mut r = Rng::new(0x4B41_4E42_4549);
+        for _ in 0..100 {
+            assert!(r.next_usize(10) < 10);
+            assert!((0.0..1.0).contains(&r.next_f64()));
+        }
+        assert_eq!(r.next_usize(0), 0);
+    }
 }

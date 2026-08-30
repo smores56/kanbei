@@ -28,7 +28,7 @@ fn pct(times: &mut [Duration], p: f64) -> Duration {
     times[idx.min(times.len() - 1)]
 }
 
-fn report(tag: &str, times: &mut Vec<Duration>) {
+fn report(tag: &str, times: &mut [Duration]) {
     times.sort();
     println!("{tag}: n={} avg={:?} p50={:?} p99={:?} max={:?}", times.len(),
         times.iter().sum::<Duration>() / times.len() as u32, pct(times, 0.5), pct(times, 0.99), *times.last().unwrap());
@@ -189,12 +189,10 @@ fn bench_kill9(frames: u64, per: usize) {
     let _ = child.kill();
     let _ = child.wait();
     // drain pipe data that was in flight at kill time
-    for l in lines {
-        if let Ok(l) = l {
-            if l.starts_with("ack ") {
-                acks += 1;
-                last_acked = l.trim_start_matches("ack ").parse().unwrap();
-            }
+    for l in lines.map_while(Result::ok) {
+        if l.starts_with("ack ") {
+            acks += 1;
+            last_acked = l.trim_start_matches("ack ").parse().unwrap();
         }
     }
     let (rec, offset, _) = recover(Path::new(&path)).unwrap();
@@ -316,7 +314,7 @@ fn bench_asyncfsync(rate: u64, secs: u64) {
         log.append(&frame);
         times.push(t.elapsed());
         n += 1;
-        if n % 500 == 0 {
+        if n.is_multiple_of(500) {
             let t = Instant::now();
             log.flush();
             flushes.push(t.elapsed());
@@ -325,7 +323,7 @@ fn bench_asyncfsync(rate: u64, secs: u64) {
     }
     log.flush();
     report(&format!("asyncfsync commit ACK (rate {rate}/s, {} events)", n), &mut times);
-    report(&format!("asyncfsync flush (effect-dispatch wait)"), &mut flushes);
+    report("asyncfsync flush (effect-dispatch wait)", &mut flushes);
 }
 
 // ---------- main ----------

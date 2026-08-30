@@ -5,25 +5,39 @@
 //! priority (R-09/E-10), and interrupted/ambiguous classification at
 //! recovery (B-05).
 
-use kanbei_capabilities::{ApprovalIntent, Capability, GrantScope, Principal};
+use kanbei_capabilities::{Capability, Principal};
+use kanbei_context::pipeline::{default_stages, run_pipeline};
+use kanbei_context::validator::ValidatorStage;
+use kanbei_context::{
+    BudgetSpec, Contradiction, EvidenceClaim, MemoryFragmentSource, ProjectionInput,
+    ReasoningContinuity, RenderedEvent, RetrievedEvidence, SchemaFragment, SourceRef,
+    TrajectoryView, TriggerFragment, lower, sensitivity_rank,
+};
 use kanbei_core::digest::Digest;
 use kanbei_core::envelope::Envelope;
 use kanbei_core::id::Id128;
+use kanbei_memory::{
+    Claim, ClaimEdge, ClaimProvenance, EdgeKind, IdempotencyKey, MEMORY_CLAIM_SCHEMA,
+    MEMORY_EDGE_SCHEMA, MEMORY_ROOT_SCHEMA, MEMORY_TRANSITION_SCHEMA, MemoryError, MemoryScope,
+    MemoryTransition, RootFold, RootManifest, TransitionKind, TransitionOutcome,
+    derive_validation_status,
+};
 use kanbei_provider::{
     CacheOutcome, CachePlan, EgressEntry, FinishReason, Message, ModelCallRecord, Role,
 };
+use kanbei_retrieval::{ActiveMemoryProjector, SalienceInput, ScopeIndexInput, SearchQuery};
 use kanbei_scheduler::{
-    Budgets, RunId, RunKind, RunOutcome, RunStart, RunUsage, StepCommand,
-    StepContext, StepResult, TerminalOutcome, Trigger,
-    WakeDecision,
+    Budgets, FailureKind, RunId, RunKind, RunOutcome, RunStart, RunUsage, StepCommand, StepContext,
+    StepResult, TerminalOutcome, Trigger, WakeDecision,
 };
 use kanbei_tools::{
-    ApprovalParked, OutcomeClassification, ToolIntent, ToolOutcome, execute_tool,
-    tool_call_id,
+    ApprovalParked, OutcomeClassification, ToolIntent, ToolOutcome, execute_tool, tool_call_id,
 };
+use std::sync::Arc;
+
 use serde_json::{Value, json};
 
-use crate::{NewEvent, Session, SessionError};
+use crate::{NewEvent, ProjectionState, Session, SessionError};
 
 /// One accepted wake: the run FSM entry (R-09/E-10 — every accepted wake
 /// creates exactly one RunId). The caller commits the canonical record and
@@ -65,8 +79,9 @@ impl Session {
                     vec![NewEvent {
                         kind: "wake_acceptance".into(),
                         payload_schema: 1,
-                        payload: serde_json::to_value(&a)
-                            .map_err(|e| SessionError::InvalidInput(format!("wake payload: {e}")))?,
+                        payload: serde_json::to_value(&a).map_err(|e| {
+                            SessionError::InvalidInput(format!("wake payload: {e}"))
+                        })?,
                         objects: Vec::new(),
                         refs: Vec::new(),
                     }],
@@ -80,8 +95,9 @@ impl Session {
                     vec![NewEvent {
                         kind: "wake_denied".into(),
                         payload_schema: 1,
-                        payload: serde_json::to_value(&d)
-                            .map_err(|e| SessionError::InvalidInput(format!("denial payload: {e}")))?,
+                        payload: serde_json::to_value(&d).map_err(|e| {
+                            SessionError::InvalidInput(format!("denial payload: {e}"))
+                        })?,
                         objects: Vec::new(),
                         refs: Vec::new(),
                     }],
@@ -101,9 +117,8 @@ impl Session {
             vec![NewEvent {
                 kind: "run_start".into(),
                 payload_schema: 1,
-                payload: serde_json::to_value(&start).map_err(|e| {
-                    SessionError::InvalidInput(format!("run start payload: {e}"))
-                })?,
+                payload: serde_json::to_value(&start)
+                    .map_err(|e| SessionError::InvalidInput(format!("run start payload: {e}")))?,
                 objects: Vec::new(),
                 refs: Vec::new(),
             }],
@@ -125,13 +140,14 @@ impl Session {
         action_digests: &[Digest],
     ) -> Result<Option<kanbei_scheduler::BreakerTrip>, SessionError> {
         self.fault(crate::FaultPoint::BeforeRunOutcome);
-        let (record, trip) = self.scheduler.record_outcome(run_id, outcome, usage, action_digests)?;
+        let (record, trip) =
+            self.scheduler
+                .record_outcome(run_id, outcome, usage, action_digests)?;
         let mut events = vec![NewEvent {
             kind: "run_outcome".into(),
             payload_schema: 1,
-            payload: serde_json::to_value(&record).map_err(|e| {
-                SessionError::InvalidInput(format!("run outcome payload: {e}"))
-            })?,
+            payload: serde_json::to_value(&record)
+                .map_err(|e| SessionError::InvalidInput(format!("run outcome payload: {e}")))?,
             objects: Vec::new(),
             refs: Vec::new(),
         }];
@@ -139,9 +155,8 @@ impl Session {
             events.push(NewEvent {
                 kind: "breaker_tripped".into(),
                 payload_schema: 1,
-                payload: serde_json::to_value(&t).map_err(|e| {
-                    SessionError::InvalidInput(format!("breaker payload: {e}"))
-                })?,
+                payload: serde_json::to_value(t)
+                    .map_err(|e| SessionError::InvalidInput(format!("breaker payload: {e}")))?,
                 objects: Vec::new(),
                 refs: Vec::new(),
             });
@@ -159,7 +174,10 @@ impl Session {
     /// Override the scheduler budgets (tests; the kernel config owns the
     /// production values).
     pub fn scheduler_budget_tokens_override(&mut self, tokens: u64) {
-        self.scheduler.set_budgets(Budgets { tokens: Some(tokens), ..self.scheduler.budgets() });
+        self.scheduler.set_budgets(Budgets {
+            tokens: Some(tokens),
+            ..self.scheduler.budgets()
+        });
     }
 
     /// Explicit user resume after a breaker trip (R-17/E-02).
@@ -197,9 +215,8 @@ impl Session {
             vec![NewEvent {
                 kind: "run_outcome".into(),
                 payload_schema: 1,
-                payload: serde_json::to_value(&record).map_err(|e| {
-                    SessionError::InvalidInput(format!("run outcome payload: {e}"))
-                })?,
+                payload: serde_json::to_value(&record)
+                    .map_err(|e| SessionError::InvalidInput(format!("run outcome payload: {e}")))?,
                 objects: Vec::new(),
                 refs: Vec::new(),
             }],
@@ -245,16 +262,35 @@ impl Session {
             })
             .unwrap_or(json!({}));
         let rendered_hash = Digest::new(rendered.as_bytes());
+        // M4 staged projection pins: the fragment-list digest, the lowering's
+        // cache plan, and the exact memory roots the request was built
+        // against (R-08/E-13, R-11).
+        let projection_hashes = self
+            .projection_state
+            .as_ref()
+            .map(|p| vec![p.projection_digest])
+            .unwrap_or_default();
+        let cache_plan = self
+            .projection_state
+            .as_ref()
+            .map(|p| p.cache_plan)
+            .unwrap_or(CachePlan::None);
+        let memory_roots = self
+            .projection_state
+            .as_ref()
+            .map(|p| p.memory_roots.clone())
+            .unwrap_or_default();
         let intent = ModelCallRecord {
             provider: provider.clone(),
             model: model.clone(),
-            projection_hashes: Vec::new(),
+            projection_hashes,
             module_hashes: Vec::new(),
             selected_events: selected_events.clone(),
             rendered_hash,
             params: params.clone(),
-            cache_plan: CachePlan::None,
+            cache_plan,
             cache_outcome: CacheOutcome::Miss,
+            memory_roots,
             input_tokens: 0,
             output_tokens: 0,
             finish_reason: FinishReason::Stop,
@@ -270,9 +306,8 @@ impl Session {
             vec![NewEvent {
                 kind: "model_call".into(),
                 payload_schema: 1,
-                payload: serde_json::to_value(&intent).map_err(|e| {
-                    SessionError::InvalidInput(format!("model call payload: {e}"))
-                })?,
+                payload: serde_json::to_value(&intent)
+                    .map_err(|e| SessionError::InvalidInput(format!("model call payload: {e}")))?,
                 objects: Vec::new(),
                 refs: Vec::new(),
             }],
@@ -284,13 +319,18 @@ impl Session {
         let request = kanbei_provider::CompletionRequest {
             model: model_id.clone(),
             messages,
-            tools: self.tool_registry.canonical_json().as_array().cloned().unwrap_or_default(),
+            tools: self
+                .tool_registry
+                .canonical_json()
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
             temperature,
             max_tokens,
         };
-        let response = engine.complete(&request).map_err(|e| {
-            SessionError::InvalidInput(format!("provider error: {e}"))
-        })?;
+        let response = engine
+            .complete(&request)
+            .map_err(|e| SessionError::InvalidInput(format!("provider error: {e}")))?;
         self.fault(crate::FaultPoint::AfterModelCall);
 
         let result = json!({
@@ -299,11 +339,59 @@ impl Session {
             "finish_reason": response.finish_reason,
             "usage": response.usage,
         });
+        // M4 cache outcome: the provider served the cached stable prefix only
+        // when the plan digest AND the live memory roots still match the last
+        // call's pins; a root change invalidates the cached prefix even when
+        // the plan digest is unchanged (the projection may be stale relative
+        // to the actors).
+        let cache_outcome = match self.projection_state.as_ref() {
+            None => CacheOutcome::Miss,
+            Some(p) => match p.cache_plan {
+                CachePlan::None => CacheOutcome::Miss,
+                CachePlan::StablePrefix { digest } => match &self.last_cache {
+                    Some((Some(prev), prev_roots)) if *prev == digest => {
+                        let live: Vec<Digest> = [
+                            self.memory_lifetime.head(),
+                            self.memory_project.as_ref().and_then(|a| a.head()),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                        if live == *prev_roots {
+                            CacheOutcome::Hit
+                        } else {
+                            CacheOutcome::Invalidated {
+                                reason: "memory root changed".into(),
+                            }
+                        }
+                    }
+                    _ => CacheOutcome::Miss,
+                },
+            },
+        };
+        // R-18/E-07: reasoning continuity — Broken on the first call after a
+        // provider change, at this outcome event's seq (the next commit is
+        // the outcome; single writer).
+        let at_event = self.next_seq;
+        let continuity = match &self.last_provider {
+            Some(prev) if *prev == provider => ReasoningContinuity::Continuous,
+            _ => ReasoningContinuity::Broken {
+                from_provider: self.last_provider.clone().unwrap_or_else(|| "none".into()),
+                at_event,
+            },
+        };
         let outcome = json!({
             "provider": provider_id,
             "model": model_id,
+            // R-08/E-13: the outcome repeats the intent's rendered digest;
+            // equality is enforced by construction — both serialize the same
+            // `rendered_hash` the session itself rendered (M3 behavior).
             "rendered_hash": rendered_hash.to_string(),
             "result": result,
+            "cache_outcome": serde_json::to_value(&cache_outcome)
+                .map_err(|e| SessionError::InvalidInput(format!("cache outcome: {e}")))?,
+            "reasoning_continuity": serde_json::to_value(&continuity)
+                .map_err(|e| SessionError::InvalidInput(format!("continuity: {e}")))?,
             "egress": EgressEntry {
                 provider: provider.clone(),
                 sensitivity_classes: vec!["call".into()],
@@ -322,6 +410,20 @@ impl Session {
             }],
             None,
         )?;
+        // The next call resolves its cache outcome against these pins.
+        self.last_cache = Some((
+            self.projection_state
+                .as_ref()
+                .and_then(|p| match p.cache_plan {
+                    CachePlan::StablePrefix { digest } => Some(digest),
+                    CachePlan::None => None,
+                }),
+            self.projection_state
+                .as_ref()
+                .map(|p| p.memory_roots.clone())
+                .unwrap_or_default(),
+        ));
+        self.last_provider = Some(provider);
         self.scheduler.record_usage(
             run_id,
             RunUsage {
@@ -362,11 +464,12 @@ impl Session {
             args: kanbei_tools::canonicalize(args),
             approval: None,
             origin_snapshot: self.current_snapshot,
+            intent_event: None,
         };
         self.fault(crate::FaultPoint::BeforeToolIntentCommit);
         let intent_payload = serde_json::to_value(&intent)
             .map_err(|e| SessionError::InvalidInput(format!("tool intent payload: {e}")))?;
-        self.commit(
+        let receipt = self.commit(
             vec![NewEvent {
                 kind: "tool_intent".into(),
                 payload_schema: 1,
@@ -377,6 +480,11 @@ impl Session {
             None,
         )?;
         self.fault(crate::FaultPoint::AfterToolIntentCommit);
+        // The committed intent's seq is the provenance anchor for the memory
+        // proposal it leads to (R-11); the committed payload itself carries
+        // null (the seq is unknowable before the commit).
+        let mut intent = intent;
+        intent.intent_event = Some(receipt.last_seq);
 
         // Approval gate: consequential tools require an approval intent;
         // approved intents carry the digest, parked intents wait in the
@@ -388,7 +496,6 @@ impl Session {
                 return Ok(self.outcome_interrupted(intent, format!("approval denied: {e}")));
             }
         };
-        let mut intent = intent;
         intent.approval = approval_digest;
 
         // Dispatch-time re-verification (R-16/D-11/C-10): revoked ⇒ the
@@ -432,6 +539,7 @@ impl Session {
                         args: Value::Null,
                         approval: None,
                         origin_snapshot: None,
+                        intent_event: None,
                     },
                     approval,
                 });
@@ -456,7 +564,10 @@ impl Session {
         // tools additionally require their parked approval entry to still be
         // valid at dispatch (re-approval is a new intent).
         let want = Capability::new(intent.tool.clone(), vec!["call".into()]);
-        match self.broker.check(&principal, &want, self.broker.policy_version()) {
+        match self
+            .broker
+            .check(&principal, &want, self.broker.policy_version())
+        {
             Ok(effective) => {
                 if effective.requires_approval && intent.approval.is_none() {
                     return Ok(self.outcome_interrupted(
@@ -466,7 +577,9 @@ impl Session {
                 }
             }
             Err(e) => {
-                return Ok(self.outcome_interrupted(intent.clone(), format!("dispatch recheck: {e}")));
+                return Ok(
+                    self.outcome_interrupted(intent.clone(), format!("dispatch recheck: {e}"))
+                );
             }
         }
         if let Some(approval) = intent.approval {
@@ -483,6 +596,15 @@ impl Session {
                     ));
                 }
             }
+        }
+
+        // M4 memory substrate + child-run routing: the kernel-owned
+        // dispatchers, never the native tool path.
+        match intent.tool.as_str() {
+            "memory.query" => return self.dispatch_memory_query(run_id, intent, principal),
+            "memory.propose" => return self.dispatch_memory_propose(run_id, intent, principal),
+            "child.spawn" => return self.dispatch_child_spawn(run_id, intent, principal),
+            _ => {}
         }
 
         let result = match execute_tool(
@@ -508,7 +630,12 @@ impl Session {
         };
         self.scheduler.record_usage(
             run_id,
-            RunUsage { tokens: 0, tools: 1, children: 0, started_at_secs: 0 },
+            RunUsage {
+                tokens: 0,
+                tools: 1,
+                children: 0,
+                started_at_secs: 0,
+            },
         )?;
         Ok(ToolOutcome {
             call_id: intent.call_id.clone(),
@@ -547,10 +674,9 @@ impl Session {
                 role: kanbei_policy::CandidateRole::ToolOutput,
                 content: serde_json::to_vec(&outcome.result)
                     .map_err(|e| SessionError::InvalidInput(format!("candidate: {e}")))?,
-                replay_relevant: self.policy.replay_relevant(
-                    kanbei_policy::CandidateRole::ToolOutput,
-                    None,
-                ),
+                replay_relevant: self
+                    .policy
+                    .replay_relevant(kanbei_policy::CandidateRole::ToolOutput, None),
                 sensitivity: None,
                 media: Some("application/json".into()),
             };
@@ -578,15 +704,953 @@ impl Session {
         events.push(NewEvent {
             kind: "tool_outcome".into(),
             payload_schema: 1,
-            payload: serde_json::to_value(outcome).map_err(|e| {
-                SessionError::InvalidInput(format!("tool outcome payload: {e}"))
-            })?,
+            payload: serde_json::to_value(outcome)
+                .map_err(|e| SessionError::InvalidInput(format!("tool outcome payload: {e}")))?,
             objects: Vec::new(),
             refs: Vec::new(),
         });
         self.commit(events, None)?;
         self.fault(crate::FaultPoint::AfterToolOutcomeCommit);
         Ok(())
+    }
+
+    // ---------- M4 context projection (staged pipeline) ----------
+
+    /// Materialize the typed staged projection for one run: the harness
+    /// contract, canonical tool schemas, the bounded recent-event trajectory
+    /// (ranges cover the full canonical history; the CONTENT is the ring
+    /// render), salience-scored memory evidence, the scope-stable memory
+    /// fragments, and the current trigger — run through the kernel pipeline
+    /// and lowered into provider messages (the model-call request source).
+    /// Children project against the project fold only (attenuation); their
+    /// budget comes from the clamped ChildRun record.
+    pub fn project_context(
+        &mut self,
+        run_id: RunId,
+        trigger: &Trigger,
+    ) -> Result<StepContext, SessionError> {
+        const HARNESS_CONTRACT: &str = "kanbei kernel harness contract v1\nstable harness contract; deterministic tool/module schemas; stable memory; conversation prefix; volatile active memory; current trigger.";
+        let frozen_seq = self.next_seq.saturating_sub(1);
+        let is_child = self.scheduler.run_kind(run_id) == Some(RunKind::Child);
+
+        // Deterministic canonical tool/module schemas (sorted; each fragment
+        // is the schema object's canonical bytes).
+        let mut schemas = Vec::new();
+        if let Some(arr) = self.tool_registry.canonical_json().as_array() {
+            for schema in arr {
+                let name = schema
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let bytes = serde_json::to_vec(schema).map_err(|e| {
+                    SessionError::InvalidInput(format!("schema serialization: {e}"))
+                })?;
+                let text = String::from_utf8(bytes.clone())
+                    .map_err(|_| SessionError::InvalidInput("schema bytes are not utf-8".into()))?;
+                schemas.push(SchemaFragment {
+                    id: name,
+                    digest: Digest::new(&bytes),
+                    text,
+                    sensitivity: "public".into(),
+                });
+            }
+        }
+
+        // Trajectory: the frozen prefix; content is the bounded ring render
+        // (compact payload JSON, truncated).
+        let mut events: Vec<RenderedEvent> = self
+            .recent_events
+            .iter()
+            .map(|(seq, kind, payload)| {
+                let mut text = serde_json::to_string(payload).unwrap_or_default();
+                if text.len() > 512 {
+                    text.truncate(512);
+                }
+                RenderedEvent {
+                    seq: *seq,
+                    kind: kind.clone(),
+                    text,
+                    sensitivity: "internal".into(),
+                }
+            })
+            .collect();
+        if frozen_seq == 0 {
+            events = Vec::new();
+        }
+        let selected_ranges = if frozen_seq >= 1 {
+            vec![(1, frozen_seq)]
+        } else {
+            Vec::new()
+        };
+
+        // Memory folds.
+        let lifetime_head = self.memory_lifetime.head();
+        let lifetime_fold = match lifetime_head {
+            Some(root) => Some(
+                self.memory_lifetime
+                    .fold(Some(root))
+                    .map_err(SessionError::Memory)?,
+            ),
+            None => None,
+        };
+        let project_head = self.memory_project.as_ref().and_then(|a| a.head());
+        let project_fold = match project_head {
+            Some(root) => Some(
+                self.memory_project
+                    .as_ref()
+                    .expect("project head implies actor")
+                    .fold(Some(root))
+                    .map_err(SessionError::Memory)?,
+            ),
+            None => None,
+        };
+
+        // Salience: children see the project fold only (empty without one);
+        // parents prefer the project fold, falling back to lifetime.
+        let salience_fold = if is_child {
+            project_fold.clone().unwrap_or_else(empty_fold)
+        } else {
+            project_fold
+                .clone()
+                .unwrap_or_else(|| lifetime_fold.clone().unwrap_or_else(empty_fold))
+        };
+        let recent_causal: Vec<u64> = self.recent_events.iter().map(|(seq, _, _)| *seq).collect();
+        let projector = ActiveMemoryProjector::new();
+        let (active_view, scored) = projector
+            .project(
+                &SalienceInput {
+                    frozen_seq,
+                    recent_causal,
+                    open_loops: Vec::new(),
+                    pins: Vec::new(),
+                    fold: salience_fold.clone(),
+                    top_n: 32,
+                },
+                &mut self.memory_index,
+            )
+            .map_err(SessionError::Retrieval)?;
+        let active_ids: Vec<Id128> = salience_fold
+            .claims
+            .iter()
+            .map(|(_, c)| c.claim_id)
+            .collect();
+        let edges: Vec<ClaimEdge> = salience_fold.edges.iter().map(|(_, e)| e.clone()).collect();
+        let evidence: Vec<EvidenceClaim> = scored
+            .iter()
+            .map(|sc| {
+                let claim = &sc.claim;
+                let mut contradictions = Vec::new();
+                for (_, edge) in &salience_fold.edges {
+                    if edge.to == Some(claim.claim_id)
+                        && matches!(edge.kind, EdgeKind::Contradicts | EdgeKind::Supersedes)
+                        && let Some((digest, from_claim)) = salience_fold
+                            .claims
+                            .iter()
+                            .chain(salience_fold.retracted.iter())
+                            .find(|(_, c)| c.claim_id == edge.from)
+                    {
+                        contradictions.push(Contradiction {
+                            digest: *digest,
+                            text: from_claim.content.clone(),
+                            supersedes: edge.kind == EdgeKind::Supersedes,
+                        });
+                    }
+                }
+                EvidenceClaim {
+                    digest: sc.digest,
+                    text: claim.content.clone(),
+                    kind: claim.kind.clone(),
+                    sensitivity: claim.sensitivity.clone(),
+                    status: derive_validation_status(claim.claim_id, &active_ids, &edges),
+                    score: sc.score,
+                    contradictions,
+                    source_events: if claim.provenance.event > 0 {
+                        vec![claim.provenance.event]
+                    } else {
+                        Vec::new()
+                    },
+                }
+            })
+            .collect();
+
+        // Scope-stable memory fragments: lifetime always when non-empty,
+        // project when bound (the child's memory.query scope resolution is
+        // what attenuates — the fragments themselves are shared).
+        let lifetime = match (&lifetime_head, &lifetime_fold) {
+            (Some(root), Some(fold)) if !fold.claims.is_empty() => {
+                Some(render_memory_source(*root, fold))
+            }
+            _ => None,
+        };
+        let project = match (&project_head, &project_fold) {
+            (Some(root), Some(fold)) if !fold.claims.is_empty() => {
+                Some(render_memory_source(*root, fold))
+            }
+            _ => None,
+        };
+
+        let trigger_fragment = TriggerFragment {
+            kind: format!("{:?}", trigger.kind),
+            // The referent text when present, else the kind name — the
+            // fragment builder rejects empty content, so a referent-less
+            // trigger still materializes a non-empty fragment.
+            text: trigger
+                .referent
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| format!("{:?}", trigger.kind)),
+            sensitivity: "internal".into(),
+        };
+        // MVP projection budgets (documented constants).
+        let budgets = BudgetSpec {
+            max_total_tokens: 8192,
+            max_volatile_tokens: 4096,
+        };
+        let read = move |src: &SourceRef| match src {
+            SourceRef::Harness => true,
+            SourceRef::ModuleSchema(_) => true,
+            SourceRef::SessionEvent(seq) => *seq <= frozen_seq,
+            SourceRef::MemoryClaim(_) => true,
+            SourceRef::CompactionRange(..) => true,
+        };
+        let input = ProjectionInput {
+            harness_contract: HARNESS_CONTRACT.into(),
+            schemas,
+            lifetime,
+            project,
+            compaction: None,
+            trajectory: TrajectoryView {
+                frozen_seq,
+                selected_ranges,
+                selected_events: Vec::new(),
+                events,
+            },
+            active: active_view,
+            evidence: RetrievedEvidence { claims: evidence },
+            trigger: trigger_fragment,
+            budgets,
+        };
+        let vpc = run_pipeline(input, &read, &default_stages(), &ValidatorStage::new(read))
+            .map_err(SessionError::Context)?;
+        let lowering = lower(&vpc, true).map_err(SessionError::Context)?;
+        let memory_roots: Vec<Digest> = [lifetime_head, project_head]
+            .into_iter()
+            .flatten()
+            .collect();
+        let projection_state = ProjectionState {
+            projection_digest: vpc.projection_digest,
+            cache_plan: lowering.cache_plan,
+            memory_roots: memory_roots.clone(),
+            lowered: lowering.messages.clone(),
+        };
+        let rendered = lowering
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let rendered_hash = Digest::new(rendered.as_bytes());
+        self.projection_state = Some(projection_state);
+        let budget = if is_child {
+            self.scheduler
+                .child(run_id)
+                .map(|c| c.budgets)
+                .unwrap_or_else(|| self.scheduler.budgets())
+        } else {
+            self.scheduler.budgets()
+        };
+        Ok(StepContext {
+            rendered,
+            rendered_hash,
+            selected_events: vpc.selected_events,
+            budget,
+            projection_digest: Some(vpc.projection_digest),
+            memory_roots,
+        })
+    }
+
+    // ---------- M4 memory tools + child runs (R-11/R-12, R-09) ----------
+
+    /// Installs a claim/edge object into a scope's objects dir through an
+    /// independent store handle (the actor's `store()` is read-only; the
+    /// caller's duty is to install before proposing — the actor verifies
+    /// refs, R-12/M-01). The dirsync is barriered before returning so the
+    /// object is durable before any referencing frame.
+    fn memory_install(&self, scope: &MemoryScope, bytes: &[u8]) -> Result<Digest, SessionError> {
+        let memory_root = self
+            .cfg
+            .memory_root
+            .clone()
+            .unwrap_or_else(|| self.cfg.dir.join("memory"));
+        let objects_dir = memory_root.join(scope.dir_name()).join("objects");
+        let queue = Arc::new(kanbei_core::queue::DurabilityQueue::start("kb-mem-install"));
+        let mut store = kanbei_objects::ObjectStore::open(&objects_dir, Arc::clone(&queue))
+            .map_err(|e| {
+                SessionError::Memory(MemoryError::InvalidInput(format!("install store: {e}")))
+            })?;
+        let digest = store.install(bytes).map_err(|e| {
+            SessionError::Memory(MemoryError::InvalidInput(format!("install: {e}")))
+        })?;
+        store.flush().map_err(|e| {
+            SessionError::Memory(MemoryError::InvalidInput(format!("install flush: {e}")))
+        })?;
+        drop(store);
+        if let Ok(q) = Arc::try_unwrap(queue) {
+            let _ = q.shutdown();
+        }
+        Ok(digest)
+    }
+
+    /// A rejected M4 dispatch resolves as a Normal outcome carrying the
+    /// error text (mirrors the native-tool error path — caller-authored
+    /// input never surfaces as a SessionError).
+    fn memory_outcome_error(&self, intent: &ToolIntent, error: String) -> ToolOutcome {
+        ToolOutcome {
+            call_id: intent.call_id.clone(),
+            tool: intent.tool.clone(),
+            result: Value::Null,
+            error: Some(error),
+            classification: OutcomeClassification::Normal,
+            origin_snapshot: intent.origin_snapshot,
+            commit_snapshot: self.current_snapshot,
+            retained: None,
+        }
+    }
+
+    /// The bound project's scope.
+    fn project_scope(&self) -> MemoryScope {
+        match self.memory_project.as_ref().expect("project bound").scope() {
+            MemoryScope::Project(id) => MemoryScope::Project(*id),
+            MemoryScope::Lifetime => unreachable!("project actor owns a project scope"),
+        }
+    }
+
+    /// memory.query: search the committed claim DAG scoped by the run's read
+    /// capability (children see project claims only; parents add the
+    /// lifetime scope). The projection index is reconciled from the live
+    /// folds first, so queries always see committed memory.
+    fn dispatch_memory_query(
+        &mut self,
+        run_id: RunId,
+        intent: &ToolIntent,
+        _principal: Principal,
+    ) -> Result<ToolOutcome, SessionError> {
+        let _ = _principal;
+        self.scheduler.record_usage(
+            run_id,
+            RunUsage {
+                tokens: 0,
+                tools: 1,
+                children: 0,
+                started_at_secs: 0,
+            },
+        )?;
+        let Some(query) = intent.args.get("query").and_then(|q| q.as_str()) else {
+            return Ok(
+                self.memory_outcome_error(intent, "memory.query requires a string query".into())
+            );
+        };
+        let requested: Option<Vec<String>> = intent
+            .args
+            .get("scopes")
+            .and_then(|s| s.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            });
+        let project_bound = self.memory_project.is_some();
+        let is_child = self.scheduler.run_kind(run_id) == Some(RunKind::Child);
+        let mut allowed: Vec<&str> = Vec::new();
+        if project_bound {
+            allowed.push("project");
+        }
+        if !is_child {
+            allowed.push("lifetime");
+        }
+        let mut scopes: Vec<MemoryScope> = Vec::new();
+        match requested {
+            Some(list) => {
+                for name in list {
+                    match name.as_str() {
+                        "project" if allowed.contains(&"project") => {
+                            scopes.push(self.project_scope());
+                        }
+                        "lifetime" if allowed.contains(&"lifetime") => {
+                            scopes.push(MemoryScope::Lifetime);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None => {
+                if allowed.contains(&"project") {
+                    scopes.push(self.project_scope());
+                }
+                if allowed.contains(&"lifetime") {
+                    scopes.push(MemoryScope::Lifetime);
+                }
+            }
+        }
+        let max_results = intent
+            .args
+            .get("max_results")
+            .and_then(|m| m.as_u64())
+            .unwrap_or(16);
+        // Reconcile the disposable index from the live folds.
+        let mut index_inputs: Vec<ScopeIndexInput> = Vec::new();
+        if let Some(root) = self.memory_lifetime.head() {
+            let fold = self
+                .memory_lifetime
+                .fold(Some(root))
+                .map_err(SessionError::Memory)?;
+            index_inputs.push(ScopeIndexInput {
+                scope: MemoryScope::Lifetime,
+                root: Some(root),
+                fold,
+            });
+        }
+        if let Some(actor) = self.memory_project.as_ref()
+            && let Some(root) = actor.head()
+        {
+            let fold = actor.fold(Some(root)).map_err(SessionError::Memory)?;
+            index_inputs.push(ScopeIndexInput {
+                scope: self.project_scope(),
+                root: Some(root),
+                fold,
+            });
+        }
+        self.memory_index
+            .reconcile(&index_inputs)
+            .map_err(SessionError::Retrieval)?;
+        let result = match self.memory_index.search(&SearchQuery {
+            text: query.to_string(),
+            scopes,
+            max_results,
+            ..Default::default()
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(self.memory_outcome_error(intent, format!("memory.query failed: {e}")));
+            }
+        };
+        let claims: Vec<Value> = result
+            .claims
+            .iter()
+            .map(|c| {
+                json!({
+                    "digest": c.digest.to_string(),
+                    "text": c.text,
+                    "kind": c.kind,
+                    "sensitivity": c.sensitivity,
+                    "status": serde_json::to_value(&c.status).unwrap_or(Value::Null),
+                    "score": c.score,
+                    "contradictions": c.contradictions.iter().map(|x| json!({
+                        "digest": x.digest.to_string(),
+                        "text": x.text,
+                        "supersedes": x.supersedes,
+                    })).collect::<Vec<_>>(),
+                    "source_events": c.source_events,
+                })
+            })
+            .collect();
+        let payload = json!({
+            "claims": claims,
+            "query_entities": result.query_entities.iter().map(|(k, kind)| json!({
+                "key": k,
+                "kind": format!("{kind:?}"),
+            })).collect::<Vec<_>>(),
+            "fts_used": result.fts_used,
+            "expanded": result.expanded,
+        });
+        Ok(ToolOutcome {
+            call_id: intent.call_id.clone(),
+            tool: intent.tool.clone(),
+            result: payload,
+            error: None,
+            classification: OutcomeClassification::Normal,
+            origin_snapshot: intent.origin_snapshot,
+            commit_snapshot: self.current_snapshot,
+            retained: None,
+        })
+    }
+
+    /// One approval-anchored root transition: commits the
+    /// `memory_root_approved` origin event, then proposes with a ≤3-attempt
+    /// CAS rebase (stale expected roots rebase onto the actor's actual head;
+    /// idempotency is keyed on the approval event). On exhaustion the
+    /// deferred facts are committed and `("deferred", None)` returned. The
+    /// session-side manifest mirrors the actor's internal construction
+    /// byte-for-byte (same schema/parent/scope/order fields; the actor
+    /// derives `retracted` from Supersedes edges itself).
+    #[allow(clippy::too_many_arguments)]
+    fn approve_transition(
+        &mut self,
+        project_id: Id128,
+        principal: &Principal,
+        decision_digest: Digest,
+        added_claims: &[Digest],
+        added_edges: &[Digest],
+        retracted: &[Digest],
+        deferred_claim: Digest,
+        expected_root: Option<Digest>,
+    ) -> Result<(String, Option<Id128>), SessionError> {
+        let receipt = self.commit(
+            vec![NewEvent {
+                kind: "memory_root_approved".into(),
+                payload_schema: 1,
+                payload: json!({
+                    "claim_digest": added_claims.first().map(|d| d.to_string()),
+                    "edge_digest": added_edges.first().map(|d| d.to_string()),
+                    "decision_digest": decision_digest.to_string(),
+                    "expected_root": expected_root.map(|d| d.to_string()),
+                }),
+                objects: Vec::new(),
+                refs: Vec::new(),
+            }],
+            None,
+        )?;
+        let approval_event = receipt.last_seq;
+        let mut expected = expected_root;
+        for attempt in 0..3u32 {
+            let outcome = {
+                let project = self.memory_project.as_mut().expect("project bound");
+                let manifest = RootManifest {
+                    schema: MEMORY_ROOT_SCHEMA,
+                    parent: expected,
+                    scope: MemoryScope::Project(project_id),
+                    added_claims: added_claims.to_vec(),
+                    added_edges: added_edges.to_vec(),
+                    retracted: retracted.to_vec(),
+                    transition_id: Id128::generate(),
+                };
+                let manifest_digest = manifest.digest();
+                let transition = MemoryTransition {
+                    schema: MEMORY_TRANSITION_SCHEMA,
+                    transition_id: manifest.transition_id,
+                    scope: MemoryScope::Project(project_id),
+                    kind: TransitionKind::RootApproval,
+                    expected_old_root: expected,
+                    accepted_new_root: manifest_digest,
+                    origin_session: self.session_id,
+                    origin_event: approval_event,
+                    origin_kind: "memory_root_approved".into(),
+                    decision_principal: principal.clone(),
+                    decision_digest,
+                    idempotency_key: IdempotencyKey {
+                        session: self.session_id,
+                        event: approval_event,
+                        decision: decision_digest,
+                    },
+                };
+                project.propose(transition, added_claims, added_edges)
+            };
+            match outcome.map_err(SessionError::Memory)? {
+                TransitionOutcome::Committed { transition_id, .. } => {
+                    self.commit(
+                        vec![NewEvent {
+                            kind: "memory_transition_backlink".into(),
+                            payload_schema: 1,
+                            payload: json!({
+                                "transition_id": transition_id.to_string(),
+                                "scope": serde_json::to_value(MemoryScope::Project(project_id))
+                                    .expect("scope serialization cannot fail"),
+                            }),
+                            objects: Vec::new(),
+                            refs: Vec::new(),
+                        }],
+                        None,
+                    )?;
+                    return Ok(("approved".into(), Some(transition_id)));
+                }
+                TransitionOutcome::CasFailed { actual, .. } if attempt < 2 => {
+                    expected = actual;
+                }
+                TransitionOutcome::CasFailed { installed, .. } => {
+                    self.commit(
+                        vec![
+                            NewEvent {
+                                kind: "promotion_deferred".into(),
+                                payload_schema: 1,
+                                payload: json!({
+                                    "claim_digest": deferred_claim.to_string(),
+                                    "reason": "CAS rebase exhausted (3 attempts)",
+                                }),
+                                objects: Vec::new(),
+                                refs: Vec::new(),
+                            },
+                            NewEvent {
+                                kind: "memory_orphans_expected".into(),
+                                payload_schema: 1,
+                                payload: json!({
+                                    "scope": serde_json::to_value(MemoryScope::Project(project_id))
+                                        .expect("scope serialization cannot fail"),
+                                    "digests": installed
+                                        .iter()
+                                        .map(|d| d.to_string())
+                                        .collect::<Vec<_>>(),
+                                }),
+                                objects: Vec::new(),
+                                refs: Vec::new(),
+                            },
+                        ],
+                        None,
+                    )?;
+                    return Ok(("deferred".into(), None));
+                }
+            }
+        }
+        unreachable!("the rebase loop returns on every branch")
+    }
+
+    /// memory.propose: install the claim object, commit the canonical
+    /// `memory_proposal` fact, then — under a broker approval — commit the
+    /// root-selection transition(s) and their backlinks. A supersede target
+    /// is retracted by a SECOND transition carrying the supersedes edge:
+    /// R-12/M-13 edges point only to already-committed claims, and the actor
+    /// derives retraction from the edge's `from` — so the edge departs from
+    /// the superseded claim toward the (by then committed) successor. Without
+    /// an approval the claim is left `proposed` for the root agent.
+    fn dispatch_memory_propose(
+        &mut self,
+        run_id: RunId,
+        intent: &ToolIntent,
+        principal: Principal,
+    ) -> Result<ToolOutcome, SessionError> {
+        self.scheduler.record_usage(
+            run_id,
+            RunUsage {
+                tokens: 0,
+                tools: 1,
+                children: 0,
+                started_at_secs: 0,
+            },
+        )?;
+        if self.memory_project.is_none() {
+            return Ok(self.memory_outcome_error(intent, "no project bound".into()));
+        }
+        let Some(claim_val) = intent.args.get("claim") else {
+            return Ok(
+                self.memory_outcome_error(intent, "memory.propose requires a claim object".into())
+            );
+        };
+        let Some(kind) = claim_val.get("kind").and_then(|k| k.as_str()) else {
+            return Ok(self.memory_outcome_error(intent, "claim.kind is required".into()));
+        };
+        let Some(content) = claim_val.get("content").and_then(|c| c.as_str()) else {
+            return Ok(self.memory_outcome_error(intent, "claim.content is required".into()));
+        };
+        let sensitivity = claim_val
+            .get("sensitivity")
+            .and_then(|v| v.as_str())
+            .unwrap_or("internal")
+            .to_string();
+        let supersedes: Option<Id128> = claim_val
+            .get("supersedes")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok());
+
+        let project_id = match self.memory_project.as_ref().expect("project bound").scope() {
+            MemoryScope::Project(id) => *id,
+            MemoryScope::Lifetime => unreachable!("project actor owns a project scope"),
+        };
+        let claim_id = Id128::generate();
+        let provenance = ClaimProvenance {
+            session: self.session_id,
+            event: intent.intent_event.unwrap_or(0),
+            source_claims: Vec::new(),
+            evidence_excerpt: String::new(),
+        };
+        let claim = Claim {
+            schema: MEMORY_CLAIM_SCHEMA,
+            claim_id,
+            kind: kind.to_string(),
+            content: content.to_string(),
+            owner: principal.clone(),
+            visibility_scope: MemoryScope::Project(project_id),
+            provenance: provenance.clone(),
+            observed_at: None,
+            valid_from: None,
+            sensitivity: sensitivity.clone(),
+        };
+        let claim_digest = self.memory_install(
+            &MemoryScope::Project(project_id),
+            &claim.to_canonical_bytes(),
+        )?;
+        self.fault(crate::FaultPoint::BeforeMemoryProposal);
+        self.commit(
+            vec![NewEvent {
+                kind: "memory_proposal".into(),
+                payload_schema: 1,
+                payload: json!({
+                    "claim_digest": claim_digest.to_string(),
+                    "claim_id": claim_id.to_string(),
+                    "kind": kind,
+                    "content": content,
+                    "sensitivity": sensitivity,
+                    "owner": principal,
+                    "intent_event": intent.intent_event,
+                }),
+                objects: Vec::new(),
+                refs: Vec::new(),
+            }],
+            None,
+        )?;
+        self.fault(crate::FaultPoint::AfterMemoryProposal);
+
+        // The supersede target must be an active claim of the project fold.
+        let edge = match supersedes {
+            Some(target) => {
+                let project = self.memory_project.as_ref().expect("project bound");
+                let fold = project.fold(project.head()).map_err(SessionError::Memory)?;
+                let Some(target_digest) = fold
+                    .claims
+                    .iter()
+                    .find(|(_, c)| c.claim_id == target)
+                    .map(|(d, _)| *d)
+                else {
+                    return Ok(
+                        self.memory_outcome_error(intent, "supersedes target not found".into())
+                    );
+                };
+                let edge = ClaimEdge {
+                    schema: MEMORY_EDGE_SCHEMA,
+                    from: target,
+                    to: Some(claim_id),
+                    kind: EdgeKind::Supersedes,
+                    entity_keys: Vec::new(),
+                    provenance: provenance.clone(),
+                };
+                let digest = self.memory_install(
+                    &MemoryScope::Project(project_id),
+                    &edge.to_canonical_bytes(),
+                )?;
+                Some((edge, digest, target_digest))
+            }
+            None => None,
+        };
+
+        let Some(approval_digest) = intent.approval else {
+            // Left proposed for the root agent: no transition, no edge.
+            return Ok(ToolOutcome {
+                call_id: intent.call_id.clone(),
+                tool: intent.tool.clone(),
+                result: json!({
+                    "claim_id": claim_id.to_string(),
+                    "claim_digest": claim_digest.to_string(),
+                    "status": "proposed",
+                }),
+                error: None,
+                classification: OutcomeClassification::Normal,
+                origin_snapshot: intent.origin_snapshot,
+                commit_snapshot: self.current_snapshot,
+                retained: None,
+            });
+        };
+
+        // Phase 1 — the claim's own transition (genesis when the project
+        // fold is empty).
+        let expected = {
+            let project = self.memory_project.as_ref().expect("project bound");
+            project.head()
+        };
+        let (status, transition_id) = self.approve_transition(
+            project_id,
+            &principal,
+            approval_digest,
+            &[claim_digest],
+            &[],
+            &[],
+            claim_digest,
+            expected,
+        )?;
+
+        // Phase 2 — the supersede edge (only after the claim committed).
+        let mut status = status;
+        let mut transition_id = transition_id;
+        if status == "approved"
+            && let Some((_edge, edge_digest, target_digest)) = edge
+        {
+            let expected = {
+                let project = self.memory_project.as_ref().expect("project bound");
+                project.head()
+            };
+            let (s, t) = self.approve_transition(
+                project_id,
+                &principal,
+                approval_digest,
+                &[],
+                &[edge_digest],
+                &[target_digest],
+                claim_digest,
+                expected,
+            )?;
+            status = s;
+            if t.is_some() {
+                transition_id = t;
+            }
+        }
+
+        Ok(ToolOutcome {
+            call_id: intent.call_id.clone(),
+            tool: intent.tool.clone(),
+            result: json!({
+                "claim_id": claim_id.to_string(),
+                "claim_digest": claim_digest.to_string(),
+                "status": status,
+                "transition_id": transition_id.map(|t| t.to_string()),
+            }),
+            error: None,
+            classification: OutcomeClassification::Normal,
+            origin_snapshot: intent.origin_snapshot,
+            commit_snapshot: self.current_snapshot,
+            retained: None,
+        })
+    }
+
+    /// child.spawn: spawn a bounded child run under the active parent,
+    /// drive it through the cognition loop with a fresh provider from the
+    /// configured factory (the child's render closure attenuates via
+    /// [`Session::project_context`]'s run-kind check), and record the child
+    /// run lifecycle (run_start + run_outcome) canonically. Every started
+    /// run reaches a terminal outcome.
+    fn dispatch_child_spawn(
+        &mut self,
+        run_id: RunId,
+        intent: &ToolIntent,
+        _principal: Principal,
+    ) -> Result<ToolOutcome, SessionError> {
+        if self.scheduler.run_kind(run_id) == Some(RunKind::Child) {
+            return Ok(self.memory_outcome_error(intent, "children cannot spawn children".into()));
+        }
+        let Some(prompt) = intent.args.get("prompt").and_then(|p| p.as_str()) else {
+            return Ok(self.memory_outcome_error(intent, "child.spawn requires a prompt".into()));
+        };
+        if prompt.len() > 8192 {
+            return Ok(
+                self.memory_outcome_error(intent, "child.spawn prompt exceeds 8192 chars".into())
+            );
+        }
+        // Clamped child budgets (the kernel clamp is the session's job; the
+        // scheduler records them as given).
+        let spec = intent.args.get("budgets");
+        let deadline = spec
+            .and_then(|b| b.get("deadline_secs"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(60)
+            .min(60);
+        let tokens = spec
+            .and_then(|b| b.get("tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20_000)
+            .min(20_000);
+        let tools = spec
+            .and_then(|b| b.get("tools"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(16)
+            .min(16);
+        let child_budgets = Budgets {
+            deadline_secs: Some(deadline),
+            tokens: Some(tokens),
+            tools: Some(tools),
+            children: Some(0),
+        };
+        // The parent's children budget bounds concurrent children.
+        let parent_children = self.scheduler.current_usage(run_id).children;
+        let parent_cap = self.scheduler.budgets().children.unwrap_or(u64::MAX);
+        if parent_children >= parent_cap {
+            return Ok(self.memory_outcome_error(intent, "child budget exhausted".into()));
+        }
+        let child_id = self
+            .scheduler
+            .spawn_child(run_id, child_budgets)
+            .map_err(SessionError::Scheduler)?;
+        self.run_start(child_id)?;
+        let trigger = Trigger {
+            kind: kanbei_scheduler::TriggerKind::ChildDone,
+            referent: Some(Digest::new(child_id.to_string().as_bytes())),
+        };
+        let outcome = {
+            let factory = self
+                .child_provider
+                .as_mut()
+                .ok_or_else(|| SessionError::InvalidInput("no child provider configured".into()))?;
+            let mut provider = factory();
+            self.cognition_loop(
+                child_id,
+                trigger.clone(),
+                provider.as_mut(),
+                |sess: &mut Session| sess.project_context(child_id, &trigger),
+            )
+        };
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                // Every started run reaches a terminal outcome (canonical):
+                // the loop errored without recording — record Failed here
+                // and close the scheduler entry.
+                let usage = self.scheduler.current_usage(child_id);
+                let record = RunOutcome {
+                    run_id: child_id,
+                    outcome: TerminalOutcome::Failed(FailureKind::Internal),
+                    reason: Some(format!("child run failed: {e}")),
+                };
+                self.commit(
+                    vec![NewEvent {
+                        kind: "run_outcome".into(),
+                        payload_schema: 1,
+                        payload: serde_json::to_value(&record).map_err(|e| {
+                            SessionError::InvalidInput(format!("run outcome payload: {e}"))
+                        })?,
+                        objects: Vec::new(),
+                        refs: Vec::new(),
+                    }],
+                    None,
+                )?;
+                let _ = self.scheduler.record_outcome(
+                    child_id,
+                    TerminalOutcome::Failed(FailureKind::Internal),
+                    usage,
+                    &[],
+                )?;
+                return Ok(self.memory_outcome_error(intent, format!("child run failed: {e}")));
+            }
+        };
+        // The child's canonical outcome was recorded inside cognition_loop;
+        // only close the scheduler entry when the loop left it live (the
+        // Blocked path commits its record directly and returns without
+        // touching the scheduler).
+        let usage = self.scheduler.current_usage(child_id);
+        if self.scheduler.child(child_id).is_some() {
+            let (record, _) = self
+                .scheduler
+                .record_outcome(child_id, outcome, usage, &[])?;
+            let _ = record;
+        }
+        self.scheduler.observe(trigger);
+        self.scheduler.record_usage(
+            run_id,
+            RunUsage {
+                tokens: 0,
+                tools: 0,
+                children: 1,
+                started_at_secs: 0,
+            },
+        )?;
+        Ok(ToolOutcome {
+            call_id: intent.call_id.clone(),
+            tool: intent.tool.clone(),
+            result: json!({
+                "run_id": child_id.to_string(),
+                "outcome": format!("{outcome:?}"),
+                "usage": json!({ "tokens": usage.tokens, "tools": usage.tools }),
+            }),
+            error: None,
+            classification: OutcomeClassification::Normal,
+            origin_snapshot: intent.origin_snapshot,
+            commit_snapshot: self.current_snapshot,
+            retained: None,
+        })
     }
 
     // ---------- bounded cognition step loop (R-18/E-01) ----------
@@ -632,13 +1696,23 @@ impl Session {
                 .map_err(|e| SessionError::InvalidInput(format!("cognition step: {e}")))?;
             match command {
                 StepCommand::ModelCall(_) => {
-                    let rendered = context.rendered.clone();
+                    // The staged projection's lowered messages are the
+                    // request; the M3 fallback renders the raw context. The
+                    // spec's rendered_hash is intentionally not re-validated
+                    // against context.rendered_hash here (M3 behavior — the
+                    // request is built from the same rendered context).
+                    let messages = self
+                        .projection_state
+                        .as_ref()
+                        .map(|p| p.lowered.clone())
+                        .unwrap_or_else(|| {
+                            vec![Message {
+                                role: Role::User,
+                                content: context.rendered.clone(),
+                                tool_call_id: None,
+                            }]
+                        });
                     let selected = context.selected_events.clone();
-                    let messages = vec![Message {
-                        role: Role::User,
-                        content: rendered,
-                        tool_call_id: None,
-                    }];
                     let result = self.model_call(run_id, messages, selected, &context.rendered)?;
                     last = Some(StepResult::Model(result));
                 }
@@ -648,23 +1722,66 @@ impl Session {
                         generation: 0,
                         run: Some(0),
                     };
-                    let tool_outcome =
-                        self.tool_call(run_id, principal, &tool, arguments)?;
+                    let tool_outcome = self.tool_call(run_id, principal, &tool, arguments)?;
                     self.commit_tool_outcome(&tool_outcome)?;
-                    last = Some(StepResult::Tool(serde_json::to_value(&tool_outcome).unwrap_or(Value::Null)));
-                }
-                StepCommand::MemoryQuery { .. } | StepCommand::MemoryPropose { .. } => {
-                    return Err(SessionError::InvalidInput(
-                        "memory commands land in M4".into(),
+                    last = Some(StepResult::Tool(
+                        serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
                     ));
                 }
-                StepCommand::ChildSpawn { .. } => {
-                    return Err(SessionError::InvalidInput(
-                        "child spawn lands in M4".into(),
+                StepCommand::MemoryQuery { query } => {
+                    let principal = Principal {
+                        session: self.session_id,
+                        generation: 0,
+                        run: Some(0),
+                    };
+                    let tool_outcome = self.tool_call(
+                        run_id,
+                        principal,
+                        "memory.query",
+                        json!({ "query": query }),
+                    )?;
+                    self.commit_tool_outcome(&tool_outcome)?;
+                    last = Some(StepResult::Memory(
+                        serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
                     ));
                 }
-                StepCommand::ScheduleWake { kind, after_secs: _ } => {
-                    self.scheduler.observe(Trigger { kind, referent: None });
+                StepCommand::MemoryPropose { claim } => {
+                    let principal = Principal {
+                        session: self.session_id,
+                        generation: 0,
+                        run: Some(0),
+                    };
+                    let tool_outcome = self.tool_call(
+                        run_id,
+                        principal,
+                        "memory.propose",
+                        json!({ "claim": claim }),
+                    )?;
+                    self.commit_tool_outcome(&tool_outcome)?;
+                    last = Some(StepResult::Memory(
+                        serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                    ));
+                }
+                StepCommand::ChildSpawn { spec } => {
+                    let principal = Principal {
+                        session: self.session_id,
+                        generation: 0,
+                        run: Some(0),
+                    };
+                    let tool_outcome = self.tool_call(run_id, principal, "child.spawn", spec)?;
+                    self.commit_tool_outcome(&tool_outcome)?;
+                    last = Some(StepResult::Child(
+                        serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                    ));
+                }
+                StepCommand::ScheduleWake {
+                    kind,
+                    after_secs: _,
+                } => {
+                    self.scheduler.observe(Trigger {
+                        kind,
+                        referent: None,
+                    });
                     last = Some(StepResult::Scheduled);
                 }
                 StepCommand::Finish(finish) => break finish,
@@ -711,11 +1828,7 @@ impl Session {
                             env.payload.get("call_id").and_then(|c| c.as_str()),
                             env.payload.get("tool").and_then(|t| t.as_str()),
                         ) {
-                            pending.push((
-                                call.to_string(),
-                                tool.to_string(),
-                                env.snapshot,
-                            ));
+                            pending.push((call.to_string(), tool.to_string(), env.snapshot));
                         }
                     }
                     _ => {}
@@ -751,5 +1864,48 @@ impl Session {
             classified += 1;
         }
         Ok(classified)
+    }
+}
+// ---------- M4 projection helpers ----------
+
+/// An empty fold (no claims, no edges, no history) for child runs without a
+/// project binding.
+fn empty_fold() -> RootFold {
+    RootFold {
+        root: None,
+        claims: Vec::new(),
+        edges: Vec::new(),
+        retracted: Vec::new(),
+        history: Vec::new(),
+    }
+}
+
+/// Deterministic fold render for a scope-stable memory fragment: claims
+/// sorted by ClaimId text, `"kind | content\n"` lines, capped at 16 KiB with
+/// a truncation marker. Sensitivity = max claim sensitivity via
+/// [`sensitivity_rank`].
+fn render_memory_source(root: Digest, fold: &RootFold) -> MemoryFragmentSource {
+    let mut claims: Vec<&(Digest, Claim)> = fold.claims.iter().collect();
+    claims.sort_by_key(|(_, c)| c.claim_id.to_string());
+    let mut text = String::new();
+    for (_, claim) in &claims {
+        text.push_str(&format!("{} | {}\n", claim.kind, claim.content));
+    }
+    if text.len() > 16 * 1024 {
+        text.truncate(16 * 1024);
+        text.push_str("…[truncated]");
+    }
+    let sensitivity = fold
+        .claims
+        .iter()
+        .map(|(_, c)| c.sensitivity.as_str())
+        .max_by_key(|s| sensitivity_rank(s))
+        .unwrap_or("internal")
+        .to_string();
+    MemoryFragmentSource {
+        root,
+        text,
+        sensitivity,
+        claim_digests: fold.claims.iter().map(|(d, _)| *d).collect(),
     }
 }

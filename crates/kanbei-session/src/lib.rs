@@ -53,11 +53,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use kanbei_core::digest::Digest;
-use kanbei_core::envelope::{Envelope, EnvelopeError, ENVELOPE_SCHEMA};
+use kanbei_core::envelope::{ENVELOPE_SCHEMA, Envelope, EnvelopeError};
 use kanbei_core::id::Id128;
 use kanbei_core::queue::DurabilityQueue;
 use kanbei_log::{AppendLog, Profile, Recovered};
-use kanbei_modules::{HeadFile, ModuleError, ModuleManager, PackageManifest, ReplacementOutcome, StateUpdate};
+use kanbei_modules::{
+    HeadFile, ModuleError, ModuleManager, PackageManifest, ReplacementOutcome, StateUpdate,
+};
 use kanbei_objects::{ObjectError, ObjectStore};
 use kanbei_policy::builtins::StoreAllPolicy;
 use kanbei_policy::{Admission, BoundaryKind, Candidate, PolicyPlugin, RetentionGate};
@@ -70,6 +72,10 @@ use kanbei_snapshot::ExecutionManifest;
 use kanbei_vm::{GuestError, Host, Vm};
 use serde_json::json;
 use thiserror::Error;
+
+/// The bounded recent-event ring size: the trajectory render covers the
+/// full canonical history, but the CONTENT is these most-recent events.
+const RECENT_RING: usize = 64;
 
 // ---------- config ----------
 
@@ -118,6 +124,16 @@ pub struct SessionConfig {
     /// The session's own identity (caller principal for kernel-originated
     /// tool calls, R-14); None = generate at open.
     pub session_id: Option<Id128>,
+    // --- M4 memory substrate + context projection ---
+    /// Memory substrate root (canonical XDG state). None = cfg.dir.join("memory").
+    pub memory_root: Option<PathBuf>,
+    /// ProjectId (pro_ brand) binding; None = no project memory scope.
+    pub project: Option<Id128>,
+    /// Kernel fault injector for the memory actors (transition/head points).
+    pub memory_fault: Option<Arc<dyn kanbei_memory::MemoryFaultInjector>>,
+    /// Factory producing a fresh CognitionProvider per spawned child run
+    /// (R-09 child runs; None = child.spawn resolves to an error outcome).
+    pub child_provider: Option<Box<dyn FnMut() -> Box<dyn kanbei_scheduler::CognitionProvider>>>,
 }
 
 impl Default for SessionConfig {
@@ -142,6 +158,10 @@ impl Default for SessionConfig {
             broker: kanbei_capabilities::Broker::new(),
             approval_bound: 64,
             session_id: None,
+            memory_root: None,
+            project: None,
+            memory_fault: None,
+            child_provider: None,
         }
     }
 }
@@ -178,6 +198,9 @@ pub enum FaultPoint {
     AfterToolOutcomeCommit,
     BeforeRunOutcome,
     AfterRunOutcome,
+    // --- M4 memory proposal points ---
+    BeforeMemoryProposal,
+    AfterMemoryProposal,
 }
 
 pub trait FaultInjector: Send + Sync {
@@ -229,6 +252,30 @@ pub struct ConfigActivation {
     pub event_seq: u64,
 }
 
+/// The materialized projection of the last [`Session::project_context`]
+/// call: the validated fragment-list digest, the lowering's cache plan, the
+/// pinned memory roots, and the lowered provider messages (the model-call
+/// request source).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectionState {
+    pub projection_digest: Digest,
+    pub cache_plan: kanbei_provider::CachePlan,
+    /// [lifetime, project] flattened, lifetime first; empty when unpinned.
+    pub memory_roots: Vec<Digest>,
+    pub lowered: Vec<kanbei_provider::Message>,
+}
+
+/// One committed compaction selection (R-18/E-06): the covered event range,
+/// the summary object digest, and the fragment ids folded into it. New
+/// events whose payload carries one of the covered fragments are rejected by
+/// the commit FSM (E-06).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CompactedRange {
+    pub range: (u64, u64),
+    pub summary_digest: Digest,
+    pub covered_fragments: Vec<String>,
+}
+
 // ---------- session ----------
 
 pub struct Session {
@@ -261,6 +308,34 @@ pub struct Session {
     approval_bound: usize,
     fs_root: PathBuf,
     session_id: Id128,
+    // --- M4 memory substrate + context projection ---
+    /// The lifetime-scope memory actor (always present; R-11).
+    memory_lifetime: kanbei_memory::MemoryRootActor,
+    /// The project-scope memory actor; None when no project is bound.
+    memory_project: Option<kanbei_memory::MemoryRootActor>,
+    /// Disposable per-session projection index over both scope folds.
+    memory_index: kanbei_retrieval::MemoryIndex,
+    /// The bound project's registry entry (None when unbounded).
+    project_entry: Option<kanbei_memory::ProjectEntry>,
+    /// The last materialized projection (M4 staged pipeline).
+    projection_state: Option<ProjectionState>,
+    /// Provider identity of the last model call (R-18/E-07 continuity).
+    last_provider: Option<String>,
+    /// (sent stable-prefix digest, memory roots) of the last model call.
+    last_cache: Option<(Option<Digest>, Vec<Digest>)>,
+    /// Bounded recent-event ring (seq, kind, payload) — the trajectory
+    /// render source, capped at [`RECENT_RING`] entries.
+    recent_events: std::collections::VecDeque<(u64, String, serde_json::Value)>,
+    /// Covered compaction ranges (R-18/E-06) recovered from the log.
+    compacted: Vec<CompactedRange>,
+    /// The memory actors' fault injector (cloned into both actors at open).
+    /// Held here per the crash-test contract so the harness can arm it via
+    /// its own shared Arc before the memory flow runs; the session itself
+    /// never fires it.
+    #[allow(dead_code)]
+    memory_fault: Option<Arc<dyn kanbei_memory::MemoryFaultInjector>>,
+    /// Child-run provider factory (R-09); None = child.spawn errors.
+    child_provider: Option<Box<dyn FnMut() -> Box<dyn kanbei_scheduler::CognitionProvider>>>,
 }
 
 impl Session {
@@ -284,7 +359,10 @@ impl Session {
         std::fs::create_dir_all(&cfg.dir)?;
         let log_path = cfg.dir.join("log.zst");
         let recovered = recover_or_fresh(&log_path)?;
-        let queue = Arc::new(DurabilityQueue::start(&format!("kb-session-{}", cfg.stream)));
+        let queue = Arc::new(DurabilityQueue::start(&format!(
+            "kb-session-{}",
+            cfg.stream
+        )));
         let log = match AppendLog::open(&log_path, &cfg.stream, Arc::clone(&queue)) {
             Ok(log) => log,
             Err(e) => {
@@ -300,7 +378,11 @@ impl Session {
                 return Err(e.into());
             }
         };
-        let next_seq = if recovered.events == 0 { 1 } else { recovered.last_seq + 1 };
+        let next_seq = if recovered.events == 0 {
+            1
+        } else {
+            recovered.last_seq + 1
+        };
         // genesis: pin the kernel bootstrap snapshot as the pre-event
         // snapshot for the first commit (R-08)
         let current_snapshot = if recovered.events == 0 {
@@ -329,8 +411,7 @@ impl Session {
         // StateStore currency callback is a placeholder — ModuleManager::new
         // re-binds it to the manager's token table (the session cannot
         // reference the manager before it exists).
-        let (modules, vm_engine_digest) = match Vm::load(cfg.engine.clone().unwrap_or_default())
-        {
+        let (modules, vm_engine_digest) = match Vm::load(cfg.engine.clone().unwrap_or_default()) {
             Ok(vm) => {
                 let vm_engine_digest = vm.engine_digest();
                 let mut state = kanbei_modules::StateStore::open(
@@ -373,6 +454,158 @@ impl Session {
         let breaker_floors = cfg.breaker_floors;
         let provider_config = cfg.provider.clone();
         let session_id = cfg.session_id.unwrap_or_else(Id128::generate);
+
+        // ---- M4 memory substrate wiring (R-11) ----
+        // Canonical memory is load-bearing: corrupt memory state is a hard
+        // open error (safe mode is config-only, never memory).
+        let memory_root = cfg
+            .memory_root
+            .clone()
+            .unwrap_or_else(|| cfg.dir.join("memory"));
+        std::fs::create_dir_all(&memory_root)?;
+        let memory_fault = cfg.memory_fault.clone();
+        let project_id = cfg.project;
+        let child_provider = cfg.child_provider.take();
+        let mut memory_lifetime = kanbei_memory::MemoryRootActor::open(
+            &memory_root,
+            kanbei_memory::MemoryScope::Lifetime,
+        )
+        .map_err(SessionError::Memory)?;
+        memory_lifetime.set_fault(memory_fault.clone());
+        let (memory_project, project_entry) = match project_id {
+            Some(project_id) => {
+                let mut registry =
+                    kanbei_memory::ProjectRegistry::open(&memory_root.join("projects.jsonl"))
+                        .map_err(SessionError::Memory)?;
+                let entry = match registry.lookup(project_id).map_err(SessionError::Memory)? {
+                    Some(entry) => entry,
+                    None => {
+                        let entry = kanbei_memory::ProjectEntry {
+                            schema: kanbei_memory::PROJECT_ENTRY_SCHEMA,
+                            project_id,
+                            name: "default".into(),
+                            // The scope dir name under <memory_root>/,
+                            // matching MemoryScope::dir_name.
+                            dir: format!("projects/{project_id}"),
+                            created_session: session_id,
+                            created_event: next_seq,
+                        };
+                        registry
+                            .register(entry.clone())
+                            .map_err(SessionError::Memory)?;
+                        entry
+                    }
+                };
+                let mut actor = kanbei_memory::MemoryRootActor::open(
+                    &memory_root,
+                    kanbei_memory::MemoryScope::Project(project_id),
+                )
+                .map_err(SessionError::Memory)?;
+                actor.set_fault(memory_fault.clone());
+                (Some(actor), Some(entry))
+            }
+            None => (None, None),
+        };
+        let mut memory_index =
+            kanbei_retrieval::MemoryIndex::open(&memory_root.join("projection.sqlite"))
+                .map_err(SessionError::Retrieval)?;
+        {
+            let lifetime_fold = memory_lifetime
+                .fold(memory_lifetime.head())
+                .map_err(SessionError::Memory)?;
+            let mut inputs = vec![kanbei_retrieval::ScopeIndexInput {
+                scope: kanbei_memory::MemoryScope::Lifetime,
+                root: memory_lifetime.head(),
+                fold: lifetime_fold,
+            }];
+            if let Some(actor) = &memory_project {
+                let project_fold = actor.fold(actor.head()).map_err(SessionError::Memory)?;
+                inputs.push(kanbei_retrieval::ScopeIndexInput {
+                    scope: kanbei_memory::MemoryScope::Project(
+                        project_id.expect("project actor implies a bound project"),
+                    ),
+                    root: actor.head(),
+                    fold: project_fold,
+                });
+            }
+            memory_index
+                .build(&inputs, kanbei_retrieval::SALIENCE_VERSION)
+                .map_err(SessionError::Retrieval)?;
+        }
+
+        // R-11 backlink recovery: transitions originating from this session
+        // that lack a committed backlink are backed at open — idempotent by
+        // TransitionId, so reopens never duplicate.
+        let mut backed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pending_backlinks: Vec<(Id128, kanbei_memory::MemoryScope)> = Vec::new();
+        kanbei_log::for_each_frame(&log_path, |info| {
+            for line in &info.events {
+                let Ok(env) = Envelope::from_line(line) else {
+                    continue;
+                };
+                if env.kind == "memory_transition_backlink"
+                    && let Some(tid) = env.payload.get("transition_id").and_then(|t| t.as_str())
+                {
+                    backed.insert(tid.to_string());
+                }
+            }
+        })?;
+        for tid in memory_lifetime.scan_backlink_candidates(session_id) {
+            if !backed.contains(&tid.to_string()) {
+                pending_backlinks.push((tid, kanbei_memory::MemoryScope::Lifetime));
+            }
+        }
+        if let Some(actor) = &memory_project {
+            for tid in actor.scan_backlink_candidates(session_id) {
+                if !backed.contains(&tid.to_string()) {
+                    pending_backlinks.push((
+                        tid,
+                        kanbei_memory::MemoryScope::Project(
+                            project_id.expect("project actor implies a bound project"),
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // R-18/E-06: recover the committed compaction selections (covered
+        // fragment ids the commit FSM rejects afterwards).
+        let mut compacted: Vec<CompactedRange> = Vec::new();
+        kanbei_log::for_each_frame(&log_path, |info| {
+            for line in &info.events {
+                let Ok(env) = Envelope::from_line(line) else {
+                    continue;
+                };
+                if env.kind != "compaction_selected" {
+                    continue;
+                }
+                if let Some(range) = env.payload.get("range").and_then(|r| r.as_array())
+                    && range.len() == 2
+                    && let Some(start) = range[0].as_u64()
+                    && let Some(end) = range[1].as_u64()
+                    && let Some(summary) =
+                        env.payload.get("summary_digest").and_then(|d| d.as_str())
+                    && let Ok(summary) = summary.parse::<Digest>()
+                {
+                    let covered = env
+                        .payload
+                        .get("covered_fragments")
+                        .and_then(|f| f.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|f| f.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    compacted.push(CompactedRange {
+                        range: (start, end),
+                        summary_digest: summary,
+                        covered_fragments: covered,
+                    });
+                }
+            }
+        })?;
+
         let config_manifest = cfg.config.clone();
         let mut session = Self {
             log,
@@ -402,6 +635,17 @@ impl Session {
             approval_bound,
             fs_root,
             session_id,
+            memory_lifetime,
+            memory_project,
+            memory_index,
+            project_entry,
+            projection_state: None,
+            last_provider: None,
+            last_cache: None,
+            recent_events: std::collections::VecDeque::new(),
+            compacted,
+            memory_fault,
+            child_provider,
         };
 
         // Root config module: atomic activation; failure → safe mode.
@@ -416,6 +660,46 @@ impl Session {
                     kind: "safe_mode_activated".into(),
                     payload_schema: 1,
                     payload: json!({ "reason": reason }),
+                    objects: Vec::new(),
+                    refs: Vec::new(),
+                }],
+                None,
+            )?;
+        }
+
+        // M4 recovery facts: commit the pending backlinks (R-11), then the
+        // one-time canonical project binding (fresh logs only — the log
+        // already carries it on resume).
+        if !pending_backlinks.is_empty() {
+            session.commit(
+                pending_backlinks
+                    .into_iter()
+                    .map(|(tid, scope)| NewEvent {
+                        kind: "memory_transition_backlink".into(),
+                        payload_schema: 1,
+                        payload: json!({
+                            "transition_id": tid.to_string(),
+                            "scope": serde_json::to_value(&scope)
+                                .expect("scope serialization cannot fail"),
+                        }),
+                        objects: Vec::new(),
+                        refs: Vec::new(),
+                    })
+                    .collect(),
+                None,
+            )?;
+        }
+        if let Some(project_id) = project_id
+            && recovered.events == 0
+        {
+            session.commit(
+                vec![NewEvent {
+                    kind: "project_bound".into(),
+                    payload_schema: 1,
+                    payload: json!({
+                        "project_id": project_id.to_string(),
+                        "memory_root": memory_root.to_string_lossy(),
+                    }),
                     objects: Vec::new(),
                     refs: Vec::new(),
                 }],
@@ -450,6 +734,20 @@ impl Session {
     ) -> Result<CommitReceipt, SessionError> {
         if events.is_empty() {
             return Err(SessionError::InvalidInput("empty commit".into()));
+        }
+
+        // R-18/E-06 compaction FSM: a new event whose payload carries a
+        // fragment id folded into a committed compaction selection is
+        // rejected — its causal parents live inside the compacted range.
+        for ev in &events {
+            if let Some(fragment) = ev.payload.get("fragment").and_then(|f| f.as_str())
+                && self
+                    .compacted
+                    .iter()
+                    .any(|c| c.covered_fragments.iter().any(|f| f == fragment))
+            {
+                return Err(SessionError::CompactionViolation(fragment.to_string()));
+            }
         }
 
         // step 2 — objects first: the object dirsync is enqueued before the
@@ -512,6 +810,50 @@ impl Session {
         self.fault(FaultPoint::AfterFrameAppend);
         self.next_seq = plan.last_seq + 1;
 
+        // The bounded recent-event ring (the trajectory render source):
+        // every committed event enters it; the oldest fall off past
+        // RECENT_RING entries.
+        for (i, ev) in events.iter().enumerate() {
+            self.recent_events.push_back((
+                first_seq + i as u64,
+                ev.kind.clone(),
+                ev.payload.clone(),
+            ));
+        }
+        while self.recent_events.len() > RECENT_RING {
+            self.recent_events.pop_front();
+        }
+        // A committed compaction selection joins the FSM's covered set (the
+        // check above rejects its covered fragments from then on).
+        for ev in &events {
+            if ev.kind != "compaction_selected" {
+                continue;
+            }
+            if let Some(range) = ev.payload.get("range").and_then(|r| r.as_array())
+                && range.len() == 2
+                && let Some(start) = range[0].as_u64()
+                && let Some(end) = range[1].as_u64()
+                && let Some(summary) = ev.payload.get("summary_digest").and_then(|d| d.as_str())
+                && let Ok(summary) = summary.parse::<Digest>()
+            {
+                let covered = ev
+                    .payload
+                    .get("covered_fragments")
+                    .and_then(|f| f.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|f| f.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.compacted.push(CompactedRange {
+                    range: (start, end),
+                    summary_digest: summary,
+                    covered_fragments: covered,
+                });
+            }
+        }
+
         // step 5 — state-changing commits pin a post-event manifest; pure
         // commits leave the manifest unchanged (content addressing dedups
         // identical manifests)
@@ -525,13 +867,15 @@ impl Session {
                     .map(|m| {
                         m.snapshot()
                             .into_iter()
-                            .map(|(module_id, generation, package)| kanbei_snapshot::ModulePin {
-                                module_id,
-                                generation,
-                                package,
-                                // M2 activates root-scope modules only.
-                                scope: "/".into(),
-                            })
+                            .map(
+                                |(module_id, generation, package)| kanbei_snapshot::ModulePin {
+                                    module_id,
+                                    generation,
+                                    package,
+                                    // M2 activates root-scope modules only.
+                                    scope: "/".into(),
+                                },
+                            )
                             .collect()
                     })
                     .unwrap_or_default();
@@ -542,6 +886,10 @@ impl Session {
                 let comp_bytes = self.composition.current().to_canonical_bytes();
                 self.store.install(&comp_bytes)?;
                 manifest.engine_digest = self.vm_engine_digest;
+                // R-11: model calls and consequential events pin the exact
+                // memory roots at commit time.
+                manifest.memory_root = self.memory_lifetime.head();
+                manifest.project_memory_root = self.memory_project.as_ref().and_then(|a| a.head());
                 let mut schema_versions = payload_schemas;
                 schema_versions.push(kanbei_snapshot::MANIFEST_SCHEMA);
                 schema_versions.sort_unstable();
@@ -583,7 +931,10 @@ impl Session {
     /// fails after the in-memory publish, the module is deactivated too and
     /// the in-memory composition is ahead of the log — M2 documents this
     /// divergence: the log is the authority at restart.
-    pub fn activate_config(&mut self, manifest: PackageManifest) -> Result<ConfigActivation, SessionError> {
+    pub fn activate_config(
+        &mut self,
+        manifest: PackageManifest,
+    ) -> Result<ConfigActivation, SessionError> {
         self.fault(FaultPoint::BeforeConfigActivation);
         // OCC: capture the current epoch before the (potentially long)
         // activation so a stale staged set can never publish.
@@ -737,14 +1088,18 @@ impl Session {
         };
         let new_generation = outcome.new.generation;
         let new_package = outcome.new.package;
-        let new_entries: Vec<(ServiceKey, ServiceProvider, Vec<kanbei_services::ServiceDependency>)> =
-            self.services
-                .lock()
-                .expect("services lock poisoned")
-                .snapshot()
-                .into_iter()
-                .filter(|(_, p, _)| p.generation == new_generation)
-                .collect();
+        let new_entries: Vec<(
+            ServiceKey,
+            ServiceProvider,
+            Vec<kanbei_services::ServiceDependency>,
+        )> = self
+            .services
+            .lock()
+            .expect("services lock poisoned")
+            .snapshot()
+            .into_iter()
+            .filter(|(_, p, _)| p.generation == new_generation)
+            .collect();
         // Stage: pull the new generation's publications out so validate/apply
         // run against the pre-replace state.
         {
@@ -938,7 +1293,11 @@ impl Session {
         let Some(manager) = self.modules.as_ref() else {
             return Err(SessionError::ModulesDisabled);
         };
-        Ok(manager.state().lock().expect("state lock poisoned").heads()?)
+        Ok(manager
+            .state()
+            .lock()
+            .expect("state lock poisoned")
+            .heads()?)
     }
 
     /// The loaded guest wasm's digest (manifest `engine_digest`); None when
@@ -976,6 +1335,31 @@ impl Session {
         self.session_id
     }
 
+    /// The lifetime-scope memory actor (R-11).
+    pub fn memory_lifetime(&self) -> &kanbei_memory::MemoryRootActor {
+        &self.memory_lifetime
+    }
+
+    /// The project-scope memory actor; None when no project is bound.
+    pub fn memory_project(&self) -> Option<&kanbei_memory::MemoryRootActor> {
+        self.memory_project.as_ref()
+    }
+
+    /// The per-session projection index (disposable SQLite).
+    pub fn memory_index(&self) -> &kanbei_retrieval::MemoryIndex {
+        &self.memory_index
+    }
+
+    /// The bound project's registry entry.
+    pub fn project_entry(&self) -> Option<&kanbei_memory::ProjectEntry> {
+        self.project_entry.as_ref()
+    }
+
+    /// The last materialized projection state (M4 staged pipeline).
+    pub fn projection_state(&self) -> Option<&ProjectionState> {
+        self.projection_state.as_ref()
+    }
+
     /// Flush, then stop the durability worker and join it. Drops the module
     /// subsystem (and with it the wasm watchdog) first, releasing its queue
     /// clones before the queue's final Arc is unwrapped. Fails while any
@@ -983,11 +1367,28 @@ impl Session {
     /// live instance keeps the host's state store (and its queue clones)
     /// alive; drop or `dispose` it first.
     pub fn close(self) -> Result<(), SessionError> {
-        let Session { log, store, queue, modules, .. } = self;
+        let Session {
+            log,
+            store,
+            queue,
+            modules,
+            memory_lifetime,
+            memory_project,
+            ..
+        } = self;
         log.flush()?;
+        // The memory actors barrier their own durability queues before the
+        // session queue shuts down (their workers exit when the last Arc
+        // drops).
+        memory_lifetime.flush().map_err(SessionError::Memory)?;
+        if let Some(project) = &memory_project {
+            project.flush().map_err(SessionError::Memory)?;
+        }
         drop(log);
         drop(store);
         drop(modules);
+        drop(memory_lifetime);
+        drop(memory_project);
         let queue = Arc::try_unwrap(queue)
             .map_err(|_| SessionError::InvalidInput("durability queue still shared".into()))?;
         queue.shutdown()?;
@@ -1039,6 +1440,14 @@ pub enum SessionError {
     Effect(String),
     #[error(transparent)]
     Scheduler(#[from] kanbei_scheduler::SchedulerError),
+    #[error(transparent)]
+    Memory(#[from] kanbei_memory::MemoryError),
+    #[error(transparent)]
+    Retrieval(#[from] kanbei_retrieval::RetrievalError),
+    #[error(transparent)]
+    Context(#[from] kanbei_context::ProjectionError),
+    #[error("compaction violation: event references compacted fragment {0}")]
+    CompactionViolation(String),
 }
 
 // ---------- helpers ----------
@@ -1051,9 +1460,12 @@ fn recover_or_fresh(log_path: &Path) -> Result<Recovered, SessionError> {
             "log path is not a file: {}",
             log_path.display()
         ))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            Ok(Recovered { events: 0, frames: 0, truncated: false, last_seq: 0 })
-        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Recovered {
+            events: 0,
+            frames: 0,
+            truncated: false,
+            last_seq: 0,
+        }),
         Err(e) => Err(e.into()),
     }
 }
