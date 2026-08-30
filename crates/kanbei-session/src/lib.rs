@@ -377,6 +377,19 @@ pub struct ForkReceipt {
     pub follow: kanbei_memory::MemoryFollowPolicy,
 }
 
+/// The outcome of [`Session::adopt`]: the fork identity, the adopted head
+/// seq, and the follow policy the `fork_adopted` fact records. The canonical
+/// record is the `fork_adopted` event on the source log; the receipt is the
+/// minimal in-memory mirror.
+pub struct AdoptReceipt {
+    /// The adopted fork session's identity.
+    pub fork_session: Id128,
+    /// The fork's head seq — its last committed event at adoption time.
+    pub fork_seq: u64,
+    /// The memory follow policy recorded in the `fork_adopted` fact.
+    pub follow: kanbei_memory::MemoryFollowPolicy,
+}
+
 /// One intent event quiesced by a branch transition (M6): its seq, kind, and
 /// event id (`evt`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1868,6 +1881,384 @@ impl Session {
         })
     }
 
+    /// Adopts a fork's outcome as the active perpetual root (M9 wave 5b,
+    /// architecture.md "adopt(fork) explicitly changes the active perpetual
+    /// root after reconciling domain state"): the fork's HEAD snapshot
+    /// manifest + full closure + memory roots are copied into THIS session's
+    /// store, the active run is quiesced exactly like `continue_from`, and
+    /// one canonical `fork_adopted` fact (schema 1) records the adoption.
+    /// The fork session is never modified — adoption is a source-side
+    /// decision (the caller decides what the fork's outcome means).
+    ///
+    /// Validation (all before any mutation of self; a failure commits
+    /// nothing): the fork's log must carry a `forked` fact whose
+    /// `source_session` is this session (else `InvalidInput` naming both
+    /// ids), and the fork must have committed events past that fact — a head
+    /// to adopt (else `InvalidInput` "fork has no outcome"). The fork's head
+    /// snapshot (its `current_snapshot`, falling back to the last envelope's
+    /// pre-event snapshot for a resumed fork) must parse as a manifest and
+    /// every closure digest must resolve in the fork's session or memory
+    /// stores (a post-fork memory root legitimately lives only in the memory
+    /// actor's store).
+    ///
+    /// Reconciliation: the head manifest, the full closure, and the fork's
+    /// memory roots (its lifetime/project actor heads) are installed into
+    /// THIS store — every digest is resolved (hash-verified) in the fork
+    /// first, so a missing object aborts with nothing installed yet; an
+    /// install failure after resolution leaves only orphan objects (the
+    /// commit semantics for the referencing `fork_adopted` fact — R-10
+    /// tolerates orphans). The head manifest is installed first. The fact's
+    /// refs = [fork_snapshot, fork memory roots].
+    ///
+    /// The committed fact mirrors `branch_transition`'s quiesce record: an
+    /// active run is cancelled as `Failed(Quiesced)` (run_outcome committed
+    /// first), pending intents become `quiesce.cancelled`, and
+    /// interrupted/ambiguous classified intents in `(frontier, transition)`
+    /// become `quiesce.ambiguous`. `frontier_seq` is the fork's origin
+    /// checkpoint seq (its `forked` fact's `checkpoint_seq`) — the point the
+    /// adopted path diverged. The commit is pure (`state_head` None — the
+    /// fork's manifest is a copied, referenced artifact, not self's live
+    /// manifest; self's `current_snapshot` is unchanged, mirroring the
+    /// `forked` fact's pure commit). Post-commit self's `pinned_roots`
+    /// mirrors the follow policy exactly like `continue_from` (the
+    /// projection folds the pinned roots; the actors' heads are untouched —
+    /// there is no actor set-head seam).
+    pub fn adopt(
+        &mut self,
+        fork: &mut Session,
+        label: Option<String>,
+    ) -> Result<AdoptReceipt, SessionError> {
+        // --- validate the fork: the canonical forked fact + a head to adopt
+        let mut found: Option<(u64, serde_json::Value)> = None;
+        {
+            let fork_log = fork.log_path.clone();
+            kanbei_log::for_each_frame(&fork_log, |info| {
+                if found.is_some() {
+                    return;
+                }
+                for line in &info.events {
+                    let Ok(env) = Envelope::from_line(line) else {
+                        continue;
+                    };
+                    if env.kind == "forked" {
+                        found = Some((env.seq, env.payload.clone()));
+                        return;
+                    }
+                }
+            })?;
+        }
+        let (forked_seq, forked_payload) = found.ok_or_else(|| {
+            SessionError::InvalidInput(format!(
+                "fork session {} carries no `forked` fact — not a fork of this or any session",
+                fork.session_id
+            ))
+        })?;
+        let source_session: Id128 = forked_payload
+            .get("source_session")
+            .and_then(|s| s.as_str())
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| {
+                SessionError::InvalidInput(format!(
+                    "fork session {} has a `forked` fact without a source_session",
+                    fork.session_id
+                ))
+            })?;
+        if source_session != self.session_id {
+            return Err(SessionError::InvalidInput(format!(
+                "fork session {} belongs to source session {}, not {}",
+                fork.session_id, source_session, self.session_id
+            )));
+        }
+        let frontier_seq = forked_payload
+            .get("checkpoint_seq")
+            .and_then(|c| c.as_u64())
+            .ok_or_else(|| {
+                SessionError::InvalidInput(format!(
+                    "fork session {} has a `forked` fact without a checkpoint_seq",
+                    fork.session_id
+                ))
+            })?;
+        // the adopted head is the fork's last committed event — past the
+        // forked fact itself (a fresh fork has no outcome to adopt)
+        let head_seq = fork.next_seq() - 1;
+        if head_seq <= forked_seq {
+            return Err(SessionError::InvalidInput(format!(
+                "fork {} has no outcome (head seq {head_seq} is the forked fact itself)",
+                fork.session_id
+            )));
+        }
+
+        // --- reconcile domain state: the fork's HEAD snapshot + closure
+        // The head snapshot is the fork's current_snapshot (the pre-event
+        // snapshot of its last envelope; advanced by a state-changing last
+        // commit); a resumed fork loses the in-memory pin, so fall back to
+        // the last envelope's snapshot field.
+        let head_snapshot = fork
+            .current_snapshot()
+            .or_else(|| fork.envelope_at(head_seq).ok().and_then(|env| env.snapshot))
+            .ok_or_else(|| {
+                SessionError::InvalidInput(format!(
+                    "fork {} head seq {head_seq} pins no snapshot manifest",
+                    fork.session_id
+                ))
+            })?;
+        let head_bytes = fork
+            .store
+            .get(&head_snapshot)
+            .map_err(|e| SessionError::Snapshot(format!("fork head snapshot {head_snapshot} unreadable: {e}")))?;
+        let manifest: ExecutionManifest = serde_json::from_slice(&head_bytes).map_err(|e| {
+            SessionError::Snapshot(format!("fork head snapshot {head_snapshot} is not a manifest: {e}"))
+        })?;
+        let mut closure = kanbei_snapshot::manifest_closure(&manifest);
+        // engine/toolchain digests are kernel-embedded identity pins, never
+        // store objects (mirror of continue_from)
+        for pin in [manifest.engine_digest, manifest.toolchain_digest]
+            .into_iter()
+            .flatten()
+        {
+            closure.remove(&pin);
+        }
+        // Resolve every closure digest in the fork's stores FIRST (get
+        // hash-verifies): a missing object aborts with nothing installed.
+        let mut to_install: Vec<Vec<u8>> = Vec::with_capacity(closure.len() + 1);
+        to_install.push(head_bytes);
+        for d in closure {
+            to_install.push(resolve_fork_object(fork, &d)?);
+        }
+        // The fork's memory roots are its actor heads — the lifetime head,
+        // plus the project head when the fork is project-bound. Root
+        // manifests live in the fork's memory stores (the session store
+        // carries them only as checkpoint event objects).
+        let lifetime_root = fork.memory_lifetime().head();
+        let project_root = fork.memory_project.as_ref().and_then(|a| a.head());
+        let follow = match lifetime_root {
+            Some(lifetime) => kanbei_memory::MemoryFollowPolicy::PinnedAt {
+                lifetime_root: lifetime,
+                project_root,
+            },
+            None => kanbei_memory::MemoryFollowPolicy::FollowHead,
+        };
+        if let Some(root) = lifetime_root {
+            let bytes = fork
+                .memory_lifetime
+                .store()
+                .get(&root)
+                .map_err(|e| SessionError::Snapshot(format!("fork lifetime memory root {root} unreadable: {e}")))?;
+            to_install.push(bytes);
+        }
+        if let Some(actor) = fork.memory_project.as_ref()
+            && let Some(root) = actor.head()
+        {
+            let bytes = actor
+                .store()
+                .get(&root)
+                .map_err(|e| SessionError::Snapshot(format!("fork project memory root {root} unreadable: {e}")))?;
+            to_install.push(bytes);
+        }
+        // All resolved — install into self's store, the head manifest first.
+        for bytes in to_install {
+            self.store.install(&bytes)?;
+        }
+
+        // --- quiesce the active run EXACTLY like continue_from: the run is
+        // cancelled (its run_outcome Failed(Quiesced) records the
+        // termination), then pending intents become cancelled and
+        // interrupted/ambiguous tail intents become ambiguous. No
+        // intent_classified facts are committed here.
+        if let Some(run_id) = self.scheduler.active_run() {
+            let usage = self.scheduler.current_usage(run_id);
+            let (record, _) = self.scheduler.record_outcome(
+                run_id,
+                kanbei_scheduler::TerminalOutcome::Failed(kanbei_scheduler::FailureKind::Quiesced),
+                usage,
+                &[],
+            )?;
+            self.commit(
+                vec![NewEvent {
+                    kind: "run_outcome".into(),
+                    payload_schema: 1,
+                    payload: serde_json::to_value(&record).map_err(|e| {
+                        SessionError::InvalidInput(format!("run outcome payload: {e}"))
+                    })?,
+                    objects: Vec::new(),
+                    refs: Vec::new(),
+                }],
+                None,
+            )?;
+            #[cfg(feature = "otel")]
+            self.telemetry_close_run(
+                kanbei_scheduler::TerminalOutcome::Failed(kanbei_scheduler::FailureKind::Quiesced),
+                usage,
+            );
+        }
+        let cancelled: Vec<QuiescedIntent> = self
+            .scan_pending_intents()?
+            .into_iter()
+            .map(|i| QuiescedIntent {
+                seq: i.seq,
+                kind: i.kind,
+                id: i.id,
+            })
+            .collect();
+        let transition_seq = self.next_seq;
+        let ambiguous: Vec<QuiescedIntent> = self
+            .scan_classified_intents()?
+            .into_iter()
+            .filter(|i| i.seq > frontier_seq && i.seq < transition_seq)
+            .collect();
+        let quiesce = QuiesceRecord { cancelled, ambiguous };
+
+        // --- the canonical adoption fact
+        let mut refs = vec![head_snapshot];
+        if let kanbei_memory::MemoryFollowPolicy::PinnedAt {
+            lifetime_root,
+            project_root,
+        } = &follow
+        {
+            refs.push(*lifetime_root);
+            if let Some(project_root) = project_root {
+                refs.push(*project_root);
+            }
+        }
+        self.commit(
+            vec![NewEvent {
+                kind: "fork_adopted".into(),
+                payload_schema: 1,
+                payload: json!({
+                    "fork_session": fork.session_id.to_string(),
+                    "fork_seq": head_seq,
+                    "fork_snapshot": head_snapshot.to_string(),
+                    "follow": serde_json::to_value(&follow)
+                        .expect("follow serialization cannot fail"),
+                    "label": label,
+                    "quiesce": serde_json::to_value(&quiesce)
+                        .expect("quiesce serialization cannot fail"),
+                    "frontier_seq": frontier_seq,
+                }),
+                objects: Vec::new(),
+                refs,
+            }],
+            None,
+        )?;
+        // Post-commit state: the projection pins the fork's roots exactly
+        // like continue_from pins a checkpoint's roots.
+        self.pinned_roots = match follow {
+            kanbei_memory::MemoryFollowPolicy::FollowHead => None,
+            kanbei_memory::MemoryFollowPolicy::PinnedAt {
+                lifetime_root,
+                project_root,
+            } => Some(PinnedRoots {
+                lifetime: lifetime_root,
+                project: project_root,
+            }),
+        };
+        Ok(AdoptReceipt {
+            fork_session: fork.session_id,
+            fork_seq: head_seq,
+            follow,
+        })
+    }
+
+    /// Imports a session directory verbatim (M9 wave 5b backup/restore):
+    /// `<source>/log.zst` is byte-copied, `objects/` recursively, and
+    /// `memory/` + `state/` when present (the memory projection.sqlite is
+    /// disposable and rebuilt at open; `state/` heads are opaque bytes and
+    /// copied as-is). The copied target is then opened and returned. The
+    /// canonical facts — envelopes (event ids, seqs, payloads, refs),
+    /// branch records, memory roots — are preserved by construction: they
+    /// are the copied bytes.
+    ///
+    /// The session id is NOT part of the on-disk layout (open derives it
+    /// from the config); import recovers it from the canonical identity
+    /// markers the source left behind — a `memory_proposal` owner, a memory
+    /// transition's `origin_session`, or the project registry's
+    /// `created_session` (in that order). A source with none of these
+    /// markers imports with a fresh id (the caller can pin the original by
+    /// reopening with `SessionConfig::session_id`). A bound project is
+    /// recovered from the log's `project_bound` fact so the project memory
+    /// actor wires up like the source.
+    ///
+    /// Validation: the source must carry a readable `log.zst` (framing
+    /// verified read-only — the source is never truncated; a torn tail is
+    /// recovered on the copy at open), and the target must be absent or
+    /// empty. Every copy error surfaces as a typed `SessionError` naming the
+    /// path. On failure the target dir may hold partial copies (the caller
+    /// may delete it; the source is untouched).
+    pub fn import(source_dir: &Path, target_dir: &Path) -> Result<Session, SessionError> {
+        // source validation — a readable log.zst (read-only framing scan;
+        // recover/truncate happens on the copy at open, never the source)
+        let source_log = source_dir.join("log.zst");
+        match std::fs::metadata(&source_log) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(SessionError::InvalidInput(format!(
+                    "import source {} has no log.zst",
+                    source_dir.display()
+                )))
+            }
+            Ok(m) if !m.is_file() => {
+                return Err(SessionError::InvalidInput(format!(
+                    "import source log {} is not a file",
+                    source_log.display()
+                )))
+            }
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
+        kanbei_log::scan_frames(&source_log)?;
+        // target must be absent or empty (refusing to merge into an
+        // existing session dir — mirror of fork)
+        match std::fs::metadata(target_dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Ok(m) if m.is_dir() => {
+                let mut entries = std::fs::read_dir(target_dir)?;
+                if entries.next().is_some() {
+                    return Err(SessionError::InvalidInput(format!(
+                        "import target dir {} is not empty (refusing to merge into an existing session dir)",
+                        target_dir.display()
+                    )));
+                }
+            }
+            Ok(_) => {
+                return Err(SessionError::InvalidInput(format!(
+                    "import target {} exists and is not a directory",
+                    target_dir.display()
+                )))
+            }
+            Err(e) => return Err(e.into()),
+        }
+        std::fs::create_dir_all(target_dir).map_err(|e| {
+            SessionError::Io(io::Error::new(
+                e.kind(),
+                format!("import create target {}: {e}", target_dir.display()),
+            ))
+        })?;
+        std::fs::copy(&source_log, target_dir.join("log.zst")).map_err(|e| {
+            SessionError::Io(io::Error::new(
+                e.kind(),
+                format!("import copy {}: {e}", source_log.display()),
+            ))
+        })?;
+        for sub in ["objects", "memory", "state"] {
+            let src = source_dir.join(sub);
+            if src.is_dir() {
+                copy_dir_all(&src, &target_dir.join(sub)).map_err(|e| {
+                    SessionError::Io(io::Error::new(
+                        e.kind(),
+                        format!("import copy {}: {e}", src.display()),
+                    ))
+                })?;
+            }
+        }
+        let session_id = recover_session_id(source_dir)?;
+        let project_id = recover_bound_project(source_dir)?;
+        Session::open(SessionConfig {
+            dir: target_dir.to_path_buf(),
+            session_id,
+            project: project_id,
+            ..Default::default()
+        })
+    }
+
     /// The config package digest chosen at `at_seq`: the last
     /// `branch_transition` `config_choice.current` or `composition_changed`
     /// added-package digest at or before that seq — the config active at the
@@ -2828,6 +3219,13 @@ impl Session {
         self.next_seq
     }
 
+    /// The memory roots pinned by the current follow policy (`None` =
+    /// FollowHead): the checkpoint/fork roots the projection folds instead
+    /// of the live actor heads.
+    pub fn pinned_roots(&self) -> Option<&PinnedRoots> {
+        self.pinned_roots.as_ref()
+    }
+
     pub fn current_snapshot(&self) -> Option<Digest> {
         self.current_snapshot
     }
@@ -3118,6 +3516,175 @@ fn truncate_log_at(log_path: &Path, root: Digest) -> Result<(), SessionError> {
     let f = std::fs::OpenOptions::new().write(true).open(log_path)?;
     f.set_len(end)?;
     Ok(())
+}
+
+// ---------- M9 wave 5b helpers (adopt + import) ----------
+
+/// Resolves `digest` in the fork's session store, falling back to its
+/// lifetime/project memory stores (a post-fork memory root manifest
+/// legitimately exists only in the actor's store — the session store carries
+/// root manifests only as checkpoint event objects). `get` hash-verifies, so
+/// a resolved object is trusted. Typed `Snapshot` errors name the digest.
+fn resolve_fork_object(fork: &Session, digest: &Digest) -> Result<Vec<u8>, SessionError> {
+    match fork.store.get(digest) {
+        Ok(bytes) => return Ok(bytes),
+        Err(ObjectError::Missing { .. }) => {}
+        Err(e) => {
+            return Err(SessionError::Snapshot(format!(
+                "fork object {digest} unreadable: {e}"
+            )))
+        }
+    }
+    for store in std::iter::once(fork.memory_lifetime.store())
+        .chain(fork.memory_project.as_ref().map(|a| a.store()))
+    {
+        match store.get(digest) {
+            Ok(bytes) => return Ok(bytes),
+            Err(ObjectError::Missing { .. }) => {}
+            Err(e) => {
+                return Err(SessionError::Snapshot(format!(
+                    "fork object {digest} unreadable: {e}"
+                )))
+            }
+        }
+    }
+    Err(SessionError::Snapshot(format!(
+        "fork object {digest} is missing from the fork session and memory stores"
+    )))
+}
+
+/// The session id an imported dir carries, if any: the first canonical
+/// identity marker, in order — a `memory_proposal` owner principal on the
+/// session log, a memory transition's `origin_session`, or the project
+/// registry's `created_session`. None = the dir carries no session identity
+/// (import then opens with a fresh id). The session id is not part of the
+/// layout; these are the markers a session leaves behind.
+fn recover_session_id(source_dir: &Path) -> Result<Option<Id128>, SessionError> {
+    let mut found: Option<Id128> = None;
+    let log_path = source_dir.join("log.zst");
+    kanbei_log::for_each_frame(&log_path, |info| {
+        if found.is_some() {
+            return;
+        }
+        for line in &info.events {
+            let Ok(env) = Envelope::from_line(line) else {
+                continue;
+            };
+            if env.kind == "memory_proposal"
+                && let Some(id) = env
+                    .payload
+                    .get("owner")
+                    .and_then(|o| o.get("session"))
+                    .and_then(|s| s.as_str())
+                    .and_then(|s| s.parse().ok())
+            {
+                found = Some(id);
+                return;
+            }
+        }
+    })?;
+    if found.is_none() {
+        let lifetime = source_dir
+            .join("memory")
+            .join("lifetime")
+            .join("transitions.jsonl.zst");
+        if lifetime.is_file() {
+            kanbei_log::for_each_frame(&lifetime, |info| {
+                if found.is_some() {
+                    return;
+                }
+                for line in &info.events {
+                    if let Some(id) = Envelope::from_line(line)
+                        .ok()
+                        .and_then(|env| {
+                            env.payload
+                                .get("origin_session")
+                                .and_then(|s| s.as_str())
+                                .and_then(|s| s.parse().ok())
+                        })
+                    {
+                        found = Some(id);
+                        return;
+                    }
+                }
+            })?;
+        }
+    }
+    if found.is_none() {
+        let projects = source_dir.join("memory").join("projects");
+        if projects.is_dir() {
+            for entry in std::fs::read_dir(&projects)? {
+                if found.is_some() {
+                    break;
+                }
+                let scope_log = entry?.path().join("transitions.jsonl.zst");
+                if !scope_log.is_file() {
+                    continue;
+                }
+                kanbei_log::for_each_frame(&scope_log, |info| {
+                    if found.is_some() {
+                        return;
+                    }
+                    for line in &info.events {
+                        if let Some(id) = Envelope::from_line(line)
+                            .ok()
+                            .and_then(|env| {
+                                env.payload
+                                    .get("origin_session")
+                                    .and_then(|s| s.as_str())
+                                    .and_then(|s| s.parse().ok())
+                            })
+                        {
+                            found = Some(id);
+                            return;
+                        }
+                    }
+                })?;
+            }
+        }
+    }
+    if found.is_none() {
+        let registry = source_dir.join("memory").join("projects.jsonl");
+        if let Ok(text) = std::fs::read_to_string(&registry) {
+            for line in text.lines() {
+                if found.is_some() {
+                    break;
+                }
+                if let Ok(entry) = serde_json::from_str::<kanbei_memory::ProjectEntry>(line) {
+                    found = Some(entry.created_session);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The project bound by the imported session's log (`project_bound` fact),
+/// so the project memory actor wires up like the source.
+fn recover_bound_project(source_dir: &Path) -> Result<Option<Id128>, SessionError> {
+    let mut found: Option<Id128> = None;
+    let log_path = source_dir.join("log.zst");
+    kanbei_log::for_each_frame(&log_path, |info| {
+        if found.is_some() {
+            return;
+        }
+        for line in &info.events {
+            let Ok(env) = Envelope::from_line(line) else {
+                continue;
+            };
+            if env.kind == "project_bound"
+                && let Some(id) = env
+                    .payload
+                    .get("project_id")
+                    .and_then(|p| p.as_str())
+                    .and_then(|p| p.parse().ok())
+            {
+                found = Some(id);
+                return;
+            }
+        }
+    })?;
+    Ok(found)
 }
 
 // M3 agent spine: run lifecycle, model/tool commit paths, approvals, breakers,
