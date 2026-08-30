@@ -329,6 +329,54 @@ pub struct CheckpointRef {
     pub seq: u64,
 }
 
+// ---------- M9 wave 5a independent-session fork ----------
+
+/// Options for [`Session::fork`]: where the forked session lives, its
+/// identity and retention policy, and the configuration lane the fork does
+/// not derive.
+///
+/// `config` carries everything [`SessionConfig`] needs that fork does not
+/// derive from the checkpoint: stream/profile, budgets, engine, provider,
+/// fs_root, tool limits, approval bound, fault injectors, GC, telemetry.
+/// Fork overrides: `dir` (= `target_dir`), `session_id` (= the fresh id),
+/// `policy` (= `policy`), `broker` (the fork-floor broker), `memory_root`
+/// (None — the seeded memory lives at `<target_dir>/memory`), `config` (the
+/// package manifest resolved from the checkpoint's config choice), and
+/// `project` (the source's project id when the source has one).
+///
+/// `target_dir` must be absent or empty — fork refuses to seed into an
+/// existing session dir, and on failure best-effort removes everything it
+/// created there.
+pub struct ForkOptions {
+    /// Root dir of the forked session (`<target>/log.zst`, `<target>/objects/`,
+    /// `<target>/memory/`, ...). Must not already hold a session.
+    pub target_dir: PathBuf,
+    /// The forked session's identity; a fresh one when None.
+    pub session_id: Option<Id128>,
+    /// Retention policy for the forked session; default [`StoreAllPolicy`].
+    pub policy: Arc<dyn PolicyPlugin>,
+    /// The remaining session configuration lane (overridden fields above).
+    pub config: SessionConfig,
+}
+
+/// The outcome of [`Session::fork`]: the forked session plus the fact
+/// coordinates (new identity, source checkpoint, branch, follow policy).
+pub struct ForkReceipt {
+    /// The forked session: opened, config-activated (when the checkpoint
+    /// chose one), memory-seeded at the checkpoint roots, and carrying the
+    /// canonical `forked` fact as its genesis record.
+    pub session: Session,
+    /// The new session's identity (never equal to the source's).
+    pub session_id: Id128,
+    /// The source checkpoint this fork derives from.
+    pub checkpoint_seq: u64,
+    /// The forked session's branch: a fresh root branch — the fork has no
+    /// branch history, the `forked` fact is its genesis record.
+    pub branch: BranchId,
+    /// The memory follow policy recorded in the `forked` fact.
+    pub follow: kanbei_memory::MemoryFollowPolicy,
+}
+
 /// One intent event quiesced by a branch transition (M6): its seq, kind, and
 /// event id (`evt`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -383,6 +431,19 @@ pub struct ConfigChoiceRecord {
 pub struct PinnedRoots {
     pub lifetime: Digest,
     pub project: Option<Digest>,
+}
+
+/// Everything a checkpoint-validation pass (M6 `continue_from`, M9 wave 5a
+/// `fork`) establishes about a committed `checkpoint_created` event: the
+/// event envelope, the snapshot manifest, the pinned memory roots, and the
+/// memory follow policy derived from them.
+struct CheckpointFacts {
+    env: Envelope,
+    snapshot: Digest,
+    manifest: ExecutionManifest,
+    memory_root: Option<Digest>,
+    project_memory_root: Option<Digest>,
+    follow: kanbei_memory::MemoryFollowPolicy,
 }
 
 /// The M6 wave 4 bundle-export report: what an [`Session::export_bundle`]
@@ -1274,101 +1335,13 @@ impl Session {
     /// History is never rewritten — the transition is appended and the new
     /// path is derived by the path filter.
     pub fn continue_from(&mut self, checkpoint: &CheckpointRef) -> Result<BranchRecord, SessionError> {
-        if checkpoint.session_id != self.session_id {
-            return Err(SessionError::InvalidInput(
-                "checkpoint belongs to a different session".into(),
-            ));
-        }
-        if checkpoint.seq == 0 || checkpoint.seq >= self.next_seq {
-            return Err(SessionError::InvalidInput(format!(
-                "checkpoint seq {} is not a committed event",
-                checkpoint.seq
-            )));
-        }
-        let env = self.envelope_at(checkpoint.seq)?;
-        if env.kind != "checkpoint_created"
-            || env.payload.get("frontier_seq").and_then(|f| f.as_u64()) != Some(checkpoint.seq)
-        {
-            return Err(SessionError::InvalidInput(format!(
-                "event at seq {} is not a checkpoint",
-                checkpoint.seq
-            )));
-        }
-        let snapshot: Digest = env
-            .payload
-            .get("snapshot")
-            .and_then(|s| s.as_str())
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| {
-                SessionError::InvalidInput(format!(
-                    "checkpoint at seq {} pins no snapshot",
-                    checkpoint.seq
-                ))
-            })?;
-        let bytes = self
-            .store
-            .get(&snapshot)
-            .map_err(|e| SessionError::Snapshot(format!("checkpoint snapshot {snapshot} unreadable: {e}")))?;
-        let manifest: ExecutionManifest = serde_json::from_slice(&bytes).map_err(|e| {
-            SessionError::Snapshot(format!("checkpoint snapshot {snapshot} is not a manifest: {e}"))
-        })?;
-        // Full closure walk (M6 wave 2): every digest field the manifest
-        // pins must resolve in the session store — modules' packages,
-        // composition, memory roots, and the tool-registry/provider-config
-        // objects (all installed before the pin). The engine/toolchain
-        // digests are kernel-embedded build-time artifacts (the guest wasm
-        // is a kanbei-vm `include_bytes!` constant that never enters the
-        // object store), so they are the only digest fields excepted from
-        // the store verification.
-        let mut closure = kanbei_snapshot::manifest_closure(&manifest);
-        if let Some(d) = manifest.engine_digest {
-            closure.remove(&d);
-        }
-        if let Some(d) = manifest.toolchain_digest {
-            closure.remove(&d);
-        }
-        kanbei_snapshot::verify_closure(&self.store, &closure)
-            .map_err(|e| SessionError::Snapshot(format!("checkpoint snapshot closure failed: {e}")))?;
-        let memory_root: Option<Digest> = env
-            .payload
-            .get("memory_root")
-            .and_then(|r| r.as_str())
-            .and_then(|r| r.parse().ok());
-        let project_memory_root: Option<Digest> = env
-            .payload
-            .get("project_memory_root")
-            .and_then(|r| r.as_str())
-            .and_then(|r| r.parse().ok());
-
-        // The follow policy before the transition commits: the checkpoint's
-        // pinned roots must be roots the memory actors know — a corrupted
-        // checkpoint event is rejected explicitly, with no branch. A
-        // checkpoint without a pinned lifetime root cannot pin (the policy's
-        // lifetime_root is required) → FollowHead.
-        let follow = match memory_root {
-            Some(lifetime_root) => {
-                if !self.memory_lifetime.contains_root(&lifetime_root) {
-                    return Err(SessionError::InvalidInput(format!(
-                        "checkpoint pins memory root {lifetime_root} unknown to the lifetime actor"
-                    )));
-                }
-                if let Some(project_root) = project_memory_root
-                    && !self
-                        .memory_project
-                        .as_ref()
-                        .is_some_and(|a| a.contains_root(&project_root))
-                {
-                    return Err(SessionError::InvalidInput(format!(
-                        "checkpoint pins project memory root {project_root} unknown to the project actor"
-                    )));
-                }
-                kanbei_memory::MemoryFollowPolicy::PinnedAt {
-                    lifetime_root,
-                    project_root: project_memory_root,
-                }
-            }
-            None => kanbei_memory::MemoryFollowPolicy::FollowHead,
-        };
+        let facts = self.validate_checkpoint(checkpoint)?;
+        let snapshot = facts.snapshot;
+        let memory_root = facts.memory_root;
+        let project_memory_root = facts.project_memory_root;
+        let follow = facts.follow;
+        let env = facts.env;
+        let manifest = facts.manifest;
 
         // Quiesce BEFORE the transition commits: an active run is cancelled
         // (its `run_outcome Failed(Quiesced)` records the termination), then
@@ -1482,6 +1455,460 @@ impl Session {
         #[cfg(feature = "otel")]
         self.telemetry_continue_from(record.transition_seq, &record.id);
         Ok(record)
+    }
+
+    /// Validates a committed `checkpoint_created` event (M6): the session
+    /// match, the committed seq, the event kind + frontier, the snapshot
+    /// manifest readability, the full closure walk, and the pinned memory
+    /// roots' membership in the memory actors' histories. Shared by
+    /// `continue_from` (which then quiesces + transitions) and `fork` (which
+    /// then seeds a new session) — both treat an invalid checkpoint as an
+    /// explicit error with no side effects.
+    fn validate_checkpoint(&self, checkpoint: &CheckpointRef) -> Result<CheckpointFacts, SessionError> {
+        if checkpoint.session_id != self.session_id {
+            return Err(SessionError::InvalidInput(
+                "checkpoint belongs to a different session".into(),
+            ));
+        }
+        if checkpoint.seq == 0 || checkpoint.seq >= self.next_seq {
+            return Err(SessionError::InvalidInput(format!(
+                "checkpoint seq {} is not a committed event",
+                checkpoint.seq
+            )));
+        }
+        let env = self.envelope_at(checkpoint.seq)?;
+        if env.kind != "checkpoint_created"
+            || env.payload.get("frontier_seq").and_then(|f| f.as_u64()) != Some(checkpoint.seq)
+        {
+            return Err(SessionError::InvalidInput(format!(
+                "event at seq {} is not a checkpoint",
+                checkpoint.seq
+            )));
+        }
+        let snapshot: Digest = env
+            .payload
+            .get("snapshot")
+            .and_then(|s| s.as_str())
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| {
+                SessionError::InvalidInput(format!(
+                    "checkpoint at seq {} pins no snapshot",
+                    checkpoint.seq
+                ))
+            })?;
+        let bytes = self
+            .store
+            .get(&snapshot)
+            .map_err(|e| SessionError::Snapshot(format!("checkpoint snapshot {snapshot} unreadable: {e}")))?;
+        let manifest: ExecutionManifest = serde_json::from_slice(&bytes).map_err(|e| {
+            SessionError::Snapshot(format!("checkpoint snapshot {snapshot} is not a manifest: {e}"))
+        })?;
+        // Full closure walk (M6 wave 2): every digest field the manifest
+        // pins must resolve in the session store — modules' packages,
+        // composition, memory roots, and the tool-registry/provider-config
+        // objects (all installed before the pin). The engine/toolchain
+        // digests are kernel-embedded build-time artifacts (the guest wasm
+        // is a kanbei-vm `include_bytes!` constant that never enters the
+        // object store), so they are the only digest fields excepted from
+        // the store verification.
+        let mut closure = kanbei_snapshot::manifest_closure(&manifest);
+        if let Some(d) = manifest.engine_digest {
+            closure.remove(&d);
+        }
+        if let Some(d) = manifest.toolchain_digest {
+            closure.remove(&d);
+        }
+        kanbei_snapshot::verify_closure(&self.store, &closure)
+            .map_err(|e| SessionError::Snapshot(format!("checkpoint snapshot closure failed: {e}")))?;
+        let memory_root: Option<Digest> = env
+            .payload
+            .get("memory_root")
+            .and_then(|r| r.as_str())
+            .and_then(|r| r.parse().ok());
+        let project_memory_root: Option<Digest> = env
+            .payload
+            .get("project_memory_root")
+            .and_then(|r| r.as_str())
+            .and_then(|r| r.parse().ok());
+
+        // The follow policy: the checkpoint's pinned roots must be roots the
+        // memory actors know — a corrupted checkpoint event is rejected
+        // explicitly, with no branch/fork. A checkpoint without a pinned
+        // lifetime root cannot pin (the policy's lifetime_root is required)
+        // → FollowHead.
+        let follow = match memory_root {
+            Some(lifetime_root) => {
+                if !self.memory_lifetime.contains_root(&lifetime_root) {
+                    return Err(SessionError::InvalidInput(format!(
+                        "checkpoint pins memory root {lifetime_root} unknown to the lifetime actor"
+                    )));
+                }
+                if let Some(project_root) = project_memory_root
+                    && !self
+                        .memory_project
+                        .as_ref()
+                        .is_some_and(|a| a.contains_root(&project_root))
+                {
+                    return Err(SessionError::InvalidInput(format!(
+                        "checkpoint pins project memory root {project_root} unknown to the project actor"
+                    )));
+                }
+                kanbei_memory::MemoryFollowPolicy::PinnedAt {
+                    lifetime_root,
+                    project_root: project_memory_root,
+                }
+            }
+            None => kanbei_memory::MemoryFollowPolicy::FollowHead,
+        };
+        Ok(CheckpointFacts {
+            env,
+            snapshot,
+            manifest,
+            memory_root,
+            project_memory_root,
+            follow,
+        })
+    }
+
+    /// Forks an independent session from a committed checkpoint (M9 wave 5a,
+    /// R-24/D-08): the new session is created from the checkpoint's snapshot
+    /// closure — a fresh SessionId, an explicit `forked` source-reference
+    /// fact, and a fork-floor broker (read-only capabilities + approval-gated
+    /// `memory.propose`, the attenuated grant recorded in the fact). Unlike
+    /// `continue_from` this never touches the source session: it is a pure
+    /// snapshot read — no quiesce, no events on the source log. Module state
+    /// heads are NOT carried over (the state store is opaque and bound to the
+    /// source's live module-manager generation tokens).
+    ///
+    /// The checkpoint is validated exactly like `continue_from` via
+    /// [`Session::validate_checkpoint`]. The snapshot closure objects
+    /// (manifest + memory roots + composition + packages; engine/toolchain
+    /// digests are kernel-embedded pins, excluded) are copied into
+    /// `<target>/objects/`, plus every `workspace_snapshot` manifest + blob
+    /// at or before the checkpoint (event-referenced objects, outside the
+    /// manifest closure — the manifests join the `forked` fact's refs so
+    /// they stay GC-rooted). Memory is seeded by copying the source's
+    /// `<memory_root>/lifetime/` (and `projects/` + `projects.jsonl` when the
+    /// source has a project) into `<target>/memory/`, then truncating each
+    /// copied transition log after the frame committing the checkpoint-pinned
+    /// root — the actor replay yields exactly the pinned root as head
+    /// (`head.json` is repaired from the log at open; `projection.sqlite` is
+    /// disposable and rebuilt at open). The fork's config choice is the last
+    /// `branch_transition` `config_choice.current` or `composition_changed`
+    /// package digest at or before the checkpoint seq; that package manifest
+    /// is activated at open, and a choice whose package is absent from the
+    /// source store (a superseded config on a multi-branch history) yields a
+    /// storage-only fork. The new session then commits one canonical `forked`
+    /// event (schema 1): `{source_session, checkpoint_seq,
+    /// checkpoint_snapshot, follow, grants, config, frontier_seq}` with
+    /// refs = [snapshot, memory roots, config package, workspace manifests] —
+    /// the fork-floor canonical fact (architecture.md R-24/D-08) and the
+    /// explicit source reference. Automatic GC is forced off at the fork's
+    /// open (the seeded objects are not yet event-referenced; run the
+    /// explicit `Session::run_gc` afterwards instead).
+    ///
+    /// The forked session's memory actors replay the seeded logs, so their
+    /// heads ARE the pinned roots by construction (there is no actor-level
+    /// set-head seam — the log replay is the authority); the fact records
+    /// `PinnedAt` and `pinned_roots` is set on the new session, so the
+    /// projection pins the checkpoint roots from the start.
+    ///
+    /// `target_dir` must be absent or empty; on any failure after creation
+    /// the target dir is best-effort removed (an orphan can remain only when
+    /// the removal itself fails — the caller may delete it).
+    pub fn fork(
+        &self,
+        checkpoint: &CheckpointRef,
+        options: ForkOptions,
+    ) -> Result<ForkReceipt, SessionError> {
+        let facts = self.validate_checkpoint(checkpoint)?;
+        let target_dir = options.target_dir.clone();
+        match std::fs::metadata(&target_dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Ok(m) if m.is_dir() => {
+                let mut entries = std::fs::read_dir(&target_dir)?;
+                if entries.next().is_some() {
+                    return Err(SessionError::InvalidInput(format!(
+                        "fork target dir {} is not empty (refusing to seed into an existing session dir)",
+                        target_dir.display()
+                    )));
+                }
+            }
+            Ok(_) => {
+                return Err(SessionError::InvalidInput(format!(
+                    "fork target {} exists and is not a directory",
+                    target_dir.display()
+                )))
+            }
+            Err(e) => return Err(e.into()),
+        }
+        // Best-effort cleanup guard: any failure below removes the target dir
+        // (it was absent or empty, so only fork's own writes live inside).
+        struct ForkCleanup(PathBuf);
+        impl Drop for ForkCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let cleanup = ForkCleanup(target_dir.clone());
+
+        let fresh_id = options.session_id.unwrap_or_else(Id128::generate);
+        let (broker, grant_digests) = fork_floor_broker(fresh_id)?;
+
+        // The checkpoint closure: the snapshot manifest, the memory roots,
+        // composition, packages, and every other digest the manifest pins —
+        // copied into the new store. Engine/toolchain digests are
+        // kernel-embedded identity pins, never store objects (mirror of
+        // continue_from).
+        let objects_dir = target_dir.join("objects");
+        std::fs::create_dir_all(&objects_dir)?;
+        let mut closure = kanbei_snapshot::manifest_closure(&facts.manifest);
+        if let Some(d) = facts.manifest.engine_digest {
+            closure.remove(&d);
+        }
+        if let Some(d) = facts.manifest.toolchain_digest {
+            closure.remove(&d);
+        }
+        // the snapshot object itself is the manifest bytes (not part of its
+        // own closure)
+        closure.insert(facts.snapshot);
+        for d in closure {
+            let bytes = self.store.get(&d).map_err(|e| {
+                SessionError::Snapshot(format!("fork closure object {d} unreadable: {e}"))
+            })?;
+            std::fs::write(objects_dir.join(d.to_string()), bytes)?;
+        }
+
+        // Workspace snapshots are ordinary store objects referenced by
+        // `workspace_snapshot` events — NOT by the execution manifest — so
+        // they are outside the checkpoint closure. Copy every snapshot at or
+        // before the checkpoint (manifest + blobs) so the fork can restore
+        // the checkpoint's workspace state; the manifests join the `forked`
+        // fact's refs, keeping them GC-rooted on the fork.
+        let mut ws_manifests: Vec<Digest> = Vec::new();
+        {
+            let log_path = self.log_path.clone();
+            kanbei_log::for_each_frame(&log_path, |info| {
+                for line in &info.events {
+                    let Ok(env) = Envelope::from_line(line) else {
+                        continue;
+                    };
+                    if env.seq <= checkpoint.seq
+                        && env.kind == "workspace_snapshot"
+                        && let Some(m) = env
+                            .payload
+                            .get("manifest")
+                            .and_then(|m| m.as_str())
+                            .and_then(|m| m.parse::<Digest>().ok())
+                    {
+                        ws_manifests.push(m);
+                    }
+                }
+            })?;
+            for manifest in &ws_manifests {
+                let bytes = self.store.get(manifest).map_err(|e| {
+                    SessionError::Snapshot(format!(
+                        "workspace snapshot manifest {manifest} unreadable: {e}"
+                    ))
+                })?;
+                let parsed: kanbei_workspace::Manifest =
+                    serde_json::from_slice(&bytes).map_err(|e| {
+                        SessionError::Snapshot(format!(
+                            "workspace snapshot manifest {manifest} is not a manifest: {e}"
+                        ))
+                    })?;
+                std::fs::write(objects_dir.join(manifest.to_string()), bytes)?;
+                for entry in &parsed.entries {
+                    if let kanbei_workspace::Entry::File { digest, .. } = entry {
+                        let blob = self.store.get(digest).map_err(|e| {
+                            SessionError::Snapshot(format!(
+                                "workspace snapshot blob {digest} unreadable: {e}"
+                            ))
+                        })?;
+                        std::fs::write(objects_dir.join(digest.to_string()), blob)?;
+                    }
+                }
+            }
+        }
+
+        // Memory seeding: copy the source's scope dirs into `<target>/memory`
+        // and truncate each copied transition log after the checkpoint root's
+        // committing frame. A checkpoint without a pinned root means the
+        // actor had no head at the fork point — nothing is copied and the
+        // new actor opens empty.
+        let source_memory_root = self
+            .cfg
+            .memory_root
+            .clone()
+            .unwrap_or_else(|| self.cfg.dir.join("memory"));
+        let target_memory_root = target_dir.join("memory");
+        if let Some(lifetime_root) = facts.memory_root {
+            let scope_dir = kanbei_memory::MemoryScope::Lifetime.dir_name();
+            copy_dir_all(
+                &source_memory_root.join(&scope_dir),
+                &target_memory_root.join(&scope_dir),
+            )?;
+            truncate_log_at(
+                &target_memory_root.join(&scope_dir).join("transitions.jsonl.zst"),
+                lifetime_root,
+            )?;
+        }
+        let source_project = self.cfg.project;
+        if let Some(project_id) = source_project {
+            std::fs::create_dir_all(&target_memory_root)?;
+            let registry = source_memory_root.join("projects.jsonl");
+            if registry.exists() {
+                std::fs::copy(&registry, target_memory_root.join("projects.jsonl"))?;
+            }
+            if let Some(project_root) = facts.project_memory_root {
+                let scope_dir = kanbei_memory::MemoryScope::Project(project_id).dir_name();
+                copy_dir_all(
+                    &source_memory_root.join(&scope_dir),
+                    &target_memory_root.join(&scope_dir),
+                )?;
+                truncate_log_at(
+                    &target_memory_root.join(&scope_dir).join("transitions.jsonl.zst"),
+                    project_root,
+                )?;
+            }
+        }
+
+        // The config choice at the checkpoint: the chosen package manifest is
+        // activated at open (None = storage-only fork).
+        let config_manifest: Option<PackageManifest> =
+            match self.config_choice_at(checkpoint.seq)? {
+                Some(digest) => match self.store.get(&digest) {
+                    Ok(bytes) => serde_json::from_slice(&bytes).ok(),
+                    Err(_) => None,
+                },
+                None => None,
+            };
+        let config_digest = config_manifest.as_ref().map(|m| {
+            Digest::new(
+                &serde_json::to_vec(m).expect("package manifest serialization cannot fail"),
+            )
+        });
+
+        // Open the forked session: the overridden lane fields (dir, identity,
+        // policy, broker, memory root, config, project) beat anything the
+        // caller set in `options.config`. GC is forced off: the seeded
+        // objects are not yet event-referenced at open, so the automatic
+        // quarantine pass would move them all (the caller can run the
+        // explicit `Session::run_gc` after the fork, when the `forked` fact
+        // roots them).
+        let mut target_cfg = options.config;
+        target_cfg.dir = target_dir.clone();
+        target_cfg.session_id = Some(fresh_id);
+        target_cfg.policy = options.policy;
+        target_cfg.broker = broker;
+        target_cfg.memory_root = None;
+        target_cfg.config = config_manifest;
+        target_cfg.gc = None;
+        if source_project.is_some() {
+            target_cfg.project = source_project;
+        }
+        let mut fork = Session::open(target_cfg)?;
+
+        // The canonical fork-floor fact: the explicit source reference and
+        // the attenuated grant record. All refs were copied into the new
+        // store above (R-10); the workspace manifests join so the inherited
+        // workspace snapshots stay GC-rooted.
+        let mut refs = vec![facts.snapshot];
+        if let Some(lifetime_root) = facts.memory_root {
+            refs.push(lifetime_root);
+        }
+        if let Some(project_root) = facts.project_memory_root {
+            refs.push(project_root);
+        }
+        if let Some(d) = config_digest {
+            refs.push(d);
+        }
+        refs.extend(ws_manifests.iter().copied());
+        let commit_result = fork.commit(
+            vec![NewEvent {
+                kind: "forked".into(),
+                payload_schema: 1,
+                payload: json!({
+                    "source_session": self.session_id.to_string(),
+                    "checkpoint_seq": checkpoint.seq,
+                    "checkpoint_snapshot": facts.snapshot.to_string(),
+                    "follow": serde_json::to_value(&facts.follow)
+                        .expect("follow serialization cannot fail"),
+                    "grants": grant_digests
+                        .iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>(),
+                    "config": config_digest.map(|d| d.to_string()),
+                    "frontier_seq": checkpoint.seq,
+                }),
+                objects: Vec::new(),
+                refs,
+            }],
+            None,
+        );
+        if let Err(e) = commit_result {
+            let _ = fork.close();
+            return Err(e);
+        }
+        // The actors' heads are the pinned roots by construction (seeded log
+        // replay); pin them for the projection like continue_from does.
+        fork.pinned_roots = facts.memory_root.map(|lifetime| PinnedRoots {
+            lifetime,
+            project: facts.project_memory_root,
+        });
+        let branch = fork.branch;
+        let session_id = fork.session_id;
+        std::mem::forget(cleanup);
+        Ok(ForkReceipt {
+            session: fork,
+            session_id,
+            checkpoint_seq: checkpoint.seq,
+            branch,
+            follow: facts.follow,
+        })
+    }
+
+    /// The config package digest chosen at `at_seq`: the last
+    /// `branch_transition` `config_choice.current` or `composition_changed`
+    /// added-package digest at or before that seq — the config active at the
+    /// checkpoint (None for sessions that never activated one).
+    fn config_choice_at(&self, at_seq: u64) -> Result<Option<Digest>, SessionError> {
+        let log_path = self.log_path.clone();
+        let mut chosen: Option<Digest> = None;
+        kanbei_log::for_each_frame(&log_path, |info| {
+            for line in &info.events {
+                let Ok(env) = Envelope::from_line(line) else {
+                    continue;
+                };
+                if env.seq > at_seq {
+                    continue;
+                }
+                let digest = match env.kind.as_str() {
+                    // the branch-point record's live config digest
+                    "branch_transition" => env
+                        .payload
+                        .get("config_choice")
+                        .and_then(|c| c.get("current"))
+                        .and_then(|c| c.as_str())
+                        .and_then(|c| c.parse::<Digest>().ok()),
+                    // the package a config activation added
+                    "composition_changed" => env
+                        .payload
+                        .get("delta")
+                        .and_then(|d| d.get("added"))
+                        .and_then(|a| a.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|m| m.get("package"))
+                        .and_then(|p| p.as_str())
+                        .and_then(|p| p.parse::<Digest>().ok()),
+                    _ => None,
+                };
+                if let Some(digest) = digest {
+                    chosen = Some(digest);
+                }
+            }
+        })?;
+        Ok(chosen)
     }
 
     /// Switch the memory-follow policy (M6 wave 2): `FollowHead` releases the
@@ -2405,6 +2832,12 @@ impl Session {
         self.current_snapshot
     }
 
+    /// The live config package digest (the `config_choice` record's `current`
+    /// field); None for storage-only sessions and safe-mode opens.
+    pub fn config_digest(&self) -> Option<Digest> {
+        self.config_digest
+    }
+
     /// The session's own identity (caller principal for kernel-originated
     /// tool calls, R-14/D-02).
     pub fn session_id(&self) -> Id128 {
@@ -2569,6 +3002,122 @@ fn shutdown_queue(queue: Arc<DurabilityQueue>) {
     if let Ok(queue) = Arc::try_unwrap(queue) {
         let _ = queue.shutdown();
     }
+}
+
+// M9 wave 5a helpers (independent-session fork): the fork-floor broker, the
+// memory scope-dir copy, and the copied-log truncation at a pinned root.
+
+/// The fork-floor broker (R-24/D-08): READ-ONLY capabilities (`fs.read`,
+/// `fs.search`, `git.status`, `git.diff`, `memory.query`) plus an
+/// approval-gated `memory.propose` (the approval path is required for
+/// consequential effects — the m6 memory_broker allow/require_approval
+/// split), one session-scoped grant per resource for the new session's
+/// principal, template version 1 monotonic. Returns the broker and the
+/// derived grant digests — the `forked` fact's canonical grant record.
+fn fork_floor_broker(
+    session_id: Id128,
+) -> Result<(kanbei_capabilities::Broker, Vec<Digest>), SessionError> {
+    let read_only = ["fs.read", "fs.search", "git.status", "git.diff", "memory.query"]
+        .map(|r| kanbei_capabilities::Capability::new(r.into(), vec!["call".into()]))
+        .to_vec();
+    let propose =
+        kanbei_capabilities::Capability::new("memory.propose".into(), vec!["call".into()]);
+    let mut broker = kanbei_capabilities::Broker::new();
+    broker
+        .add_template(kanbei_capabilities::PolicyTemplate {
+            trust_class: kanbei_capabilities::TrustClass::Builtin,
+            allow: {
+                let mut allow = read_only.clone();
+                allow.push(propose.clone());
+                allow
+            },
+            deny: vec![],
+            require_approval: vec![propose.clone()],
+            version: 1,
+            monotonic: true,
+        })
+        .map_err(|e| SessionError::InvalidInput(format!("fork-floor template: {e}")))?;
+    let mut digests = Vec::new();
+    for resource in read_only.into_iter().chain([propose]) {
+        let mut grant = kanbei_capabilities::Grant {
+            grant_digest: Digest::new(b"placeholder"),
+            principal: kanbei_capabilities::Principal {
+                session: session_id,
+                generation: 0,
+                run: None,
+            },
+            module_generation: 0,
+            capability: resource,
+            scope: kanbei_capabilities::GrantScope::Session,
+            expiry: None,
+            budget: None,
+            purpose: Some("fork-floor".into()),
+            policy_version: 1,
+        };
+        grant.grant_digest = grant.derive_digest();
+        broker
+            .add_grant(grant.clone())
+            .map_err(|e| SessionError::InvalidInput(format!("fork-floor grant: {e}")))?;
+        digests.push(grant.grant_digest);
+    }
+    Ok((broker, digests))
+}
+
+/// Recursive directory copy (the memory-seeding path; the target never
+/// pre-exists, so copies never merge).
+fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Truncates a copied memory-scope transition log after the frame that
+/// commits `root`, so replaying the copied log yields exactly `root` as the
+/// actor head — the fork snapshot point; a later source transition never
+/// leaks into the fork. Dropping only complete trailing frames keeps the
+/// frame chain/digest verification valid. Errors when no frame commits
+/// `root`: the fork aborts rather than silently seeding a newer head.
+fn truncate_log_at(log_path: &Path, root: Digest) -> Result<(), SessionError> {
+    let (boundaries, _truncated) = kanbei_log::scan_frames(log_path)?;
+    let mut cut: Option<(u64, u64)> = None;
+    let mut frame_idx = 0usize;
+    kanbei_log::for_each_frame(log_path, |info| {
+        for line in &info.events {
+            let Ok(env) = Envelope::from_line(line) else {
+                continue;
+            };
+            if env.kind == "memory_transition"
+                && env
+                    .payload
+                    .get("accepted_new_root")
+                    .and_then(|r| r.as_str())
+                    .and_then(|r| r.parse::<Digest>().ok())
+                    == Some(root)
+            {
+                cut = Some(boundaries[frame_idx]);
+            }
+        }
+        frame_idx += 1;
+    })?;
+    let Some((start, len)) = cut else {
+        return Err(SessionError::Snapshot(format!(
+            "memory root {root} is not committed by the copied transition log {}",
+            log_path.display()
+        )));
+    };
+    let end = start + len;
+    let f = std::fs::OpenOptions::new().write(true).open(log_path)?;
+    f.set_len(end)?;
+    Ok(())
 }
 
 // M3 agent spine: run lifecycle, model/tool commit paths, approvals, breakers,
