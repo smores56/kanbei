@@ -2065,7 +2065,11 @@ impl Session {
     /// generation), replaces via the manager, stages the new generation's
     /// entries, validates + OCC-publishes the new contribution set, and
     /// commits a `composition_changed` event whose delta records the removed
-    /// old generation and the added new one.
+    /// old generation and the added new one. Since M8 the replaced
+    /// generation's UI mounts/theme overlays are removed from the
+    /// composition (mid-session UI deactivation), the new generation's own
+    /// contributions join the staged set, and the UI host rebinds — mounts
+    /// of the removed generation unbind, the rest rebind in slot order.
     ///
     /// The manager's `replace` is not rollback-atomic: on error the session
     /// returns unchanged (no event, epoch untouched). Best-effort rollback:
@@ -2097,6 +2101,11 @@ impl Session {
             .filter(|(_, p, _)| p.generation == old_generation)
             .map(|(k, p, _)| (k, p))
             .collect();
+        // M8 mid-session UI deactivation: capture the replaced generation's
+        // non-service contributions (UI mounts / theme overlays staged via
+        // `contribution_publish`) BEFORE the swap — `replace` drops the
+        // generation's staging records.
+        let old_published = manager.published_contributions(old_generation);
         let outcome = match manager.replace(module_id, &new_manifest) {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -2132,6 +2141,9 @@ impl Session {
                 if let Err(e) = reg.remove(key, provider.module_id) {
                     drop(reg);
                     let _ = manager.deactivate(module_id);
+                    // The old generation is already gone: rebind so its UI
+                    // mounts unbind (their components no longer resolve).
+                    let _ = self.rebind_ui(new_generation);
                     return Err(e.into());
                 }
             }
@@ -2148,12 +2160,26 @@ impl Session {
                 }),
             })
             .collect();
+        // M8: the replaced generation's UI mounts/theme overlays leave the
+        // composition (clone-and-swap removal, idempotent), and the new
+        // generation's own contributions join the staged set — a replaced UI
+        // module re-mounts under its new generation.
+        if let Err(e) = self.registry.remove_contributions(&old_published) {
+            let _ = manager.deactivate(module_id);
+            let _ = self.rebind_ui(new_generation);
+            return Err(e.into());
+        }
+        staged
+            .contributions
+            .extend(manager.published_contributions(new_generation));
         if let Err(e) = self.registry.validate(&staged.contributions) {
             let _ = manager.deactivate(module_id);
+            let _ = self.rebind_ui(new_generation);
             return Err(e.into());
         }
         if let Err(e) = self.composition.publish(&staged, &mut self.registry) {
             let _ = manager.deactivate(module_id);
+            let _ = self.rebind_ui(new_generation);
             return Err(e.into());
         }
         let epoch = self.composition.current().epoch;
@@ -2192,8 +2218,13 @@ impl Session {
             if let Some(m) = self.modules.as_mut() {
                 let _ = m.deactivate(module_id);
             }
+            let _ = self.rebind_ui(new_generation);
             return Err(e);
         }
+        // M8: rebind the UI host — the replaced generation's mounts unbind
+        // (their components no longer resolve) and the remaining mounts
+        // rebind in slot order.
+        self.rebind_ui(new_generation)?;
         Ok(outcome)
     }
 

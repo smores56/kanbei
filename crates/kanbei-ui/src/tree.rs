@@ -115,6 +115,11 @@ impl Node {
         self.children.push(node);
         self
     }
+
+    pub fn children(mut self, nodes: Vec<Node>) -> Self {
+        self.children = nodes;
+        self
+    }
 }
 
 /// An immutable module-authored UI snapshot. `root.kind` must be `Root`.
@@ -249,6 +254,58 @@ impl SemanticTree {
             .into_iter()
             .find(|n| n.kind == NodeKind::Input && !n.disabled)
     }
+
+    /// Nodes at or below `root_id` in depth-first order (the within-mount
+    /// focus ring of the composite, M8). Empty when the id is unknown.
+    pub fn subtree(&self, root_id: &str) -> Vec<&Node> {
+        let mut out = Vec::new();
+        fn walk<'a>(n: &'a Node, out: &mut Vec<&'a Node>) {
+            out.push(n);
+            for c in &n.children {
+                walk(c, out);
+            }
+        }
+        if let Some(found) = self.nodes().into_iter().find(|n| n.id == root_id) {
+            walk(found, &mut out);
+        }
+        out
+    }
+
+    /// Compose per-mount trees into one synthetic composite root (M8
+    /// multi-module UI): each mount's own root node becomes a child of a new
+    /// synthetic root, and every node id is prefixed with `"{index}."` so
+    /// focus identity is unambiguous across mounts (two mounts may use the
+    /// same ids). The synthetic root carries no content and is never
+    /// focusable. The input order IS the slot order the caller determined;
+    /// `index` is the mount's position in that order. A single mount is
+    /// returned verbatim (no prefix, no wrapper) so the single-mount
+    /// workbench stays byte-identical to M5.
+    pub fn compose(mounts: &[(&str, &SemanticTree)]) -> Self {
+        if let [(_slot, single)] = mounts {
+            return (*single).clone();
+        }
+        let children: Vec<Node> = mounts
+            .iter()
+            .enumerate()
+            .map(|(i, (_, tree))| prefix_node(&tree.root, i))
+            .collect();
+        SemanticTree::new(Node::new("composite", NodeKind::Root).children(children))
+    }
+
+    /// Resolve a composite id (see [`Self::compose`]) back to
+    /// `(mount index, original id)`. The first `.` always separates the
+    /// index because the prefix is prepended verbatim.
+    pub fn split_composite_id(id: &str) -> Option<(usize, &str)> {
+        let (index, rest) = id.split_once('.')?;
+        Some((index.parse().ok()?, rest))
+    }
+}
+
+fn prefix_node(node: &Node, index: usize) -> Node {
+    let mut prefixed = node.clone();
+    prefixed.id = format!("{index}.{}", node.id);
+    prefixed.children = node.children.iter().map(|c| prefix_node(c, index)).collect();
+    prefixed
 }
 
 #[cfg(test)]
@@ -309,5 +366,51 @@ mod tests {
         assert_eq!(ring, vec!["a", "c"]);
         assert!(!tree.is_focusable("b"));
         assert_eq!(tree.input_node(Some("a")).unwrap().id, "c");
+    }
+
+    #[test]
+    fn compose_prefixes_ids_and_keeps_roots() {
+        let a = SemanticTree::new(
+            Node::new("root", NodeKind::Root).child(
+                Node::new("input", NodeKind::Input)
+                    .with_content("a")
+                    .focusable(),
+            ),
+        );
+        let b = SemanticTree::new(
+            Node::new("root", NodeKind::Root).child(
+                Node::new("input", NodeKind::Input)
+                    .with_content("b")
+                    .focusable(),
+            ),
+        );
+        // a single mount is returned verbatim (M5 byte-identical workbench)
+        let solo = SemanticTree::compose(&[("main", &a)]);
+        assert_eq!(solo.root.id, "root");
+        assert_eq!(solo.focusable()[0].id, "input");
+        let composite = SemanticTree::compose(&[("main", &a), ("status", &b)]);
+        // synthetic root is not focusable; both mount roots are children
+        assert_eq!(composite.root.id, "composite");
+        assert_eq!(composite.root.children.len(), 2);
+        assert_eq!(composite.root.children[0].id, "0.root");
+        assert_eq!(composite.root.children[1].id, "1.root");
+        // ids are unambiguous across mounts
+        let ring: Vec<String> = composite.focusable().iter().map(|n| n.id.clone()).collect();
+        assert_eq!(ring, vec!["0.input".to_string(), "1.input".to_string()]);
+        // content is preserved per mount
+        assert_eq!(composite.input_node(Some("1.input")).unwrap().content, "b");
+        assert_eq!(composite.input_node(None).unwrap().content, "a");
+        // round-trip resolution
+        assert_eq!(SemanticTree::split_composite_id("1.input"), Some((1, "input")));
+        assert_eq!(SemanticTree::split_composite_id("0.a.b"), Some((0, "a.b")));
+        assert_eq!(SemanticTree::split_composite_id("noprefix"), None);
+        // subtree() gives the within-mount ring
+        let sub: Vec<&str> = composite
+            .subtree("1.root")
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(sub, vec!["1.root", "1.input"]);
+        assert!(composite.subtree("unknown").is_empty());
     }
 }

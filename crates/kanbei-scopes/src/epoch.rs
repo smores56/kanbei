@@ -224,6 +224,7 @@ mod tests {
                 kind: ContributionKind::UiMount(UiMountContribution {
                     name: "header".into(),
                     component: "Header".into(),
+                    slot: None,
                 }),
             },
             Contribution {
@@ -293,6 +294,7 @@ mod tests {
                 kind: ContributionKind::UiMount(UiMountContribution {
                     name: "footer".into(),
                     component: "Footer".into(),
+                    slot: None,
                 }),
             },
             Contribution {

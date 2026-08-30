@@ -66,27 +66,48 @@ impl FocusModel {
     /// the focused node is an input and are otherwise no-ops.
     pub fn move_focus(&mut self, tree: &SemanticTree, dir: FocusDirection) {
         self.revalidate(tree);
+        let ring = tree.focusable();
+        self.move_ring(dir, ring);
+    }
+
+    /// Move focus through the ring RESTRICTED to the subtree of `root_id`
+    /// (M8: Up/Down stay within the focused mount's subtree of the composite
+    /// tree). When the focused node is outside the boundary the ring
+    /// position resolves to its start, like a fresh entry. The boundary id
+    /// must be a composite id (see `SemanticTree::compose`).
+    pub fn move_focus_within(&mut self, tree: &SemanticTree, dir: FocusDirection, root_id: &str) {
+        self.revalidate(tree);
+        let ring: Vec<&Node> = tree
+            .subtree(root_id)
+            .into_iter()
+            .filter(|n| n.focusable && !n.disabled)
+            .collect();
+        self.move_ring(dir, ring);
+    }
+
+    fn move_ring(&mut self, dir: FocusDirection, ring: Vec<&Node>) {
         match dir {
             FocusDirection::Left | FocusDirection::Right => {
-                if let Some(node) = self.focused_node(tree)
+                if let Some(node) = self.focused_node_ring(&ring)
                     && node.kind == crate::NodeKind::Input
                 {
                     let len = node.content.chars().count();
-                        match dir {
-                            FocusDirection::Left => self.caret = self.caret.saturating_sub(1),
-                            FocusDirection::Right => self.caret = (self.caret + 1).min(len),
-                            _ => unreachable!(),
-                        }
+                    match dir {
+                        FocusDirection::Left => self.caret = self.caret.saturating_sub(1),
+                        FocusDirection::Right => self.caret = (self.caret + 1).min(len),
+                        _ => unreachable!(),
+                    }
                 }
             }
             FocusDirection::Next | FocusDirection::Down => {
-                let ring = tree.focusable();
                 if ring.is_empty() {
                     self.focused = None;
                     self.caret = 0;
                     return;
                 }
-                let idx = ring.iter().position(|n| Some(n.id.as_str()) == self.focused.as_deref());
+                let idx = ring
+                    .iter()
+                    .position(|n| Some(n.id.as_str()) == self.focused.as_deref());
                 let next = match idx {
                     Some(i) if i + 1 < ring.len() => i + 1,
                     _ => 0,
@@ -95,13 +116,14 @@ impl FocusModel {
                 self.caret = 0;
             }
             FocusDirection::Prev | FocusDirection::Up => {
-                let ring = tree.focusable();
                 if ring.is_empty() {
                     self.focused = None;
                     self.caret = 0;
                     return;
                 }
-                let idx = ring.iter().position(|n| Some(n.id.as_str()) == self.focused.as_deref());
+                let idx = ring
+                    .iter()
+                    .position(|n| Some(n.id.as_str()) == self.focused.as_deref());
                 let next = match idx {
                     Some(0) | None => ring.len() - 1,
                     Some(i) => i - 1,
@@ -110,6 +132,12 @@ impl FocusModel {
                 self.caret = 0;
             }
         }
+    }
+
+    fn focused_node_ring<'a>(&self, ring: &[&'a Node]) -> Option<&'a Node> {
+        self.focused
+            .as_deref()
+            .and_then(|id| ring.iter().find(|n| n.id == id).copied())
     }
 
     pub fn focused_node<'a>(&self, tree: &'a SemanticTree) -> Option<&'a Node> {
@@ -256,5 +284,35 @@ mod tests {
         assert_eq!(c.classify(&crate::InputEvent::CtrlX), InputClass::Consumed);
         assert_eq!(c.classify(&crate::InputEvent::Char('a')), InputClass::Forward);
         assert_eq!(c.classify(&crate::InputEvent::Char('s')), InputClass::Forward);
+    }
+
+    #[test]
+    fn within_mount_ring_restricts_arrows() {
+        let a = SemanticTree::new(
+            Node::new("root", NodeKind::Root)
+                .child(Node::new("input", NodeKind::Input).with_content("x").focusable())
+                .child(Node::new("btn", NodeKind::Button).focusable()),
+        );
+        let b = SemanticTree::new(
+            Node::new("root", NodeKind::Root)
+                .child(Node::new("input", NodeKind::Input).with_content("y").focusable()),
+        );
+        let composite = SemanticTree::compose(&[("main", &a), ("status", &b)]);
+        let mut f = FocusModel::new();
+        f.revalidate(&composite);
+        assert_eq!(f.focused.as_deref(), Some("0.input"));
+        // Down stays within mount 0: 0.input -> 0.btn (never 1.input)
+        f.move_focus_within(&composite, FocusDirection::Down, "0.root");
+        assert_eq!(f.focused.as_deref(), Some("0.btn"));
+        f.move_focus_within(&composite, FocusDirection::Down, "0.root");
+        assert_eq!(f.focused.as_deref(), Some("0.input"), "wraps within the mount");
+        // Tab (full ring) crosses into mount 1 (0.input -> 0.btn -> 1.input)
+        f.move_focus(&composite, FocusDirection::Next);
+        assert_eq!(f.focused.as_deref(), Some("0.btn"));
+        f.move_focus(&composite, FocusDirection::Next);
+        assert_eq!(f.focused.as_deref(), Some("1.input"));
+        // Up from mount 1 stays there
+        f.move_focus_within(&composite, FocusDirection::Up, "1.root");
+        assert_eq!(f.focused.as_deref(), Some("1.input"));
     }
 }

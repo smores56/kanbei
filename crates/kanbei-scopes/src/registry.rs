@@ -192,6 +192,7 @@ impl ContributionRegistry {
                     seen_stages.insert(key, p.handler.clone());
                 }
                 ContributionKind::UiMount(u) => {
+                    validate_ui_slot(&contribution.scope, u.slot.as_deref())?;
                     let key = (contribution.scope.clone(), u.name.clone());
                     let holder = seen_ui
                         .get(&key)
@@ -297,7 +298,19 @@ impl ContributionRegistry {
                         .insert((c.scope.clone(), p.slot.clone(), p.ordering), p.clone());
                 }
                 ContributionKind::UiMount(u) => {
-                    next.ui.insert((c.scope.clone(), u.name.clone()), u.clone());
+                    // None means the default slot "main"; normalize so the
+                    // registry state (and the composition digest over its
+                    // canonical JSON) is canonical — a mount published
+                    // without a slot and one published with "main" are the
+                    // same contribution.
+                    next.ui.insert(
+                        (c.scope.clone(), u.name.clone()),
+                        UiMountContribution {
+                            name: u.name.clone(),
+                            component: u.component.clone(),
+                            slot: Some(u.slot.clone().unwrap_or_else(|| "main".to_string())),
+                        },
+                    );
                 }
                 ContributionKind::Guard(g) => {
                     next.guards
@@ -511,6 +524,54 @@ impl ContributionRegistry {
         })
     }
 
+    /// Removes the given non-service contributions (mid-session deactivation,
+    /// M8: a replaced generation's UI mounts/theme overlays leave the
+    /// composition). Every removal must match a currently registered entry by
+    /// (scope, kind, name); unknown entries are skipped so removal is
+    /// idempotent (a failed replacement may already have removed them).
+    /// Service contributions are rejected — services live in the shared
+    /// service registry and have their own lifecycle. Like [`Self::apply`],
+    /// all mutations happen on a clone and swap in only on success.
+    pub fn remove_contributions(&mut self, removals: &[Contribution]) -> Result<(), ScopeError> {
+        let mut next = self.clone_state();
+        for c in removals {
+            match &c.kind {
+                ContributionKind::Command(cmd) => {
+                    next.commands.remove(&(c.scope.clone(), cmd.name.clone()));
+                }
+                ContributionKind::Tool(t) => {
+                    next.tools.remove(&(c.scope.clone(), t.name.clone()));
+                }
+                ContributionKind::Theme(t) => {
+                    next.themes.remove(&(c.scope.clone(), t.name.clone()));
+                }
+                ContributionKind::ProjectionStage(p) => {
+                    next.stages.remove(&(c.scope.clone(), p.slot.clone(), p.ordering));
+                }
+                ContributionKind::UiMount(u) => {
+                    next.ui.remove(&(c.scope.clone(), u.name.clone()));
+                }
+                ContributionKind::Guard(g) => {
+                    next.guards.remove(&(c.scope.clone(), g.name.clone()));
+                }
+                ContributionKind::Keymap(km) => {
+                    next.keymaps.retain(|(s, e)| !(s == &c.scope && e.key == km.key));
+                }
+                ContributionKind::Service(_) => {
+                    return Err(ScopeError::InvalidContribution {
+                        scope: c.scope.clone(),
+                        reason:
+                            "remove_contributions is for non-service contributions; services \
+                             are removed through the shared service registry"
+                                .into(),
+                    });
+                }
+            }
+        }
+        *self = next;
+        Ok(())
+    }
+
     /// Full registry state as contributions in deterministic order: sorted by
     /// (scope, kind tag, name, ordering) with a content tiebreak, so equal
     /// states always snapshot identically.
@@ -691,7 +752,15 @@ impl ContributionRegistry {
                 challenger: new.component.clone(),
             });
         }
-        self.ui.insert(key, new);
+        validate_ui_slot(scope, new.slot.as_deref())?;
+        self.ui.insert(
+            key,
+            UiMountContribution {
+                name: new.name.clone(),
+                component: new.component.clone(),
+                slot: Some(new.slot.clone().unwrap_or_else(|| "main".to_string())),
+            },
+        );
         Ok(())
     }
 
@@ -760,6 +829,31 @@ fn conflict(
         holder: holder.to_string(),
         challenger: challenger.to_string(),
     }
+}
+
+/// UI slot charset (M8): alphanumeric + `-` + `_`, max 32 chars, non-empty.
+/// `None` is the default slot (`"main"`) and always valid; validation keeps
+/// the composition digest canonical (two mounts can never express the same
+/// slot differently).
+fn validate_ui_slot(scope: &ScopePath, slot: Option<&str>) -> Result<(), ScopeError> {
+    let Some(slot) = slot else {
+        return Ok(());
+    };
+    let valid = !slot.is_empty()
+        && slot.len() <= 32
+        && slot
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !valid {
+        return Err(ScopeError::InvalidContribution {
+            scope: scope.clone(),
+            reason: format!(
+                "ui mount slot `{slot}` violates the kernel charset \
+                 (alphanumeric + '-' + '_', max 32 chars)"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Deterministic holder identity for service conflicts: `module@generation`.
@@ -867,6 +961,7 @@ mod tests {
                 kind: ContributionKind::UiMount(UiMountContribution {
                     name: "header".into(),
                     component: "Header".into(),
+                    slot: None,
                 }),
             },
             Contribution {
@@ -1407,6 +1502,7 @@ mod tests {
                 kind: ContributionKind::UiMount(UiMountContribution {
                     name: "u".into(),
                     component: "Old".into(),
+                    slot: None,
                 }),
             },
             Contribution {
@@ -1438,6 +1534,7 @@ mod tests {
                 UiMountContribution {
                     name: "u".into(),
                     component: "New".into(),
+                    slot: None,
                 },
                 "Old",
             )
@@ -1475,6 +1572,7 @@ mod tests {
                 UiMountContribution {
                     name: "u".into(),
                     component: "X".into(),
+                    slot: None,
                 },
                 "wrong",
             )
@@ -1582,5 +1680,134 @@ mod tests {
         assert_eq!(removed.contributions.len(), 8);
         assert!(removed.cascaded_scopes.is_empty());
         assert!(registry.snapshot().is_empty());
+    }
+
+    #[test]
+    fn ui_slot_defaults_and_charset() {
+        let s = scope("app");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        // None is the default slot; the registry normalizes it to "main" so
+        // the composition digest is canonical.
+        let set = vec![Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::UiMount(UiMountContribution {
+                name: "a".into(),
+                component: "A".into(),
+                slot: None,
+            }),
+        }];
+        validate_and_apply(&mut registry, &s, &set);
+        let snap = registry.snapshot();
+        let ui = snap
+            .iter()
+            .find_map(|c| match &c.kind {
+                ContributionKind::UiMount(u) if u.name == "a" => Some(u),
+                _ => None,
+            })
+            .expect("mount registered");
+        assert_eq!(ui.slot.as_deref(), Some("main"));
+        // an explicit "main" mount is the same contribution (no conflict)
+        validate_and_apply(
+            &mut registry,
+            &s,
+            &[Contribution {
+                scope: s.clone(),
+                kind: ContributionKind::UiMount(UiMountContribution {
+                    name: "b".into(),
+                    component: "B".into(),
+                    slot: Some("main".into()),
+                }),
+            }],
+        );
+        let snap = registry.snapshot();
+        let ui_b = snap
+            .iter()
+            .find_map(|c| match &c.kind {
+                ContributionKind::UiMount(u) if u.name == "b" => Some(u),
+                _ => None,
+            })
+            .expect("mount registered");
+        assert_eq!(ui_b.slot.as_deref(), Some("main"));
+
+        // canonical slots pass; the charset rejects anything else
+        for ok in ["status", "header", "composer", "aux", "my_slot-2"] {
+            let err = registry.validate(&[Contribution {
+                scope: s.clone(),
+                kind: ContributionKind::UiMount(UiMountContribution {
+                    name: format!("ok-{ok}"),
+                    component: "C".into(),
+                    slot: Some(ok.into()),
+                }),
+            }]);
+            assert!(err.is_ok(), "slot {ok:?} must validate");
+        }
+        for bad in ["", "sp ace", "semi;colon", "dots.in", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"] {
+            let err = registry
+                .validate(&[Contribution {
+                    scope: s.clone(),
+                    kind: ContributionKind::UiMount(UiMountContribution {
+                        name: format!("bad-{bad}"),
+                        component: "C".into(),
+                        slot: Some(bad.to_string()),
+                    }),
+                }])
+                .unwrap_err();
+            assert!(
+                matches!(err, ScopeError::InvalidContribution { .. }),
+                "slot {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_contributions_drops_matching_entries_idempotently() {
+        let s = scope("app");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        validate_and_apply(&mut registry, &s, &full_set(&s));
+        assert_eq!(registry.snapshot().len(), 8);
+
+        let ui_mount = Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::UiMount(UiMountContribution {
+                name: "header".into(),
+                component: "Header".into(),
+                slot: None,
+            }),
+        };
+        let theme = Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::Theme(ThemeContribution {
+                name: "t".into(),
+                overlay: json!({"colors": {"bg": "#000"}}),
+            }),
+        };
+        registry.remove_contributions(&[ui_mount.clone()]).unwrap();
+        assert_eq!(registry.snapshot().len(), 7);
+        assert!(registry.snapshot().iter().all(|c| !matches!(
+            &c.kind,
+            ContributionKind::UiMount(u) if u.name == "header"
+        )));
+        // idempotent: removing the same (already gone) entry is a no-op
+        registry.remove_contributions(&[ui_mount]).unwrap();
+        assert_eq!(registry.snapshot().len(), 7);
+
+        registry.remove_contributions(&[theme]).unwrap();
+        assert_eq!(registry.snapshot().len(), 6);
+
+        // service removals are rejected (they live in the shared registry)
+        let svc = Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::Service(ServiceContribution {
+                key: ServiceKey {
+                    scope: s.clone(),
+                    name: "svc".into(),
+                },
+                provider: provider("svc", 1),
+                deps: vec![],
+            }),
+        };
+        let err = registry.remove_contributions(&[svc]).unwrap_err();
+        assert!(matches!(err, ScopeError::InvalidContribution { .. }));
+        assert_eq!(registry.snapshot().len(), 6, "failed removal mutates nothing");
     }
 }

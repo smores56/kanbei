@@ -425,7 +425,7 @@ impl ModuleHost {
     /// activation delta (staged via OCC, R-26/C-09).
     ///
     /// Payloads:
-    /// - `{"kind":"ui","name":<string>,"component":<string>}`
+    /// - `{"kind":"ui","name":<string>,"component":<string>,"slot":<string, optional>}`
     /// - `{"kind":"theme","name":<string>,"overlay":<object>}`
     fn op_contribution_publish(&self, info: &TokenInfo, payload: &str) -> Result<String, String> {
         let v: Value = serde_json::from_str(payload)
@@ -450,13 +450,21 @@ impl ModuleHost {
                     .ok_or_else(|| {
                         "contribution_publish: ui mount must carry a \"component\"".to_string()
                     })?;
+                // M8: an optional composite slot (default "main", normalized
+                // by the registry at publish); charset is kernel-validated in
+                // the registry validate pass.
+                let slot = v.get("slot").and_then(Value::as_str).map(String::from);
                 self.ui_components
                     .lock()
                     .expect("ui components lock poisoned")
                     .insert(component.clone(), info.generation);
                 Contribution {
                     scope: info.scope.clone(),
-                    kind: ContributionKind::UiMount(UiMountContribution { name, component }),
+                    kind: ContributionKind::UiMount(UiMountContribution {
+                        name,
+                        component,
+                        slot,
+                    }),
                 }
             }
             "theme" => {

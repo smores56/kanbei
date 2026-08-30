@@ -91,11 +91,20 @@ pub struct ProjectionStageContribution {
     pub handler: String,
 }
 
-/// A named UI mount point (R-19).
+/// A named UI mount point (R-19). `slot` names the composite region the
+/// mount renders into (M8 multi-module composition): the canonical slots are
+/// `"main"` (the default when `None`), `"status"`, `"header"`, `"composer"`,
+/// and `"aux"`; any free-form string matching the kernel charset
+/// (alphanumeric + `-` + `_`, max 32 chars) is accepted. The kernel orders
+/// mounts deterministically by (slot, scope path, name) and fans input out to
+/// every mount's reducer (the event carries the focused mount's slot as a
+/// `target` hint; each reducer decides).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct UiMountContribution {
     pub name: String,
     pub component: String,
+    #[serde(default)]
+    pub slot: Option<String>,
 }
 
 /// A guard: monotonic (R-19) — a monotonic guard cannot be removed or
