@@ -1139,7 +1139,9 @@ dependencies = [
 name = "kanbei-policy"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "kanbei-core",
+ "kanbei-vm",
  "regex",
  "serde",
  "serde_json",

@@ -8,10 +8,11 @@
 //! silent drop (R-04/A-04).
 //!
 //! The replaceable-policy seam ([`PolicyPlugin`] + [`RetentionGate`]) is
-//! defined now; the no-effect policy runtime is deferred (R-20). The deferred
-//! runtime will host this same trait in the Wasm no-effect path (R-28/D-S3).
-//! The MVP default policy is [`builtins::StoreAllPolicy`]; the kernel contains
-//! no mandatory secret-classification algorithm.
+//! defined now; the no-effect policy runtime ([`wasm::WasmPolicyPlugin`],
+//! R-28/D-S3) hosts this same trait in the Wasm path with an empty capability
+//! import set ([`wasm::DenyAllHost`]). The MVP default policy is
+//! [`builtins::StoreAllPolicy`]; the kernel contains no mandatory
+//! secret-classification algorithm.
 
 use std::sync::Arc;
 
@@ -133,10 +134,11 @@ pub struct BoundaryFact {
 /// The replaceable-policy seam. The kernel enforces no-effect by
 /// construction: the trait exposes no capabilities (no network, native
 /// process, model, filesystem, memory-write, tool, or install access), only a
-/// pure `content -> decision` function over a bounded candidate. The deferred
-/// no-effect runtime (R-28/D-S3) hosts this same trait in the Wasm path with
-/// an empty capability import set; [`is_no_effect`](PolicyPlugin::is_no_effect)
-/// is the declarative flag that runtime checks.
+/// pure `content -> decision` function over a bounded candidate. The
+/// no-effect runtime ([`wasm::WasmPolicyPlugin`]) hosts this same trait in the
+/// Wasm path with an empty capability import set;
+/// [`is_no_effect`](PolicyPlugin::is_no_effect) is the declarative flag that
+/// runtime checks.
 pub trait PolicyPlugin: Send + Sync {
     /// Classify one candidate. Must be pure and bounded; the gate runs it
     /// only after the phase-1 size check.
@@ -146,8 +148,9 @@ pub trait PolicyPlugin: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Declares the plugin side-effect-free. Defaults to true; native
-    /// built-ins are no-effect by construction, the deferred Wasm runtime
-    /// enforces it via its empty capability import set.
+    /// built-ins are no-effect by construction, the Wasm runtime
+    /// ([`wasm::WasmPolicyPlugin`]) enforces it via its empty capability
+    /// import set ([`wasm::DenyAllHost`]).
     fn is_no_effect(&self) -> bool {
         true
     }
@@ -364,6 +367,260 @@ pub mod builtins {
         fn name(&self) -> &'static str {
             "pattern-redaction"
         }
+    }
+}
+
+/// Replaceable policies hosted in the kernel-enforced no-effect Wasm runtime
+/// (R-28/D-S3, docs/architecture.md line 378): Luau policy source runs inside
+/// a kanbei-vm instance whose only host is [`DenyAllHost`] — the empty
+/// capability import set — so a policy cannot reach the network, native
+/// processes, the model, the filesystem, memory writes, tools, or
+/// installation. A policy that attempts a host call traps and the call fails
+/// explicitly (never a silent pass); all other failures (trap, fuel, epoch,
+/// timeout, bad decision JSON) are explicit [`PolicyError`]s — fail-closed,
+/// nothing unclassified commits (R-04/D-07).
+pub mod wasm {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use base64::Engine as _;
+    use kanbei_vm::{CompiledModule, GuestError, Host, Instance, Vm, VmConfig};
+    use serde::{Deserialize, Serialize};
+
+    use super::{Candidate, CandidateRole, PolicyError, PolicyPlugin, RetentionDecision};
+
+    /// Candidate content ceiling for one `kb_hot` call. Base64 of 700 KiB
+    /// (~933 KiB) plus the JSON envelope fits the guest's 1 MiB scratch
+    /// (`kanbei-guest::SCRATCH_SIZE`) with room for the result buffer. The
+    /// gate's phase-1 ceiling ([`super::RetentionGate`]) still applies first;
+    /// this is the wasm path's tighter, documented bound. Over-limit
+    /// candidates fail explicitly, never silently.
+    pub const MAX_WASM_CONTENT_BYTES: usize = 700 * 1024;
+
+    /// The empty capability import set: every host call is denied. The no-effect
+    /// contract is enforced by construction — this is the only host a policy
+    /// instance ever sees, so `kb_host_call`/`kb_host_double` always trap.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct DenyAllHost;
+
+    impl Host for DenyAllHost {
+        fn call(&self, _generation_token: u64, op: u32, _payload: &str) -> Result<String, String> {
+            Err(format!(
+                "no-effect policy runtime: host op {op} denied (empty capability set)"
+            ))
+        }
+    }
+
+    /// Policy instances are not session generations; [`DenyAllHost`] ignores
+    /// the token.
+    const GENERATION_TOKEN: u64 = 0;
+
+    /// VmConfig for policy instances. The stock defaults are unusable here:
+    /// luaur accounts fuel per wasm instruction, so the default 1M fuel
+    /// budget is exhausted by the `kb_init` of any non-trivial policy source,
+    /// and the default 1-tick epoch deadline is an *absolute* deadline — the
+    /// watchdog counter grows forever, so any finite value trips every call
+    /// once passed (kanbei-vm's own tests set `u64::MAX` for the same
+    /// reason). Fuel is therefore the deterministic interrupt: `2^35`
+    /// instructions is ~4x the measured ~8.4G cost of a max-size redaction
+    /// call, and an infinite loop trips it in ~3 s of guest work. The 5 s
+    /// wall-clock timeout, the 64 MiB memory ceiling, the 1 MiB guest
+    /// scratch, and the gate's phase-1 candidate ceiling back it up. A
+    /// runaway policy fails closed with an explicit error, never a hang.
+    const POLICY_VM_CONFIG: VmConfig = VmConfig {
+        max_memory_bytes: 64 * 1024 * 1024,
+        max_tables: 100,
+        max_instances: 10,
+        fuel_per_call: 1u64 << 35,
+        epoch_deadline: u64::MAX,
+        call_timeout: Duration::from_secs(5),
+        watchdog_tick: Duration::from_millis(10),
+    };
+
+    /// A policy plugin that hosts Luau source in the Wasm no-effect path.
+    ///
+    /// The policy source must define the global `kb_hot(candidate_json) ->
+    /// decision_json`:
+    ///
+    /// ```json
+    /// {"role":"ModelContext","content":"<base64>","replay_relevant":true,
+    ///  "sensitivity":"test","media":"text/plain"}
+    /// ```
+    ///
+    /// returning one of:
+    ///
+    /// ```json
+    /// {"decision":"store"}
+    /// {"decision":"transform","bytes":"<base64>"}
+    /// {"decision":"drop","reason":"..."}
+    /// {"decision":"reject","reason":"..."}
+    /// ```
+    ///
+    /// `content`/`bytes` are base64 (arbitrary candidate bytes round-trip
+    /// exactly); `role` is the [`CandidateRole`] variant name; `sensitivity`
+    /// and `media` are `null` when absent. Unknown decisions, missing
+    /// `reason`/`bytes`, and unparseable JSON are explicit
+    /// [`PolicyError::Plugin`]s.
+    ///
+    /// Bounded: the gate's phase-1 ceiling runs before any plugin code, and
+    /// [`MAX_WASM_CONTENT_BYTES`] bounds one call's content. The guest runs
+    /// under [`POLICY_VM_CONFIG`]: a finite fuel budget (the deterministic
+    /// interrupt — ~4x the measured cost of a max-size redaction call), an
+    /// effectively-off epoch deadline (the vm's absolute-deadline API makes
+    /// any finite value trip every call once the watchdog counter passes
+    /// it), and the 5 s call timeout, 64 MiB memory ceiling, and 1 MiB guest
+    /// scratch as backstops. One instance is kept per plugin (deterministic
+    /// `kb_hot` cache); a call that traps or trips a limit is replaced with a
+    /// fresh instance so the failure does not wedge the plugin — the error is
+    /// still returned.
+    pub struct WasmPolicyPlugin {
+        vm: Vm,
+        compiled: CompiledModule,
+        instance: Mutex<Instance>,
+        label: &'static str,
+    }
+
+    impl WasmPolicyPlugin {
+        /// Compile `source` and instantiate it with [`DenyAllHost`] under
+        /// [`POLICY_VM_CONFIG`]. `label` is the stable identifier
+        /// [`name()`](PolicyPlugin::name) reports — conventionally
+        /// `"wasm:<policy-name>"`.
+        ///
+        /// Failures (guest wasm absent, Luau compile error, missing `kb_hot`,
+        /// instantiation limits) are explicit [`PolicyError`]s, never panics.
+        pub fn new(source: &str, label: &'static str) -> Result<Self, PolicyError> {
+            let vm = Vm::load(POLICY_VM_CONFIG).map_err(guest_error)?;
+            let compiled = vm.compile(source).map_err(guest_error)?;
+            let instance = vm
+                .instantiate(&compiled, GENERATION_TOKEN, Arc::new(DenyAllHost))
+                .map_err(guest_error)?;
+            Ok(Self {
+                vm,
+                compiled,
+                instance: Mutex::new(instance),
+                label,
+            })
+        }
+
+        /// A fresh instance of the compiled policy, replacing one interrupted
+        /// by a trap or limit (a trapped instance is not reused; see the
+        /// kanbei-vm tests).
+        fn respawn(&self) -> Result<Instance, PolicyError> {
+            self.vm
+                .instantiate(&self.compiled, GENERATION_TOKEN, Arc::new(DenyAllHost))
+                .map_err(guest_error)
+        }
+    }
+
+    impl PolicyPlugin for WasmPolicyPlugin {
+        fn decide(&self, candidate: &Candidate) -> Result<RetentionDecision, PolicyError> {
+            if candidate.content.len() > MAX_WASM_CONTENT_BYTES {
+                return Err(PolicyError::Plugin(format!(
+                    "candidate content {} bytes exceeds the wasm policy bound \
+                     ({MAX_WASM_CONTENT_BYTES} bytes; guest scratch is 1 MiB)",
+                    candidate.content.len()
+                )));
+            }
+
+            let args = candidate_json(candidate);
+            let mut instance = self
+                .instance
+                .lock()
+                .map_err(|_| PolicyError::Plugin("policy instance lock poisoned".into()))?;
+            let result = match instance.call_json("kb_hot", &args) {
+                Ok(result) => result,
+                Err(e) => {
+                    let fresh = self.respawn()?;
+                    *instance = fresh;
+                    return Err(PolicyError::Plugin(format!("kb_hot call failed: {e}")));
+                }
+            };
+            drop(instance);
+            parse_decision(&result)
+        }
+
+        fn name(&self) -> &'static str {
+            self.label
+        }
+
+        fn is_no_effect(&self) -> bool {
+            // Enforced by construction: DenyAllHost is the only host, so no
+            // capability import can succeed.
+            true
+        }
+    }
+
+    /// Candidate as the bounded JSON value the guest sees. Infallible: every
+    /// field serializes, and `content` is bounded by the caller's checks.
+    fn candidate_json(candidate: &Candidate) -> String {
+        let role = match candidate.role {
+            CandidateRole::ModelContext => "ModelContext",
+            CandidateRole::ToolOutput => "ToolOutput",
+            CandidateRole::UserInput => "UserInput",
+            CandidateRole::Internal => "Internal",
+        };
+        let content = base64::engine::general_purpose::STANDARD.encode(&candidate.content);
+        serde_json::to_string(&CandidateJson {
+            role,
+            content,
+            replay_relevant: candidate.replay_relevant,
+            sensitivity: candidate.sensitivity.as_deref(),
+            media: candidate.media.as_deref(),
+        })
+        .expect("candidate JSON is always serializable")
+    }
+
+    #[derive(Debug, Serialize)]
+    struct CandidateJson<'a> {
+        role: &'static str,
+        content: String,
+        replay_relevant: bool,
+        sensitivity: Option<&'a str>,
+        media: Option<&'a str>,
+    }
+
+    /// The guest's decision JSON. Missing optional fields decode as `None`;
+    /// unknown extra fields are ignored.
+    #[derive(Debug, Deserialize)]
+    struct DecisionJson {
+        decision: String,
+        bytes: Option<String>,
+        reason: Option<String>,
+    }
+
+    fn parse_decision(result: &str) -> Result<RetentionDecision, PolicyError> {
+        let d: DecisionJson = serde_json::from_str(result)
+            .map_err(|e| PolicyError::Plugin(format!("invalid decision JSON: {e}")))?;
+        match d.decision.as_str() {
+            "store" => Ok(RetentionDecision::Store),
+            "transform" => {
+                let bytes = d.bytes.ok_or_else(|| {
+                    PolicyError::Plugin("transform decision is missing \"bytes\" (base64)".into())
+                })?;
+                let bytes = base64::engine::general_purpose::STANDARD.decode(bytes).map_err(
+                    |e| PolicyError::Plugin(format!("transform \"bytes\" is not valid base64: {e}")),
+                )?;
+                Ok(RetentionDecision::Transform { bytes })
+            }
+            "drop" => Ok(RetentionDecision::Drop {
+                reason: d.reason.ok_or_else(|| {
+                    PolicyError::Plugin("drop decision is missing \"reason\"".into())
+                })?,
+            }),
+            "reject" => Ok(RetentionDecision::RejectExecution {
+                reason: d.reason.ok_or_else(|| {
+                    PolicyError::Plugin("reject decision is missing \"reason\"".into())
+                })?,
+            }),
+            other => Err(PolicyError::Plugin(format!(
+                "unknown decision {other:?} (expected \"store\", \"transform\", \
+                 \"drop\", or \"reject\")"
+            ))),
+        }
+    }
+
+    fn guest_error(e: GuestError) -> PolicyError {
+        PolicyError::Plugin(format!("wasm policy runtime: {e}"))
     }
 }
 

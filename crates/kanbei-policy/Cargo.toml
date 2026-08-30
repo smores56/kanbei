@@ -5,10 +5,13 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64 = "0.22"
 kanbei-core.workspace = true
-# Pure-Rust regex (no C), wasm-compatible (the deferred no-effect policy
-# runtime is the wasm hosting path, R-28/D-S3), and panic-free on input —
-# fits the no-effect policy seam. Version "1" resolves from the local cache.
+# The no-effect policy runtime (R-28/D-S3) hosts Luau policy sources in the
+# kanbei-vm Wasm path behind an empty capability import set (DenyAllHost).
+kanbei-vm.workspace = true
+# Pure-Rust regex (no C), wasm-compatible, and panic-free on input — fits
+# the no-effect policy seam. Version "1" resolves from the local cache.
 regex = "1"
 serde.workspace = true
 serde_json.workspace = true
