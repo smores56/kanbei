@@ -652,7 +652,14 @@ fn acceptance_crash_m2_points() {
                 | FaultPoint::BeforeUiReduce
                 | FaultPoint::AfterUiReduce
                 | FaultPoint::BeforeUiRender
-                | FaultPoint::AfterUiRender => false,
+                | FaultPoint::AfterUiRender
+                // M6 historical-correction points never fire in the M2 child
+                | FaultPoint::BeforeCheckpointCommit
+                | FaultPoint::AfterCheckpointCommit
+                | FaultPoint::BeforeBranchTransition
+                | FaultPoint::AfterBranchTransition
+                | FaultPoint::BeforeSessionHeadAdvance
+                | FaultPoint::AfterSessionHeadAdvance => false,
             };
             if fires {
                 assert_eq!(

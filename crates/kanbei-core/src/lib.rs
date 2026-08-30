@@ -12,7 +12,8 @@ pub mod registry;
 pub use digest::{Digest, DigestParseError, ALG};
 pub use envelope::{Envelope, EnvelopeError, ENVELOPE_SCHEMA};
 pub use id::{
-    parse_branded_any, BrandedId, BrandedParseError, Id128, Id128ParseError, BRANDS, UUID_BYTES,
+    parse_branded_any, BranchId, BrandedId, BrandedParseError, Id128, Id128ParseError, BRANDS,
+    UUID_BYTES,
 };
 pub use queue::{DurabilityQueue, SyncOp};
 pub use registry::{KindStat, Registry, RegistryError, Report, Upcaster};

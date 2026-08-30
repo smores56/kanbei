@@ -72,6 +72,12 @@ pub fn fault_point_name(point: FaultPoint) -> &'static str {
         FaultPoint::AfterUiReduce => "AfterUiReduce",
         FaultPoint::BeforeUiRender => "BeforeUiRender",
         FaultPoint::AfterUiRender => "AfterUiRender",
+        FaultPoint::BeforeCheckpointCommit => "BeforeCheckpointCommit",
+        FaultPoint::AfterCheckpointCommit => "AfterCheckpointCommit",
+        FaultPoint::BeforeBranchTransition => "BeforeBranchTransition",
+        FaultPoint::AfterBranchTransition => "AfterBranchTransition",
+        FaultPoint::BeforeSessionHeadAdvance => "BeforeSessionHeadAdvance",
+        FaultPoint::AfterSessionHeadAdvance => "AfterSessionHeadAdvance",
     }
 }
 
@@ -107,6 +113,12 @@ pub fn parse_fault_point(s: &str) -> Option<FaultPoint> {
         "AfterUiReduce" => Some(FaultPoint::AfterUiReduce),
         "BeforeUiRender" => Some(FaultPoint::BeforeUiRender),
         "AfterUiRender" => Some(FaultPoint::AfterUiRender),
+        "BeforeCheckpointCommit" => Some(FaultPoint::BeforeCheckpointCommit),
+        "AfterCheckpointCommit" => Some(FaultPoint::AfterCheckpointCommit),
+        "BeforeBranchTransition" => Some(FaultPoint::BeforeBranchTransition),
+        "AfterBranchTransition" => Some(FaultPoint::AfterBranchTransition),
+        "BeforeSessionHeadAdvance" => Some(FaultPoint::BeforeSessionHeadAdvance),
+        "AfterSessionHeadAdvance" => Some(FaultPoint::AfterSessionHeadAdvance),
         _ => None,
     }
 }

@@ -111,6 +111,8 @@ pub enum FailureKind {
     Provider,
     Tool,
     Internal,
+    /// The run was terminated by a branch transition quiesce (M6).
+    Quiesced,
 }
 
 /// Canonical terminal-outcome payload.

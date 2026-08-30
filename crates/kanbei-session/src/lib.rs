@@ -54,7 +54,7 @@ use std::sync::{Arc, Mutex};
 
 use kanbei_core::digest::Digest;
 use kanbei_core::envelope::{ENVELOPE_SCHEMA, Envelope, EnvelopeError};
-use kanbei_core::id::Id128;
+use kanbei_core::id::{BranchId, Id128};
 use kanbei_core::queue::DurabilityQueue;
 use kanbei_log::{AppendLog, Profile, Recovered};
 use kanbei_modules::{
@@ -79,6 +79,9 @@ pub use ui::{UiHost, UiIntent, UiOutcome, UI_INTENT_RESOURCE};
 /// The bounded recent-event ring size: the trajectory render covers the
 /// full canonical history, but the CONTENT is these most-recent events.
 const RECENT_RING: usize = 64;
+
+/// Checkpoint label length cap (M6): beyond this the label is rejected.
+const CHECKPOINT_LABEL_MAX: usize = 200;
 
 // ---------- config ----------
 
@@ -209,6 +212,13 @@ pub enum FaultPoint {
     AfterUiReduce,
     BeforeUiRender,
     AfterUiRender,
+    // --- M6 historical-correction points ---
+    BeforeCheckpointCommit,
+    AfterCheckpointCommit,
+    BeforeBranchTransition,
+    AfterBranchTransition,
+    BeforeSessionHeadAdvance,
+    AfterSessionHeadAdvance,
 }
 
 pub trait FaultInjector: Send + Sync {
@@ -284,6 +294,74 @@ pub struct CompactedRange {
     pub covered_fragments: Vec<String>,
 }
 
+// ---------- M6 historical correction (branching) ----------
+
+/// One committed checkpoint (M6): session + event seq identify the
+/// `checkpoint_created` event the new branch continues from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CheckpointRef {
+    pub session_id: Id128,
+    pub seq: u64,
+}
+
+/// One intent event quiesced by a branch transition (M6): its seq, kind, and
+/// event id (`evt`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QuiescedIntent {
+    pub seq: u64,
+    pub kind: String,
+    pub id: String,
+}
+
+/// The intents a branch transition abandoned (M6): pending intents
+/// (committed without an outcome) are cancelled; classified interrupted/
+/// ambiguous intents in the abandoned tail are ambiguous.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QuiesceRecord {
+    pub cancelled: Vec<QuiescedIntent>,
+    pub ambiguous: Vec<QuiescedIntent>,
+}
+
+/// One committed branch (M6): its frontier and its `branch_transition` event.
+/// `follow`/`config_choice` are opaque to wave 1 (always null; wave 2 fills
+/// the memory-follow policy and the config choice the transition recorded).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BranchRecord {
+    pub id: BranchId,
+    pub from: Option<BranchId>,
+    /// The checkpoint seq this branch continues from (== its frontier).
+    pub frontier_seq: u64,
+    /// The seq of the `branch_transition` event itself (== next_seq of the
+    /// new branch's first event).
+    pub transition_seq: u64,
+    pub follow: serde_json::Value,
+    pub config_choice: serde_json::Value,
+    pub quiesce: QuiesceRecord,
+}
+
+/// The memory roots pinned by the checkpoint a branch continues from (M6;
+/// wave 2 consumes them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedRoots {
+    pub lifetime: Digest,
+    pub project: Option<Digest>,
+}
+
+/// One committed intent-kind event awaiting its outcome-kind event (B-05/M6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingIntent {
+    pub seq: u64,
+    /// The intent event's id (`evt`).
+    pub id: String,
+    pub kind: String,
+    /// `tool_intent` payloads pair by call_id; None for other kinds.
+    pub call_id: Option<String>,
+    /// The tool name for `tool_intent`; None for other kinds.
+    pub tool: Option<String>,
+    /// The intent event's pre-event snapshot (the origin world, B-05).
+    pub origin_snapshot: Option<Digest>,
+}
+
 // ---------- session ----------
 
 pub struct Session {
@@ -339,6 +417,15 @@ pub struct Session {
     recent_events: std::collections::VecDeque<(u64, String, serde_json::Value)>,
     /// Covered compaction ranges (R-18/E-06) recovered from the log.
     compacted: Vec<CompactedRange>,
+    // --- M6 historical correction ---
+    /// The current branch; the root branch on a fresh session.
+    branch: BranchId,
+    /// Committed branch records, chronological (rebuilt from the log on
+    /// open — the log is the authority for branch identity).
+    branch_records: Vec<BranchRecord>,
+    /// The memory roots pinned by the checkpoint this branch continues from
+    /// (wave 2 consumes them).
+    pinned_roots: Option<PinnedRoots>,
     /// The memory actors' fault injector (cloned into both actors at open).
     /// Held here per the crash-test contract so the harness can arm it via
     /// its own shared Arc before the memory flow runs; the session itself
@@ -617,6 +704,67 @@ impl Session {
             }
         })?;
 
+        // M6: recover the committed branch transitions (chronological; the
+        // log is the authority for branch identity). The current branch is
+        // the last record's; a log without transitions gets a fresh root
+        // branch — the M1/M2 genesis path commits no genesis event, so the
+        // root id is session-lifetime state (wave 1).
+        let mut branch_records: Vec<BranchRecord> = Vec::new();
+        kanbei_log::for_each_frame(&log_path, |info| {
+            for line in &info.events {
+                let Ok(env) = Envelope::from_line(line) else {
+                    continue;
+                };
+                if env.kind != "branch_transition" {
+                    continue;
+                }
+                let Some(branch) = env
+                    .payload
+                    .get("branch")
+                    .and_then(|b| b.as_str())
+                    .and_then(|b| b.parse::<BranchId>().ok())
+                else {
+                    continue;
+                };
+                let from = env
+                    .payload
+                    .get("from_branch")
+                    .and_then(|f| f.as_str())
+                    .and_then(|f| f.parse::<BranchId>().ok());
+                let Some(frontier) = env.payload.get("frontier_seq").and_then(|f| f.as_u64()) else {
+                    continue;
+                };
+                let follow = env
+                    .payload
+                    .get("follow")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let config_choice = env
+                    .payload
+                    .get("config_choice")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let quiesce = env
+                    .payload
+                    .get("quiesce")
+                    .and_then(|q| serde_json::from_value(q.clone()).ok())
+                    .unwrap_or_default();
+                branch_records.push(BranchRecord {
+                    id: branch,
+                    from,
+                    frontier_seq: frontier,
+                    transition_seq: env.seq,
+                    follow,
+                    config_choice,
+                    quiesce,
+                });
+            }
+        })?;
+        let branch = branch_records
+            .last()
+            .map(|r| r.id)
+            .unwrap_or_else(BranchId::generate);
+
         let config_manifest = cfg.config.clone();
         let mut session = Self {
             log,
@@ -656,6 +804,9 @@ impl Session {
             last_cache: None,
             recent_events: std::collections::VecDeque::new(),
             compacted,
+            branch,
+            branch_records,
+            pinned_roots: None,
             memory_fault,
             child_provider,
         };
@@ -820,7 +971,9 @@ impl Session {
         self.fault(FaultPoint::BeforeFrameAppend);
         let plan = self.log.append(&envelopes, self.cfg.profile)?;
         self.fault(FaultPoint::AfterFrameAppend);
+        self.fault(FaultPoint::BeforeSessionHeadAdvance);
         self.next_seq = plan.last_seq + 1;
+        self.fault(FaultPoint::AfterSessionHeadAdvance);
 
         // The bounded recent-event ring (the trajectory render source):
         // every committed event enters it; the oldest fall off past
@@ -871,42 +1024,12 @@ impl Session {
         // identical manifests)
         let post_snapshot = match state_head {
             Some(head) => {
-                let mut manifest = ExecutionManifest::bootstrap();
-                manifest.state_head = Some(head);
-                manifest.modules = self
-                    .modules
-                    .as_ref()
-                    .map(|m| {
-                        m.snapshot()
-                            .into_iter()
-                            .map(
-                                |(module_id, generation, package)| kanbei_snapshot::ModulePin {
-                                    module_id,
-                                    generation,
-                                    package,
-                                    // M2 activates root-scope modules only.
-                                    scope: "/".into(),
-                                },
-                            )
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                manifest.composition = Some(self.composition.current().digest);
+                let manifest = self.build_manifest(Some(head), &payload_schemas);
                 // the composition's canonical bytes must exist as an object
                 // for the manifest's composition ref to be closure-valid
                 // (R-10); install dedups when the publish already pinned them
                 let comp_bytes = self.composition.current().to_canonical_bytes();
                 self.store.install(&comp_bytes)?;
-                manifest.engine_digest = self.vm_engine_digest;
-                // R-11: model calls and consequential events pin the exact
-                // memory roots at commit time.
-                manifest.memory_root = self.memory_lifetime.head();
-                manifest.project_memory_root = self.memory_project.as_ref().and_then(|a| a.head());
-                let mut schema_versions = payload_schemas;
-                schema_versions.push(kanbei_snapshot::MANIFEST_SCHEMA);
-                schema_versions.sort_unstable();
-                schema_versions.dedup();
-                manifest.schema_versions = schema_versions;
                 let (digest, _deduped) = kanbei_snapshot::pin(&mut self.store, &manifest)?;
                 self.current_snapshot = Some(digest);
                 Some(digest)
@@ -923,6 +1046,453 @@ impl Session {
             pre_snapshot,
             post_snapshot,
         })
+    }
+
+    // ---------- M6 historical correction (branching) ----------
+
+    /// Commit one canonical `checkpoint_created` event (M6): a record event
+    /// freezing the current frontier — its own seq — with the post-event
+    /// manifest digest, the pinned memory roots, the composition digest, and
+    /// the current branch. The manifest is built with the same
+    /// [`Session::build_manifest`] helper commit step 5 uses, so its digest
+    /// (computed before the commit) is byte-exact with the receipt's
+    /// post_snapshot.
+    pub fn create_checkpoint(&mut self, label: Option<String>) -> Result<CheckpointRef, SessionError> {
+        if label.as_ref().is_some_and(|l| l.chars().count() > CHECKPOINT_LABEL_MAX) {
+            return Err(SessionError::InvalidInput(format!(
+                "checkpoint label exceeds {CHECKPOINT_LABEL_MAX} characters"
+            )));
+        }
+        let seq = self.next_seq;
+        let state_head = Some(self.composition.current().digest);
+        let manifest = self.build_manifest(state_head, &[1]);
+        let snapshot = Digest::new(&manifest.to_bytes());
+        // The manifest pins memory roots whose objects live in the memory
+        // stores; install them into the session store so the checkpoint's
+        // snapshot closure is verifiable from the session store alone (the
+        // checkpoint event's refs then cover its pinned roots, R-10).
+        let mut objects: Vec<Vec<u8>> = Vec::new();
+        if let Some(root) = self.memory_lifetime.head() {
+            let bytes = self
+                .memory_lifetime
+                .store()
+                .get(&root)
+                .map_err(|e| SessionError::Snapshot(format!("checkpoint lifetime root {root} unreadable: {e}")))?;
+            objects.push(bytes);
+        }
+        if let Some(root) = self.memory_project.as_ref().and_then(|a| a.head()) {
+            let bytes = self
+                .memory_project
+                .as_ref()
+                .expect("project head implies actor")
+                .store()
+                .get(&root)
+                .map_err(|e| SessionError::Snapshot(format!("checkpoint project root {root} unreadable: {e}")))?;
+            objects.push(bytes);
+        }
+        self.fault(FaultPoint::BeforeCheckpointCommit);
+        let receipt = self.commit(
+            vec![NewEvent {
+                kind: "checkpoint_created".into(),
+                payload_schema: 1,
+                payload: json!({
+                    "label": label,
+                    "frontier_seq": seq,
+                    "snapshot": snapshot.to_string(),
+                    "memory_root": self.memory_lifetime.head().map(|d| d.to_string()),
+                    "project_memory_root": self
+                        .memory_project
+                        .as_ref()
+                        .and_then(|a| a.head())
+                        .map(|d| d.to_string()),
+                    "composition": self.composition.current().digest.to_string(),
+                    "branch": self.branch.to_string(),
+                }),
+                objects,
+                refs: Vec::new(),
+            }],
+            state_head,
+        )?;
+        self.fault(FaultPoint::AfterCheckpointCommit);
+        debug_assert_eq!(
+            receipt.post_snapshot,
+            Some(snapshot),
+            "checkpoint manifest digest must match the pinned post-snapshot"
+        );
+        Ok(CheckpointRef {
+            session_id: self.session_id,
+            seq: receipt.last_seq,
+        })
+    }
+
+    /// Branch off a committed checkpoint (M6): validate the checkpoint
+    /// (session, committed seq, event kind, snapshot closure), quiesce
+    /// (cancel the active run as `Failed(Quiesced)`; list pending and
+    /// abandoned-tail intents), then commit one canonical
+    /// `branch_transition` event and switch the session to the new branch.
+    /// History is never rewritten — the transition is appended and the new
+    /// path is derived by the path filter.
+    pub fn continue_from(&mut self, checkpoint: &CheckpointRef) -> Result<BranchRecord, SessionError> {
+        if checkpoint.session_id != self.session_id {
+            return Err(SessionError::InvalidInput(
+                "checkpoint belongs to a different session".into(),
+            ));
+        }
+        if checkpoint.seq == 0 || checkpoint.seq >= self.next_seq {
+            return Err(SessionError::InvalidInput(format!(
+                "checkpoint seq {} is not a committed event",
+                checkpoint.seq
+            )));
+        }
+        let env = self.envelope_at(checkpoint.seq)?;
+        if env.kind != "checkpoint_created"
+            || env.payload.get("frontier_seq").and_then(|f| f.as_u64()) != Some(checkpoint.seq)
+        {
+            return Err(SessionError::InvalidInput(format!(
+                "event at seq {} is not a checkpoint",
+                checkpoint.seq
+            )));
+        }
+        let snapshot: Digest = env
+            .payload
+            .get("snapshot")
+            .and_then(|s| s.as_str())
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| {
+                SessionError::InvalidInput(format!(
+                    "checkpoint at seq {} pins no snapshot",
+                    checkpoint.seq
+                ))
+            })?;
+        let bytes = self
+            .store
+            .get(&snapshot)
+            .map_err(|e| SessionError::Snapshot(format!("checkpoint snapshot {snapshot} unreadable: {e}")))?;
+        let manifest: ExecutionManifest = serde_json::from_slice(&bytes).map_err(|e| {
+            SessionError::Snapshot(format!("checkpoint snapshot {snapshot} is not a manifest: {e}"))
+        })?;
+        let mut closure: std::collections::HashSet<Digest> =
+            manifest.modules.iter().map(|m| m.package).collect();
+        if let Some(c) = manifest.composition {
+            closure.insert(c);
+        }
+        if let Some(r) = manifest.memory_root {
+            closure.insert(r);
+        }
+        if let Some(r) = manifest.project_memory_root {
+            closure.insert(r);
+        }
+        kanbei_snapshot::verify_closure(&self.store, &closure)
+            .map_err(|e| SessionError::Snapshot(format!("checkpoint snapshot closure failed: {e}")))?;
+        let memory_root: Option<Digest> = env
+            .payload
+            .get("memory_root")
+            .and_then(|r| r.as_str())
+            .and_then(|r| r.parse().ok());
+        let project_memory_root: Option<Digest> = env
+            .payload
+            .get("project_memory_root")
+            .and_then(|r| r.as_str())
+            .and_then(|r| r.parse().ok());
+
+        // Quiesce BEFORE the transition commits: an active run is cancelled
+        // (its `run_outcome Failed(Quiesced)` records the termination), then
+        // the pending intents (any committed intent-kind event without its
+        // outcome-kind event) become the cancelled list and tail intents with
+        // an interrupted/ambiguous classification become the ambiguous list.
+        // No `intent_classified` facts are committed here — the transition
+        // event's listing is the record; a crash before the transition leaves
+        // open()'s classification to handle it.
+        if let Some(run_id) = self.scheduler.active_run() {
+            let usage = self.scheduler.current_usage(run_id);
+            let (record, _) = self.scheduler.record_outcome(
+                run_id,
+                kanbei_scheduler::TerminalOutcome::Failed(
+                    kanbei_scheduler::FailureKind::Quiesced,
+                ),
+                usage,
+                &[],
+            )?;
+            self.commit(
+                vec![NewEvent {
+                    kind: "run_outcome".into(),
+                    payload_schema: 1,
+                    payload: serde_json::to_value(&record).map_err(|e| {
+                        SessionError::InvalidInput(format!("run outcome payload: {e}"))
+                    })?,
+                    objects: Vec::new(),
+                    refs: Vec::new(),
+                }],
+                None,
+            )?;
+        }
+        let cancelled: Vec<QuiescedIntent> = self
+            .scan_pending_intents()?
+            .into_iter()
+            .map(|i| QuiescedIntent {
+                seq: i.seq,
+                kind: i.kind,
+                id: i.id,
+            })
+            .collect();
+        let transition_seq = self.next_seq;
+        let ambiguous: Vec<QuiescedIntent> = self
+            .scan_classified_intents()?
+            .into_iter()
+            .filter(|i| i.seq > checkpoint.seq && i.seq < transition_seq)
+            .collect();
+        let quiesce = QuiesceRecord { cancelled, ambiguous };
+
+        let new_branch = BranchId::generate();
+        self.fault(FaultPoint::BeforeBranchTransition);
+        let receipt = self.commit(
+            vec![NewEvent {
+                kind: "branch_transition".into(),
+                payload_schema: 1,
+                payload: json!({
+                    "branch": new_branch.to_string(),
+                    "from_branch": self.branch.to_string(),
+                    "frontier_seq": checkpoint.seq,
+                    "checkpoint_event": env.evt,
+                    "checkpoint_snapshot": snapshot.to_string(),
+                    // wave 2 fills the memory-follow policy and the config
+                    // choice; the fields exist now so the payload shape is
+                    // frozen.
+                    "follow": serde_json::Value::Null,
+                    "config_choice": serde_json::Value::Null,
+                    "quiesce": serde_json::to_value(&quiesce)
+                        .expect("quiesce serialization cannot fail"),
+                    "memory_root": memory_root.map(|d| d.to_string()),
+                    "project_memory_root": project_memory_root.map(|d| d.to_string()),
+                }),
+                objects: Vec::new(),
+                refs: Vec::new(),
+            }],
+            Some(self.composition.current().digest),
+        )?;
+        self.fault(FaultPoint::AfterBranchTransition);
+        let record = BranchRecord {
+            id: new_branch,
+            from: Some(self.branch),
+            frontier_seq: checkpoint.seq,
+            transition_seq: receipt.last_seq,
+            follow: serde_json::Value::Null,
+            config_choice: serde_json::Value::Null,
+            quiesce,
+        };
+        self.branch = new_branch;
+        self.branch_records.push(record.clone());
+        // Wave 2 consumes the pinned roots; None when the checkpoint pinned
+        // no lifetime root.
+        self.pinned_roots = memory_root.map(|lifetime| PinnedRoots {
+            lifetime,
+            project: project_memory_root,
+        });
+        Ok(record)
+    }
+
+    /// Whether `seq` is on the current branch's path: false exactly for the
+    /// abandoned tails `(frontier_seq, transition_seq]` of every committed
+    /// branch record. The checkpoint event at the frontier stays on-path; the
+    /// `branch_transition` event itself is excluded from the new path.
+    pub fn on_path(&self, seq: u64) -> bool {
+        !self
+            .branch_records
+            .iter()
+            .any(|r| r.frontier_seq < seq && seq <= r.transition_seq)
+    }
+
+    /// The current branch's on-path ranges (inclusive on both ends):
+    /// `[1..=first.frontier]`, then per record
+    /// `[records[i].transition + 1 ..= records[i+1].frontier]`, and
+    /// `[last.transition + 1 ..= u64::MAX]` for the last — the transition
+    /// event itself is off-path. No records → the whole seq space.
+    pub fn path_ranges(&self) -> Vec<(u64, u64)> {
+        if self.branch_records.is_empty() {
+            return vec![(1, u64::MAX)];
+        }
+        let mut ranges = vec![(1, self.branch_records[0].frontier_seq)];
+        for pair in self.branch_records.windows(2) {
+            ranges.push((pair[0].transition_seq + 1, pair[1].frontier_seq));
+        }
+        let last = self.branch_records.last().expect("non-empty records");
+        ranges.push((last.transition_seq + 1, u64::MAX));
+        ranges
+    }
+
+    /// The post-event execution manifest for `state_head` and the committed
+    /// payload schemas — the exact byte layout commit step 5 pins (and
+    /// [`Session::create_checkpoint`] pre-computes for its payload).
+    fn build_manifest(&self, state_head: Option<Digest>, payload_schemas: &[u32]) -> ExecutionManifest {
+        let mut manifest = ExecutionManifest::bootstrap();
+        manifest.state_head = state_head;
+        manifest.modules = self
+            .modules
+            .as_ref()
+            .map(|m| {
+                m.snapshot()
+                    .into_iter()
+                    .map(
+                        |(module_id, generation, package)| kanbei_snapshot::ModulePin {
+                            module_id,
+                            generation,
+                            package,
+                            // M2 activates root-scope modules only.
+                            scope: "/".into(),
+                        },
+                    )
+                    .collect()
+            })
+            .unwrap_or_default();
+        manifest.composition = Some(self.composition.current().digest);
+        manifest.engine_digest = self.vm_engine_digest;
+        // R-11: model calls and consequential events pin the exact memory
+        // roots at commit time.
+        manifest.memory_root = self.memory_lifetime.head();
+        manifest.project_memory_root = self.memory_project.as_ref().and_then(|a| a.head());
+        let mut schema_versions = payload_schemas.to_vec();
+        schema_versions.push(kanbei_snapshot::MANIFEST_SCHEMA);
+        schema_versions.sort_unstable();
+        schema_versions.dedup();
+        manifest.schema_versions = schema_versions;
+        manifest
+    }
+
+    /// The envelope at `seq`, scanning the log (M6 checkpoint validation).
+    fn envelope_at(&self, seq: u64) -> Result<Envelope, SessionError> {
+        let log_path = self.log_path.clone();
+        let mut found: Option<Envelope> = None;
+        kanbei_log::for_each_frame(&log_path, |info| {
+            for line in &info.events {
+                let Ok(env) = Envelope::from_line(line) else {
+                    continue;
+                };
+                if env.seq == seq {
+                    found = Some(env);
+                    return;
+                }
+            }
+        })?;
+        found.ok_or_else(|| SessionError::InvalidInput(format!("no event at seq {seq}")))
+    }
+
+    /// Scan the committed log for intent-kind events without their
+    /// outcome-kind event (B-05/M6): `model_call`→`model_outcome`,
+    /// `tool_intent`→`tool_outcome` (paired by call_id, with
+    /// `intent_classified` counting as an outcome), `memory_proposal`→
+    /// `memory_root_approved`. In seq order.
+    fn scan_pending_intents(&self) -> Result<Vec<PendingIntent>, SessionError> {
+        let log_path = self.log_path.clone();
+        let mut intents: Vec<PendingIntent> = Vec::new();
+        let mut resolved_calls: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // The latest seq of each outcome kind: an intent is pending when no
+        // outcome-kind event follows it (the spine commits serially).
+        let mut outcome_seqs: std::collections::HashMap<&str, u64> =
+            std::collections::HashMap::new();
+        kanbei_log::for_each_frame(&log_path, |info| {
+            for line in &info.events {
+                let Ok(env) = Envelope::from_line(line) else {
+                    continue;
+                };
+                match env.kind.as_str() {
+                    "tool_intent" => {
+                        if let (Some(call), Some(tool)) = (
+                            env.payload.get("call_id").and_then(|c| c.as_str()),
+                            env.payload.get("tool").and_then(|t| t.as_str()),
+                        ) {
+                            intents.push(PendingIntent {
+                                seq: env.seq,
+                                id: env.evt,
+                                kind: "tool_intent".into(),
+                                call_id: Some(call.to_string()),
+                                tool: Some(tool.to_string()),
+                                origin_snapshot: env.snapshot,
+                            });
+                        }
+                    }
+                    "model_call" | "memory_proposal" => {
+                        intents.push(PendingIntent {
+                            seq: env.seq,
+                            id: env.evt,
+                            kind: env.kind.clone(),
+                            call_id: None,
+                            tool: None,
+                            origin_snapshot: env.snapshot,
+                        });
+                    }
+                    "tool_outcome" | "intent_classified" => {
+                        if let Some(call) = env.payload.get("call_id").and_then(|c| c.as_str()) {
+                            resolved_calls.insert(call.to_string());
+                        }
+                    }
+                    "model_outcome" => {
+                        outcome_seqs.insert("model_call", env.seq);
+                    }
+                    "memory_root_approved" => {
+                        outcome_seqs.insert("memory_proposal", env.seq);
+                    }
+                    _ => {}
+                }
+            }
+        })?;
+        Ok(intents
+            .into_iter()
+            .filter(|i| match i.kind.as_str() {
+                "tool_intent" => !resolved_calls.contains(i.call_id.as_deref().unwrap_or_default()),
+                kind => outcome_seqs.get(kind).is_none_or(|s| *s < i.seq),
+            })
+            .collect())
+    }
+
+    /// Tool intents with an interrupted/ambiguous classification, in seq
+    /// order (M6: the abandoned-tail `ambiguous` quiesce list).
+    fn scan_classified_intents(&self) -> Result<Vec<QuiescedIntent>, SessionError> {
+        let log_path = self.log_path.clone();
+        // call_id → (intent identity, classification)
+        let mut by_call: std::collections::HashMap<String, (QuiescedIntent, Option<String>)> =
+            std::collections::HashMap::new();
+        kanbei_log::for_each_frame(&log_path, |info| {
+            for line in &info.events {
+                let Ok(env) = Envelope::from_line(line) else {
+                    continue;
+                };
+                match env.kind.as_str() {
+                    "tool_intent" => {
+                        if let Some(call) = env.payload.get("call_id").and_then(|c| c.as_str()) {
+                            by_call.entry(call.to_string()).or_insert_with(|| {
+                                (
+                                    QuiescedIntent {
+                                        seq: env.seq,
+                                        kind: "tool_intent".into(),
+                                        id: env.evt,
+                                    },
+                                    None,
+                                )
+                            });
+                        }
+                    }
+                    "intent_classified" => {
+                        if let (Some(call), Some(class)) = (
+                            env.payload.get("call_id").and_then(|c| c.as_str()),
+                            env.payload.get("classification").and_then(|c| c.as_str()),
+                        ) {
+                            if let Some(entry) = by_call.get_mut(call) {
+                                entry.1 = Some(class.to_string());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })?;
+        Ok(by_call
+            .into_iter()
+            .filter(|(_, (_, class))| {
+                matches!(class.as_deref(), Some("interrupted") | Some("ambiguous"))
+            })
+            .map(|(_, (intent, _))| intent)
+            .collect())
     }
 
     /// THE atomic config reload (R-01/C-02): activates the manifest's module

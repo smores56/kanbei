@@ -14,7 +14,6 @@ use kanbei_context::{
     TrajectoryView, TriggerFragment, lower, sensitivity_rank,
 };
 use kanbei_core::digest::Digest;
-use kanbei_core::envelope::Envelope;
 use kanbei_core::id::Id128;
 use kanbei_memory::{
     Claim, ClaimEdge, ClaimProvenance, EdgeKind, IdempotencyKey, MEMORY_CLAIM_SCHEMA,
@@ -758,10 +757,12 @@ impl Session {
         }
 
         // Trajectory: the frozen prefix; content is the bounded ring render
-        // (compact payload JSON, truncated).
+        // (compact payload JSON, truncated), filtered to the current
+        // branch's path — abandoned tails never enter the projection (M6).
         let mut events: Vec<RenderedEvent> = self
             .recent_events
             .iter()
+            .filter(|(seq, _, _)| self.on_path(*seq))
             .map(|(seq, kind, payload)| {
                 let mut text = serde_json::to_string(payload).unwrap_or_default();
                 if text.len() > 512 {
@@ -778,8 +779,18 @@ impl Session {
         if frozen_seq == 0 {
             events = Vec::new();
         }
+        // The conv.prefix coverage: the current branch's path ranges
+        // intersected with the frozen prefix (the prefix never claims
+        // coverage over an abandoned tail, R-05 chronology).
         let selected_ranges = if frozen_seq >= 1 {
-            vec![(1, frozen_seq)]
+            self.path_ranges()
+                .into_iter()
+                .filter_map(|(start, end)| {
+                    let start = start.max(1);
+                    let end = end.min(frozen_seq);
+                    (start <= end).then_some((start, end))
+                })
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
@@ -815,7 +826,12 @@ impl Session {
                 .clone()
                 .unwrap_or_else(|| lifetime_fold.clone().unwrap_or_else(empty_fold))
         };
-        let recent_causal: Vec<u64> = self.recent_events.iter().map(|(seq, _, _)| *seq).collect();
+        let recent_causal: Vec<u64> = self
+            .recent_events
+            .iter()
+            .filter(|(seq, _, _)| self.on_path(*seq))
+            .map(|(seq, _, _)| *seq)
+            .collect();
         let projector = ActiveMemoryProjector::new();
         let (active_view, scored) = projector
             .project(
@@ -1801,55 +1817,24 @@ impl Session {
     /// always committed as facts, classified interrupted/ambiguous when the
     /// origin world is stale (R-02/C-03).
     pub fn classify_pending_intents(&mut self) -> Result<u64, SessionError> {
-        let log_path = self.log_path.clone();
-        let mut committed_outcomes: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut already_classified: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let mut pending: Vec<(String, String, Option<Digest>)> = Vec::new();
-        kanbei_log::for_each_frame(&log_path, |info| {
-            for line in &info.events {
-                let Ok(env) = Envelope::from_line(line) else {
-                    continue;
-                };
-                match env.kind.as_str() {
-                    "intent_classified" => {
-                        if let Some(call) = env.payload.get("call_id").and_then(|c| c.as_str()) {
-                            already_classified.insert(call.to_string());
-                        }
-                    }
-                    "tool_outcome" => {
-                        if let Some(call) = env.payload.get("call_id").and_then(|c| c.as_str()) {
-                            committed_outcomes.insert(call.to_string());
-                        }
-                    }
-                    "tool_intent" => {
-                        if let (Some(call), Some(tool)) = (
-                            env.payload.get("call_id").and_then(|c| c.as_str()),
-                            env.payload.get("tool").and_then(|t| t.as_str()),
-                        ) {
-                            pending.push((call.to_string(), tool.to_string(), env.snapshot));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        })?;
         let mut classified = 0u64;
-        for (call_id, tool, origin) in pending {
-            if committed_outcomes.contains(&call_id) || already_classified.contains(&call_id) {
+        for intent in self.scan_pending_intents()? {
+            if intent.kind != "tool_intent" {
                 continue;
             }
-            let kind = match origin {
+            let Some(call_id) = intent.call_id else {
+                continue;
+            };
+            let kind = match intent.origin_snapshot {
                 Some(_) => "ambiguous",
                 None => "interrupted",
             };
             let payload = json!({
                 "call_id": call_id,
-                "tool": tool,
+                "tool": intent.tool.unwrap_or_default(),
                 "classification": kind,
                 "reason": "committed intent without outcome (B-05)",
-                "origin_snapshot": origin.map(|d| d.to_string()),
+                "origin_snapshot": intent.origin_snapshot.map(|d| d.to_string()),
             });
             self.commit(
                 vec![NewEvent {

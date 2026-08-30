@@ -302,6 +302,8 @@ fn fault_points_recorded() {
             FaultPoint::AfterObjectInstall, // promoted payload
             FaultPoint::BeforeFrameAppend,
             FaultPoint::AfterFrameAppend,
+            FaultPoint::BeforeSessionHeadAdvance,
+            FaultPoint::AfterSessionHeadAdvance,
         ]
     );
     session.close().unwrap();

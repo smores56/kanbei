@@ -96,7 +96,7 @@ impl<'de> Deserialize<'de> for Id128 {
 /// (All current brands are the same length; order is still significant if a
 /// brand ever becomes a prefix of another.)
 pub const BRANDS: &[&str] = &[
-    "ses_", "br_", "ev_", "mod_", "gen_", "run_", "call_", "pro_", "claim_", "tr_",
+    "branch_", "ses_", "br_", "ev_", "mod_", "gen_", "run_", "call_", "pro_", "claim_", "tr_",
 ];
 
 /// An [`Id128`] with its object class named by a [`BRANDS`] prefix.
@@ -185,6 +185,49 @@ impl Serialize for BrandedId {
 }
 
 impl<'de> Deserialize<'de> for BrandedId {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// A `branch_`-branded id naming a conversation branch (M6): one logical
+/// causal future within a session, created by a `branch_transition`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BranchId(Id128);
+
+impl BranchId {
+    pub fn generate() -> Self {
+        Self(Id128::generate())
+    }
+
+    pub fn id(&self) -> Id128 {
+        self.0
+    }
+}
+
+impl fmt::Display for BranchId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "branch_{}", self.0)
+    }
+}
+
+impl FromStr for BranchId {
+    type Err = BrandedParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parsed = parse_with(s, Some("branch_"))?;
+        Ok(BranchId(parsed.id()))
+    }
+}
+
+impl Serialize for BranchId {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for BranchId {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         let s = String::deserialize(de)?;
         s.parse().map_err(serde::de::Error::custom)
