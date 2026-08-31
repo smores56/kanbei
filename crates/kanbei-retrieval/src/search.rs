@@ -111,6 +111,15 @@ fn candidate_order(a: &Candidate, b: &Candidate) -> Ordering {
         .then_with(|| a.claim_id.cmp(&b.claim_id))
 }
 
+/// Lineage-union dedup on a sorted pool: keep the first (best) candidate per
+/// `dedup_key`, dropping later duplicates wherever they land. Key-based —
+/// `Vec::dedup_by` would only collapse adjacent duplicates, which reorder
+/// whenever scores interleave same-content claims.
+fn dedup_by_key(pool: &mut Vec<Candidate>) {
+    let mut seen = std::collections::HashSet::new();
+    pool.retain(|c| seen.insert(c.dedup_key.clone()));
+}
+
 /// A `scope IN (?, ...)` clause with one mark per allowed scope.
 fn scope_clause(n: usize) -> String {
     format!("scope IN ({})", vec!["?"; n].join(","))
@@ -309,8 +318,11 @@ impl MemoryIndex {
 
         // Step 5 — authority ordering + lineage-union dedup: keep the best
         // (rank, score, claim_id) per dedup_key, ordered by (rank, score).
+        // Key-based, not adjacency-based: same-content claims at different
+        // scores interleave, and `Vec::dedup_by` only removes consecutive
+        // equals (M-07 lineage union, not first-seen adjacency).
         pool.sort_by(candidate_order);
-        pool.dedup_by(|a, b| a.dedup_key == b.dedup_key);
+        dedup_by_key(&mut pool);
 
         // Step 7 — bounded one-hop expansion seeded by the top fused-score
         // matches: claims sharing an entity key, and edge-connected claims.
@@ -450,7 +462,7 @@ impl MemoryIndex {
         // included in the lineage dedup), truncate to max_results, map to the
         // context view.
         pool.sort_by(candidate_order);
-        pool.dedup_by(|a, b| a.dedup_key == b.dedup_key);
+        dedup_by_key(&mut pool);
         pool.truncate(q.max_results as usize);
         let claims = pool
             .into_iter()
@@ -657,6 +669,33 @@ mod tests {
         assert!(id1.to_string() < id2.to_string());
         assert_eq!(result.claims[0].digest, d1);
         remove_db(&path);
+    }
+
+    /// Same-content claims can interleave in the sorted pool when scores
+    /// diverge (evidence boosts apply between the two dedup passes); the
+    /// lineage-union dedup is key-based, so duplicates drop wherever they
+    /// sit. Directly covers the invariant `Vec::dedup_by` violated (only
+    /// adjacent equals collapse).
+    #[test]
+    fn dedup_by_key_is_key_based_not_adjacent() {
+        let cand = |key: &str, score: f64, id: &str| Candidate {
+            digest: format!("d-{id}"),
+            claim_id: id.to_string(),
+            kind: "decision".into(),
+            content: format!("content-{key}"),
+            sensitivity: "public".into(),
+            status: ValidationStatus::Active,
+            dedup_key: key.to_string(),
+            score,
+            source_events: Vec::new(),
+            contradictions: Vec::new(),
+        };
+        // sorted order under `candidate_order`: k1(3.0), k2(2.9), k1(2.8)
+        let mut pool = vec![cand("k1", 3.0, "a"), cand("k2", 2.9, "b"), cand("k1", 2.8, "c")];
+        dedup_by_key(&mut pool);
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool[0].digest, "d-a");
+        assert_eq!(pool[1].digest, "d-b");
     }
 
     #[test]

@@ -254,6 +254,12 @@ impl MemoryIndex {
                     .execute("DELETE FROM retracted WHERE digest = ?1", params![digest])?;
             }
         }
+        // Scope-wide tables are full-refresh across ALL scopes, not per
+        // scope: a per-scope `DELETE` here keeps only the last scope's rows
+        // after a multi-scope reconcile (the edges/roots of every earlier
+        // scope were silently dropped).
+        self.conn.execute("DELETE FROM edges", [])?;
+        self.conn.execute("DELETE FROM roots", [])?;
         for (seq, input) in scopes.iter().enumerate() {
             let scope_json = scope_json(&input.scope)?;
             let root = input.root.map(|d| d.to_string()).unwrap_or_default();
@@ -294,8 +300,6 @@ impl MemoryIndex {
                     )?;
                 }
             }
-            // the edge set is small and canonical: full refresh
-            self.conn.execute("DELETE FROM edges", [])?;
             for (digest, edge) in &input.fold.edges {
                 self.conn.execute(
                     "INSERT INTO edges (digest, from_id, to_id, kind) VALUES (?1, ?2, ?3, ?4)",
@@ -321,7 +325,6 @@ impl MemoryIndex {
                     ],
                 )?;
             }
-            self.conn.execute("DELETE FROM roots", [])?;
             self.conn.execute(
                 "INSERT INTO roots (scope, root, transition_id, seq) VALUES (?1, ?2, NULL, ?3)",
                 params![scope_json, root, seq as i64],
@@ -654,6 +657,52 @@ mod tests {
             .unwrap();
         let second = table_dump(&index);
         assert_eq!(first, second);
+        remove_db(&path);
+    }
+
+    /// Multi-scope reconcile must not clobber earlier scopes' rows: the
+    /// edges/roots tables are full-refresh across ALL scopes (a per-scope
+    /// DELETE kept only the last scope's rows — lifetime contradictions
+    /// and one-hop edges silently vanished after any multi-scope reconcile,
+    /// which the session runs before every memory.query).
+    #[test]
+    fn reconcile_multi_scope_keeps_earlier_scope_rows() {
+        let path = temp_db("reconcile-multi");
+        let mut index = MemoryIndex::open(&path).unwrap();
+        let s = session();
+        let (d1, c1) = make_claim(Id128::generate(), "decision", "the widget is fast", s, 1);
+        let (d2, c2) = make_claim(Id128::generate(), "decision", "the fast widget broke", s, 2);
+        let (de, ce) = make_edge(c1.claim_id, Some(c2.claim_id), EdgeKind::Contradicts);
+        let fold_lifetime = make_fold(vec![(d1, c1), (d2, c2)], vec![(de, ce)], vec![]);
+        let (d3, c3) = make_claim(Id128::generate(), "preference", "prefer /abs/other.rs", s, 3);
+        let fold_project = make_fold(vec![(d3, c3)], vec![], vec![]);
+        let inputs = [
+            scope_input(MemoryScope::Lifetime, fold_lifetime),
+            scope_input(MemoryScope::Project(Id128::generate()), fold_project),
+        ];
+        index.build(&inputs, "salience-v1").unwrap();
+        let built_edges: u64 = index
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .unwrap();
+        let built_roots: u64 = index
+            .conn
+            .query_row("SELECT COUNT(*) FROM roots", [], |r| r.get(0))
+            .unwrap();
+        let report = index.reconcile(&inputs).unwrap();
+        assert_eq!(report.claims, 3);
+        assert_eq!(report.scopes, 2);
+        let after_edges: u64 = index
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .unwrap();
+        let after_roots: u64 = index
+            .conn
+            .query_row("SELECT COUNT(*) FROM roots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after_edges, built_edges, "reconcile dropped scope edges");
+        assert_eq!(after_roots, built_roots, "reconcile dropped scope roots");
+        assert_eq!(after_roots, 2, "both scopes must keep a roots row");
         remove_db(&path);
     }
 
