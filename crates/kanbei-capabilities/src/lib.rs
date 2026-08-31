@@ -439,6 +439,18 @@ impl Broker {
         if !intent.validate() {
             return Err(BrokerError::StaleIntent { digest: intent.digest });
         }
+        // The intent carries its own expiry contract (R-16/D-12): an
+        // expired approval never rechecks OK. Standing grants without
+        // purpose are rejected at add_grant; the intent scope is Run
+        // by construction (approval_for).
+        if let Some(expiry) = intent.expiry {
+            if expiry <= now_secs() {
+                return Err(BrokerError::Expired {
+                    resource: intent.action.clone(),
+                    principal: intent.principal.clone(),
+                });
+            }
+        }
         let actual_policy = self.policy_version();
         if policy_version != actual_policy {
             return Err(BrokerError::PolicyVersionMismatch { expected: policy_version, actual: actual_policy });

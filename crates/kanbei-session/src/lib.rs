@@ -137,6 +137,11 @@ pub struct SessionConfig {
     pub broker: kanbei_capabilities::Broker,
     /// Approval queue bound with eviction (R-17/H-05); 0 = no approvals.
     pub approval_bound: usize,
+    /// Driver-side approval resolver: when the cognition loop parks an
+    /// approval-gated intent, this seam decides it on the driver's behalf
+    /// (an unattended battery plays the user; production wires the UI's
+    /// approval queue). None = park until `resolve_approval`.
+    pub approval_resolver: Option<ApprovalResolver>,
     /// The session's own identity (caller principal for kernel-originated
     /// tool calls, R-14); None = generate at open.
     pub session_id: Option<Id128>,
@@ -168,7 +173,9 @@ impl Default for SessionConfig {
         Self {
             dir: PathBuf::from("."),
             stream: "default".into(),
-            profile: Profile::Fast,
+            // Balanced is the design default (architecture.md:406); Fast is
+            // the caller's opt-in.
+            profile: Profile::Balanced,
             inline_max: 1024,
             object_min: 8192,
             fault: None,
@@ -185,6 +192,7 @@ impl Default for SessionConfig {
             fs_root: PathBuf::from("."),
             broker: kanbei_capabilities::Broker::new(),
             approval_bound: 64,
+            approval_resolver: None,
             session_id: None,
             memory_root: None,
             project: None,
@@ -495,6 +503,13 @@ pub struct PendingIntent {
 
 // ---------- session ----------
 
+/// Driver-side approval resolver: decides a parked approval-gated intent
+/// during the cognition loop (`true` = approve, `false` = leave parked for
+/// `Session::resolve_approval`). Unattended batteries wire an auto-approve
+/// stand-in for the user; production wires the UI approval queue.
+pub type ApprovalResolver =
+    std::sync::Arc<dyn Fn(&kanbei_core::digest::Digest) -> bool + Send + Sync>;
+
 pub struct Session {
     log: AppendLog,
     store: ObjectStore,
@@ -526,6 +541,7 @@ pub struct Session {
     /// Bounded pending-approval queue (oldest evicted on overflow).
     approvals: std::collections::VecDeque<kanbei_tools::ApprovalParked>,
     approval_bound: usize,
+    approval_resolver: Option<ApprovalResolver>,
     fs_root: PathBuf,
     session_id: Id128,
     // --- M4 memory substrate + context projection ---
@@ -698,6 +714,7 @@ impl Session {
         let fs_root = cfg.fs_root.clone();
         let tool_limits = cfg.tool_limits;
         let approval_bound = cfg.approval_bound;
+        let approval_resolver = cfg.approval_resolver.clone();
         let budgets = cfg.budgets;
         let breaker_floors = cfg.breaker_floors;
         let provider_config = cfg.provider.clone();
@@ -970,6 +987,7 @@ impl Session {
             broker,
             approvals: std::collections::VecDeque::new(),
             approval_bound,
+            approval_resolver,
             fs_root,
             session_id,
             memory_lifetime,

@@ -142,6 +142,9 @@ fn open_session(
             Some(Box::new(FakeEngine::new(fake_config("probe"), responses)))
         },
         broker,
+        // the probe plays the user: parked approvals resolve so the
+        // scripted loop proceeds (writing fidelity, not approval UX)
+        approval_resolver: Some(std::sync::Arc::new(|_| true)),
         session_id: Some(session_id),
         project,
         memory_root: memory_root.map(|p| p.to_path_buf()),
@@ -176,6 +179,14 @@ fn propose_claim(
     let outcome = session
         .tool_call(run_id, principal(session_id), "memory.propose", json!({ "claim": claim }))
         .unwrap();
+    if outcome.awaiting_approval() {
+        // the probe plays the user on the direct path too
+        let digest = *session.pending_approvals().last().expect("parked");
+        return session
+            .resolve_approval(&digest, true)
+            .unwrap()
+            .expect("approval resolves");
+    }
     session.commit_tool_outcome(&outcome).unwrap();
     outcome
 }

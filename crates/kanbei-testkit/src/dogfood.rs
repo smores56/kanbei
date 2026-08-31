@@ -123,6 +123,8 @@ pub fn battery_session(
             Some(Box::new(FakeEngine::new(fake_config(), responses)))
         },
         broker: battery_broker(session_id),
+        // unattended battery: the harness approves on the user's behalf
+        approval_resolver: Some(std::sync::Arc::new(|_| true)),
         session_id: Some(session_id),
         project: Some(project),
         memory_root: Some(dir.join("memory")),
@@ -1008,6 +1010,8 @@ pub fn run_spend_scenario(root: &Path) -> (Option<(u64, u64, bool)>, SessionFact
             vec![response("spend", 100, 25)],
         ))),
         broker: battery_broker(session_id),
+        // unattended battery: the harness approves on the user's behalf
+        approval_resolver: Some(std::sync::Arc::new(|_| true)),
         session_id: Some(session_id),
         project: Some(project),
         memory_root: Some(dir.join("memory")),

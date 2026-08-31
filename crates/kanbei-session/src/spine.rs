@@ -30,13 +30,24 @@ use kanbei_scheduler::{
     StepResult, TerminalOutcome, Trigger, WakeDecision,
 };
 use kanbei_tools::{
-    ApprovalParked, OutcomeClassification, ToolIntent, ToolOutcome, execute_tool, tool_call_id,
+    AWAITING_APPROVAL, ApprovalParked, OutcomeClassification, ToolIntent, ToolOutcome,
+    approval_for, execute_tool, tool_call_id,
 };
 use std::sync::Arc;
 
 use serde_json::{Value, json};
 
 use crate::{NewEvent, ProjectionState, Session, SessionError};
+
+/// Tools whose execution is a consequential side effect: the committed
+/// intent is flushed to durable storage before these run (fast/balanced
+/// profiles otherwise acknowledge kernel-buffered writes).
+fn consequential_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "fs.write" | "fs.patch" | "process.exec" | "child.spawn" | "memory.propose"
+    )
+}
 
 /// One accepted wake: the run FSM entry (R-09/E-10 — every accepted wake
 /// creates exactly one RunId). The caller commits the canonical record and
@@ -140,10 +151,27 @@ impl Session {
         usage: RunUsage,
         action_digests: &[Digest],
     ) -> Result<Option<kanbei_scheduler::BreakerTrip>, SessionError> {
+        self.run_outcome_with_reason(run_id, outcome, usage, action_digests, None)
+    }
+
+    /// The terminal-outcome path with a user-visible reason (Blocked's
+    /// responsible constraint, R-17).
+    pub fn run_outcome_with_reason(
+        &mut self,
+        run_id: RunId,
+        outcome: TerminalOutcome,
+        usage: RunUsage,
+        action_digests: &[Digest],
+        reason: Option<String>,
+    ) -> Result<Option<kanbei_scheduler::BreakerTrip>, SessionError> {
         self.fault(crate::FaultPoint::BeforeRunOutcome);
-        let (record, trip) =
-            self.scheduler
-                .record_outcome(run_id, outcome, usage, action_digests)?;
+        let (record, trip) = self.scheduler.record_outcome_reason(
+            run_id,
+            outcome,
+            usage,
+            action_digests,
+            reason,
+        )?;
         let mut events = vec![NewEvent {
             kind: "run_outcome".into(),
             payload_schema: 1,
@@ -543,16 +571,36 @@ impl Session {
         intent.intent_event = Some(receipt.last_seq);
 
         // Approval gate: consequential tools require an approval intent;
-        // approved intents carry the digest, parked intents wait in the
-        // bounded queue.
+        // the gate parks the intent-shaped approval (R-16/D-12: the digest
+        // binds the exact committed intent) and the tool resolves
+        // `Interrupted` until the user resolves it — the caller may NEVER
+        // self-approve and dispatch in the same breath.
         let want = Capability::new(tool.into(), vec!["call".into()]);
-        let approval_digest = match self.check_approval(&principal, &want) {
-            Ok(d) => d,
+        let approval_digest = match self.check_approval(&principal, &want, &intent) {
+            Ok(Some(d)) => Some(d),
+            Ok(None) => None,
             Err(e) => {
                 return Ok(self.outcome_interrupted(intent, format!("approval denied: {e}")));
             }
         };
-        intent.approval = approval_digest;
+        if let Some(digest) = approval_digest {
+            // A parked gate is a resolution point, not a green light: the
+            // committed intent stays put (B-05 — its outcome arrives when
+            // `resolve_approval` dispatches, or recovery classifies it).
+            return Ok(ToolOutcome {
+                call_id: intent.call_id,
+                tool: intent.tool,
+                result: Value::Null,
+                error: None,
+                classification: OutcomeClassification::Interrupted(format!(
+                    "{AWAITING_APPROVAL}: {digest}"
+                )),
+                origin_snapshot: intent.origin_snapshot,
+                commit_snapshot: self.current_snapshot,
+                retained: None,
+            });
+        }
+        intent.approval = None;
 
         // Dispatch-time re-verification (R-16/D-11/C-10): revoked ⇒ the
         // intent resolves `interrupted` with a user-visible reason.
@@ -562,44 +610,70 @@ impl Session {
         Ok(outcome)
     }
 
-    /// The approval gate: tools whose capability requires approval park in
-    /// the bounded queue; `Ok(Some(digest))` = approved. `Ok(None)` = not
-    /// gated. `Err` = explicitly denied by policy.
+    
+/// A driver-side resolver decision on the newest parked approval (the
+/// cognition-loop path): `None` = no resolver or it declined — the intent
+/// stays parked for explicit `resolve_approval`; otherwise the resolved
+/// outcome (already dispatched + committed by the resolve).
+fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionError> {
+    let Some(digest) = self.pending_approvals().last().copied() else {
+        return Ok(None);
+    };
+    let Some(resolver) = self.approval_resolver.clone() else {
+        return Ok(None);
+    };
+    if !resolver(&digest) {
+        return Ok(None);
+    }
+    self.resolve_approval(&digest, true)
+}
+
+/// The approval gate: tools whose capability requires approval park in
+    /// the bounded queue; `Ok(Some(digest))` = gated (parked, awaiting the
+    /// user); `Ok(None)` = not gated. `Err` = explicitly denied by policy.
+    /// The parked approval binds the exact committed intent (R-16/D-12) plus
+    /// the policy/grant version snapshot the dispatch-time re-verification
+    /// compares against (R-16/D-11/C-10).
     fn check_approval(
         &mut self,
         principal: &Principal,
         want: &Capability,
+        intent: &ToolIntent,
     ) -> Result<Option<Digest>, String> {
         if self.approval_bound == 0 {
             return Ok(None);
         }
         let policy_version = self.broker.policy_version();
+        let grants_version = self.broker.grants_version();
         match self.broker.check(principal, want, policy_version) {
             Ok(effective) => {
                 if !effective.requires_approval {
                     return Ok(None);
                 }
-                let approval = self
-                    .broker
-                    .require_approval(principal, want)
-                    .map_err(|e| e.to_string())?;
-                // The caller must explicitly approve; park the intent-shaped
-                // approval. The digest returned marks the intent approved.
+                // Exact-approval digest (R-16/D-12): the parked intent binds
+                // the committed canonical args, not the empty default the
+                // broker placeholder used — a changed intent cannot ride a
+                // parked approval.
+                let approval = approval_for(
+                    principal,
+                    &intent.tool,
+                    &intent.args,
+                    None,
+                    kanbei_capabilities::GrantScope::Run,
+                    None,
+                );
                 let digest = approval.digest;
                 self.approvals.push_back(ApprovalParked {
-                    intent: ToolIntent {
-                        call_id: tool_call_id(),
-                        run_id: Id128::generate(),
-                        principal: principal.clone(),
-                        tool: want.resource.clone(),
-                        args: Value::Null,
-                        approval: None,
-                        origin_snapshot: None,
-                        intent_event: None,
-                    },
+                    intent: intent.clone(),
                     approval,
+                    policy_version,
+                    grants_version,
                 });
                 while self.approvals.len() > self.approval_bound {
+                    // Overflow resolves the evicted intent `Interrupted`
+                    // (R-17/H-05): the entry is gone, so its resolution is
+                    // the next dispatch's rejection — re-approval is a NEW
+                    // intent, never a resurrected digest.
                     self.approvals.pop_front();
                 }
                 Ok(Some(digest))
@@ -608,12 +682,99 @@ impl Session {
         }
     }
 
+    /// The digests of parked approval intents awaiting user resolution
+    /// (R-16/D-12; re-approval is a new intent, never a resurrected one).
+    pub fn pending_approvals(&self) -> Vec<Digest> {
+        self.approvals.iter().map(|p| p.approval.digest).collect()
+    }
+
+    /// Resolves a parked approval (the user's approve/deny decision).
+    /// `None` = the digest is not parked anymore (already resolved, or
+    /// evicted by the bound — re-approval is a new intent).
+    /// Approval re-derives the digest from the parked committed intent,
+    /// re-runs the guards, and verifies the policy/grant versions captured
+    /// at park time are unchanged (R-16/D-11/C-10); a mismatch resolves the
+    /// intent `Interrupted` with the user-visible reason. The approved
+    /// dispatch commits its outcome like any other tool outcome.
+    pub fn resolve_approval(
+        &mut self,
+        digest: &Digest,
+        approve: bool,
+    ) -> Result<Option<ToolOutcome>, SessionError> {
+        let position = self
+            .approvals
+            .iter()
+            .position(|p| p.approval.digest == *digest);
+        let Some(position) = position else {
+            return Ok(None);
+        };
+        let parked = self.approvals[position].clone();
+        if !approve {
+            self.approvals.remove(position);
+            return Ok(Some(
+                self.outcome_interrupted(parked.intent, "approval denied by user".into()),
+            ));
+        }
+        // Dispatch-time re-verification (R-16/D-11/C-10): the digest is
+        // re-derived from the parked committed intent; the version snapshot
+        // is the one captured when the gate parked it.
+        let expected = approval_for(
+            &parked.approval.principal,
+            &parked.intent.tool,
+            &parked.intent.args,
+            None,
+            kanbei_capabilities::GrantScope::Run,
+            None,
+        );
+        if expected.digest != parked.approval.digest {
+            return Ok(Some(self.outcome_interrupted(
+                parked.intent,
+                "approval stale: the committed intent no longer matches the approved digest".into(),
+            )));
+        }
+        if let Err(e) = self.broker.recheck(
+            &parked.approval,
+            parked.grants_version,
+            parked.policy_version,
+        ) {
+            return Ok(Some(
+                self.outcome_interrupted(parked.intent, format!("approval recheck: {e}")),
+            ));
+        }
+        // A parked approval outlives its initiating run: the queue holds
+        // intents between runs, and resolving one whose run has closed
+        // still commits the outcome as a fact (B-02: outcomes of already-
+        // dispatched host work are always committed) — run usage accounting
+        // simply has nothing to add to anymore (dispatch is NotActiveRun
+        // tolerant).
+        let mut intent = parked.intent;
+        intent.approval = Some(parked.approval.digest);
+        let principal = intent.principal.clone();
+        let run_id = intent.run_id;
+        // The parked entry stays in place through the dispatch (the
+        // dispatch re-check validates its presence + digest), then the
+        // resolution is one-shot: the entry is removed on both paths.
+        let outcome = self.dispatch_tool(run_id, &intent, principal)?;
+        if let Some(position) = self.approvals.iter().position(|p| p.approval.digest == *digest) {
+            self.approvals.remove(position);
+        }
+        self.commit_tool_outcome(&outcome)?;
+        Ok(Some(outcome))
+    }
+
     fn dispatch_tool(
         &mut self,
         run_id: RunId,
         intent: &ToolIntent,
         principal: Principal,
     ) -> Result<ToolOutcome, SessionError> {
+        // fsync-before-consequential-effect (architecture.md:408): under
+        // every durability profile, the committed intent frame is durable
+        // before a consequential effect runs — a crash between effect and
+        // outcome must classify, never orphan.
+        if consequential_tool(&intent.tool) {
+            self.flush()?;
+        }
         // Dispatch-time re-verification (R-16/D-11/C-10): re-run the broker
         // guard set against the current composition; revoked ⇒ the intent
         // resolves `interrupted` with a user-visible reason. Approval-gated
@@ -684,7 +845,9 @@ impl Session {
                 });
             }
         };
-        self.scheduler.record_usage(
+        // Usage accounting is NotActiveRun-tolerant at dispatch: an
+        // approval resolved after its run closed still commits the fact.
+        if let Err(e) = self.scheduler.record_usage(
             run_id,
             RunUsage {
                 tokens: 0,
@@ -692,7 +855,12 @@ impl Session {
                 children: 0,
                 started_at_secs: 0,
             },
-        )?;
+        ) {
+            match e {
+                kanbei_scheduler::SchedulerError::NotActiveRun(_) => {}
+                other => return Err(other.into()),
+            }
+        }
         Ok(ToolOutcome {
             call_id: intent.call_id.clone(),
             tool: intent.tool.clone(),
@@ -1146,7 +1314,9 @@ impl Session {
         _principal: Principal,
     ) -> Result<ToolOutcome, SessionError> {
         let _ = _principal;
-        self.scheduler.record_usage(
+        // Usage accounting is NotActiveRun-tolerant at dispatch: an
+        // approval resolved after its run closed still commits the fact.
+        if let Err(e) = self.scheduler.record_usage(
             run_id,
             RunUsage {
                 tokens: 0,
@@ -1154,7 +1324,12 @@ impl Session {
                 children: 0,
                 started_at_secs: 0,
             },
-        )?;
+        ) {
+            match e {
+                kanbei_scheduler::SchedulerError::NotActiveRun(_) => {}
+                other => return Err(other.into()),
+            }
+        }
         let Some(query) = intent.args.get("query").and_then(|q| q.as_str()) else {
             return Ok(
                 self.memory_outcome_error(intent, "memory.query requires a string query".into())
@@ -1437,7 +1612,9 @@ impl Session {
         intent: &ToolIntent,
         principal: Principal,
     ) -> Result<ToolOutcome, SessionError> {
-        self.scheduler.record_usage(
+        // Usage accounting is NotActiveRun-tolerant at dispatch: an
+        // approval resolved after its run closed still commits the fact.
+        if let Err(e) = self.scheduler.record_usage(
             run_id,
             RunUsage {
                 tokens: 0,
@@ -1445,7 +1622,12 @@ impl Session {
                 children: 0,
                 started_at_secs: 0,
             },
-        )?;
+        ) {
+            match e {
+                kanbei_scheduler::SchedulerError::NotActiveRun(_) => {}
+                other => return Err(other.into()),
+            }
+        }
         if self.memory_project.is_none() {
             return Ok(self.memory_outcome_error(intent, "no project bound".into()));
         }
@@ -1792,22 +1974,17 @@ impl Session {
         let outcome = loop {
             // Wake deadline/budget at each host-command boundary.
             if let Err(e) = self.scheduler.check_boundary(run_id) {
-                let record = RunOutcome {
+                // Route through the run FSM like any terminal outcome: the
+                // canonical record alone left `active` occupied and every
+                // later wake denied ConcurrencyLimit (Wake=Run pairing,
+                // architecture.md:118 broken otherwise).
+                let usage = self.scheduler.current_usage(run_id);
+                self.run_outcome_with_reason(
                     run_id,
-                    outcome: TerminalOutcome::Blocked,
-                    reason: Some(e.to_string()),
-                };
-                self.commit(
-                    vec![NewEvent {
-                        kind: "run_outcome".into(),
-                        payload_schema: 1,
-                        payload: serde_json::to_value(&record).map_err(|e| {
-                            SessionError::InvalidInput(format!("run outcome payload: {e}"))
-                        })?,
-                        objects: Vec::new(),
-                        refs: Vec::new(),
-                    }],
-                    None,
+                    TerminalOutcome::Blocked,
+                    usage,
+                    &[],
+                    Some(e.to_string()),
                 )?;
                 return Ok(TerminalOutcome::Blocked);
             }
@@ -1843,10 +2020,30 @@ impl Session {
                         run: Some(0),
                     };
                     let tool_outcome = self.tool_call(run_id, principal, &tool, arguments)?;
-                    self.commit_tool_outcome(&tool_outcome)?;
-                    last = Some(StepResult::Tool(
-                        serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
-                    ));
+                    // A parked approval is pending resolution, not final:
+                    // its outcome event arrives at resolution (or recovery
+                    // classifies the intent) — committing the park report
+                    // would terminate the intent story early.
+                    if tool_outcome.awaiting_approval() {
+                        // the driver seam resolves parked approvals (an
+                        // unattended battery plays the user); the park
+                        // report never commits as an outcome — resolution
+                        // dispatches + commits, or recovery classifies
+                        if let Some(resolved) = self.resolve_parked_via_driver()? {
+                            last = Some(StepResult::Tool(
+                                serde_json::to_value(&resolved).unwrap_or(Value::Null),
+                            ));
+                        } else {
+                            last = Some(StepResult::Tool(
+                                serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                            ));
+                        }
+                    } else {
+                        self.commit_tool_outcome(&tool_outcome)?;
+                        last = Some(StepResult::Tool(
+                            serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                        ));
+                    }
                 }
                 StepCommand::MemoryQuery { query } => {
                     let principal = Principal {
@@ -1860,10 +2057,22 @@ impl Session {
                         "memory.query",
                         json!({ "query": query }),
                     )?;
-                    self.commit_tool_outcome(&tool_outcome)?;
-                    last = Some(StepResult::Memory(
-                        serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
-                    ));
+                    if tool_outcome.awaiting_approval() {
+                        if let Some(resolved) = self.resolve_parked_via_driver()? {
+                            last = Some(StepResult::Memory(
+                                serde_json::to_value(&resolved).unwrap_or(Value::Null),
+                            ));
+                        } else {
+                            last = Some(StepResult::Memory(
+                                serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                            ));
+                        }
+                    } else {
+                        self.commit_tool_outcome(&tool_outcome)?;
+                        last = Some(StepResult::Memory(
+                            serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                        ));
+                    }
                 }
                 StepCommand::MemoryPropose { claim } => {
                     let principal = Principal {
@@ -1877,10 +2086,22 @@ impl Session {
                         "memory.propose",
                         json!({ "claim": claim }),
                     )?;
-                    self.commit_tool_outcome(&tool_outcome)?;
-                    last = Some(StepResult::Memory(
-                        serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
-                    ));
+                    if tool_outcome.awaiting_approval() {
+                        if let Some(resolved) = self.resolve_parked_via_driver()? {
+                            last = Some(StepResult::Memory(
+                                serde_json::to_value(&resolved).unwrap_or(Value::Null),
+                            ));
+                        } else {
+                            last = Some(StepResult::Memory(
+                                serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                            ));
+                        }
+                    } else {
+                        self.commit_tool_outcome(&tool_outcome)?;
+                        last = Some(StepResult::Memory(
+                            serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                        ));
+                    }
                 }
                 StepCommand::ChildSpawn { spec } => {
                     let principal = Principal {
@@ -1889,10 +2110,22 @@ impl Session {
                         run: Some(0),
                     };
                     let tool_outcome = self.tool_call(run_id, principal, "child.spawn", spec)?;
-                    self.commit_tool_outcome(&tool_outcome)?;
-                    last = Some(StepResult::Child(
-                        serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
-                    ));
+                    if tool_outcome.awaiting_approval() {
+                        if let Some(resolved) = self.resolve_parked_via_driver()? {
+                            last = Some(StepResult::Child(
+                                serde_json::to_value(&resolved).unwrap_or(Value::Null),
+                            ));
+                        } else {
+                            last = Some(StepResult::Child(
+                                serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                            ));
+                        }
+                    } else {
+                        self.commit_tool_outcome(&tool_outcome)?;
+                        last = Some(StepResult::Child(
+                            serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                        ));
+                    }
                 }
                 StepCommand::ScheduleWake {
                     kind,

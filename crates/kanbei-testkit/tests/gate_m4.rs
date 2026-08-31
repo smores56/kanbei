@@ -155,6 +155,19 @@ fn propose_claim(
             json!({ "claim": claim }),
         )
         .unwrap();
+    if outcome.awaiting_approval() {
+        // the harness plays the user: resolve the parked approval so the
+        // propose flow proceeds (the approval gate parks by design)
+        let digest = *session
+            .pending_approvals()
+            .last()
+            .expect("a parked approval");
+        let resolved = session
+            .resolve_approval(&digest, true)
+            .unwrap()
+            .expect("approval resolves while parked");
+        return resolved;
+    }
     session.commit_tool_outcome(&outcome).unwrap();
     outcome
 }

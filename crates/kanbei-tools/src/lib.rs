@@ -254,6 +254,24 @@ pub struct ToolOutcome {
     pub retained: Option<bool>,
 }
 
+/// Classification reason prefix marking an intent parked behind the
+/// approval gate: the intent is committed and awaiting the user's
+/// `resolve_approval`; its canonical `tool_outcome` arrives at resolution
+/// (or recovery classifies it) — the parked classification itself is never
+/// committed as an outcome event.
+pub const AWAITING_APPROVAL: &str = "awaiting approval";
+
+impl ToolOutcome {
+    /// Whether this outcome reports a parked approval (see
+    /// [`AWAITING_APPROVAL`]).
+    pub fn awaiting_approval(&self) -> bool {
+        matches!(
+            &self.classification,
+            OutcomeClassification::Interrupted(reason) if reason.starts_with(AWAITING_APPROVAL)
+        )
+    }
+}
+
 /// A tool intent parked in the session's bounded approval queue (R-17/H-05):
 /// the committed intent plus the approval intent whose digest gates it. On
 /// overflow the oldest entry is evicted and resolves `Interrupted`.
@@ -261,6 +279,10 @@ pub struct ToolOutcome {
 pub struct ApprovalParked {
     pub intent: ToolIntent,
     pub approval: ApprovalIntent,
+    /// Policy/grant version snapshot at park time; the resolve-time
+    /// re-verification compares against these (R-16/D-11/C-10).
+    pub policy_version: u64,
+    pub grants_version: u64,
 }
 
 // ---------- approval binding (R-16/D-12) ----------

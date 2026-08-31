@@ -730,10 +730,32 @@ fn run_m4(dir: String, after_acks: u64) {
         }
     };
     ack(format!("acked={}", session.next_seq() - 1));
-    if let Err(e) = session.commit_tool_outcome(&outcome) {
-        ack(format!("outcome_error={e}"));
-        exit(2);
-    }
+    // The approval gate parks the intent (crash child is its own user):
+    // resolve it so the propose flow reaches the proposal → transition
+    // → backlink path the fault points guard.
+    let outcome = if outcome.awaiting_approval() {
+        let digest = *session
+            .pending_approvals()
+            .last()
+            .expect("the parked approval");
+        match session.resolve_approval(&digest, true) {
+            Ok(Some(o)) => o,
+            Ok(None) => {
+                ack("approval_error=evicted".into());
+                exit(2);
+            }
+            Err(e) => {
+                ack(format!("approval_error={e}"));
+                exit(2);
+            }
+        }
+    } else {
+        if let Err(e) = session.commit_tool_outcome(&outcome) {
+            ack(format!("outcome_error={e}"));
+            exit(2);
+        }
+        outcome
+    };
     ack(format!("acked={}", session.next_seq() - 1));
     ack("done".into());
     exit(0);

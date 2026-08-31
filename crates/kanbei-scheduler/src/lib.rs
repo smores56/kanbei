@@ -419,6 +419,11 @@ pub struct Scheduler {
     /// Child runs spawned by the active parent (R-09 child tool).
     children: HashMap<RunId, ChildRun>,
     outcomes: Vec<(RunId, TerminalOutcome)>,
+    /// The most recently closed child's final usage: the child's loop
+    /// closes its own run record (Blocked paths), but the dispatcher reads
+    /// usage right after the loop returns — the single-slot cache serves
+    /// that read (the session actor serializes loop → dispatch).
+    last_child_usage: Option<(RunId, RunUsage)>,
     budgets: Budgets,
 }
 
@@ -439,6 +444,7 @@ impl Scheduler {
             runs: HashMap::new(),
             children: HashMap::new(),
             outcomes: Vec::new(),
+            last_child_usage: None,
             budgets,
         }
     }
@@ -600,6 +606,42 @@ impl Scheduler {
 
     /// Record a run's usage (tokens/tools/children) and its terminal outcome.
     /// Returns the breaker trip when one fires.
+    /// Whether `run_id` is the scheduler's current active run (resolution
+    /// paths outside the run loop — e.g. an approval resolved after the run
+    /// closed — check liveness before committing outcomes against the run).
+    pub fn run_active(&self, run_id: RunId) -> bool {
+        self.active.is_some_and(|(id, _, _)| id == run_id)
+    }
+
+    /// `reason` is the terminal record's user-visible explanation ( Blocked
+    /// carries the responsible constraint; Failed its failure kind detail).
+    pub fn record_outcome_reason(
+        &mut self,
+        run_id: RunId,
+        outcome: TerminalOutcome,
+        usage: RunUsage,
+        action_digests: &[Digest],
+        reason: Option<String>,
+    ) -> SchedulerResult<(RunOutcome, Option<BreakerTrip>)> {
+        // Child runs: drop the entry and return without any breaker
+        // interaction — breakers are cognition/responder concerns, and the
+        // parent's budgets bound the child through the session's clamp.
+        if let Some(child) = self.children.remove(&run_id) {
+            self.last_child_usage = Some((run_id, child.usage));
+            return Ok((
+                RunOutcome {
+                    run_id,
+                    outcome,
+                    reason,
+                },
+                None,
+            ));
+        }
+        let blocker_reason = reason;
+        let result = self.record_outcome_inner(run_id, outcome, usage, action_digests, blocker_reason);
+        result
+    }
+
     pub fn record_outcome(
         &mut self,
         run_id: RunId,
@@ -607,15 +649,24 @@ impl Scheduler {
         usage: RunUsage,
         action_digests: &[Digest],
     ) -> SchedulerResult<(RunOutcome, Option<BreakerTrip>)> {
-        // Child runs: drop the entry and return without any breaker
-        // interaction — breakers are cognition/responder concerns, and the
-        // parent's budgets bound the child through the session's clamp.
-        if self.children.remove(&run_id).is_some() {
+        self.record_outcome_inner(run_id, outcome, usage, action_digests, None)
+    }
+
+    fn record_outcome_inner(
+        &mut self,
+        run_id: RunId,
+        outcome: TerminalOutcome,
+        usage: RunUsage,
+        action_digests: &[Digest],
+        reason: Option<String>,
+    ) -> SchedulerResult<(RunOutcome, Option<BreakerTrip>)> {
+        if let Some(child) = self.children.remove(&run_id) {
+            self.last_child_usage = Some((run_id, child.usage));
             return Ok((
                 RunOutcome {
                     run_id,
                     outcome,
-                    reason: None,
+                    reason,
                 },
                 None,
             ));
@@ -725,7 +776,15 @@ impl Scheduler {
             RunOutcome {
                 run_id: id,
                 outcome: final_outcome,
-                reason: None,
+                reason: reason.or_else(|| {
+                    // a budget-forced Blocked carries the responsible
+                    // constraint as its user-visible reason
+                    if !budget_ok {
+                        Some("run budget exhausted (session budgets)".into())
+                    } else {
+                        None
+                    }
+                }),
             },
             trip,
         ))
@@ -773,6 +832,9 @@ impl Scheduler {
     pub fn current_usage(&self, run_id: RunId) -> RunUsage {
         if let Some(child) = self.children.get(&run_id) {
             return child.usage;
+        }
+        if let Some((id, usage)) = self.last_child_usage.filter(|(id, _)| *id == run_id) {
+            return usage;
         }
         self.active
             .as_ref()
