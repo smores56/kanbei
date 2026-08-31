@@ -410,6 +410,9 @@ pub struct Scheduler {
     /// Breaker counters.
     consecutive_failed: u32,
     no_progress_run: u32,
+    /// seq of a causal event the next outcome has not accounted for yet
+    /// (D-F-L: the no-progress streak must not count outcomes that
+    /// follow fresh causal events).
     last_causal_event: Option<u64>,
     /// Identical action digests within the window (digest -> count).
     action_window: HashMap<Digest, (u64, u32)>,
@@ -624,10 +627,11 @@ impl Scheduler {
     }
 
     /// Record one causal event committed during the run (refreshes the
-    /// no-progress breaker).
+    /// no-progress breaker: the streak restarts at the outcome that
+    /// follows it — architecture.md:120 "consecutive NoProgress/Waiting
+    /// without new causal events", D-F-L).
     pub fn record_causal_event(&mut self, seq: u64) {
         self.last_causal_event = Some(seq);
-        self.no_progress_run = 0;
     }
 
     /// Record a run's usage (tokens/tools/children) and its terminal outcome.
@@ -743,14 +747,12 @@ impl Scheduler {
                 }
             }
             TerminalOutcome::NoProgress | TerminalOutcome::Waiting => {
-                if self.last_causal_event.is_none()
-                    || self.outcomes.iter().rev().any(|(_, o)| {
-                        matches!(
-                            o,
-                            TerminalOutcome::Progress | TerminalOutcome::CompletedGoal
-                        )
-                    })
-                {
+                // D-F-L: the streak counts consecutive NoProgress/Waiting
+                // outcomes with no causal event between them; one landed
+                // since the previous outcome restarts it.
+                if self.last_causal_event.take().is_some() {
+                    self.no_progress_run = 0;
+                } else {
                     self.no_progress_run += 1;
                 }
                 if self.no_progress_run >= self.floors.no_progress_without_causal {
@@ -1218,6 +1220,45 @@ mod tests {
         let (_, trip) = s.record_outcome(a.run_id, failed, usage, &[]).unwrap();
         assert!(trip.is_none(), "a single failure stays under the kernel floor");
         assert!(!s.is_paused());
+    }
+
+    #[test]
+    fn no_progress_streak_requires_no_causal_events_between_outcomes() {
+        // D-F-L: five straight NoProgress outcomes (the kernel floor) trip
+        // the breaker; a causal event between outcomes restarts the
+        // streak, so the same outcomes with causal events never trip.
+        let floors = BreakerFloors {
+            no_progress_without_causal: 5,
+            ..Default::default()
+        };
+        let mut s = Scheduler::new(Budgets::default(), floors);
+        let usage = RunUsage {
+            tokens: 0,
+            tools: 0,
+            children: 0,
+            started_at_secs: 0,
+        };
+        for i in 0..8 {
+            let run = accept(&mut s);
+            if i < 3 {
+                // Fresh causal work lands before each of the first three
+                // outcomes — the streak restarts every time.
+                s.record_causal_event(i as u64);
+            }
+            let (_, trip) = s
+                .record_outcome(run, TerminalOutcome::NoProgress, usage, &[])
+                .unwrap();
+            if i == 7 {
+                assert!(trip.is_some(), "outcomes without causal events must trip");
+                assert_eq!(
+                    trip.unwrap().counter,
+                    BreakerCounter::NoProgressWithoutCausal
+                );
+            } else {
+                assert!(trip.is_none(), "no trip before the streak reaches the floor");
+            }
+        }
+        assert!(s.is_paused());
     }
 
     #[test]
