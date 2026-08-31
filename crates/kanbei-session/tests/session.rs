@@ -10,6 +10,7 @@ use kanbei_core::digest::Digest;
 use kanbei_core::envelope::{Envelope, ENVELOPE_SCHEMA};
 use kanbei_log::for_each_frame;
 use kanbei_provider::{AnthropicEngine, HttpEngine, KeySource, ProviderConfig, WireProtocol};
+use kanbei_scheduler::{Trigger, TriggerKind};
 use kanbei_session::{
     FaultInjector, FaultPoint, NewEvent, Session, SessionConfig, SessionError,
 };
@@ -438,4 +439,55 @@ fn provider_protocol_selects_wire_engine() {
             .downcast_ref::<AnthropicEngine>()
             .is_some()
     );
+}
+
+#[test]
+fn breaker_pause_survives_reopen() {
+    // D-F-Kb (architecture.md:120): a tripped breaker pauses cognition until
+    // an explicit user resume — closing before the resume must not silently
+    // un-pause the session on reopen.
+    let dir = TempDir::new("breaker-reopen");
+    {
+        let mut session = open(dir.path());
+        let trip = kanbei_scheduler::BreakerTrip {
+            counter: kanbei_scheduler::BreakerCounter::ConsecutiveFailed,
+            value: 3,
+            threshold: 3,
+        };
+        session
+            .commit(
+                vec![event(
+                    "breaker_tripped",
+                    serde_json::to_value(&trip).unwrap(),
+                )],
+                None,
+            )
+            .unwrap();
+        session.close().unwrap();
+    }
+    let mut session = open(dir.path());
+    session.observe_trigger(Trigger {
+        kind: TriggerKind::NewCausalEvent,
+        referent: None,
+    });
+    assert!(
+        session.accept_wake().unwrap().is_none(),
+        "a wake must be denied while the trip is un-resumed"
+    );
+    let denial = envelopes(session.log_path())
+        .into_iter()
+        .rev()
+        .find(|e| e.kind == "wake_denied")
+        .expect("denial record");
+    assert!(
+        denial.payload["reason"]["BreakerTripped"].is_string(),
+        "denial names the breaker, got {}",
+        denial.payload["reason"]
+    );
+    session.resume_cognition().unwrap();
+    assert!(
+        session.accept_wake().unwrap().is_some(),
+        "resume un-pauses cognition"
+    );
+    session.close().unwrap();
 }

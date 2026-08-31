@@ -959,6 +959,27 @@ impl Session {
             .map(|r| r.id)
             .unwrap_or_else(BranchId::generate);
 
+        // D-F-Kb: a trip pauses cognition until an explicit user resume
+        // (architecture.md:120), so a reopened session must stay paused
+        // when the canonical `breaker_tripped` record has no later
+        // `cognition_resumed`. The trip payload is the canonical event
+        // payload, so it deserializes straight back into a BreakerTrip.
+        let mut unresumed_trip: Option<kanbei_scheduler::BreakerTrip> = None;
+        kanbei_log::for_each_frame(&log_path, |info| {
+            for line in &info.events {
+                let Ok(env) = Envelope::from_line(line) else {
+                    continue;
+                };
+                match env.kind.as_str() {
+                    "breaker_tripped" => {
+                        unresumed_trip = serde_json::from_value(env.payload).ok();
+                    }
+                    "cognition_resumed" => unresumed_trip = None,
+                    _ => {}
+                }
+            }
+        })?;
+
         let config_manifest = cfg.config.clone();
         let mut session = Self {
             log,
@@ -1012,6 +1033,12 @@ impl Session {
             open_run_span: None,
             gc_pins: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
+
+        // D-F-Kb: re-arm the pause the log still carries, so the reopened
+        // session denies cognition until the user resumes it.
+        if let Some(trip) = unresumed_trip {
+            session.scheduler.pause(trip);
+        }
 
         // M8 wave 2: best-effort automatic GC pass at open (quarantine
         // now, sweep per config; a GC failure must never fail open — the

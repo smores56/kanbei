@@ -506,6 +506,13 @@ impl Scheduler {
         }
     }
 
+    /// Re-arm a pause from a committed trip (D-F-Kb): the session restores
+    /// the paused state at open when the log's last `breaker_tripped` event
+    /// was never resumed.
+    pub fn pause(&mut self, trip: BreakerTrip) {
+        self.paused = Some(trip);
+    }
+
     /// Record an observed trigger (ephemeral; batched at accept time).
     pub fn observe(&mut self, trigger: Trigger) {
         self.pending.push_back(trigger);
@@ -1210,6 +1217,26 @@ mod tests {
         let failed = TerminalOutcome::Failed(FailureKind::Provider);
         let (_, trip) = s.record_outcome(a.run_id, failed, usage, &[]).unwrap();
         assert!(trip.is_none(), "a single failure stays under the kernel floor");
+        assert!(!s.is_paused());
+    }
+
+    #[test]
+    fn pause_re_arms_denial_until_resume() {
+        // D-F-Kb: re-armed pauses behave exactly like a fresh trip.
+        let mut s = Scheduler::new(Budgets::default(), BreakerFloors::default());
+        s.pause(BreakerTrip {
+            counter: BreakerCounter::NoProgressWithoutCausal,
+            value: 5,
+            threshold: 5,
+        });
+        assert!(s.is_paused());
+        match s.accept_wake(false) {
+            WakeDecision::Denied(d) => {
+                assert!(matches!(d.reason, DenialReason::BreakerTripped(_)))
+            }
+            other => panic!("expected denial, got {other:?}"),
+        }
+        s.resume().unwrap();
         assert!(!s.is_paused());
     }
 
