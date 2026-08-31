@@ -82,6 +82,9 @@ impl ProjectionStage for ValidatorStage {
                 .into_iter()
                 .chain(f.source_refs.iter().filter_map(|r| match r {
                     SourceRef::SessionEvent(e) => Some(*e),
+                    // A compaction range covers session events through its
+                    // end — the range's tail is the chronology fact (A-06).
+                    SourceRef::CompactionRange(_, end) => Some(*end),
                     _ => None,
                 }))
                 .filter(|e| *e > frozen_seq)

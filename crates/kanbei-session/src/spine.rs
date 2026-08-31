@@ -1153,10 +1153,14 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
             .collect();
 
         // Scope-stable memory fragments: lifetime always when non-empty,
-        // project when bound (the child's memory.query scope resolution is
-        // what attenuates — the fragments themselves are shared).
+        // project when bound. Children get NO lifetime fragment (R-12:
+        // children do not see user/lifetime memory by default — the
+        // projection must not hand what memory.query's scope resolution
+        // would refuse; the child fold attenuates salience the same way).
         let lifetime = match (&lifetime_root, &lifetime_fold) {
-            (Some(root), Some(fold)) if !fold.claims.is_empty() => {
+            (Some(root), Some(fold))
+                if !fold.claims.is_empty() && !is_child =>
+            {
                 Some(render_memory_source(*root, fold))
             }
             _ => None,

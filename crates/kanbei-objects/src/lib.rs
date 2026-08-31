@@ -22,6 +22,20 @@ use thiserror::Error;
 /// bounding a hostile/artifacted store.
 pub const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Current time since the epoch (quarantine clock start).
+fn quarantine_clock() -> std::time::SystemTime {
+    std::time::SystemTime::now()
+}
+
+/// Sets a file's mtime via std (no new dependency): the quarantine mtime
+/// IS the grace clock, so quarantine-begin is stamped over the rename's
+/// preserved original mtime.
+fn stamp_mtime(path: &std::path::Path, at: std::time::SystemTime) {
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.set_modified(at);
+    }
+}
+
 /// Per-session content-addressed object store.
 ///
 /// Objects live flat in one directory, named `<digest display>` (e.g.
@@ -180,12 +194,22 @@ impl ObjectStore {
             return Ok(Vec::new());
         }
         std::fs::create_dir_all(self.gc_dir())?;
+        let now = quarantine_clock();
         let mut moved = Vec::new();
         for digest in digests {
             let src = self.path_for(digest);
             let dst = self.gc_dir().join(digest.to_string());
             match std::fs::rename(&src, &dst) {
-                Ok(()) => moved.push(*digest),
+                Ok(()) => {
+                    // The quarantine mtime IS the grace clock (F-F4): stamp
+                    // quarantine-begin at the rename, because the rename
+                    // preserves the object's original mtime — a
+                    // re-referenced-then-re-quarantined object would
+                    // otherwise keep its first-quarantine clock and be
+                    // deleted on the next sweep immediately.
+                    stamp_mtime(&dst, now);
+                    moved.push(*digest);
+                }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }

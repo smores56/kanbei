@@ -150,19 +150,36 @@ impl Session {
 
     /// Emit the storage gauges (filesystem observations + canonical seq):
     /// objects count/bytes, log bytes/seq, projection bytes.
-    pub(crate) fn telemetry_storage(&self) -> Result<(), SessionError> {        let Some(t) = &self.telemetry else {
+    pub(crate) fn telemetry_storage(&self) -> Result<(), SessionError> {
+        let Some(t) = &self.telemetry else {
             return Ok(());
         };
         let session_id = self.session_id.to_string();
-        t.metric(
-            "kanbei.objects.count",
-            self.store().scan()?.len() as i64,
-            &[("session_id", AttrValue::Str(session_id.clone()))],
-        );
+        // One listing pass computes both gauges: count + bytes previously
+        // scanned twice (a full read_dir + digest parse per entry, then a
+        // second read_dir + per-file stat) on EVERY run outcome.
+        let mut objects_count: i64 = 0;
         let mut objects_bytes: i64 = 0;
         for entry in std::fs::read_dir(self.cfg.dir.join("objects"))? {
-            objects_bytes += entry?.metadata()?.len() as i64;
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            if !meta.is_file() {
+                continue;
+            }
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| Digest::from_hex(n).is_ok())
+            {
+                objects_count += 1;
+                objects_bytes += meta.len() as i64;
+            }
         }
+        t.metric(
+            "kanbei.objects.count",
+            objects_count,
+            &[("session_id", AttrValue::Str(session_id.clone()))],
+        );
         t.metric(
             "kanbei.objects.bytes",
             objects_bytes,

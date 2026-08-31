@@ -64,7 +64,9 @@ impl ProjectRegistry {
             .map_err(|e| MemoryError::InvalidInput(format!("project entry serialization: {e}")))?;
         let mut f = File::options().append(true).create(true).open(&self.file)?;
         writeln!(f, "{line}")?;
-        f.flush()?;
+        // canonical stream: the entry is durable before register acks
+        // (sync_data is the content; the parent dir already exists)
+        f.sync_data()?;
         Ok(())
     }
 
@@ -89,12 +91,22 @@ impl ProjectRegistry {
             context: format!("{}: not utf-8: {e}", self.file.display()),
         })?;
         let mut out = Vec::new();
+        let total = text.lines().count();
         for (idx, line) in text.lines().enumerate() {
             let line_no = idx + 1;
-            let entry: ProjectEntry =
-                serde_json::from_str(line).map_err(|e| MemoryError::Corrupt {
-                    context: format!("{} line {line_no}: {e}", self.file.display()),
-                })?;
+            let entry: ProjectEntry = match serde_json::from_str(line) {
+                Ok(entry) => entry,
+                // Torn final line (crash between write and flush): the
+                // registry is the writer's own file — the last line is
+                // dropped exactly like an append-log torn tail, instead of
+                // bricking every future `list()` with Corrupt.
+                Err(_e) if idx + 1 == total && !text.ends_with('\n') => break,
+                Err(e) => {
+                    return Err(MemoryError::Corrupt {
+                        context: format!("{} line {line_no}: {e}", self.file.display()),
+                    })
+                }
+            };
             if entry.schema != PROJECT_ENTRY_SCHEMA {
                 return Err(MemoryError::Corrupt {
                     context: format!(
