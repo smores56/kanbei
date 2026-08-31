@@ -503,12 +503,14 @@ pub struct PendingIntent {
 
 // ---------- session ----------
 
-/// Driver-side approval resolver: decides a parked approval-gated intent
-/// during the cognition loop (`true` = approve, `false` = leave parked for
-/// `Session::resolve_approval`). Unattended batteries wire an auto-approve
-/// stand-in for the user; production wires the UI approval queue.
+/// Driver-side approval resolver: decides the newest parked approval-gated
+/// intent during the cognition loop (`true` = approve, `false` = leave
+/// parked for `Session::resolve_approval`). The parked intent carries the
+/// committed tool, arguments, and bindings the driver presents to the user
+/// (R-16/D-12). Unattended batteries wire an auto-approve stand-in;
+/// production wires the interactive approval queue.
 pub type ApprovalResolver =
-    std::sync::Arc<dyn Fn(&kanbei_core::digest::Digest) -> bool + Send + Sync>;
+    std::sync::Arc<dyn Fn(&kanbei_tools::ApprovalParked) -> bool + Send + Sync>;
 
 pub struct Session {
     log: AppendLog,
@@ -2603,7 +2605,7 @@ impl Session {
     }
 
     /// The envelope at `seq`, scanning the log (M6 checkpoint validation).
-    fn envelope_at(&self, seq: u64) -> Result<Envelope, SessionError> {
+    pub fn envelope_at(&self, seq: u64) -> Result<Envelope, SessionError> {
         let log_path = self.log_path.clone();
         let mut found: Option<Envelope> = None;
         kanbei_log::for_each_frame(&log_path, |info| {

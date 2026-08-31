@@ -616,13 +616,14 @@ impl Session {
 /// stays parked for explicit `resolve_approval`; otherwise the resolved
 /// outcome (already dispatched + committed by the resolve).
 fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionError> {
-    let Some(digest) = self.pending_approvals().last().copied() else {
+    let Some(last) = self.approvals.back() else {
         return Ok(None);
     };
+    let digest = last.approval.digest;
     let Some(resolver) = self.approval_resolver.clone() else {
         return Ok(None);
     };
-    if !resolver(&digest) {
+    if !resolver(last) {
         return Ok(None);
     }
     self.resolve_approval(&digest, true)
