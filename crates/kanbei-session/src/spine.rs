@@ -721,9 +721,13 @@ impl Session {
     /// Commit a tool outcome record (the committed intent's fact — R-02).
     /// The outcome's result runs the retention gate FIRST (R-28/D-S1: tools
     /// emit candidates; policy decides before persistence); a boundary fact
-    /// commits alongside the outcome.
+    /// commits alongside the outcome. The gate's bytes are what commit: a
+    /// `Transform` redaction must reach storage, not just a fee note
+    /// (R-04/D-07). A policy error is fail-closed — unclassified candidate
+    /// bytes never commit; the outcome classifies `Interrupted`.
     pub fn commit_tool_outcome(&mut self, outcome: &ToolOutcome) -> Result<(), SessionError> {
         self.fault(crate::FaultPoint::BeforeToolOutcomeCommit);
+        let mut outcome = outcome.clone();
         let mut boundary: Option<kanbei_policy::BoundaryFact> = None;
         if outcome.error.is_none() && outcome.result != Value::Null {
             let candidate = kanbei_policy::Candidate {
@@ -736,8 +740,33 @@ impl Session {
                 sensitivity: None,
                 media: Some("application/json".into()),
             };
-            if let Ok(admission) = self.policy.admit(candidate) {
-                boundary = self.policy.boundary_fact(&admission);
+            match self.policy.admit(candidate) {
+                Ok(admission) => {
+                    boundary = self.policy.boundary_fact(&admission);
+                    match admission {
+                        kanbei_policy::Admission::Stored { bytes } => {
+                            // The gate stores exactly these bytes; the
+                            // canonical outcome carries them, not the raw
+                            // result a Transform replaced.
+                            outcome.result = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                                Value::String(String::from_utf8_lossy(&bytes).to_string())
+                            });
+                            outcome.retained = Some(true);
+                        }
+                        kanbei_policy::Admission::Dropped { .. } => {
+                            // A permitted Drop never stores the candidate.
+                            outcome.result = Value::Null;
+                            outcome.retained = Some(false);
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    outcome.result = Value::Null;
+                    outcome.retained = None;
+                    outcome.classification =
+                        OutcomeClassification::Interrupted(format!("retention gate failed closed: {e}"));
+                }
             }
         }
         let mut events = Vec::new();
