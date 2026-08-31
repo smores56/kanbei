@@ -1040,6 +1040,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kanbei-cli"
+version = "0.1.0"
+dependencies = [
+ "kanbei-core",
+ "kanbei-driver",
+ "kanbei-provider",
+ "kanbei-session",
+ "kanbei-tools",
+ "kanbei-vm",
+ "serde_json",
+]
+
+[[package]]
 name = "kanbei-context"
 version = "0.1.0"
 dependencies = [
@@ -1062,6 +1075,19 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "uuid",
+]
+
+[[package]]
+name = "kanbei-driver"
+version = "0.1.0"
+dependencies = [
+ "kanbei-core",
+ "kanbei-provider",
+ "kanbei-scheduler",
+ "kanbei-session",
+ "kanbei-testkit",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

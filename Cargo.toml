@@ -6,6 +6,8 @@ members = [
     "crates/kanbei-memory",
     "crates/kanbei-objects",
     "crates/kanbei-session",
+    "crates/kanbei-driver",
+    "crates/kanbei-cli",
     "crates/kanbei-snapshot",
     "crates/kanbei-projection",
     "crates/kanbei-testkit",
@@ -35,6 +37,8 @@ default-members = [
     "crates/kanbei-memory",
     "crates/kanbei-objects",
     "crates/kanbei-session",
+    "crates/kanbei-driver",
+    "crates/kanbei-cli",
     "crates/kanbei-snapshot",
     "crates/kanbei-projection",
     "crates/kanbei-testkit",
@@ -66,6 +70,7 @@ kanbei-log = { path = "crates/kanbei-log" }
 kanbei-memory = { path = "crates/kanbei-memory" }
 kanbei-objects = { path = "crates/kanbei-objects" }
 kanbei-session = { path = "crates/kanbei-session" }
+kanbei-driver = { path = "crates/kanbei-driver" }
 kanbei-snapshot = { path = "crates/kanbei-snapshot" }
 kanbei-telemetry = { path = "crates/kanbei-telemetry" }
 kanbei-gc = { path = "crates/kanbei-gc" }
