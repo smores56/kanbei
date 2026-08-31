@@ -430,6 +430,7 @@ pub mod wasm {
     const POLICY_VM_CONFIG: VmConfig = VmConfig {
         max_memory_bytes: 64 * 1024 * 1024,
         max_tables: 100,
+        max_table_elements: 10_000,
         max_instances: 10,
         fuel_per_call: 1u64 << 35,
         epoch_deadline: u64::MAX,

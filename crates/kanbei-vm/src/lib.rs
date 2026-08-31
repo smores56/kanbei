@@ -58,6 +58,9 @@ pub struct VmConfig {
     pub max_memory_bytes: usize,
     /// Per-instance table count ceiling.
     pub max_tables: u32,
+    /// Per-instance table element ceiling (B-F14): bounds a table without a
+    /// module-declared maximum (wasmtime's StoreLimits default is 10_000).
+    pub max_table_elements: usize,
     /// Per-instance instance count ceiling.
     pub max_instances: u32,
     /// Fuel budget each guest call (and `kb_init`) starts with.
@@ -77,6 +80,7 @@ impl Default for VmConfig {
         Self {
             max_memory_bytes: 64 * 1024 * 1024,
             max_tables: 100,
+            max_table_elements: 10_000,
             max_instances: 10,
             fuel_per_call: 1_000_000,
             epoch_deadline: 1,
@@ -159,6 +163,10 @@ struct Limiter {
     memory_size: usize,
     instances: usize,
     tables: usize,
+    /// Per-instance table element ceiling (B-F14): wasmtime's StoreLimits also
+    /// caps table elements per store, which bounds a table without a
+    /// module-declared maximum.
+    max_table_elements: usize,
 }
 
 impl ResourceLimiter for Limiter {
@@ -177,10 +185,14 @@ impl ResourceLimiter for Limiter {
     fn table_growing(
         &mut self,
         _current: usize,
-        _desired: usize,
+        desired: usize,
         maximum: Option<usize>,
     ) -> Result<bool, WasmError> {
-        Ok(maximum.is_none_or(|max| _desired <= max))
+        // B-F14: reject growth past the store's element ceiling too, so an
+        // undeclared-maximum table cannot grow without bound. Rejection is
+        // graceful here (Ok(false) — the guest's table.grow fails), matching
+        // how StoreLimits bounds tables.
+        Ok(desired <= self.max_table_elements && maximum.is_none_or(|max| desired <= max))
     }
 
     fn instances(&self) -> usize {
@@ -473,6 +485,7 @@ impl Vm {
             memory_size: self.config.max_memory_bytes,
             instances: self.config.max_instances as usize,
             tables: self.config.max_tables as usize,
+            max_table_elements: self.config.max_table_elements,
         };
         let wasi = WasiCtxBuilder::new().build_p1();
         let mut store = Store::new(&self.engine, Ctx { limiter, wasi });
@@ -670,5 +683,32 @@ impl Instance {
             0 => Ok(()),
             other => Err(guest_code(other)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B-F14: a table without a module-declared maximum is still bounded by
+    /// the store's element ceiling, and the rejection is graceful (the guest
+    /// sees a failed table.grow).
+    #[test]
+    fn table_growth_bounded_without_declared_maximum() {
+        let mut l = Limiter {
+            memory_size: 1024,
+            instances: 1,
+            tables: 1,
+            max_table_elements: 10,
+        };
+        assert!(l.table_growing(0, 10, None).unwrap(), "growth to the ceiling passes");
+        assert!(
+            !l.table_growing(10, 11, None).unwrap(),
+            "growth past the ceiling is rejected without a declared maximum"
+        );
+        // The module-declared maximum still applies on its own.
+        assert!(!l.table_growing(0, 11, Some(10)).unwrap());
+        assert!(l.table_growing(0, 10, Some(10)).unwrap());
+        assert!(l.table_growing(0, 10, Some(50)).unwrap());
     }
 }
