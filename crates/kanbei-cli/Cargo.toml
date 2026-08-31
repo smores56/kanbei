@@ -1,0 +1,18 @@
+[package]
+name = "kanbei-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kanbei"
+path = "src/main.rs"
+
+[dependencies]
+kanbei-core.workspace = true
+kanbei-driver.workspace = true
+kanbei-provider.workspace = true
+kanbei-session.workspace = true
+kanbei-tools.workspace = true
+kanbei-vm.workspace = true
+serde_json.workspace = true
