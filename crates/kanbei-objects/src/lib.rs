@@ -493,7 +493,7 @@ mod tests {
         let err = store.install(&big).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         // nothing landed (no partial temp, no object)
-        let entries = std::fs::read_dir(dir.join("objects")).unwrap().count();
+        let entries = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(entries, 0, "no temp or object may leak from a rejected install");
         std::fs::remove_dir_all(&dir).unwrap();
         drop(store);
