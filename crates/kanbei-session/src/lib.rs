@@ -581,12 +581,6 @@ pub struct Session {
     /// The memory roots pinned by the checkpoint this branch continues from
     /// (wave 2 consumes them).
     pinned_roots: Option<PinnedRoots>,
-    /// The memory actors' fault injector (cloned into both actors at open).
-    /// Held here per the crash-test contract so the harness can arm it via
-    /// its own shared Arc before the memory flow runs; the session itself
-    /// never fires it.
-    #[allow(dead_code)]
-    memory_fault: Option<Arc<dyn kanbei_memory::MemoryFaultInjector>>,
     /// Child-run provider factory (R-09); None = child.spawn errors.
     child_provider: Option<Box<dyn FnMut() -> Box<dyn kanbei_scheduler::CognitionProvider>>>,
     // --- M8 wave 1 telemetry (optional; feature `otel`) ---
@@ -1025,7 +1019,6 @@ impl Session {
             branch_records,
             config_digest: None,
             pinned_roots: None,
-            memory_fault,
             child_provider,
             #[cfg(feature = "otel")]
             telemetry,
