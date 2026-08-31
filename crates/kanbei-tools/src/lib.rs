@@ -570,15 +570,28 @@ fn str_arg(args: &Value, key: &str) -> Result<String, ToolError> {
 
 /// Resolve a possibly-relative path against the fs root; absolute paths
 /// outside the root are rejected (fs tools never escape the session root).
+/// Containment is checked on the LEXICALLY normalized path first: a target
+/// that does not exist yet cannot rely on `canonicalize` to expose a `..`
+/// escape (`root/../x` passes a component-wise prefix check on the spelt
+/// path).
 fn resolve(root: &Path, p: &str) -> Result<PathBuf, ToolError> {
     let cand = Path::new(p);
+    let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let joined = if cand.is_absolute() {
         cand.to_path_buf()
     } else {
-        root.join(cand)
+        root_abs.join(cand)
     };
-    let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let joined_abs = joined.canonicalize().unwrap_or(joined.clone());
+    let joined_lex = normalize_lexical(&joined);
+    if !joined_lex.starts_with(&root_abs) {
+        return Err(ToolError::InvalidArgs(
+            "fs".into(),
+            format!("path escapes session root: {p}"),
+        ));
+    }
+    // Canonicalize when the target exists so a symlinked directory cannot
+    // route the real destination outside the root.
+    let joined_abs = joined_lex.canonicalize().unwrap_or(joined_lex);
     if !joined_abs.starts_with(&root_abs) {
         return Err(ToolError::InvalidArgs(
             "fs".into(),
@@ -586,6 +599,25 @@ fn resolve(root: &Path, p: &str) -> Result<PathBuf, ToolError> {
         ));
     }
     Ok(joined_abs)
+}
+
+/// Lexical normalization (resolve `.`/`..` without touching the filesystem).
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::Prefix(_) => return path.to_path_buf(),
+            Component::RootDir | Component::Normal(_) => out.push(comp),
+            Component::ParentDir => {
+                // Popping past the root leaves the lexical root itself, which
+                // then fails the containment prefix check.
+                out.pop();
+            }
+        }
+    }
+    out
 }
 
 fn walk(dir: &Path, query: &str, max: usize, out: &mut Vec<String>) -> std::io::Result<()> {
@@ -862,6 +894,44 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgs(_, _)));
+    }
+
+    /// Nonexistent targets must not escape: `canonicalize` fails for a path
+    /// that does not exist yet, so `..` escapes can only be caught lexically.
+    #[test]
+    fn fs_tools_reject_dotdot_escape_on_nonexistent_target() {
+        let root = tmpdir("escape-nonexistent");
+        let mut t = tools();
+        let reg = registry();
+        for path in ["../escaped.txt", "sub/../../escaped.txt"] {
+            let err = execute_tool(
+                &mut t,
+                &reg,
+                "fs.write",
+                &json!({"path": path, "content": "leak"}),
+                &root,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, ToolError::InvalidArgs(ref k, _) if k == "fs"),
+                "{path}: expected escape rejection, got {err:?}"
+            );
+        }
+        assert!(
+            !root.parent().unwrap().join("escaped.txt").exists(),
+            "the escape committed bytes outside the root"
+        );
+        // the same spell inside the root still succeeds
+        execute_tool(
+            &mut t,
+            &reg,
+            "fs.write",
+            &json!({"path": "sub/../inside.txt", "content": "ok"}),
+            &root,
+        )
+        .unwrap();
+        assert!(root.join("inside.txt").exists());
+        let _ = (t, reg);
     }
 
     #[test]
