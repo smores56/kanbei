@@ -33,7 +33,10 @@ fn main() {
             println!(
                 "cargo:warning=kanbei-guest wasm not found (set KANBEI_GUEST_WASM or run \
                  `cargo build -p kanbei-guest --target wasm32-wasip1 --release`); \
-                 embedding empty stub — Vm::load returns NotBuilt"
+                 embedding empty stub — Vm::load returns NotBuilt. After building \
+                 the guest, run `cargo clean -p kanbei-vm` once: while the stub is \
+                 embedded, cargo does not recompile kanbei-vm, so the stale stub \
+                 freezes until then."
             );
             fs::write(&out, []).expect("write empty guest stub");
         }

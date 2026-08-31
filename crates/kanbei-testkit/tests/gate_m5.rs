@@ -23,6 +23,23 @@ fn engine() -> kanbei_vm::VmConfig {
     }
 }
 
+/// Module tests need the guest wasm; without it they skip with a note (the
+/// crash matrix skips too — its points fire inside the module lifecycle, so
+/// a wasm-less run would fail every point instead).
+fn require_guest() -> bool {
+    match kanbei_vm::Vm::load(engine()) {
+        Ok(_) => true,
+        Err(kanbei_vm::GuestError::NotBuilt) => {
+            eprintln!(
+                "skip: guest wasm not built (run `cargo build -p kanbei-guest \
+                 --target wasm32-wasip1 --release`)"
+            );
+            false
+        }
+        Err(e) => panic!("guest vm load: {e}"),
+    }
+}
+
 fn tempdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "kanbei-m5-{tag}-{}-{}",
@@ -417,6 +434,13 @@ fn hot_path_structure() {
 fn crash_matrix_m5() {
     if std::env::var("KANBEI_SKIP_CRASH").is_ok() {
         eprintln!("skip: KANBEI_SKIP_CRASH set");
+        return;
+    }
+    // The M5 points fire inside the UI module lifecycle; without the guest
+    // wasm the child never activates a module and every point FAILS instead
+    // of skipping (every other m5 test guards on `modules().is_none()` — the
+    // matrix must too, or the suite is red on a clean tree).
+    if !require_guest() {
         return;
     }
     let points = [
