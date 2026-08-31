@@ -78,7 +78,7 @@ implemented change, and the amendment proposals follow.
 | `d2cd7b9` quota test fix | — |
 | `c16ad63` child-lifetime gate, chronology compaction ranges, GC mtime clock, gauge single pass, registry durability | E-F3, E-F9, F-F4, F-F5, E-F10 |
 
-Gates on the final tree: `cargo nextest run --workspace` **544 passed / 2
+Gates on the final tree: `cargo nextest run --workspace` **549 passed / 2
 skipped** (baseline 535 — the delta is this review's regression tests),
 `--all-features` and `--run-ignored all` green, `cargo clean -p` every
 touched crate + `cargo clippy --workspace -- -D warnings` **clean**.
@@ -128,7 +128,7 @@ each lane's clean list is in the lane records.
 | B-F11 | mod | craft | `Host` stringly; `STALE_GENERATION` magic string duplicated across vm/modules. | **Deferred** (craft, small). |
 | B-F12 | mod | craft | ABI consts scattered; `SCRATCH_SIZE` unshared and the vm-initiated scratch write unchecked (oversized args scribble guest statics instead of a typed error). | **Deferred**: shared `kanbei-abi` consts crate sketched; bounds-check on the vm write path is the safety-relevant slice. |
 | B-F13 | mod | craft | POLICY_VM_CONFIG epoch comments factually wrong (absolute-vs-relative; relies on the invisible `MAX/2` clamp). | **Deferred** (small): `VmConfig::without_epoch_deadline()` + comment fixes. |
-| B-F14 | mod | eff | Custom `Limiter` drops the per-table element bound. | **Deferred** (3 lines): `max_table_elements`. |
+| B-F14 | mod | eff | Custom `Limiter` drops the per-table element bound. | **Fixed** (`04f0005`): `VmConfig::max_table_elements` (default 10_000, StoreLimits' default); `table_growing` rejects past the ceiling, gracefully like the memory path. |
 | B-F15 | minor | fid | Caller/tool-provider legs collapsed; `principal.run` always None (documented M2 scope). | **Wontfix** (documented deferral), recorded for the run-lane. |
 | B-F16 | mod | craft | `admit` bypasses the kernel replay-default resolution (candidate bit `Some` always); `with_replay_default(false)` can open the default wide. | **Deferred** (small): `admit(declared: Option<bool>)`, privatize the default setter. |
 | B-F17 | minor | craft | Memory fault points never exercised by an *aborting* crash child. | **Wontfix/moot**: lane B's premise is stale — `crash_child.rs` m4 mode drives `MemoryAbortInjector` under gate_m4 (verified by lane G's reachability table). |
@@ -161,8 +161,8 @@ each lane's clean list is in the lane records.
 | D-F-H | major | fid | `effect_dispatch` and `restore_workspace` bypass intent-before-dispatch (restore writes the tree then commits the event). | **Deferred**: commit `workspace_restore_intent` before executing; `effect_dispatch` needs an event vocabulary decision (hosted effects are the R-19 tier-2 seam). |
 | D-F-I | major | fid | R-08/E-13 rendered-hash equality "enforced by construction" — no typed check, no outcome→intent ref, `commit_tool_outcome` accepts any outcome. | **Deferred**: re-read the committed intent at outcome commit; validate intent-pairing for committed outcomes (the pending-intent scan already provides the data at open). |
 | D-F-J | major | fid | No responder preemption: any wake is denied `ConcurrencyLimit` while a run is active (doc comment claims auto-cancel — false); single-threaded driver cannot process input during a run. | **Deferred**: responder-accept → cancel active cognition run; needs a concurrency-model note (the single-actor driver is by ratified design). |
-| D-F-K | major | fid | Breaker floors unclamped (doc claims clamping); paused state not restored at open (re-open un-pauses cognition without user resume — arch:120). | **Deferred**: clamp at `Scheduler::new`; restore `paused` from the last unresumed `breaker_tripped`. Both small, gate-shaped. |
-| D-F-L | major | fid | No-progress counter never resets on causal events ("ever-progressed" semantics vs arch:120). | **Deferred** (small, gate-shaped). |
+| D-F-K | major | fid | Breaker floors unclamped (doc claims clamping); paused state not restored at open (re-open un-pauses cognition without user resume — arch:120). | **Fixed** (`3bea9c7` + `b668207`): `Scheduler::new` clamps every floor field to the kernel defaults; open re-arms an un-resumed trip from the last `breaker_tripped` event lacking a `cognition_resumed` (deserialized `BreakerTrip` → `Scheduler::pause`). Tests added; three pre-existing tests tuned below the kernel floor were raised to it (their config was un-clamped before). |
+| D-F-L | major | fid | No-progress counter never resets on causal events ("ever-progressed" semantics vs arch:120). | **Fixed** (`683fb55`): the streak restarts on a causal event since the previous outcome (the old guard evaluated to always-true and was removed). |
 | D-F-M | minor | fid | Egress sensitivity classes hardcoded (`vec!["call"]`). | **Deferred** (fold real fragment classes). |
 | D-F-N | minor | fid | Compaction selection has enforcement, no kernel API; "causal-closed" is fragment-id containment, not a causal-parent check. | **Wontfix** (deferred milestone-shaped; enforcement half exists and tests drive the kind manually). |
 | D-F-O | major | fid | SessionId never persisted; default lifetime memory is per-session (`<dir>/memory` vs the XDG shared `memory/lifetime`); no `sessions/<SessionId>/` layout; import reverse-engineers the id from markers. | **Deferred (layout)** / **partial**: identity persistence (session.json at open, import reads it) is the bounded slice that kills the T3 fragility — recorded as the pick; full XDG layout conformance is a storage-model wave. |
@@ -174,7 +174,7 @@ each lane's clean list is in the lane records.
 | T1 WireProtocol | minor | craft | `WireProtocol` on `SessionConfig` (wrong home; cost = 16 ProviderConfig literals). | **Deferred**, pick recorded: `protocol: Option<WireProtocol>` on `ProviderConfig` with `serde(default)`, one-line literal fixes. |
 | T2 fork surface | minor | — | `ForkOptions` carries a whole `SessionConfig` (~80% silently overridden); grant set correct per arch:212 but the approval path made it toothless (now fixed); `truncate_log_at` splice verified correct. | **Partial**: the toothless-approval half is fixed by D-B-C; the facade-streamlining deferred with the candidate (record cut seq+offset in the `forked` fact). |
 | T4 quiesce duplication | minor | craft | adopt/continue_from share ~50 copied lines. | **Deferred** (factor `quiesce(tail_cutoff)`). |
-| T8 memory_fault | minor | craft | `#[allow(dead_code)]` field genuinely dead. | **Deferred** — now that lanes verified it, removal is 3 lines; lost to wave budget (recorded). |
+| T8 memory_fault | minor | craft | `#[allow(dead_code)]` field genuinely dead. | **Fixed** (`58c75b1`): field + allow + assignment deleted; `SessionConfig.memory_fault` stays (it feeds the actor wiring). |
 | T9 gauges | major | eff | O(objects) scan per run outcome under otel. | **Fixed** in `c16ad63` (single pass). |
 
 ### E. Memory / context / retrieval (kanbei-memory, -context, -retrieval)
@@ -323,3 +323,19 @@ the fidelity rule (cite both passages; amend; never silently reconcile).
 
 Baseline comparison: `main@d84908c` = 535 default tests; final tree 544
 (+9: approval ×4, retrieval ×2, gc ×1, objects quota ×1, plus guard changes).
+
+## Addendum — fixer wave 2 (medium-tier delegation)
+
+| Commit | Finding |
+|---|---|
+| `3bea9c7` breaker floor clamp at construction + test | D-F-Ka |
+| `b668207` paused state restored at open from an un-resumed trip (scheduler `pause()` + open scan) + tests | D-F-Kb |
+| `683fb55` no-progress streak restarts on fresh causal events + test | D-F-L |
+| `58c75b1` dead `Session.memory_fault` copy removed (config field stays) | T8 |
+| `04f0005` per-store table element bound (`VmConfig::max_table_elements`) + test | B-F14 |
+
+Three pre-existing tests tuned below the kernel floor were raised to the
+first cloned floor (their configs predate the clamp; the kernel floor is
+the design's minimum — `consecutive_failed` 3, identical actions 4). The
+dogfood spend scenario's sub-floor values survive because that battery is
+`#[ignore]`d by convention.
