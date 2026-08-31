@@ -119,6 +119,55 @@ fn no_epoch() -> VmConfig {
 
 // --- session-store GC -------------------------------------------------------
 
+/// Workspace snapshots must survive GC: the blobs behind a snapshot's
+/// manifest are referenced only inside the manifest object, so the
+/// collector has to walk that closure — anything else quarantines every
+/// workspace blob on the first run and sweeps them after grace.
+#[test]
+fn workspace_snapshot_blobs_survive_gc() {
+    let tmp = TempDir::new("gc-workspace");
+    let dir = tmp.path().to_path_buf();
+    let ws = dir.join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(ws.join("b.txt"), b"beta").unwrap();
+    let mut session = Session::open(SessionConfig {
+        dir: dir.clone(),
+        fs_root: ws.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+    let manifest = session
+        .snapshot_workspace(kanbei_workspace::SnapshotOptions::default())
+        .unwrap();
+    let parsed: kanbei_workspace::Manifest = serde_json::from_slice(
+        &session.store().get(&manifest).unwrap(),
+    )
+    .unwrap();
+    let blobs: Vec<Digest> = parsed
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            kanbei_workspace::Entry::File { digest, .. } => Some(*digest),
+            _ => None,
+        })
+        .collect();
+    assert!(blobs.len() >= 2, "the snapshot grounded its file blobs");
+
+    // a sweep with zero grace deletes anything the collector missed
+    let report = session.run_gc(sweep_cfg()).unwrap();
+    for digest in &blobs {
+        assert!(
+            session.store().exists(digest),
+            "workspace blob {digest} was quarantined by GC (swept: {})",
+            report.swept
+        );
+    }
+    let restored = session.restore_workspace(&manifest).unwrap();
+    assert_eq!(restored.entries_restored, parsed.entries.len() as u64);
+    session.close().unwrap();
+}
+
 #[test]
 fn orphan_swept_and_gc_run_recorded() {
     let tmp = TempDir::new("session-basic");
