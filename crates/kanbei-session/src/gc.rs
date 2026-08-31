@@ -216,18 +216,13 @@ impl Collector for SessionCollector {
             let Ok(bytes) = store.get(&digest) else {
                 continue;
             };
-            let Ok(manifest) =
-                serde_json::from_slice::<kanbei_snapshot::ExecutionManifest>(&bytes)
-            else {
+            // fail-closed on future schemas only; a corrupt/missing
+            // manifest object cannot classify its closure, so it stays
+            // referenced (below)
+            let Ok(manifest) = kanbei_snapshot::ExecutionManifest::from_bytes(&bytes) else {
                 continue;
             };
-            let mut closure = kanbei_snapshot::manifest_closure(&manifest);
-            for pin in [manifest.engine_digest, manifest.toolchain_digest]
-                .into_iter()
-                .flatten()
-            {
-                closure.remove(&pin);
-            }
+            let closure = kanbei_snapshot::store_closure(&manifest);
             out.extend(closure);
         }
         Ok(())

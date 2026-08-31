@@ -17,6 +17,16 @@ use serde::{Deserialize, Serialize};
 /// tool-registry/provider/scheduler pins; 2 — module pins + composition
 /// digest).
 pub const MANIFEST_SCHEMA: u32 = 4;
+/// Fail-closed manifest decode errors (see
+/// [`ExecutionManifest::from_bytes`]).
+#[derive(Debug, thiserror::Error)]
+pub enum ManifestDecodeError {
+    #[error("manifest JSON decode: {0}")]
+    Serde(#[source] serde_json::Error),
+    #[error("manifest schema {schema} is newer than this kernel supports ({current}); refusing a lossy decode")]
+    FutureSchema { schema: u32, current: u32 },
+}
+
 
 /// One active module generation pin: stable module id, generation, package
 /// digest, and the scope it was activated in (M2: "/" — root scope only).
@@ -78,7 +88,43 @@ pub struct ExecutionManifest {
     pub schema_versions: Vec<u32>,
 }
 
+/// The store-verifiable closure of a manifest: every digest field EXCEPT the
+/// kernel-embedded identity pins — the engine/toolchain digests are build
+/// artifacts (`include_bytes!`), never store objects, so they never need to
+/// verify in a store. One shared helper: the exclusion was previously
+/// hand-duplicated at four call sites (session export/fork/adopt, gc), each
+/// of which could silently drop it and report false `Missing` closures.
+pub fn store_closure(manifest: &ExecutionManifest) -> std::collections::HashSet<Digest> {
+    let mut out = manifest_closure(manifest);
+    for pin in [manifest.engine_digest, manifest.toolchain_digest]
+        .into_iter()
+        .flatten()
+    {
+        out.remove(&pin);
+    }
+    out
+}
+
 impl ExecutionManifest {
+    /// Fail-closed decode (constitution §7: explicit schema versions): a
+    /// manifest written by a NEWER schema would otherwise deserialize
+    /// cleanly while silently dropping its new digest fields — the derived
+    /// closure would then omit objects while verification still claimed
+    /// completeness. Unknown-future schemas are rejected; older schemas
+    /// decode (`<= MANIFEST_SCHEMA`, the ratified defaults-based
+    /// back-compat).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ManifestDecodeError> {
+        let manifest: ExecutionManifest = serde_json::from_slice(bytes)
+            .map_err(ManifestDecodeError::Serde)?;
+        if manifest.schema > MANIFEST_SCHEMA {
+            return Err(ManifestDecodeError::FutureSchema {
+                schema: manifest.schema,
+                current: MANIFEST_SCHEMA,
+            });
+        }
+        Ok(manifest)
+    }
+
     /// Kernel bootstrap manifest — used for the genesis snapshot (R-08: "A
     /// genesis event uses an explicit kernel bootstrap snapshot").
     pub fn bootstrap() -> Self {

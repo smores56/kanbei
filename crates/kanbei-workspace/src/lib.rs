@@ -202,7 +202,9 @@ pub fn restore(
 ) -> Result<RestoreReport, WorkspaceError> {
     let bytes = store.get(manifest_digest).map_err(|e| match e {
         ObjectError::Missing { digest } => WorkspaceError::MissingObject { digest },
-        ObjectError::Corruption { digest, .. } => WorkspaceError::Corruption { digest },
+        ObjectError::Corruption { digest, .. } | ObjectError::Quota { digest, .. } => {
+            WorkspaceError::Corruption { digest }
+        }
         ObjectError::Io(source) => WorkspaceError::Io {
             path: store.path_for(manifest_digest),
             source,
@@ -268,7 +270,8 @@ pub fn restore(
                         path: entry.path().into(),
                         written: report.entries_restored,
                     },
-                    ObjectError::Corruption { digest, .. } => WorkspaceError::Corruption { digest },
+                    ObjectError::Corruption { digest, .. }
+                    | ObjectError::Quota { digest, .. } => WorkspaceError::Corruption { digest },
                     ObjectError::Io(source) => WorkspaceError::Io {
                         path: dst.clone(),
                         source,

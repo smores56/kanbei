@@ -1542,13 +1542,7 @@ impl Session {
         // is a kanbei-vm `include_bytes!` constant that never enters the
         // object store), so they are the only digest fields excepted from
         // the store verification.
-        let mut closure = kanbei_snapshot::manifest_closure(&manifest);
-        if let Some(d) = manifest.engine_digest {
-            closure.remove(&d);
-        }
-        if let Some(d) = manifest.toolchain_digest {
-            closure.remove(&d);
-        }
+        let closure = kanbei_snapshot::store_closure(&manifest);
         kanbei_snapshot::verify_closure(&self.store, &closure)
             .map_err(|e| SessionError::Snapshot(format!("checkpoint snapshot closure failed: {e}")))?;
         let memory_root: Option<Digest> = env
@@ -1693,13 +1687,7 @@ impl Session {
         // continue_from).
         let objects_dir = target_dir.join("objects");
         std::fs::create_dir_all(&objects_dir)?;
-        let mut closure = kanbei_snapshot::manifest_closure(&facts.manifest);
-        if let Some(d) = facts.manifest.engine_digest {
-            closure.remove(&d);
-        }
-        if let Some(d) = facts.manifest.toolchain_digest {
-            closure.remove(&d);
-        }
+        let mut closure = kanbei_snapshot::store_closure(&facts.manifest);
         // the snapshot object itself is the manifest bytes (not part of its
         // own closure)
         closure.insert(facts.snapshot);
@@ -2027,15 +2015,9 @@ impl Session {
         let manifest: ExecutionManifest = serde_json::from_slice(&head_bytes).map_err(|e| {
             SessionError::Snapshot(format!("fork head snapshot {head_snapshot} is not a manifest: {e}"))
         })?;
-        let mut closure = kanbei_snapshot::manifest_closure(&manifest);
         // engine/toolchain digests are kernel-embedded identity pins, never
-        // store objects (mirror of continue_from)
-        for pin in [manifest.engine_digest, manifest.toolchain_digest]
-            .into_iter()
-            .flatten()
-        {
-            closure.remove(&pin);
-        }
+        // store objects (shared exclusion in kanbei-snapshot)
+        let closure = kanbei_snapshot::store_closure(&manifest);
         // Resolve every closure digest in the fork's stores FIRST (get
         // hash-verifies): a missing object aborts with nothing installed.
         let mut to_install: Vec<Vec<u8>> = Vec::with_capacity(closure.len() + 1);
@@ -2499,15 +2481,14 @@ impl Session {
                     continue;
                 }
             };
-            let mut closure = kanbei_snapshot::manifest_closure(&manifest);
             // Engine/toolchain digests are kernel-embedded build-time
             // identity pins, not store objects — excluded from the closure,
             // recorded in the report (mirror of continue_from).
+            let closure = kanbei_snapshot::store_closure(&manifest);
             for pin in [manifest.engine_digest, manifest.toolchain_digest]
                 .into_iter()
                 .flatten()
             {
-                closure.remove(&pin);
                 identity_pins.insert(pin);
             }
             for d in closure {

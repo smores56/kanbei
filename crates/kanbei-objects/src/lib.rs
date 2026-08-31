@@ -14,6 +14,14 @@ use kanbei_core::digest::Digest;
 use kanbei_core::queue::{DurabilityQueue, SyncOp};
 use thiserror::Error;
 
+/// Hard per-object size quota (R-22: closes part of `ledger:572`).
+/// Install rejects larger payloads before any write; reads classify
+/// on-disk overshoot as corruption-classified quota violation. Sized at
+/// 64 MiB — comfortably above any single session payload the MVP tool
+/// surface produces (the MAX_STATE_BYTES head quota is 1 MiB) while
+/// bounding a hostile/artifacted store.
+pub const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
+
 /// Per-session content-addressed object store.
 ///
 /// Objects live flat in one directory, named `<digest display>` (e.g.
@@ -47,11 +55,28 @@ impl ObjectStore {
     }
 
     /// Content-addressed install: dedup on existing file; otherwise temp
-    /// write + atomic rename, then enqueue a dirsync on the shared queue.
-    /// No per-object temp fsync (relaxed per packet §8.3); the caller's
-    /// contract is that this dirsync is enqueued before the referencing
-    /// event frame's fsync, both FIFO on the same queue.
+    /// write + atomic rename, then enqueue file-data fsync + dirsync on the
+    /// shared queue (R-10/B-03: fsync temp, rename, fsync parent directory).
+    /// The data fsync keeps the file's fd open across the rename — syncing
+    /// the still-open inode flushes the content the same queue slot the
+    /// dirsync makes the name durable in; both land ahead of the
+    /// referencing event frame's fsync (one FIFO queue). Without it a
+    /// power loss could leave a committed event referencing a renamed-but-
+    /// unwritten object (hash-verify detects, but the contract promises
+    /// prevention, architecture.md:373).
+    /// Objects above the hard per-object quota (R-22) are rejected before
+    /// any write.
     pub fn install(&mut self, bytes: &[u8]) -> io::Result<Digest> {
+        if bytes.len() > MAX_OBJECT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "object payload {} exceeds the per-object quota {}",
+                    bytes.len(),
+                    MAX_OBJECT_BYTES
+                ),
+            ));
+        }
         let digest = Digest::new(bytes);
         let dst = self.path_for(&digest);
         if dst.exists() {
@@ -62,20 +87,23 @@ impl ObjectStore {
             .join(format!(".tmp-{}-{}", std::process::id(), self.installs));
         let mut f = File::create(&tmp)?;
         f.write_all(bytes)?;
-        drop(f);
         std::fs::rename(&tmp, &dst)?;
+        self.queue.enqueue(SyncOp::Fsync(f))?;
         self.installs += 1;
         self.queue.enqueue(SyncOp::Dirsync(self.dir.clone()))?;
         self.dirsyncs += 1;
         Ok(digest)
     }
 
-    /// Waits until every enqueued durability op (incl. our dirsyncs) ran.
+    /// Waits until every enqueued durability op (incl. our fsync/dirsyncs) ran.
     pub fn flush(&self) -> io::Result<()> {
         self.queue.flush()
     }
 
     /// Reads an object and verifies its hash. Never returns unverified bytes.
+    /// Objects are quota-bounded at install; an on-disk object exceeding the
+    /// quota is classified corruption (an externally planted or hand-edited
+    /// file), never silently read.
     pub fn get(&self, want: &Digest) -> Result<Vec<u8>, ObjectError> {
         let mut bytes = Vec::new();
         File::open(self.path_for(want))
@@ -84,6 +112,13 @@ impl ObjectStore {
                 io::ErrorKind::NotFound => ObjectError::Missing { digest: *want },
                 _ => ObjectError::Io(e),
             })?;
+        if bytes.len() > MAX_OBJECT_BYTES {
+            return Err(ObjectError::Quota {
+                digest: *want,
+                bytes: bytes.len(),
+                limit: MAX_OBJECT_BYTES,
+            });
+        }
         let actual = Digest::new(&bytes);
         if actual != *want {
             return Err(ObjectError::Corruption {
@@ -245,6 +280,8 @@ pub enum ObjectError {
         expected: Digest,
         actual: Digest,
     },
+    #[error("object exceeds the per-object quota: {digest}: {bytes} bytes > {limit}")]
+    Quota { digest: Digest, bytes: usize, limit: usize },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -445,5 +482,23 @@ mod tests {
             .shutdown()
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R-22: oversized payloads are rejected before any write — no orphan
+    /// temp files, no partial name.
+    #[test]
+    fn oversized_install_rejected_before_write() {
+        let (dir, mut store, queue) = store("quota");
+        let big = vec![0u8; MAX_OBJECT_BYTES + 1];
+        let err = store.install(&big).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        // nothing landed (no partial temp, no object)
+        let entries = std::fs::read_dir(dir.join("objects")).unwrap().count();
+        assert_eq!(entries, 0, "no temp or object may leak from a rejected install");
+        std::fs::remove_dir_all(&dir).unwrap();
+        drop(store);
+        if let Ok(queue) = Arc::try_unwrap(queue) {
+            let _ = queue.shutdown();
+        }
     }
 }
