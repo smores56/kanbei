@@ -267,7 +267,8 @@ fn acceptance_crash_m3_points() {
 fn breaker_trips_within_budget_and_is_canonical() {
     let dir = fresh_session_dir("breaker");
     let _guard = DirGuard(dir.clone());
-    // Floors low enough to trip within a few runs.
+    // Below the kernel floor: the scheduler clamps it back to 3, so the
+    // trip needs three failures (D-F-Ka).
     let floors = BreakerFloors {
         consecutive_failed: 2,
         ..Default::default()
@@ -281,7 +282,7 @@ fn breaker_trips_within_budget_and_is_canonical() {
     })
     .unwrap();
     let mut session = session;
-    for _ in 0..2 {
+    for _ in 0..3 {
         session.observe_trigger(Trigger {
             kind: TriggerKind::NewCausalEvent,
             referent: None,

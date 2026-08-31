@@ -430,6 +430,19 @@ pub struct Scheduler {
 impl Scheduler {
     pub fn new(budgets: Budgets, floors: BreakerFloors) -> Self {
         let now = now_secs();
+        // D-F-Ka: the floors are kernel-owned — policy may only raise them
+        // (R-17/E-02), so clamp each field at the default instead of trusting
+        // the config to stay above it.
+        let kernel = BreakerFloors::default();
+        let floors = BreakerFloors {
+            consecutive_failed: floors.consecutive_failed.max(kernel.consecutive_failed),
+            no_progress_without_causal: floors
+                .no_progress_without_causal
+                .max(kernel.no_progress_without_causal),
+            identical_action: floors.identical_action.max(kernel.identical_action),
+            spend_window_secs: floors.spend_window_secs.max(kernel.spend_window_secs),
+            spend_tokens: floors.spend_tokens.max(kernel.spend_tokens),
+        };
         Self {
             policy: Box::new(DefaultPolicy),
             floors,
@@ -460,6 +473,12 @@ impl Scheduler {
 
     pub fn is_paused(&self) -> bool {
         self.paused.is_some()
+    }
+
+    /// The effective floors: the configured floors clamped up to the kernel
+    /// defaults at construction (D-F-Ka).
+    pub fn floors(&self) -> BreakerFloors {
+        self.floors
     }
 
     pub fn paused_trip(&self) -> Option<BreakerTrip> {
@@ -990,12 +1009,14 @@ mod tests {
 
     #[test]
     fn consecutive_failed_trips_breaker_and_pauses() {
+        // Below the kernel floor: the clamp raises it back to 3, so the
+        // trip needs three failures (D-F-Ka).
         let floors = BreakerFloors {
             consecutive_failed: 2,
             ..Default::default()
         };
         let mut s = Scheduler::new(Budgets::default(), floors);
-        for _ in 0..2 {
+        for _ in 0..3 {
             s.observe(trigger(TriggerKind::NewCausalEvent));
             let a = match s.accept_wake(false) {
                 WakeDecision::Accepted(a) => a,
@@ -1084,13 +1105,15 @@ mod tests {
 
     #[test]
     fn identical_action_breaker_fires() {
+        // Below the kernel floor: the clamp raises it back to 4, so the
+        // window needs four identical actions (D-F-Ka).
         let floors = BreakerFloors {
             identical_action: 2,
             ..Default::default()
         };
         let mut s = Scheduler::new(Budgets::default(), floors);
         let d = Digest::new(b"same-action");
-        for _ in 0..2 {
+        for _ in 0..4 {
             s.observe(trigger(TriggerKind::NewCausalEvent));
             let a = match s.accept_wake(false) {
                 WakeDecision::Accepted(a) => a,
@@ -1147,6 +1170,46 @@ mod tests {
                 .unwrap();
             assert!(trip.is_none(), "causal events must reset the breaker");
         }
+        assert!(!s.is_paused());
+    }
+
+    #[test]
+    fn breaker_floors_clamp_at_kernel_defaults() {
+        // D-F-Ka: the floors are kernel-owned, so a config below them is
+        // raised to the kernel values — a zero cannot disable a breaker.
+        let floors = BreakerFloors {
+            consecutive_failed: 0,
+            no_progress_without_causal: 0,
+            identical_action: 0,
+            spend_window_secs: 0,
+            spend_tokens: 0,
+        };
+        let s = Scheduler::new(Budgets::default(), floors);
+        assert_eq!(s.floors(), BreakerFloors::default());
+        // Raised values survive untouched.
+        let raised = BreakerFloors {
+            consecutive_failed: 7,
+            ..Default::default()
+        };
+        let s = Scheduler::new(Budgets::default(), raised);
+        assert_eq!(s.floors().consecutive_failed, 7);
+        // The clamped threshold is the one the trip uses: below-default
+        // floors still need the kernel's three failures.
+        let mut s = Scheduler::new(Budgets::default(), floors);
+        s.observe(trigger(TriggerKind::NewCausalEvent));
+        let a = match s.accept_wake(false) {
+            WakeDecision::Accepted(a) => a,
+            other => panic!("expected accepted, got {other:?}"),
+        };
+        let usage = RunUsage {
+            tokens: 0,
+            tools: 0,
+            children: 0,
+            started_at_secs: 0,
+        };
+        let failed = TerminalOutcome::Failed(FailureKind::Provider);
+        let (_, trip) = s.record_outcome(a.run_id, failed, usage, &[]).unwrap();
+        assert!(trip.is_none(), "a single failure stays under the kernel floor");
         assert!(!s.is_paused());
     }
 
