@@ -179,23 +179,18 @@ impl Collector for SessionCollector {
                 // its file blobs are referenced only inside the manifest
                 // object, so the collector must walk that closure or every
                 // opted-in GC run quarantines the snapshot's contents.
-                if matches!(env.kind.as_str(), "workspace_snapshot" | "workspace_restore") {
-                    if let Some(d) = env
+                if matches!(env.kind.as_str(), "workspace_snapshot" | "workspace_restore")
+                    && let Some(d) = env
                         .payload
                         .get("manifest")
                         .and_then(|v| v.as_str())
                         .and_then(|s| s.parse::<Digest>().ok())
-                    {
-                        if let Ok(bytes) = store.get(&d) {
-                            if let Ok(m) =
-                                serde_json::from_slice::<kanbei_workspace::Manifest>(&bytes)
-                            {
-                                for entry in &m.entries {
-                                    if let kanbei_workspace::Entry::File { digest, .. } = entry {
-                                        out.insert(*digest);
-                                    }
-                                }
-                            }
+                    && let Ok(bytes) = store.get(&d)
+                    && let Ok(m) = serde_json::from_slice::<kanbei_workspace::Manifest>(&bytes)
+                {
+                    for entry in &m.entries {
+                        if let kanbei_workspace::Entry::File { digest, .. } = entry {
+                            out.insert(*digest);
                         }
                     }
                 }

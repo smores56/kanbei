@@ -637,9 +637,7 @@ impl Scheduler {
                 None,
             ));
         }
-        let blocker_reason = reason;
-        let result = self.record_outcome_inner(run_id, outcome, usage, action_digests, blocker_reason);
-        result
+        self.record_outcome_inner(run_id, outcome, usage, action_digests, reason)
     }
 
     pub fn record_outcome(
@@ -833,7 +831,7 @@ impl Scheduler {
         if let Some(child) = self.children.get(&run_id) {
             return child.usage;
         }
-        if let Some((id, usage)) = self.last_child_usage.filter(|(id, _)| *id == run_id) {
+        if let Some((_, usage)) = self.last_child_usage.filter(|(id, _)| *id == run_id) {
             return usage;
         }
         self.active

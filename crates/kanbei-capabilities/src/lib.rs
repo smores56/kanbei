@@ -443,13 +443,13 @@ impl Broker {
         // expired approval never rechecks OK. Standing grants without
         // purpose are rejected at add_grant; the intent scope is Run
         // by construction (approval_for).
-        if let Some(expiry) = intent.expiry {
-            if expiry <= now_secs() {
-                return Err(BrokerError::Expired {
-                    resource: intent.action.clone(),
-                    principal: intent.principal.clone(),
-                });
-            }
+        if let Some(expiry) = intent.expiry
+            && expiry <= now_secs()
+        {
+            return Err(BrokerError::Expired {
+                resource: intent.action.clone(),
+                principal: intent.principal.clone(),
+            });
         }
         let actual_policy = self.policy_version();
         if policy_version != actual_policy {
