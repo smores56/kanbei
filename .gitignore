@@ -1,3 +1,9 @@
 /target
 **/target
 spikes/**/target
+
+# Local kanbei session state (the CLI defaults its session dir to ".")
+/log.zst
+/memory/
+/objects/
+/state/
