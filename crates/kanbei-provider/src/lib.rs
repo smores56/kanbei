@@ -216,6 +216,59 @@ impl HttpEngine {
     }
 }
 
+/// Build the OpenAI-compatible request body from the canonical request.
+/// Every system message folds into ONE leading system message (joined with
+/// "\n\n") — the OpenAI API tolerates many system turns, but provider chat
+/// templates (llama.cpp Jinja, e.g. Qwen's "System message must be at the
+/// beginning") reject more than one; mirrors the Anthropic body's `system`
+/// fold. Canonical tool schemas map to the OpenAI `tools` shape.
+fn openai_body(cfg: &ProviderConfig, req: &CompletionRequest) -> Result<Value, ProviderError> {
+    let systems: Vec<&str> = req
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::System)
+        .map(|m| m.content.as_str())
+        .collect();
+    let messages: Vec<Value> = {
+        let mut out = Vec::new();
+        if !systems.is_empty() {
+            out.push(json!({"role": "system", "content": systems.join("\n\n")}));
+        }
+        for m in &req.messages {
+            if m.role == Role::System {
+                continue;
+            }
+            let mut obj = serde_json::Map::new();
+            obj.insert("role".into(), json!(match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::Tool => "tool",
+                Role::System => "system",
+            }));
+            obj.insert("content".into(), json!(m.content));
+            if let Some(id) = &m.tool_call_id {
+                obj.insert("tool_call_id".into(), json!(id));
+            }
+            out.push(Value::Object(obj));
+        }
+        out
+    };
+    let mut body = json!({
+        "model": req.model,
+        "messages": messages,
+    });
+    if !req.tools.is_empty() {
+        body["tools"] = json!(openai_tools(&cfg.provider, &req.tools)?);
+    }
+    if let Some(t) = req.temperature {
+        body["temperature"] = json!(t);
+    }
+    if let Some(m) = req.max_tokens {
+        body["max_tokens"] = json!(m);
+    }
+    Ok(body)
+}
+
 impl ProviderEngine for HttpEngine {
     fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         let key = resolve_key(&self.cfg)?;
@@ -223,32 +276,7 @@ impl ProviderEngine for HttpEngine {
             "{}/chat/completions",
             self.cfg.base_url.trim_end_matches('/')
         );
-        let mut body = json!({
-            "model": req.model,
-            "messages": req.messages.iter().map(|m| {
-                let mut obj = serde_json::Map::new();
-                obj.insert("role".into(), json!(match m.role {
-                    Role::System => "system",
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                    Role::Tool => "tool",
-                }));
-                obj.insert("content".into(), json!(m.content));
-                if let Some(id) = &m.tool_call_id {
-                    obj.insert("tool_call_id".into(), json!(id));
-                }
-                Value::Object(obj)
-            }).collect::<Vec<_>>(),
-        });
-        if !req.tools.is_empty() {
-            body["tools"] = json!(req.tools);
-        }
-        if let Some(t) = req.temperature {
-            body["temperature"] = json!(t);
-        }
-        if let Some(m) = req.max_tokens {
-            body["max_tokens"] = json!(m);
-        }
+        let body = openai_body(&self.cfg, req)?;
         let agent = ureq::Agent::new_with_config(
             ureq::Agent::config_builder()
                 .timeout_global(Some(self.cfg.timeout))
@@ -563,43 +591,63 @@ fn anthropic_body(
     Ok(Value::Object(body))
 }
 
-/// Map the canonical (OpenAI-shaped) tool schemas to the Anthropic `tools`
-/// shape: each `{"type":"function","function":{name,description,parameters}}`
-/// becomes `{name, description, input_schema: parameters}`. Unknown shapes
-/// are Malformed with the tool index.
+/// Map the canonical tool schemas (`{name, description, input, output}` —
+/// `ToolRegistry::canonical_json`, R-05) to the OpenAI `tools` shape: each
+/// becomes `{"type":"function","function":{name,description,parameters}}`,
+/// where `parameters` carries the `input` schema (the `output` schema is
+/// record-only, not part of the OpenAI wire contract). Unknown shapes are
+/// Malformed with the tool index.
+fn openai_tools(provider: &str, tools: &[Value]) -> Result<Vec<Value>, ProviderError> {
+    tools
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let name = t.get("name").and_then(|n| n.as_str()).ok_or_else(|| {
+                ProviderError::Malformed {
+                    provider: provider.into(),
+                    message: format!("tools[{i}]: missing name"),
+                }
+            })?;
+            let mut function = serde_json::Map::new();
+            function.insert("name".into(), json!(name));
+            if let Some(d) = t.get("description").and_then(|d| d.as_str()) {
+                function.insert("description".into(), json!(d));
+            }
+            function.insert(
+                "parameters".into(),
+                t.get("input").cloned().unwrap_or(Value::Null),
+            );
+            let mut out = serde_json::Map::new();
+            out.insert("type".into(), json!("function"));
+            out.insert("function".into(), Value::Object(function));
+            Ok(Value::Object(out))
+        })
+        .collect()
+}
+
+/// Map the canonical tool schemas to the Anthropic `tools` shape: each
+/// `{name, description, input, output}` becomes
+/// `{name, description, input_schema: input}`. Unknown shapes are Malformed
+/// with the tool index.
 fn anthropic_tools(provider: &str, tools: &[Value]) -> Result<Vec<Value>, ProviderError> {
     tools
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            let obj = t.as_object().ok_or_else(|| ProviderError::Malformed {
-                provider: provider.into(),
-                message: format!("tools[{i}]: not an object"),
+            let name = t.get("name").and_then(|n| n.as_str()).ok_or_else(|| {
+                ProviderError::Malformed {
+                    provider: provider.into(),
+                    message: format!("tools[{i}]: missing name"),
+                }
             })?;
-            let kind = obj.get("type").and_then(|t| t.as_str());
-            if kind.is_some() && kind != Some("function") {
-                return Err(ProviderError::Malformed {
-                    provider: provider.into(),
-                    message: format!("tools[{i}]: unknown tool type {kind:?}"),
-                });
-            }
-            let name = t
-                .pointer("/function/name")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| ProviderError::Malformed {
-                    provider: provider.into(),
-                    message: format!("tools[{i}]: missing function.name"),
-                })?;
             let mut out = serde_json::Map::new();
             out.insert("name".into(), json!(name));
-            if let Some(d) = t.pointer("/function/description").and_then(|d| d.as_str()) {
+            if let Some(d) = t.get("description").and_then(|d| d.as_str()) {
                 out.insert("description".into(), json!(d));
             }
             out.insert(
                 "input_schema".into(),
-                t.pointer("/function/parameters")
-                    .cloned()
-                    .unwrap_or(Value::Null),
+                t.get("input").cloned().unwrap_or(Value::Null),
             );
             Ok(Value::Object(out))
         })
@@ -1232,12 +1280,10 @@ mod tests {
                 model: "claude".into(),
                 messages: vec![],
                 tools: vec![json!({
-                    "type": "function",
-                    "function": {
-                        "name": "fs_read",
-                        "description": "Read a file",
-                        "parameters": {"type": "object"},
-                    },
+                    "name": "fs_read",
+                    "description": "Read a file",
+                    "input": {"type": "object"},
+                    "output": {"type": "object"},
                 })],
                 temperature: None,
                 max_tokens: None,
@@ -1257,7 +1303,7 @@ mod tests {
             &CompletionRequest {
                 model: "claude".into(),
                 messages: vec![],
-                tools: vec![json!({"type": "webhook", "function": {"name": "x"}})],
+                tools: vec![json!({"description": "no name"})],
                 temperature: None,
                 max_tokens: None,
                 tool_calls: vec![],
@@ -1271,6 +1317,95 @@ mod tests {
             }
             _ => panic!("expected Malformed, got {err:?}"),
         }
+    }
+
+    #[test]
+    fn openai_tools_mapping_and_malformed() {
+        let tools = vec![json!({
+            "name": "fs_read",
+            "description": "Read a file",
+            "input": {"type": "object"},
+            "output": {"type": "object"},
+        })];
+        assert_eq!(
+            openai_tools("http", &tools).unwrap(),
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "fs_read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object"},
+                },
+            })]
+        );
+        let err = openai_tools("http", &[json!({"description": "no name"})]).unwrap_err();
+        match err {
+            ProviderError::Malformed { message, .. } => {
+                assert!(message.contains("tools[0]"));
+            }
+            _ => panic!("expected Malformed, got {err:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_body_folds_systems_and_maps_tools() {
+        let body = openai_body(
+            &cfg(),
+            &CompletionRequest {
+                model: "test-model".into(),
+                messages: vec![
+                    Message {
+                        role: Role::System,
+                        content: "sys1".into(),
+                        tool_call_id: None,
+                    },
+                    Message {
+                        role: Role::User,
+                        content: "u1".into(),
+                        tool_call_id: None,
+                    },
+                    Message {
+                        role: Role::System,
+                        content: "sys2".into(),
+                        tool_call_id: None,
+                    },
+                ],
+                tools: vec![json!({
+                    "name": "fs_read",
+                    "description": "Read a file",
+                    "input": {"type": "object"},
+                })],
+                temperature: Some(0.5),
+                max_tokens: None,
+                tool_calls: vec![],
+                opaque_artifacts: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(body["model"], "test-model");
+        assert_eq!(body["temperature"], 0.5);
+        // Both system turns fold into one leading system message (provider
+        // chat templates reject more than one); turn order is preserved.
+        assert_eq!(
+            body["messages"],
+            json!([
+                {"role": "system", "content": "sys1\n\nsys2"},
+                {"role": "user", "content": "u1"},
+            ])
+        );
+        assert_eq!(
+            body["tools"],
+            json!([
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "fs_read",
+                        "description": "Read a file",
+                        "parameters": {"type": "object"},
+                    },
+                },
+            ])
+        );
     }
 
     #[test]
@@ -1396,8 +1531,9 @@ mod tests {
                 },
             ],
             tools: vec![json!({
-                "type": "function",
-                "function": {"name": "fs_read", "description": "Read", "parameters": {"type": "object"}},
+                "name": "fs_read",
+                "description": "Read",
+                "input": {"type": "object"},
             })],
             temperature: Some(0.2),
             max_tokens: None,
