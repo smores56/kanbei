@@ -217,6 +217,58 @@ impl Theme {
             },
         );
         styles.insert(
+            "approval".to_string(),
+            Style {
+                fg: Color::BrightYellow,
+                bold: true,
+                ..Style::default()
+            },
+        );
+        styles.insert(
+            "divider".to_string(),
+            Style {
+                fg: Color::BrightBlack,
+                ..Style::default()
+            },
+        );
+        styles.insert(
+            "progress".to_string(),
+            Style {
+                fg: Color::BrightBlack,
+                bold: true,
+                ..Style::default()
+            },
+        );
+        styles.insert(
+            "response".to_string(),
+            Style {
+                fg: Color::BrightWhite,
+                ..Style::default()
+            },
+        );
+        styles.insert(
+            "thought".to_string(),
+            Style {
+                fg: Color::BrightBlack,
+                ..Style::default()
+            },
+        );
+        styles.insert(
+            "tool".to_string(),
+            Style {
+                fg: Color::BrightBlack,
+                ..Style::default()
+            },
+        );
+        styles.insert(
+            "user".to_string(),
+            Style {
+                fg: Color::BrightCyan,
+                bold: true,
+                ..Style::default()
+            },
+        );
+        styles.insert(
             "banner".to_string(),
             Style {
                 fg: Color::Black,

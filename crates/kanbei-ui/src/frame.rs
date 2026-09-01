@@ -108,10 +108,10 @@ pub enum RenderError {
     TooSmall { rows: u16 },
 }
 
-struct BodyLine<'a> {
-    node: &'a Node,
-    text: String,
-    style: String,
+pub struct BodyLine<'a> {
+    pub node: &'a Node,
+    pub text: String,
+    pub style: String,
 }
 
 /// Render the tree into cells. Layout (top to bottom):
@@ -228,7 +228,7 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
 
 /// Depth-first body lines. `Header` and `Input` nodes are kernel-rendered
 /// (top/bottom rows) and skipped here.
-fn collect_lines<'a>(node: &'a Node, out: &mut Vec<BodyLine<'a>>) {
+pub(crate) fn collect_lines<'a>(node: &'a Node, out: &mut Vec<BodyLine<'a>>) {
     match node.kind {
         NodeKind::Root | NodeKind::List => {
             for child in &node.children {
@@ -257,11 +257,44 @@ fn collect_lines<'a>(node: &'a Node, out: &mut Vec<BodyLine<'a>>) {
                 style: "error".to_string(),
             });
         }
+        NodeKind::User
+        | NodeKind::Response
+        | NodeKind::Thought
+        | NodeKind::Group
+        | NodeKind::Progress
+        | NodeKind::Code
+        | NodeKind::Divider
+        | NodeKind::KeymapHint => {
+            out.push(BodyLine {
+                node,
+                text: node.content.clone(),
+                style: node
+                    .style
+                    .clone()
+                    .unwrap_or_else(|| kind_default_style(node.kind).to_string()),
+            });
+        }
+    }
+}
+
+/// Default style name for a conversation node kind when the node carries no
+/// explicit style (both renderers resolve it through the theme).
+pub(crate) fn kind_default_style(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Status | NodeKind::KeymapHint => "status",
+        NodeKind::Placeholder => "error",
+        NodeKind::User => "user",
+        NodeKind::Response => "response",
+        NodeKind::Thought | NodeKind::Group => "thought",
+        NodeKind::Progress => "progress",
+        NodeKind::Code => "tool",
+        NodeKind::Divider => "divider",
+        _ => DEFAULT_STYLE,
     }
 }
 
 /// Split into lines (on '\n') then char-wrap each to `cols`.
-fn wrap(text: &str, cols: usize) -> Vec<String> {
+pub(crate) fn wrap(text: &str, cols: usize) -> Vec<String> {
     let mut out = Vec::new();
     for raw in text.split('\n') {
         let mut line = String::new();

@@ -24,6 +24,23 @@ pub enum NodeKind {
     Input,
     Button,
     Placeholder,
+    /// Conversation item: a user message.
+    User,
+    /// Conversation item: an agent response (the turn's final answer).
+    Response,
+    /// Conversation item: an agent thought (intermediate model output).
+    Thought,
+    /// Conversation item: an expandable group (thought bubble). Children are
+    /// present only while expanded; the content is the summary line.
+    Group,
+    /// Conversation item: live working indicator (spinner text).
+    Progress,
+    /// Conversation item: a tool step (call or outcome, indented).
+    Code,
+    /// Conversation item: a horizontal separator.
+    Divider,
+    /// Conversation item: keymap hints (status-bar right side).
+    KeymapHint,
 }
 
 impl NodeKind {
@@ -38,11 +55,21 @@ impl NodeKind {
             NodeKind::Input => "input",
             NodeKind::Button => "button",
             NodeKind::Placeholder => "placeholder",
-        }
+            NodeKind::User => "user",
+            NodeKind::Response => "response",
+            NodeKind::Thought => "thought",
+            NodeKind::Group => "group",
+            NodeKind::Progress => "progress",
+            NodeKind::Code => "code",
+            NodeKind::Divider => "divider",
+            NodeKind::KeymapHint => "keymap_hint",
+    }
     }
 
+    /// Parse a kind from its wire name. `None` for unknown kinds (fail-closed,
+    /// R-27).
     pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
+        let k = match s {
             "root" => NodeKind::Root,
             "header" => NodeKind::Header,
             "status" => NodeKind::Status,
@@ -52,8 +79,17 @@ impl NodeKind {
             "input" => NodeKind::Input,
             "button" => NodeKind::Button,
             "placeholder" => NodeKind::Placeholder,
+            "user" => NodeKind::User,
+            "response" => NodeKind::Response,
+            "thought" => NodeKind::Thought,
+            "group" => NodeKind::Group,
+            "progress" => NodeKind::Progress,
+            "code" => NodeKind::Code,
+            "divider" => NodeKind::Divider,
+            "keymap_hint" => NodeKind::KeymapHint,
             _ => return None,
-        })
+        };
+        Some(k)
     }
 }
 

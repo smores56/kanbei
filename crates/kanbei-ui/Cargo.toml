@@ -9,3 +9,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 rustix.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+kanbei-core.workspace = true

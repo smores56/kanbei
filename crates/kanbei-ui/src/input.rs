@@ -23,6 +23,12 @@ pub enum InputEvent {
     CtrlC,
     CtrlL,
     CtrlX,
+    /// Lone escape (TUI: back to input focus). The byte decoder cannot
+    /// produce it (a lone ESC is ambiguous with an Alt prefix); the
+    /// terminal-event decoder does.
+    Escape,
+    /// TUI: quit (cancels the active run first).
+    CtrlQ,
     /// Unrecognized input, dropped by sanitization.
     Drop,
 }

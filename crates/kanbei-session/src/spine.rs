@@ -1977,6 +1977,22 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
         context.budget = self.scheduler.budgets();
         let mut last: Option<StepResult> = None;
         let outcome = loop {
+            // External cancel (UI seam): a user-requested cancel lands at the
+            // next step boundary — the same canonical path as
+            // `cancel_active_run` (Failed(UserCancelled) + run_outcome).
+            if let Some(flag) = &self.cancel_flag
+                && flag.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let usage = self.scheduler.current_usage(run_id);
+                self.run_outcome_with_reason(
+                    run_id,
+                    TerminalOutcome::Failed(FailureKind::UserCancelled),
+                    usage,
+                    &[],
+                    Some("cancelled by user".into()),
+                )?;
+                return Ok(TerminalOutcome::Failed(FailureKind::UserCancelled));
+            }
             // Wake deadline/budget at each host-command boundary.
             if let Err(e) = self.scheduler.check_boundary(run_id) {
                 // Route through the run FSM like any terminal outcome: the

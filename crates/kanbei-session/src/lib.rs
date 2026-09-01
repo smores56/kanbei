@@ -145,6 +145,18 @@ pub struct SessionConfig {
     /// The session's own identity (caller principal for kernel-originated
     /// tool calls, R-14); None = generate at open.
     pub session_id: Option<Id128>,
+    // --- UI/driver observer seams ---
+    /// Envelope observer (UI seam): called after every commit with each
+    /// resolved envelope (a promoted `$object` marker dereferenced to the
+    /// full payload). Runs on the committing thread; the observer must not
+    /// block the commit path. None = no observer.
+    pub commit_listener: Option<Arc<dyn Fn(&Envelope) + Send + Sync>>,
+    /// External cancel flag (UI seam): when set, the cognition loop ends the
+    /// active run at the next step boundary with `Failed(UserCancelled)` —
+    /// the same canonical path as [`Session::cancel_active_run`]. Shared
+    /// with the caller so the UI can set it without session access.
+    /// None = no external cancel.
+    pub cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     // --- M4 memory substrate + context projection ---
     /// Memory substrate root (canonical XDG state). None = cfg.dir.join("memory").
     pub memory_root: Option<PathBuf>,
@@ -194,6 +206,8 @@ impl Default for SessionConfig {
             approval_bound: 64,
             approval_resolver: None,
             session_id: None,
+            commit_listener: None,
+            cancel_flag: None,
             memory_root: None,
             project: None,
             memory_fault: None,
@@ -544,6 +558,10 @@ pub struct Session {
     approvals: std::collections::VecDeque<kanbei_tools::ApprovalParked>,
     approval_bound: usize,
     approval_resolver: Option<ApprovalResolver>,
+    /// Envelope observer (UI seam); called per commit with resolved payloads.
+    commit_listener: Option<Arc<dyn Fn(&Envelope) + Send + Sync>>,
+    /// External cancel flag (UI seam); checked at each cognition step.
+    cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     fs_root: PathBuf,
     session_id: Id128,
     // --- M4 memory substrate + context projection ---
@@ -711,6 +729,8 @@ impl Session {
         let tool_limits = cfg.tool_limits;
         let approval_bound = cfg.approval_bound;
         let approval_resolver = cfg.approval_resolver.clone();
+        let commit_listener = cfg.commit_listener.clone();
+        let cancel_flag = cfg.cancel_flag.clone();
         let budgets = cfg.budgets;
         let breaker_floors = cfg.breaker_floors;
         let provider_config = cfg.provider.clone();
@@ -1005,6 +1025,8 @@ impl Session {
             approvals: std::collections::VecDeque::new(),
             approval_bound,
             approval_resolver,
+            commit_listener,
+            cancel_flag,
             fs_root,
             session_id,
             memory_lifetime,
@@ -1224,6 +1246,16 @@ impl Session {
         }
         while self.recent_events.len() > RECENT_RING {
             self.recent_events.pop_front();
+        }
+        // Envelope observer (UI seam): the transcript is a pure projection of
+        // committed envelopes (R-19), and promoted payloads must reach it
+        // resolved — a `$object` marker is dereferenced to the full record.
+        if let Some(listener) = &self.commit_listener {
+            for env in &envelopes {
+                let mut resolved = env.clone();
+                resolved.payload = self.resolved_payload(env);
+                listener(&resolved);
+            }
         }
         // A committed compaction selection joins the FSM's covered set (the
         // check above rejects its covered fragments from then on).
@@ -2620,6 +2652,39 @@ impl Session {
             }
         })?;
         found.ok_or_else(|| SessionError::InvalidInput(format!("no event at seq {seq}")))
+    }
+
+    /// Iterate committed envelopes in seq order starting at `from_seq`,
+    /// calling `f` with each resolved envelope (promoted `$object` markers
+    /// dereferenced). One pass over the log — the transcript replay seam for
+    /// UIs that render the whole history (R-19: the transcript is a pure
+    /// projection of committed envelopes; launch is always resume). Returns
+    /// the last seq seen (`None` when no envelope reached `from_seq`).
+    pub fn replay_envelopes(
+        &self,
+        from_seq: u64,
+        mut f: impl FnMut(&Envelope),
+    ) -> Result<Option<u64>, SessionError> {
+        let log_path = self.log_path.clone();
+        let mut last: Option<u64> = None;
+        kanbei_log::for_each_frame(&log_path, |info| {
+            for line in &info.events {
+                let Ok(env) = Envelope::from_line(line) else {
+                    continue;
+                };
+                let seq = env.seq;
+                if seq < from_seq {
+                    continue;
+                }
+                let mut resolved = env;
+                if resolved.payload.get("$object").is_some() {
+                    resolved.payload = self.resolved_payload(&resolved);
+                }
+                f(&resolved);
+                last = Some(seq);
+            }
+        })?;
+        Ok(last)
     }
 
     /// Resolve an event payload that may be object-promoted (`{"$object":
