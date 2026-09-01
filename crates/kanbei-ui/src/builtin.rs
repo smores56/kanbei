@@ -30,9 +30,9 @@ function kb_on_activate(ctx)
   ctx.contribution_publish('{"kind":"ui","name":"workbench","component":"builtin_workbench"}')
   ctx.contribution_publish(
     '{"kind":"theme","name":"default","overlay":{' ..
-    '"header":{"fg":"bright_white","bold":true},' ..
+    '"header":{"fg":"bright_black","bold":true},' ..
     '"status":{"fg":"bright_black"},' ..
-    '"input":{"fg":"bright_white"},' ..
+    '"input":{},' ..
     '"selected":{"reverse":true},' ..
     '"banner":{"fg":"black","bg":"bright_yellow","bold":true}' ..
     '}}')

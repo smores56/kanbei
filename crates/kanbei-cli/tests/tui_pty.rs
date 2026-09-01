@@ -104,14 +104,18 @@ fn tui_drives_a_fake_turn_and_exits_clean() {
     send(&mut master_in, b"hello world\r");
 
     // 3. The turn renders: the committed user line (one span), then the
-    //    fake provider's answer (one span, first line starts at column 0).
+    //    fake provider's answer (first line starts at column 0). The answer
+    //    is in the terminal default text style, so its space cells are
+    //    indistinguishable from blank terminal cells: the diff writes only
+    //    the non-space runs, each as its own write with cursor moves between
+    //    them. Match the longest contiguous run of the answer.
     assert!(
         wait_for(&buf, "❯ hello world", TURN_TIMEOUT),
         "the user prompt did not render\n---\n{}",
         rendered(&buf)
     );
     assert!(
-        wait_for(&buf, "kanbei ready (fake provider", TURN_TIMEOUT),
+        wait_for(&buf, "KANBEI_PROVIDER_URL/KEY", TURN_TIMEOUT),
         "the fake response did not render\n---\n{}",
         rendered(&buf)
     );

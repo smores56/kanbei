@@ -176,7 +176,7 @@ impl Theme {
         styles.insert(
             "header".to_string(),
             Style {
-                fg: Color::BrightWhite,
+                fg: Color::BrightBlack,
                 bold: true,
                 ..Style::default()
             },
@@ -191,7 +191,7 @@ impl Theme {
         styles.insert(
             "input".to_string(),
             Style {
-                fg: Color::BrightWhite,
+                fg: Color::Default,
                 ..Style::default()
             },
         );
@@ -242,7 +242,7 @@ impl Theme {
         styles.insert(
             "response".to_string(),
             Style {
-                fg: Color::BrightWhite,
+                fg: Color::Default,
                 ..Style::default()
             },
         );
