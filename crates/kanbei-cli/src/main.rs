@@ -1,6 +1,6 @@
 //! kanbei — a terminal REPL over the kanbei driver.
 //!
-//! Usage: `kanbei [DIR] [--model M] [--fake] [--auto-approve]`
+//! Usage: `kanbei [DIR] [--model M] [--fake] [--auto-approve] [--yolo]`
 //!
 //! DIR defaults to `$KANBEI_DIR`, then `.` (the session dir). Provider:
 //! `--fake` (a scripted one-shot engine for smoke runs) or
@@ -23,14 +23,19 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kanbei_capabilities::{
+    Broker, Capability, Grant, GrantScope, PolicyTemplate, Principal, TrustClass,
+};
+use kanbei_core::digest::Digest;
 use kanbei_core::envelope::Envelope;
+use kanbei_core::id::Id128;
 use kanbei_driver::{Driver, Turn};
 use kanbei_provider::{
     CompletionRequest, CompletionResponse, FinishReason, HttpEngine, KeySource, ProviderConfig,
     ProviderEngine, ProviderError, Usage,
 };
 use kanbei_session::{Session, SessionConfig, SessionError};
-use kanbei_tools::ApprovalParked;
+use kanbei_tools::{ApprovalParked, ToolRegistry};
 use kanbei_ui::{
     build_viewport, key_to_input, resolve_style, total_rows, transcript_paragraph,
     ConversationState, InputEvent, Row, StyledRow, Theme,
@@ -47,7 +52,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
-const USAGE: &str = "usage: kanbei [DIR] [--model M] [--fake] [--auto-approve]";
+const USAGE: &str = "usage: kanbei [DIR] [--model M] [--fake] [--auto-approve] [--yolo]";
 
 #[derive(Debug)]
 struct Options {
@@ -55,6 +60,7 @@ struct Options {
     model: Option<String>,
     fake: bool,
     auto_approve: bool,
+    yolo: bool,
 }
 
 impl Options {
@@ -66,6 +72,8 @@ impl Options {
             model: std::env::var("KANBEI_PROVIDER_MODEL").ok(),
             fake: false,
             auto_approve: false,
+            yolo: std::env::var("KANBEI_YOLO")
+                .is_ok_and(|v| !v.is_empty() && v != "0" && v != "false"),
         }
     }
 }
@@ -78,6 +86,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         match args[i].as_str() {
             "--fake" => opts.fake = true,
             "--auto-approve" => opts.auto_approve = true,
+            "--yolo" => opts.yolo = true,
             "--model" => {
                 i += 1;
                 opts.model = Some(
@@ -307,14 +316,64 @@ fn cli_engine() -> VmConfig {
     }
 }
 
+/// YOLO broker: every builtin tool, verb `call`, granted to this launch's
+/// session principal with no approvals and no budget. Grants are
+/// launch-local by design (the broker never persists); `session_id` is the
+/// id this launch adopted (`SessionConfig::session_id`), so kernel-originated
+/// calls (principal `session == session_id`) match on fresh and resumed
+/// sessions alike.
+fn yolo_broker(session_id: Id128) -> Broker {
+    let tools = ToolRegistry::builtin().names();
+    let mut broker = Broker::new();
+    broker
+        .add_template(PolicyTemplate {
+            trust_class: TrustClass::Builtin,
+            allow: tools
+                .iter()
+                .map(|t| Capability::new(t.clone(), vec!["call".into()]))
+                .collect(),
+            deny: vec![],
+            require_approval: vec![],
+            version: 1,
+            monotonic: true,
+        })
+        .expect("yolo policy");
+    for tool in tools {
+        let mut grant = Grant {
+            grant_digest: Digest::new(b"placeholder"),
+            principal: Principal {
+                session: session_id,
+                generation: 0,
+                run: None,
+            },
+            module_generation: 0,
+            capability: Capability::new(tool, vec!["call".into()]),
+            scope: GrantScope::Session,
+            expiry: None,
+            budget: None,
+            purpose: Some("yolo: full auto-approval".into()),
+            policy_version: 1,
+        };
+        grant.grant_digest = grant.derive_digest();
+        broker.add_grant(grant).expect("yolo grant");
+    }
+    broker
+}
+
 /// Piped-stdin path: the plain line REPL.
 fn run_repl(opts: Options, engine: Box<dyn ProviderEngine>) {
+    let yolo_id = opts.yolo.then(Id128::generate);
     let session = match Session::open(SessionConfig {
         dir: opts.dir.clone(),
         stream: "cli".into(),
         engine: Some(cli_engine()),
         provider_engine: Some(engine),
         fs_root: opts.dir.clone(),
+        broker: yolo_id
+            .as_ref()
+            .map(|id| yolo_broker(*id))
+            .unwrap_or_default(),
+        session_id: yolo_id,
         approval_resolver: Some(Arc::new(if opts.auto_approve {
             |_p| true
         } else {
@@ -434,7 +493,8 @@ fn run_tui(opts: Options, engine: Box<dyn ProviderEngine>) -> i32 {
     // rendezvous (the worker blocks until the UI answers y/n).
     let commit_tx = evt_tx.clone();
     let approval_tx = evt_tx.clone();
-    let auto = opts.auto_approve;
+    let yolo_id = opts.yolo.then(Id128::generate);
+    let auto = opts.auto_approve || opts.yolo;
     let cancel_cfg = cancel_flag.clone();
     let cfg = SessionConfig {
         dir: opts.dir.clone(),
@@ -442,6 +502,11 @@ fn run_tui(opts: Options, engine: Box<dyn ProviderEngine>) -> i32 {
         engine: Some(cli_engine()),
         provider_engine: Some(engine),
         fs_root: opts.dir.clone(),
+        broker: yolo_id
+            .as_ref()
+            .map(|id| yolo_broker(*id))
+            .unwrap_or_default(),
+        session_id: yolo_id,
         approval_resolver: Some(Arc::new(move |p: &ApprovalParked| {
             if auto {
                 return true;
@@ -1041,6 +1106,34 @@ mod tests {
         assert!(opts.fake && opts.auto_approve);
         assert_eq!(opts.model.as_deref(), Some("m1"));
         assert_eq!(opts.dir, PathBuf::from("/tmp/x"));
+    }
+
+    #[test]
+    fn parse_yolo_flag() {
+        let args: Vec<String> = ["--yolo", "/tmp/z"].iter().map(|s| s.to_string()).collect();
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.yolo);
+        assert_eq!(opts.dir, PathBuf::from("/tmp/z"));
+    }
+
+    #[test]
+    fn yolo_broker_grants_every_builtin_tool_without_approval() {
+        let id = Id128::generate();
+        let broker = yolo_broker(id);
+        for name in ToolRegistry::builtin().names() {
+            let eff = broker
+                .check(
+                    &Principal {
+                        session: id,
+                        generation: 0,
+                        run: Some(0),
+                    },
+                    &Capability::new(name.clone(), vec!["call".into()]),
+                    1,
+                )
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!eff.requires_approval, "{name}");
+        }
     }
 
     #[test]

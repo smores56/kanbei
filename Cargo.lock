@@ -1333,6 +1333,7 @@ name = "kanbei-cli"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "kanbei-capabilities",
  "kanbei-core",
  "kanbei-driver",
  "kanbei-provider",

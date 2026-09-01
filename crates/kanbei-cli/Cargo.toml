@@ -9,6 +9,7 @@ name = "kanbei"
 path = "src/main.rs"
 
 [dependencies]
+kanbei-capabilities.workspace = true
 kanbei-core.workspace = true
 kanbei-driver.workspace = true
 kanbei-provider.workspace = true
