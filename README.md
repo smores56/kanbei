@@ -23,12 +23,32 @@ cargo run -p kanbei-cli --bin kanbei -- [DIR] [--model M] [--fake] [--auto-appro
 - Provider: `$KANBEI_PROVIDER_URL` / `$KANBEI_PROVIDER_KEY` /
   `$KANBEI_PROVIDER_MODEL` (an OpenAI-compatible chat-completions endpoint;
   `--model` overrides the env), or `--fake` for a scripted smoke run.
-- The REPL takes one user message per line and drives the resulting wakes to
-  quiescence; the model's final answer is printed to stdout. Intermediate tool
-  round-trips are canonical facts (inspect with `/history`). Gated tools
-  prompt interactively unless `--auto-approve` is set.
-- Commands: `/status`, `/history [N]`, `/export DIR`, `/resume` (after a
-  breaker pause), `/exit`.
+
+On a TTY the CLI runs a full-screen TUI; piped stdin falls back to the plain
+REPL.
+
+**TUI.** Launch is always resume: the transcript is a live projection of the
+session's committed envelopes, rebuilt on start from the canonical log. A
+turn's working segment renders as a thought bubble — expanded while the turn
+runs (live tool steps), then collapsed to a summary line (`state · steps ·
+runs · tokens · elapsed`, plus the reason on a non-clean end). Reopen any
+turn by clicking its summary or selecting it (arrows/`j`/`k`) and pressing
+`Enter`. The final answer renders below the bubble. The status bar shows
+`state · model · egress tokens · key hints`; scrollback covers the whole log
+(bottom-pinned, `↑`/`↓`/PageUp/Down to scroll).
+
+- Input: `Enter` sends; `Esc` switches to transcript browse and back.
+- Approvals render inline in the transcript (`y` approve / `n` deny); the
+  status bar shows `awaiting approval` while the run is parked.
+- `Ctrl-C` cancels the active run; `Ctrl-Q` quits (cancelling first if a run
+  is active); `Ctrl-L` repaints.
+
+**REPL (piped stdin).** One user message per line; the resulting wakes are
+driven to quiescence and the model's final answer is printed to stdout.
+Intermediate tool round-trips are canonical facts (inspect with `/history`).
+Gated tools prompt interactively unless `--auto-approve` is set. Commands:
+`/status`, `/history [N]`, `/export DIR`, `/resume` (after a breaker pause),
+`/exit`.
 
 Embedding: `kanbei_driver::Driver::user_turn(text)` returns
 `Turn { answer, runs, last_outcome }`; the gates in `crates/kanbei-testkit`

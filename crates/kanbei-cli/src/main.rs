@@ -394,6 +394,7 @@ struct Ui {
     active: bool,
     status: String,
     quit: bool,
+    repaint: bool,
 }
 
 impl Ui {
@@ -411,6 +412,7 @@ impl Ui {
             active: false,
             status: "idle".into(),
             quit: false,
+            repaint: false,
         }
     }
 }
@@ -528,9 +530,11 @@ fn run_tui_loop(
         let _ = terminal::disable_raw_mode();
         return (2, ui);
     }
+    // No term.clear() here: the fresh alternate screen is blank on entry, the
+    // first draw covers the full area, and Terminal::clear issues a blocking
+    // cursor-position query (\x1b[6n) that a pty never answers.
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut term = Terminal::new(backend).expect("terminal backend");
-    term.clear().ok();
 
     // Mouse hit-testing uses the previous frame's layout (rendered rows).
     let mut last_hit: Vec<usize> = Vec::new();
@@ -543,9 +547,14 @@ fn run_tui_loop(
             handle_evt(&mut ui, evt);
         }
 
-        // 2. Poll the terminal (short timeout so events interleave with input).
+        // 2. Poll the terminal (short timeout so events interleave with
+        //    input). Read in a batch: event::read() blocks on an empty queue,
+        //    so it runs only while a poll confirms an event is pending.
         if event::poll(Duration::from_millis(16)).unwrap_or(false) {
-            while let Ok(ev) = event::read() {
+            loop {
+                let Ok(ev) = event::read() else {
+                    break;
+                };
                 match ev {
                     Event::Key(k) => {
                         if let Some(input) = key_to_input(&k) {
@@ -559,6 +568,9 @@ fn run_tui_loop(
                     }
                     _ => {}
                 }
+                if !event::poll(Duration::ZERO).unwrap_or(false) {
+                    break;
+                }
             }
         }
 
@@ -567,6 +579,15 @@ fn run_tui_loop(
             break 0;
         };
         let area = Rect::new(0, 0, size.width, size.height);
+        // Ctrl-L: force a full repaint. resize() clears the screen and resets
+        // the diff baseline so the next draw re-emits everything; unlike
+        // clear(), it issues no blocking cursor-position query.
+        if ui.repaint {
+            ui.repaint = false;
+            if term.resize(area).is_err() {
+                break 0;
+            }
+        }
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -747,6 +768,10 @@ fn handle_input(
                 ui.quit = true;
                 None
             }
+            InputEvent::CtrlL => {
+                ui.repaint = true;
+                None
+            }
             InputEvent::Escape => {
                 let sel = ui.conv.turns.len().saturating_sub(1);
                 ui.focus = Focus::Transcript { sel };
@@ -794,6 +819,10 @@ fn handle_input(
             }
             InputEvent::CtrlQ => {
                 ui.quit = true;
+                None
+            }
+            InputEvent::CtrlL => {
+                ui.repaint = true;
                 None
             }
             InputEvent::CtrlC => {

@@ -1341,6 +1341,7 @@ dependencies = [
  "kanbei-ui",
  "kanbei-vm",
  "ratatui",
+ "rustix",
  "serde_json",
 ]
 
