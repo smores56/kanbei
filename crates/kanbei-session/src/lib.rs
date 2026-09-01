@@ -90,6 +90,11 @@ const CHECKPOINT_LABEL_MAX: usize = 200;
 
 // ---------- config ----------
 
+/// Envelope observer (UI seam): called after every commit with each resolved
+/// envelope. Runs on the committing thread; the observer must not block the
+/// commit path.
+pub type CommitListener = Arc<dyn Fn(&Envelope) + Send + Sync>;
+
 /// Session configuration. `dir` is the session layout root: `<dir>/log.zst`
 /// (append log), `<dir>/objects/` (object store), and `<dir>/state/` (module
 /// state heads).
@@ -150,7 +155,7 @@ pub struct SessionConfig {
     /// resolved envelope (a promoted `$object` marker dereferenced to the
     /// full payload). Runs on the committing thread; the observer must not
     /// block the commit path. None = no observer.
-    pub commit_listener: Option<Arc<dyn Fn(&Envelope) + Send + Sync>>,
+    pub commit_listener: Option<CommitListener>,
     /// External cancel flag (UI seam): when set, the cognition loop ends the
     /// active run at the next step boundary with `Failed(UserCancelled)` —
     /// the same canonical path as [`Session::cancel_active_run`]. Shared
@@ -559,7 +564,7 @@ pub struct Session {
     approval_bound: usize,
     approval_resolver: Option<ApprovalResolver>,
     /// Envelope observer (UI seam); called per commit with resolved payloads.
-    commit_listener: Option<Arc<dyn Fn(&Envelope) + Send + Sync>>,
+    commit_listener: Option<CommitListener>,
     /// External cancel flag (UI seam); checked at each cognition step.
     cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     fs_root: PathBuf,

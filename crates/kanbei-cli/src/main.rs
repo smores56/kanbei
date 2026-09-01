@@ -551,16 +551,13 @@ fn run_tui_loop(
         //    input). Read in a batch: event::read() blocks on an empty queue,
         //    so it runs only while a poll confirms an event is pending.
         if event::poll(Duration::from_millis(16)).unwrap_or(false) {
-            loop {
-                let Ok(ev) = event::read() else {
-                    break;
-                };
+            while let Ok(ev) = event::read() {
                 match ev {
                     Event::Key(k) => {
-                        if let Some(input) = key_to_input(&k) {
-                            if let Some(cmd) = handle_input(&mut ui, input, cancel_flag) {
-                                let _ = cmd_tx.send(cmd);
-                            }
+                        if let Some(input) = key_to_input(&k)
+                            && let Some(cmd) = handle_input(&mut ui, input, cancel_flag)
+                        {
+                            let _ = cmd_tx.send(cmd);
                         }
                     }
                     Event::Mouse(m) => {
@@ -1000,7 +997,7 @@ fn format_args(args: &str) -> String {
         return s;
     }
     let mut out: String = chars[..60].iter().collect();
-    out.push_str("…");
+    out.push('…');
     out
 }
 
