@@ -10,7 +10,7 @@ use ratatui::style::{Color as RColor, Modifier, Style as RStyle};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::frame::{wrap, BodyLine};
+use crate::frame::wrap;
 use crate::input::InputEvent;
 use crate::theme::{Color, Style, Theme};
 
@@ -72,45 +72,53 @@ pub struct StyledRow {
     pub style: Option<String>,
 }
 
-/// Build the transcript viewport over the body lines: each line is
-/// char-wrapped to `width` (the `frame::wrap` contract — plain wrapped
-/// text, no markdown in v1), starting at item `top` (the scroll offset, in
-/// item space) for at most `height` visible rows. Returns the visible rows
-/// plus a row→item hit map (same length as the rows) for mouse
-/// click-to-toggle.
+/// One transcript row the viewport consumes (text + theme style name). Owned
+/// and free of tree borrows so the CLI builds them directly from the
+/// conversation projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    pub text: String,
+    pub style: String,
+}
+
+/// Build the transcript viewport over the rows: each row is char-wrapped to
+/// `width` (the `frame::wrap` contract — plain wrapped text, no markdown in
+/// v1), starting at item `top` (the scroll offset, in item space) for at
+/// most `height` visible rows. Returns the visible rows plus a row→item hit
+/// map (same length as the rows) for mouse click-to-toggle.
 pub fn build_viewport(
-    lines: &[BodyLine<'_>],
+    rows: &[Row],
     top: usize,
     height: usize,
     width: usize,
 ) -> (Vec<StyledRow>, Vec<usize>) {
-    let mut rows: Vec<StyledRow> = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
+    let mut visible: Vec<StyledRow> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
         if i < top {
             continue;
         }
-        if rows.len() >= height {
+        if visible.len() >= height {
             break;
         }
-        for text in wrap(&line.text, width) {
-            if rows.len() >= height {
+        for text in wrap(&row.text, width) {
+            if visible.len() >= height {
                 break;
             }
-            rows.push(StyledRow {
+            visible.push(StyledRow {
                 item: i,
                 text,
-                style: Some(line.style.clone()),
+                style: Some(row.style.clone()),
             });
         }
     }
-    let map = rows.iter().map(|r| r.item).collect();
-    (rows, map)
+    let map = visible.iter().map(|r| r.item).collect();
+    (visible, map)
 }
 
 /// The total rendered row count of the body lines at `width` (wraps each
 /// line) — the transcript's height in rows, used for bottom-pinned scroll.
-pub fn total_rows(lines: &[BodyLine<'_>], width: usize) -> usize {
-    lines.iter().map(|l| wrap(&l.text, width).len()).sum()
+pub fn total_rows(rows: &[Row], width: usize) -> usize {
+    rows.iter().map(|r| wrap(&r.text, width).len()).sum()
 }
 
 /// One line of a rendered transcript row, styled through the theme.
@@ -176,8 +184,6 @@ pub fn key_to_input(k: &crossterm::event::KeyEvent) -> Option<InputEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::collect_lines;
-    use crate::tree::{Node, NodeKind, SemanticTree};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, KeyEventKind};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -203,15 +209,12 @@ mod tests {
 
     #[test]
     fn viewport_windows_and_hits() {
-        let tree = SemanticTree::new(
-            Node::new("root", NodeKind::Root)
-                .child(Node::new("a", NodeKind::User).with_content("aa"))
-                .child(Node::new("b", NodeKind::Response).with_content("bbbb"))
-                .child(Node::new("c", NodeKind::User).with_content("cc")),
-        );
-        let mut lines = Vec::new();
-        collect_lines(&tree.root, &mut lines);
-        let (rows, hits) = build_viewport(&lines, 1, 2, 80);
+        let input = vec![
+            Row { text: "aa".into(), style: "user".into() },
+            Row { text: "bbbb".into(), style: "response".into() },
+            Row { text: "cc".into(), style: "user".into() },
+        ];
+        let (rows, hits) = build_viewport(&input, 1, 2, 80);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].text, "bbbb");
         assert_eq!(rows[1].text, "cc");
@@ -220,13 +223,11 @@ mod tests {
 
     #[test]
     fn viewport_wraps_to_width() {
-        let tree = SemanticTree::new(
-            Node::new("root", NodeKind::Root)
-                .child(Node::new("a", NodeKind::Response).with_content("abcdefghij")),
-        );
-        let mut lines = Vec::new();
-        collect_lines(&tree.root, &mut lines);
-        let (rows, _) = build_viewport(&lines, 0, 10, 4);
+        let input = vec![Row {
+            text: "abcdefghij".into(),
+            style: "response".into(),
+        }];
+        let (rows, _) = build_viewport(&input, 0, 10, 4);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].text, "abcd");
         assert_eq!(rows[1].text, "efgh");

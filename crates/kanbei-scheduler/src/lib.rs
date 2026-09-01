@@ -400,7 +400,7 @@ pub enum WakeDecision {
 /// Kernel-owned scheduler bounds. The session actor drives it; every
 /// decision it returns is meant to be committed as a canonical record.
 pub struct Scheduler {
-    policy: Box<dyn SchedulerPolicy>,
+    policy: Box<dyn SchedulerPolicy + Send>,
     floors: BreakerFloors,
     paused: Option<BreakerTrip>,
     /// Pending triggers not yet batched (ephemeral).
@@ -465,7 +465,7 @@ impl Scheduler {
         }
     }
 
-    pub fn with_policy(mut self, policy: Box<dyn SchedulerPolicy>) -> Self {
+    pub fn with_policy(mut self, policy: Box<dyn SchedulerPolicy + Send>) -> Self {
         self.policy = policy;
         self
     }

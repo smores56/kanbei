@@ -166,7 +166,7 @@ pub struct SessionConfig {
     pub memory_fault: Option<Arc<dyn kanbei_memory::MemoryFaultInjector>>,
     /// Factory producing a fresh CognitionProvider per spawned child run
     /// (R-09 child runs; None = child.spawn resolves to an error outcome).
-    pub child_provider: Option<Box<dyn FnMut() -> Box<dyn kanbei_scheduler::CognitionProvider>>>,
+    pub child_provider: Option<Box<dyn FnMut() -> Box<dyn kanbei_scheduler::CognitionProvider> + Send>>,
     // --- M8 wave 1 telemetry (optional; feature `otel`) ---
     /// Optional OTel-compatible telemetry handle (M8 wave 1); None = no
     /// telemetry. The `otel` feature only.
@@ -602,7 +602,7 @@ pub struct Session {
     /// (wave 2 consumes them).
     pinned_roots: Option<PinnedRoots>,
     /// Child-run provider factory (R-09); None = child.spawn errors.
-    child_provider: Option<Box<dyn FnMut() -> Box<dyn kanbei_scheduler::CognitionProvider>>>,
+    child_provider: Option<Box<dyn FnMut() -> Box<dyn kanbei_scheduler::CognitionProvider> + Send>>,
     // --- M8 wave 1 telemetry (optional; feature `otel`) ---
     /// The optional OTel-compatible exporter handle (M8 wave 1).
     #[cfg(feature = "otel")]

@@ -131,7 +131,7 @@ fn open_session(
     session_id: Id128,
     broker: Broker,
     responses: Vec<CompletionResponse>,
-    child_provider: Option<Box<dyn FnMut() -> Box<dyn CognitionProvider>>>,
+    child_provider: Option<Box<dyn FnMut() -> Box<dyn CognitionProvider> + Send>>,
 ) -> Session {
     Session::open(SessionConfig {
         dir: dir.to_path_buf(),
@@ -1307,17 +1307,18 @@ fn probe_c2(root: &Path) -> (bool, String) {
 
     let child_results: Arc<Mutex<Vec<StepResult>>> = Arc::new(Mutex::new(Vec::new()));
     let child_results_after = Arc::clone(&child_results);
-    let factory: Box<dyn FnMut() -> Box<dyn CognitionProvider>> = Box::new(move || {
-        Box::new(RecordingProvider::new(
-            vec![
-                StepCommand::MemoryQuery {
-                    query: "widget staging api".into(),
-                },
-                StepCommand::Finish(TerminalOutcome::CompletedGoal),
-            ],
-            Arc::clone(&child_results_after),
-        ))
-    });
+    let factory: Box<dyn FnMut() -> Box<dyn CognitionProvider> + Send> =
+        Box::new(move || {
+            Box::new(RecordingProvider::new(
+                vec![
+                    StepCommand::MemoryQuery {
+                        query: "widget staging api".into(),
+                    },
+                    StepCommand::Finish(TerminalOutcome::CompletedGoal),
+                ],
+                Arc::clone(&child_results_after),
+            ))
+        });
     let mut session = open_session(
         &dir,
         Some(&memory_root),

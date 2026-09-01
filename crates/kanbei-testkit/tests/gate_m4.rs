@@ -610,7 +610,7 @@ fn child_runs_bounded_and_attenuated() {
     let child_results: Arc<Mutex<Vec<StepResult>>> = Arc::new(Mutex::new(Vec::new()));
     let child_results_after = Arc::clone(&child_results);
     let mut spawned = 0usize;
-    let factory: Box<dyn FnMut() -> Box<dyn CognitionProvider>> = Box::new(move || {
+    let factory: Box<dyn FnMut() -> Box<dyn CognitionProvider> + Send> = Box::new(move || {
         spawned += 1;
         let commands = match spawned {
             1 => vec![StepCommand::Finish(TerminalOutcome::CompletedGoal)],

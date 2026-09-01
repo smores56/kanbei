@@ -236,6 +236,17 @@ impl TurnView {
     }
 }
 
+/// One flat transcript row for the TUI (document order): text, theme style
+/// name, and the turn index it renders (the toggle identity for click/
+/// keyboard selection). Mirrors [`ConversationState::tree`] so the kernel
+/// renderer and the TUI stay in lockstep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptRow {
+    pub text: String,
+    pub style: String,
+    pub turn: usize,
+}
+
 /// The whole transcript: turns in commit order. A pure function of the
 /// envelope stream applied so far (plus finalize events, which mirror
 /// committed terminal records).
@@ -556,6 +567,75 @@ impl ConversationState {
         }
         SemanticTree::new(root)
     }
+
+    /// The flat TUI transcript (document order) with per-row turn
+    /// attribution. Thought segments render only while the turn is running or
+    /// its bubble is expanded (R-02/C-03). Mirrors [`Self::tree`].
+    pub fn transcript(&self, expanded: &HashSet<String>) -> Vec<TranscriptRow> {
+        let mut rows = Vec::new();
+        for (n, turn) in self.turns.iter().enumerate() {
+            rows.push(TranscriptRow {
+                text: format!("❯ {}", turn.user),
+                style: "user".into(),
+                turn: n,
+            });
+            let open =
+                turn.state == TurnState::Running || expanded.contains(&format!("t{n}"));
+            if open && !turn.thoughts.is_empty() {
+                for row in turn.thoughts.iter() {
+                    let (text, style) = match row {
+                        BubbleRow::Text(t) => (indent(t, 2), "thought"),
+                        BubbleRow::Step(s) => (step_line(s), "tool"),
+                        BubbleRow::Notice(t) => (indent(t, 2), "status"),
+                    };
+                    rows.push(TranscriptRow {
+                        text,
+                        style: style.into(),
+                        turn: n,
+                    });
+                }
+                if turn.state == TurnState::Running {
+                    rows.push(TranscriptRow {
+                        text: "  … working".into(),
+                        style: "progress".into(),
+                        turn: n,
+                    });
+                }
+            }
+            if turn.state != TurnState::Running {
+                let marker = if open { "▾" } else { "▸" };
+                rows.push(TranscriptRow {
+                    text: format!("{marker} {}", turn.summary()),
+                    style: "thought".into(),
+                    turn: n,
+                });
+            }
+            if let Some(answer) = &turn.response {
+                rows.push(TranscriptRow {
+                    text: indent(answer, 1),
+                    style: "response".into(),
+                    turn: n,
+                });
+            }
+            rows.push(TranscriptRow {
+                text: "──".into(),
+                style: "divider".into(),
+                turn: n,
+            });
+        }
+        rows
+    }
+
+    /// Total model egress across all turns (input, output) — status bar.
+    pub fn tokens(&self) -> (u64, u64) {
+        let mut tin = 0u64;
+        let mut tout = 0u64;
+        for t in &self.turns {
+            tin += t.input_tokens;
+            tout += t.output_tokens;
+        }
+        (tin, tout)
+    }
 }
 
 fn step_line(step: &ToolStep) -> String {
@@ -800,5 +880,68 @@ mod tests {
         let content: Vec<String> = t.nodes().iter().map(|n| n.content.clone()).collect();
         assert!(content.iter().any(|c| c.contains("fs.read")));
         assert!(content.iter().any(|c| c.starts_with("▾")));
+    }
+
+    #[test]
+    fn transcript_projects_document_order_and_toggle_state() {
+        let mut s = ConversationState::new();
+        s.apply(&env(1, "user_message", json!({ "text": "hi" })));
+        s.apply(&env(2, "run_start", json!({})));
+        s.apply(&env(
+            3,
+            "tool_intent",
+            json!({ "call_id": "c1", "tool": "fs.read", "args": { "path": "a" } }),
+        ));
+        // running: bubble open (step + spinner), no summary marker yet
+        let rows = s.transcript(&HashSet::new());
+        assert_eq!(rows[0].text, "❯ hi");
+        assert_eq!(rows[0].style, "user");
+        assert!(rows.iter().any(|r| r.text.contains("fs.read") && r.style == "tool"));
+        assert!(rows
+            .iter()
+            .any(|r| r.text == "  … working" && r.style == "progress"));
+        assert!(!rows.iter().any(|r| r.text.starts_with("▸")));
+
+        s.apply(&env(
+            4,
+            "tool_outcome",
+            json!({ "call_id": "c1", "tool": "fs.read", "result": "x", "error": null,
+                    "classification": "Normal" }),
+        ));
+        s.apply(&env(5, "model_outcome", model_outcome(Some("done"), &[], 3, 4)));
+        s.finalize_turn(Some((OutcomeClass::Progress, None)));
+
+        // collapsed: summary marker, no step rows, indented response, divider
+        let rows = s.transcript(&HashSet::new());
+        assert!(rows.iter().any(|r| r.text.starts_with("▸ [✓]")));
+        assert!(!rows.iter().any(|r| r.text.contains("fs.read")));
+        // `indent` prefixes only continuation lines; a single-line answer
+        // renders bare.
+        assert!(rows
+            .iter()
+            .any(|r| r.text == "done" && r.style == "response"));
+        assert_eq!(rows.last().unwrap().text, "──");
+        assert_eq!(
+            rows.iter().map(|r| r.turn).collect::<Vec<_>>(),
+            vec![0; rows.len()]
+        );
+
+        // expanded: steps come back, marker flips, spinner only while running
+        let rows = s.transcript(&HashSet::from([String::from("t0")]));
+        assert!(rows.iter().any(|r| r.text.starts_with("▾ [✓]")));
+        assert!(rows.iter().any(|r| r.text.contains("fs.read") && r.style == "tool"));
+        assert!(!rows.iter().any(|r| r.text.contains("… working")));
+    }
+
+    #[test]
+    fn tokens_sums_egress_across_turns() {
+        let mut s = ConversationState::new();
+        s.apply(&env(1, "user_message", json!({ "text": "a" })));
+        s.apply(&env(2, "model_outcome", model_outcome(Some("x"), &[], 10, 5)));
+        s.finalize_turn(Some((OutcomeClass::Progress, None)));
+        s.apply(&env(3, "user_message", json!({ "text": "b" })));
+        s.apply(&env(4, "model_outcome", model_outcome(Some("y"), &[], 7, 2)));
+        s.finalize_turn(Some((OutcomeClass::Progress, None)));
+        assert_eq!(s.tokens(), (17, 7));
     }
 }
