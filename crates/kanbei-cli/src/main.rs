@@ -307,11 +307,16 @@ fn build_engine(opts: &Options) -> Result<Box<dyn ProviderEngine>, String> {
 }
 
 /// The M2 fuel recipe (module activation and host-ABI round-trips exceed the
-/// 1M default per call).
+/// 1M default per call) plus the R-24 bounds: a finite relative epoch (500
+/// ticks ~= 5 s, matching `call_timeout`) so a runaway guest is interrupted
+/// mid-call, a per-generation wall-clock budget, and the host-import worker
+/// ceiling.
 fn cli_engine() -> VmConfig {
     VmConfig {
-        fuel_per_call: u64::MAX,
-        epoch_deadline: u64::MAX / 2,
+        fuel_per_call: 1u64 << 35,
+        epoch_deadline: 500,
+        generation_budget: Duration::from_secs(300),
+        max_inflight_host_calls: 32,
         ..Default::default()
     }
 }

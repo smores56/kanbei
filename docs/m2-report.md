@@ -46,7 +46,7 @@ The first gate run burned 42 min CPU / 294 s wall: wasmtime's default `parallel-
 ## M3 inputs
 
 - Typed tools + effect dispatch (the broker gate becomes the real dispatch path; approval loop), async provenance, interrupted/ambiguous recovery (R-02/C-03).
-- Provider gateway (one provider) + model intents/outcomes; per-generation wall-clock budgets already enforced by the vm.
+- Provider gateway (one provider) + model intents/outcomes; per-generation wall-clock budgets and supervised host-import timeouts enforced by the vm (R-24).
 - The pre-registered dogfooding instrument must exist before M3 begins (high-level-architecture.md M3).
 - Native process execution (R-28/D-S2 launch controls) — the capability surface exists; the concrete tool set lands at M3.
 - Replaceable no-effect policy runtime (host the `PolicyPlugin` trait in the wasm empty-import path — the seam and the guest are both ready).

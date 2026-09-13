@@ -3,6 +3,8 @@
 //! A missing guest is a hard failure: build it with `cargo xtask build-guest`
 //! from the workspace root first.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -265,6 +267,199 @@ fn trap_containment_fresh_instance_still_works() {
     inst2
         .run_script("assert(kb_host_double(21) == 42)")
         .expect("host call after trap");
+}
+
+/// Host that blocks forever on every call (for the B-F2 timeout wrapper) and
+/// counts retirement calls.
+struct HangHost {
+    retires: Arc<AtomicUsize>,
+}
+
+impl HangHost {
+    fn new() -> (Arc<Self>, Arc<AtomicUsize>) {
+        let retires = Arc::new(AtomicUsize::new(0));
+        (Arc::new(Self { retires: Arc::clone(&retires) }), retires)
+    }
+}
+
+impl Host for HangHost {
+    fn call(&self, _generation_token: u64, _op: u32, _payload: &str) -> Result<String, String> {
+        // Hold the sender so `recv` never disconnects: block the worker.
+        let (_tx, rx) = mpsc::channel::<()>();
+        let _ = rx.recv();
+        Ok("never".into())
+    }
+
+    fn retire(&self, _generation_token: u64, _reason: &str) {
+        self.retires.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Host that returns quickly after a short delay (a slow-by-not-hung import),
+/// used to confirm the limiter recovers a permit when a worker completes.
+struct SlowHost;
+
+impl Host for SlowHost {
+    fn call(&self, _generation_token: u64, _op: u32, _payload: &str) -> Result<String, String> {
+        std::thread::sleep(Duration::from_millis(20));
+        Ok("ok".into())
+    }
+}
+
+/// Host that counts retirement calls without varying its dispatch behavior.
+struct CountHost {
+    retires: Arc<AtomicUsize>,
+}
+
+impl Host for CountHost {
+    fn call(&self, _generation_token: u64, _op: u32, payload: &str) -> Result<String, String> {
+        Ok(payload.to_string())
+    }
+
+    fn retire(&self, _generation_token: u64, _reason: &str) {
+        self.retires.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn host_import_hang_times_out() {
+    let config = VmConfig {
+        epoch_deadline: NO_EPOCH,
+        call_timeout: Duration::from_millis(200),
+        ..Default::default()
+    };
+    let vm = load_vm(config);
+    let compiled = vm
+        .compile("function kb_hot(x) return kb_host_call(7, '{}') end")
+        .expect("compile");
+    let (host, retires) = HangHost::new();
+    let mut inst = vm.instantiate(&compiled, 1, host).expect("instantiate");
+    let t0 = Instant::now();
+    let err = inst
+        .call_json("kb_hot", "0")
+        .expect_err("a hanging host import must time out");
+    assert!(
+        matches!(err, GuestError::HostTimeout { .. }),
+        "expected HostTimeout, got {err:?}"
+    );
+    assert_eq!(
+        retires.load(Ordering::Relaxed),
+        1,
+        "a timed-out import must retire the generation"
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "timeout took too long: {:?}",
+        t0.elapsed()
+    );
+}
+
+#[test]
+fn host_import_capacity_bounds_abandoned_workers() {
+    let config = VmConfig {
+        epoch_deadline: NO_EPOCH,
+        call_timeout: Duration::from_millis(100),
+        max_inflight_host_calls: 2,
+        ..Default::default()
+    };
+    let vm = load_vm(config);
+    let compiled = vm
+        .compile("function kb_hot(x) return kb_host_call(7, '{}') end")
+        .expect("compile");
+    // Two hangs leak both permits; the third import must fail closed at the
+    // ceiling instead of spawning another worker.
+    for i in 0..2 {
+        let (host, _) = HangHost::new();
+        let mut inst = vm.instantiate(&compiled, 1, host).expect("instantiate");
+        let err = inst.call_json("kb_hot", "0").expect_err("hang times out");
+        assert!(
+            matches!(err, GuestError::HostTimeout { .. }),
+            "call {i}: {err:?}"
+        );
+    }
+    let (host, _) = HangHost::new();
+    let mut inst = vm.instantiate(&compiled, 1, host).expect("instantiate");
+    let err = inst.call_json("kb_hot", "0").expect_err("capacity exhausted");
+    let GuestError::Host(msg) = err else {
+        panic!("expected Host (capacity), got {err:?}");
+    };
+    assert!(msg.contains("capacity exhausted"), "msg: {msg}");
+}
+
+#[test]
+fn host_import_capacity_recovers_after_a_slow_call() {
+    let config = VmConfig {
+        epoch_deadline: NO_EPOCH,
+        call_timeout: Duration::from_secs(2),
+        max_inflight_host_calls: 1,
+        ..Default::default()
+    };
+    let vm = load_vm(config);
+    let compiled = vm
+        .compile("function kb_hot(x) return kb_host_call(7, '{}') end")
+        .expect("compile");
+    let mut inst = vm
+        .instantiate(&compiled, 1, Arc::new(SlowHost))
+        .expect("instantiate");
+    inst.call_json("kb_hot", "0")
+        .expect("first call completes and releases its permit");
+    inst.call_json("kb_hot", "0")
+        .expect("second call must not see capacity exhausted");
+}
+
+#[test]
+fn generation_budget_zero_retires_at_activation() {
+    let config = VmConfig {
+        epoch_deadline: NO_EPOCH,
+        generation_budget: Duration::ZERO,
+        ..Default::default()
+    };
+    let vm = load_vm(config);
+    let compiled = vm
+        .compile("function kb_hot(x) return x * 2 end")
+        .expect("compile");
+    let retires = Arc::new(AtomicUsize::new(0));
+    let host = Arc::new(CountHost { retires: Arc::clone(&retires) });
+    let mut inst = vm.instantiate(&compiled, 1, host).expect("instantiate");
+    assert!(inst.is_dead(), "a zero budget is exhausted by activation");
+    assert!(
+        retires.load(Ordering::Relaxed) >= 1,
+        "budget exhaustion must retire the generation"
+    );
+    let err = inst
+        .call_json("kb_hot", "5")
+        .expect_err("a retired generation rejects calls");
+    assert!(
+        matches!(err, GuestError::Retired { .. }),
+        "expected Retired, got {err:?}"
+    );
+}
+
+#[test]
+fn generation_budget_accrues_on_trap_path() {
+    let config = VmConfig {
+        fuel_per_call: 1_000_000,
+        epoch_deadline: NO_EPOCH,
+        generation_budget: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let vm = load_vm(config);
+    let busy = vm
+        .compile(&format!("function kb_hot(x) {BUSY} return x end"))
+        .expect("compile");
+    let mut inst = vm
+        .instantiate(&busy, 1, Arc::new(TestHost))
+        .expect("instantiate");
+    let before = inst.spent();
+    let err = inst
+        .call_json("kb_hot", "0")
+        .expect_err("busy loop trips fuel");
+    assert!(matches!(err, GuestError::Fuel { .. }), "got {err:?}");
+    assert!(
+        inst.spent() > before,
+        "budget must accrue on the trap path (before {before:?}, after {:?})",
+        inst.spent()
+    );
 }
 
 #[test]

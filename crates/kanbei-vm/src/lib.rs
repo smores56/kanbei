@@ -5,15 +5,20 @@
 //! generation runs in its own instance backed by a fresh `Store` with
 //! configured limits; interruption is fuel + an epoch-deadline watchdog thread
 //! (bumping `Engine::increment_epoch` every `watchdog_tick`); a host-side
-//! wall-clock `call_timeout` is checked after every call. Fuel and epoch are
-//! the interruption mechanisms — a synchronous wasmtime call cannot be
-//! cancelled from another thread — so `call_timeout` is the post-return bound,
-//! not an interrupt.
+//! wall-clock `call_timeout` bounds every host import (each import is
+//! supervised on a bounded worker, B-F2/R-24) and is also checked after every
+//! call. Fuel and epoch are the in-guest interruption mechanisms — a
+//! synchronous wasmtime call cannot be cancelled from another thread — so a
+//! host import is what the wall-clock wrapper can preempt. A per-generation
+//! wall-clock budget (`generation_budget`, B-F3/R-24) retires generations that
+//! accumulate too much guest time across calls.
 //!
 //! After any trap the instance must be dropped and re-instantiated (the S1
 //! respawn pattern); the `Vm` (engine + module) is unaffected.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -69,8 +74,19 @@ pub struct VmConfig {
     /// watchdog has ticked this many times during it. Values are capped at
     /// `u64::MAX / 2` (effectively no epoch limit).
     pub epoch_deadline: u64,
-    /// Host-side wall-clock bound checked after every call/instantiate.
+    /// Host-side wall-clock bound checked after every call/instantiate, and
+    /// the deadline for the supervised host-import wrapper.
     pub call_timeout: Duration,
+    /// Ceiling on concurrently in-flight supervised host-import workers per
+    /// `Vm`. A host import past `call_timeout` is abandoned with its permit
+    /// (a blocked thread cannot be killed), so a genuine hang leaks a worker;
+    /// at this ceiling further imports fail closed instead of spawning
+    /// unbounded threads (B-F2/R-24).
+    pub max_inflight_host_calls: u32,
+    /// Per-instance cumulative wall-clock budget (includes time blocked in
+    /// host imports). Enforced at instance entry and after every call; an
+    /// exhausted instance is retired (B-F3/R-24).
+    pub generation_budget: Duration,
     /// Watchdog epoch-bump period.
     pub watchdog_tick: Duration,
 }
@@ -85,6 +101,8 @@ impl Default for VmConfig {
             fuel_per_call: 1_000_000,
             epoch_deadline: 1,
             call_timeout: Duration::from_secs(5),
+            max_inflight_host_calls: 32,
+            generation_budget: Duration::from_secs(300),
             watchdog_tick: Duration::from_millis(10),
         }
     }
@@ -113,6 +131,12 @@ pub enum GuestError {
     GuestReturn { code: i32 },
     #[error("host call failed: {0}")]
     Host(String),
+    #[error("host import op {op} exceeded the host timeout ({elapsed:?})")]
+    HostTimeout { op: u32, elapsed: Duration },
+    #[error("generation wall-clock budget exhausted (spent {spent:?} of {budget:?})")]
+    GenerationBudget { spent: Duration, budget: Duration },
+    #[error("generation retired: {reason}")]
+    Retired { reason: String },
     #[error("guest wasm not built (see build.rs)")]
     NotBuilt,
     #[error("io error: {0}")]
@@ -133,12 +157,28 @@ pub enum TrapKind {
 /// `Err("stale generation")` maps to [`GuestError::StaleGeneration`].
 pub trait Host: Send + Sync {
     fn call(&self, generation_token: u64, op: u32, payload: &str) -> Result<String, String>;
+
+    /// Retire a generation the vm can no longer trust (a host import timed out
+    /// or the wall-clock budget was exhausted). Defaulted: hosts with no
+    /// generation-currency notion ignore it. Implementors must be cheap and
+    /// must not wait on an instance lock (the caller may hold one). Retirement
+    /// invalidates *future* effects; an import already in flight is not
+    /// cancelled (a blocked thread cannot be killed).
+    fn retire(&self, _generation_token: u64, _reason: &str) {}
 }
 
 /// Trap markers that cross the wasm boundary as host errors.
 #[derive(Debug, thiserror::Error)]
 #[error("generation token is stale")]
 struct StaleGeneration;
+
+/// Marker for a host import abandoned past `call_timeout` (B-F2/R-24).
+#[derive(Debug, thiserror::Error)]
+#[error("host call timed out")]
+struct HostCallTimeout {
+    op: u32,
+    elapsed: Duration,
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("host call failed: {0}")]
@@ -254,6 +294,7 @@ pub struct Vm {
     module: Module,
     config: VmConfig,
     digest: Digest,
+    host_limiter: Arc<HostCallLimiter>,
     _watchdog: Watchdog,
 }
 
@@ -281,6 +322,14 @@ pub struct Instance {
     epoch_deadline: u64,
     call_timeout: Duration,
     generation_token: u64,
+    /// The dispatching host, so budget exhaustion can retire the generation.
+    host: Arc<dyn Host>,
+    /// Per-instance cumulative guest wall-clock ceiling (B-F3/R-24).
+    budget: Duration,
+    spent: Duration,
+    /// Set once retired (budget exhaustion or a host-import timeout); further
+    /// calls are rejected with [`GuestError::Retired`].
+    dead: Option<String>,
 }
 
 struct GuestExports {
@@ -306,6 +355,9 @@ fn memory_error(what: &str, e: impl std::fmt::Display) -> GuestError {
 fn trap_error(e: WasmError, fuel_consumed: u64) -> GuestError {
     if e.downcast_ref::<StaleGeneration>().is_some() {
         return GuestError::StaleGeneration;
+    }
+    if let Some(h) = e.downcast_ref::<HostCallTimeout>() {
+        return GuestError::HostTimeout { op: h.op, elapsed: h.elapsed };
     }
     if let Some(h) = e.downcast_ref::<HostFailure>() {
         return GuestError::Host(h.0.clone());
@@ -382,7 +434,8 @@ impl Vm {
         let module = load_or_compile_guest(&engine)?;
         let digest = Digest::new(GUEST_WASM);
         let watchdog = Watchdog::spawn(engine.clone(), config.watchdog_tick);
-        Ok(Self { engine, module, config, digest, _watchdog: watchdog })
+        let host_limiter = HostCallLimiter::new(config.max_inflight_host_calls);
+        Ok(Self { engine, module, config, digest, host_limiter, _watchdog: watchdog })
     }
 
     /// blake3 digest of the embedded guest wasm bytes (execution-snapshot
@@ -435,6 +488,7 @@ impl Vm {
         host: Arc<dyn Host>,
     ) -> Result<Instance, GuestError> {
         let t0 = Instant::now();
+        let instance_host = Arc::clone(&host);
         let (mut store, exports) =
             self.instantiate_guest(host, generation_token, self.config.fuel_per_call, NO_EPOCH_LIMIT)?;
         let base = exports
@@ -459,6 +513,13 @@ impl Vm {
         if code < 0 {
             return Err(guest_code(code));
         }
+        let spent = elapsed;
+        let dead = if spent > self.config.generation_budget {
+            instance_host.retire(generation_token, "generation wall-clock budget exhausted");
+            Some("generation wall-clock budget exhausted".to_string())
+        } else {
+            None
+        };
         Ok(Instance {
             store,
             scratch: exports.scratch,
@@ -469,6 +530,10 @@ impl Vm {
             epoch_deadline: cap_epoch(self.config.epoch_deadline),
             call_timeout: self.config.call_timeout,
             generation_token,
+            host: instance_host,
+            budget: self.config.generation_budget,
+            spent,
+            dead,
         })
     }
 
@@ -496,7 +561,13 @@ impl Vm {
         let mut linker = Linker::new(&self.engine);
         wasi_p1::add_to_linker_sync(&mut linker, |c: &mut Ctx| &mut c.wasi)
             .map_err(|e| api_error("wasi linker", e))?;
-        link_host_dispatchers(&mut linker, host, generation_token)?;
+        link_host_dispatchers(
+            &mut linker,
+            host,
+            Arc::clone(&self.host_limiter),
+            generation_token,
+            self.config.call_timeout,
+        )?;
 
         let instance = linker
             .instantiate(&mut store, &self.module)
@@ -525,27 +596,154 @@ impl Vm {
     }
 }
 
-/// Link the two dispatcher imports. Both wrap `host.call(token, ..)`; a host
-/// `Err("stale generation")` traps with the `StaleGeneration` marker, any
-/// other `Err` traps with `HostFailure`.
+/// Per-`Vm` ceiling on concurrently in-flight supervised host-import workers.
+/// A worker abandoned past the timeout keeps its permit forever (a blocked
+/// thread cannot be killed), so `inflight` doubles as a circuit breaker: at
+/// the ceiling, further imports fail closed rather than spawning more threads.
+struct HostCallLimiter {
+    inflight: AtomicU64,
+    max: u64,
+}
+
+impl HostCallLimiter {
+    fn new(max: u32) -> Arc<Self> {
+        Arc::new(Self { inflight: AtomicU64::new(0), max: max.max(1) as u64 })
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<HostCallPermit> {
+        if self.inflight.fetch_add(1, Ordering::AcqRel) >= self.max {
+            self.inflight.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(HostCallPermit { limiter: Arc::clone(self) })
+    }
+}
+
+/// Holds one in-flight slot until the worker thread finishes (or forever, if
+/// the worker is abandoned on timeout — the intended circuit-breaker leak).
+struct HostCallPermit {
+    limiter: Arc<HostCallLimiter>,
+}
+
+impl Drop for HostCallPermit {
+    fn drop(&mut self) {
+        self.limiter.inflight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+thread_local! {
+    /// True while inside a supervised host-import worker. Nested imports (a
+    /// provider's `service_call` re-entering wasm) then run inline on that
+    /// worker, so the thread count stays one per top-level import and the
+    /// thread-local `SERVICE_DEPTH` in kanbei-modules survives.
+    static SUPERVISED_HOST_CALL: Cell<bool> = const { Cell::new(false) };
+}
+
+fn on_supervised_host_call() -> bool {
+    SUPERVISED_HOST_CALL.with(Cell::get)
+}
+
+/// Outcome of one supervised host import.
+enum Dispatched {
+    Done(String),
+    Stale,
+    TimedOut { elapsed: Duration },
+    Failed(String),
+}
+
+fn classify(res: Result<String, String>) -> Dispatched {
+    match res {
+        Ok(s) => Dispatched::Done(s),
+        Err(m) if m == STALE_GENERATION => Dispatched::Stale,
+        Err(m) => Dispatched::Failed(m),
+    }
+}
+
+/// Map a supervised-import outcome to the wasm error the guest traps on.
+fn map_dispatched(label: &str, op: u32, d: Dispatched) -> Result<String, WasmError> {
+    match d {
+        Dispatched::Done(s) => Ok(s),
+        Dispatched::Stale => Err(WasmError::new(StaleGeneration)),
+        Dispatched::TimedOut { elapsed } => Err(WasmError::new(HostCallTimeout { op, elapsed })),
+        Dispatched::Failed(msg) => {
+            Err(WasmError::new(HostFailure(format!("{label} op {op}: {msg}"))))
+        }
+    }
+}
+
+/// Run one host import under the timeout wrapper (B-F2/R-24). On a worker
+/// thread the call runs inline (the top-level wrapper already bounds the whole
+/// nested chain); elsewhere it is offloaded to a bounded worker and awaited
+/// with `recv_timeout`. On timeout the worker is abandoned, its permit is
+/// consumed (fail-closed at the ceiling), and the generation is retired.
+fn supervise_host_call(
+    host: &Arc<dyn Host>,
+    limiter: &Arc<HostCallLimiter>,
+    timeout: Duration,
+    generation_token: u64,
+    op: u32,
+    payload: &str,
+) -> Dispatched {
+    if on_supervised_host_call() {
+        return classify(host.call(generation_token, op, payload));
+    }
+    let Some(permit) = limiter.try_acquire() else {
+        return Dispatched::Failed(
+            "host import capacity exhausted (too many in-flight host calls)".into(),
+        );
+    };
+    let (tx, rx) = mpsc::channel();
+    let worker_host = Arc::clone(host);
+    let payload = payload.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("kb-host-call".into())
+        .spawn(move || {
+            let _permit = permit;
+            SUPERVISED_HOST_CALL.with(|c| c.set(true));
+            let _ = tx.send(worker_host.call(generation_token, op, &payload));
+        });
+    if let Err(e) = spawned {
+        return Dispatched::Failed(format!("host import worker spawn failed: {e}"));
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(res) => classify(res),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            host.retire(generation_token, "host import timeout");
+            Dispatched::TimedOut { elapsed: timeout }
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Dispatched::Failed("host import worker panicked".into())
+        }
+    }
+}
+
+/// Link the two dispatcher imports. Both run `host.call(token, ..)` under the
+/// supervised host-import wrapper (B-F2/R-24): offloaded to a bounded worker
+/// and awaited with `recv_timeout`, or inline when already on a worker (nested
+/// imports). A stale token traps with `StaleGeneration`, a timeout with
+/// `HostCallTimeout`, any other `Err` with `HostFailure`.
 fn link_host_dispatchers(
     linker: &mut Linker<Ctx>,
     host: Arc<dyn Host>,
+    limiter: Arc<HostCallLimiter>,
     generation_token: u64,
+    timeout: Duration,
 ) -> Result<(), GuestError> {
     let host_buf = Arc::clone(&host);
+    let limiter_buf = Arc::clone(&limiter);
     linker
         .func_wrap("env", "kb_host", move |op: i32, x: i32| -> Result<i32, WasmError> {
             let payload = x.to_string();
-            match host.call(generation_token, op as u32, &payload) {
-                Ok(s) => s.parse::<i32>().map_err(|e| {
-                    WasmError::new(HostFailure(format!(
-                        "kb_host op {op}: result {s:?} is not an i32: {e}"
-                    )))
-                }),
-                Err(msg) if msg == STALE_GENERATION => Err(WasmError::new(StaleGeneration)),
-                Err(msg) => Err(WasmError::new(HostFailure(format!("kb_host op {op}: {msg}")))),
-            }
+            let s = map_dispatched(
+                "kb_host",
+                op as u32,
+                supervise_host_call(&host, &limiter, timeout, generation_token, op as u32, &payload),
+            )?;
+            s.parse::<i32>().map_err(|e| {
+                WasmError::new(HostFailure(format!(
+                    "kb_host op {op}: result {s:?} is not an i32: {e}"
+                )))
+            })
         })
         .map_err(|e| api_error("kb_host", e))?;
 
@@ -574,15 +772,18 @@ fn link_host_dispatchers(
                     .map_err(|e| WasmError::new(HostFailure(format!("kb_host_buf: read: {e}"))))?;
                 let payload = String::from_utf8(payload)
                     .map_err(|_| WasmError::new(HostFailure("kb_host_buf: payload is not UTF-8".into())))?;
-                let result = match host_buf.call(generation_token, op as u32, &payload) {
-                    Ok(s) => s,
-                    Err(msg) if msg == STALE_GENERATION => return Err(WasmError::new(StaleGeneration)),
-                    Err(msg) => {
-                        return Err(WasmError::new(HostFailure(format!(
-                            "kb_host_buf op {op}: {msg}"
-                        ))));
-                    }
-                };
+                let result = map_dispatched(
+                    "kb_host_buf",
+                    op as u32,
+                    supervise_host_call(
+                        &host_buf,
+                        &limiter_buf,
+                        timeout,
+                        generation_token,
+                        op as u32,
+                        &payload,
+                    ),
+                )?;
                 let result = result.into_bytes();
                 if ptr.saturating_add(result.len()) > memory.data_size(&caller) {
                     return Err(WasmError::new(HostFailure(format!(
@@ -606,6 +807,57 @@ impl Instance {
     /// `kb_hot_call_str`). Each call resets fuel and the epoch deadline, so a
     /// call gets a fresh `epoch_deadline`-tick window.
     pub fn call_json(&mut self, entry: &str, args: &str) -> Result<String, GuestError> {
+        if let Some(reason) = &self.dead {
+            return Err(GuestError::Retired { reason: reason.clone() });
+        }
+        let t0 = Instant::now();
+        let result = self.call_json_inner(entry, args);
+        if matches!(&result, Err(GuestError::HostTimeout { .. })) {
+            // The host retired the generation; make the vm-side terminal state
+            // match so fail-closed does not depend on the host's `retire`.
+            self.mark_dead("host import timeout");
+        }
+        let tripped = self.accrue(t0.elapsed());
+        match result {
+            Ok(_) if tripped => Err(self.budget_error()),
+            other => other,
+        }
+    }
+
+    /// Cumulative guest wall-clock spend, for budget tests/observability.
+    pub fn spent(&self) -> Duration {
+        self.spent
+    }
+
+    /// True once the generation is retired (budget exhausted or timed out).
+    pub fn is_dead(&self) -> bool {
+        self.dead.is_some()
+    }
+
+    fn budget_error(&self) -> GuestError {
+        GuestError::GenerationBudget { spent: self.spent, budget: self.budget }
+    }
+
+    fn mark_dead(&mut self, reason: &str) {
+        if self.dead.is_none() {
+            self.dead = Some(reason.to_string());
+        }
+    }
+
+    /// Charge `elapsed`; returns true when this accrual first exhausts the
+    /// budget (retiring the generation exactly once).
+    fn accrue(&mut self, elapsed: Duration) -> bool {
+        self.spent += elapsed;
+        if self.dead.is_none() && self.spent > self.budget {
+            let reason = "generation wall-clock budget exhausted";
+            self.host.retire(self.generation_token, reason);
+            self.dead = Some(reason.into());
+            return true;
+        }
+        false
+    }
+
+    fn call_json_inner(&mut self, entry: &str, args: &str) -> Result<String, GuestError> {
         if entry != "kb_hot" {
             return Err(GuestError::Host(format!(
                 "unknown call entry {entry:?}: only \"kb_hot\" is cached (kb_init)"
@@ -655,6 +907,22 @@ impl Instance {
 
     /// Compile + run `source` with the host functions available (for tests).
     pub fn run_script(&mut self, source: &str) -> Result<(), GuestError> {
+        if let Some(reason) = &self.dead {
+            return Err(GuestError::Retired { reason: reason.clone() });
+        }
+        let t0 = Instant::now();
+        let result = self.run_script_inner(source);
+        if matches!(&result, Err(GuestError::HostTimeout { .. })) {
+            self.mark_dead("host import timeout");
+        }
+        let tripped = self.accrue(t0.elapsed());
+        match result {
+            Ok(()) if tripped => Err(self.budget_error()),
+            other => other,
+        }
+    }
+
+    fn run_script_inner(&mut self, source: &str) -> Result<(), GuestError> {
         let t0 = Instant::now();
         self.store
             .set_fuel(self.fuel_per_call)

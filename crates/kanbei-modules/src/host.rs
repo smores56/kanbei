@@ -36,6 +36,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 use kanbei_capabilities::{ApprovalIntent, Broker, Capability, GrantScope, Principal};
 use kanbei_core::id::Id128;
@@ -56,6 +57,30 @@ const STALE_GENERATION: &str = "stale generation";
 
 /// `service_call` recursion cap (one hop per level; M2 is shallow).
 const MAX_SERVICE_DEPTH: u32 = 8;
+
+/// Upper bound on waiting for a provider instance lock inside `service_call`.
+/// Kept below the vm's host-import timeout so a supervised worker returns (and
+/// releases its permit) rather than being abandoned; the coupling is not
+/// enforced here because the vm's timeout is not visible to this crate.
+pub(crate) const HOST_LOCK_WAIT: Duration = Duration::from_secs(4);
+
+/// Acquire `m` without blocking past `wait`; `None` means the current holder is
+/// wedged (or the lock is poisoned).
+pub(crate) fn acquire_bounded<'a, T>(
+    m: &'a Mutex<T>,
+    wait: Duration,
+) -> Option<std::sync::MutexGuard<'a, T>> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Ok(g) = m.try_lock() {
+            return Some(g);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
 
 thread_local! {
     static SERVICE_DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -292,9 +317,15 @@ impl ModuleHost {
                     )
                 })?;
             drop(map);
-            let mut inst = instance
-                .lock()
-                .map_err(|_| "service_call: provider instance lock poisoned".to_string())?;
+            let mut inst = acquire_bounded(&instance, HOST_LOCK_WAIT).ok_or_else(|| {
+                // Contention is not proof of a wedge (a provider call may simply
+                // be slow); never retire a generation on a lock wait — only the
+                // vm's own timeout path retires.
+                format!(
+                    "service_call: provider generation {} is busy (lock wait exceeded)",
+                    provider.generation
+                )
+            })?;
             inst.call_json("kb_hot", &args.to_string()).map_err(|e| {
                 format!(
                     "service_call: provider generation {} failed: {e}",
@@ -583,6 +614,15 @@ impl Host for ModuleHost {
             6 => self.op_service_publish(&info, payload),
             7 => self.op_contribution_publish(&info, payload),
             other => Err(format!("unknown host op {other}")),
+        }
+    }
+
+    fn retire(&self, generation_token: u64, _reason: &str) {
+        // Invalidate currency and drop the kernel's handle. Neither lock is an
+        // instance lock, so this is safe to call while a caller holds one.
+        self.tokens.write().expect("tokens lock poisoned").remove(&generation_token);
+        if let Some(map) = self.instances.upgrade() {
+            map.lock().expect("instances lock poisoned").remove(&generation_token);
         }
     }
 }

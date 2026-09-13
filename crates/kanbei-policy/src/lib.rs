@@ -416,25 +416,28 @@ pub mod wasm {
     const GENERATION_TOKEN: u64 = 0;
 
     /// VmConfig for policy instances. The stock defaults are unusable here:
-    /// luaur accounts fuel per wasm instruction, so the default 1M fuel
-    /// budget is exhausted by the `kb_init` of any non-trivial policy source,
-    /// and the default 1-tick epoch deadline is an *absolute* deadline — the
-    /// watchdog counter grows forever, so any finite value trips every call
-    /// once passed (kanbei-vm's own tests set `u64::MAX` for the same
-    /// reason). Fuel is therefore the deterministic interrupt: `2^35`
-    /// instructions is ~4x the measured ~8.4G cost of a max-size redaction
-    /// call, and an infinite loop trips it in ~3 s of guest work. The 5 s
-    /// wall-clock timeout, the 64 MiB memory ceiling, the 1 MiB guest
-    /// scratch, and the gate's phase-1 candidate ceiling back it up. A
-    /// runaway policy fails closed with an explicit error, never a hang.
+    /// luaur accounts fuel per wasm instruction, so the default 1M fuel budget
+    /// is exhausted by the `kb_init` of any non-trivial policy source.
+    /// `set_epoch_deadline` is *relative* (`ticks_beyond_current`), so a finite
+    /// epoch is usable: 500 ticks at the 10 ms watchdog is ~5 s, matching
+    /// `call_timeout` (fuel only trips once a call returns). This comment is
+    /// the correction of the older "absolute deadline" claim below.
+    /// Fuel backstops it: `2^35` instructions is ~4x the measured ~8.4G cost
+    /// of a max-size redaction call, and an infinite loop trips it in ~3 s of
+    /// guest work. The per-generation wall-clock budget (lifetime cumulative
+    /// guest time), the 64 MiB memory ceiling, the 1 MiB guest scratch, and the
+    /// gate's phase-1 candidate ceiling back it up. A runaway policy fails
+    /// closed with an explicit error, never a hang.
     const POLICY_VM_CONFIG: VmConfig = VmConfig {
         max_memory_bytes: 64 * 1024 * 1024,
         max_tables: 100,
         max_table_elements: 10_000,
         max_instances: 10,
         fuel_per_call: 1u64 << 35,
-        epoch_deadline: u64::MAX,
+        epoch_deadline: 500,
         call_timeout: Duration::from_secs(5),
+        max_inflight_host_calls: 8,
+        generation_budget: Duration::from_secs(300),
         watchdog_tick: Duration::from_millis(10),
     };
 
@@ -465,15 +468,14 @@ pub mod wasm {
     ///
     /// Bounded: the gate's phase-1 ceiling runs before any plugin code, and
     /// [`MAX_WASM_CONTENT_BYTES`] bounds one call's content. The guest runs
-    /// under [`POLICY_VM_CONFIG`]: a finite fuel budget (the deterministic
-    /// interrupt — ~4x the measured cost of a max-size redaction call), an
-    /// effectively-off epoch deadline (the vm's absolute-deadline API makes
-    /// any finite value trip every call once the watchdog counter passes
-    /// it), and the 5 s call timeout, 64 MiB memory ceiling, and 1 MiB guest
-    /// scratch as backstops. One instance is kept per plugin (deterministic
-    /// `kb_hot` cache); a call that traps or trips a limit is replaced with a
-    /// fresh instance so the failure does not wedge the plugin — the error is
-    /// still returned.
+    /// under [`POLICY_VM_CONFIG`]: a finite relative epoch deadline (500 ticks
+    /// ~= 5 s, the mid-call interrupt), a finite fuel budget as the
+    /// deterministic backstop (~4x the measured cost of a max-size redaction
+    /// call), the 5 s call timeout, 64 MiB memory ceiling, and 1 MiB guest
+    /// scratch as further backstops. One instance is kept per plugin
+    /// (deterministic `kb_hot` cache); a call that traps or trips a limit is
+    /// replaced with a fresh instance so the failure does not wedge the plugin
+    /// — the error is still returned.
     pub struct WasmPolicyPlugin {
         vm: Vm,
         compiled: CompiledModule,

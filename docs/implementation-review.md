@@ -46,10 +46,8 @@ fsyncs object *data* before the referencing frame became durable, commit
 paths no longer swallow `PolicyError`, and the epoch-digest / store-closure
 duplication collects into shared primitives.
 
-**Biggest things left unfixed (all dispositioned, none silent):** R-24's
-host-import timeout wrapper and per-generation wall-clock budget are missing
-in `kanbei-vm` (the wall-clock leg is misreported by `docs/m2-report.md`);
-the module-lifecycle majors (activation-time state-schema validation,
+**Biggest things left unfixed (all dispositioned, none silent):** the
+module-lifecycle majors (activation-time state-schema validation,
 rollback leakage of registry publications, non-transactional service apply,
 post-swap `RestartFailed`, disposal facts discarded) are recorded with
 candidate fixes but not landed — they need their own milestone-sized waves;
@@ -116,8 +114,8 @@ each lane's clean list is in the lane records.
 | ID | Sev | Axis | Finding | Disposition |
 |---|---|---|---|---|
 | B-F1 | blocker | eff | Retention admission errors swallowed at the only wired sink (session spine) — gate fails open. | **Fixed** in `8c27120`. |
-| B-F2 | major | eff | R-24 leg 2 missing: no host-side timeout wrapper around host imports; a hanging `Host::call` wedges the call past the 5 s post-return-only bound. | **Deferred**: the thread+`recv_timeout` candidate is specified and host-internal; deliberately not rushed in (leaked-thread semantics on genuine hangs deserve their own CR). Highest-priority follow-up. |
-| B-F3 | major | eff | R-24 leg 3 missing: no per-generation wall-clock budget; `docs/m2-report.md:49` overstates it. | **Deferred** with candidate (`Instance::accrue(nanos)`); docs/report drift recorded here as the correction. |
+| B-F2 | major | eff | R-24 leg 2 missing: no host-side timeout wrapper around host imports; a hanging `Host::call` wedges the call past the 5 s post-return-only bound. | **Fixed in the pivot (T6)**: `kanbei-vm` supervises every host import — one bounded worker per top-level import, nested imports inline (preserving the `SERVICE_DEPTH` cap), `recv_timeout` per import, a per-`Vm` in-flight ceiling that fails closed on abandoned workers, `Host::retire` on timeout, and vm-side terminal state on timeout. A blocked worker cannot be killed, so retirement invalidates *future* effects; an import already in flight is not cancelled (documented on `Host::retire`). |
+| B-F3 | major | eff | R-24 leg 3 missing: no per-generation wall-clock budget; `docs/m2-report.md:49` overstates it. | **Fixed in the pivot (T6)**: `Instance::accrue` charges every call (including trap/timeout paths) and retires the generation at the ceiling; production configs now carry finite budgets and epochs. |
 | B-F4 | major | eff | `Broker::recheck` dead code; approval version snapshot never captured. | **Fixed** in `399ae4a` (park captures `policy_version`/`grants_version`; resolve calls `recheck`). |
 | B-F5 | major | eff | `check()` applies the UNION of all trust-class templates; design prescribes class-keyed intersection with default-deny for agent/workspace origins (arch:191-196,208,209). Latent (one template per broker in tests). | **Deferred**: needs `TrustClass` plumbed onto the invocation input; the union is self-documented in the crate. Design-correct, code-shape change. |
 | B-F6 | major | eff | WASI p1 ctx exposes host clocks + seeded RNG to guest Luau (`os.time`, `math.random` seeded `time^clock`) — contradicts the guest-determinism claim and policy purity. Rust guest shim is clean; fs/net/process genuinely unreachable. | **Design conflict (minor)**: WASI clock/random override (constant clocks + fixed RNG) + nil-ing the leaky Lua globals is *internal* guest behavior, but the handoff requires ABI-adjacent changes to be signed off. Proposed: do both in one change with determinism tests pinned on observable values. Not landed here. |
@@ -298,8 +296,8 @@ the fidelity rule (cite both passages; amend; never silently reconcile).
 
 ## Deferred-work register (ranked)
 
-1. R-24 host-import timeout wrappers + per-generation wall-clock budget
-   (B-F2/F3) — vm hardening, highest risk-adjusted value.
+1. ~~R-24 host-import timeout wrappers + per-generation wall-clock budget
+   (B-F2/F3)~~ — landed in the pivot (T6).
 2. State-schema wire-up + `module reset-state` + rollback leak (C-F1/C-F2)
    and the epoch-digest de-mixing (C-F5).
 3. Registry-bypass decode boundary (D-F-Q) + `resolved_payload` Result

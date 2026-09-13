@@ -143,11 +143,15 @@ impl Generation {
     /// because M2 modules have no cancellable effects; `forced` is therefore
     /// always false (the routine drop IS the force and cannot fail).
     pub fn dispose(self) -> DisposalRecord {
-        let token = self
-            .instance
-            .lock()
-            .expect("instance lock poisoned")
-            .generation_token();
+        // A wedged worker may hold the lock; the token equals the generation id
+        // (never reused), so disposal does not block on the instance lock. The
+        // kernel tables touched below are held only briefly.
+        let token = match self.instance.try_lock() {
+            Ok(i) => i.generation_token(),
+            Err(std::sync::TryLockError::WouldBlock | std::sync::TryLockError::Poisoned(_)) => {
+                self.generation
+            }
+        };
         self.tokens.write().expect("tokens lock poisoned").remove(&token);
         self.instances
             .lock()
@@ -528,10 +532,13 @@ impl ModuleManager {
             .get(&generation)
             .cloned()
             .ok_or_else(|| ModuleError::Call(format!("generation {generation} is not live")))?;
-        instance
-            .lock()
-            .expect("instance lock poisoned")
-            .call_json("kb_hot", args)
+        let mut inst = crate::host::acquire_bounded(&instance, crate::host::HOST_LOCK_WAIT)
+            .ok_or_else(|| {
+                ModuleError::Call(format!(
+                    "generation {generation} is wedged (lock wait exceeded)"
+                ))
+            })?;
+        inst.call_json("kb_hot", args)
             .map_err(|e| ModuleError::Call(format!("generation {generation} failed: {e}")))
     }
 

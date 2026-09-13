@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kanbei_capabilities::{Capability, PolicyTemplate, TrustClass};
 use kanbei_core::queue::DurabilityQueue;
@@ -414,6 +415,32 @@ fn service_call_routes_to_provider_kb_hot() {
     assert_eq!(log.len(), 1);
     assert!(log[0].contains(r#""from":"A""#), "log entry: {}", log[0]);
     assert!(log[0].contains(r#""n":42"#), "log entry: {}", log[0]);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+#[test]
+fn exhausted_generation_budget_fails_activation() {
+    let vm = match Vm::load(VmConfig {
+        fuel_per_call: u64::MAX,
+        epoch_deadline: u64::MAX,
+        generation_budget: Duration::ZERO,
+        ..Default::default()
+    }) {
+        Ok(vm) => vm,
+        Err(GuestError::NotBuilt) => {
+            panic!("guest wasm not built: run `cargo xtask build-guest`")
+        }
+        Err(e) => panic!("Vm::load failed: {e}"),
+    };
+    let (dir, mut manager, queue) = manager_setup("budget", vm);
+    let err = manager
+        .activate(&manifest(Id128::generate(), TRIVIAL_HOT, vec![]))
+        .expect_err("an exhausted budget must fail activation");
+    assert!(
+        matches!(err, ModuleError::Activation(ref m) if m.contains("budget")),
+        "expected an activation budget failure, got {err:?}"
+    );
     drop(manager);
     cleanup(dir, queue);
 }
