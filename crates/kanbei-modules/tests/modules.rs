@@ -18,7 +18,7 @@ use kanbei_modules::{
 };
 use kanbei_objects::ObjectStore;
 use kanbei_services::{ScopePath, ServiceDependency, ServiceKey, ServiceRegistry};
-use kanbei_vm::{GuestError, Vm, VmConfig};
+use kanbei_vm::{GuestError, Host, Vm, VmConfig};
 
 // --- helpers ---------------------------------------------------------------
 
@@ -669,6 +669,67 @@ fn require_approval_returns_intent_shape() {
     assert_eq!(intent["principal"]["generation"], g.generation);
     assert!(intent["digest"].as_str().unwrap().starts_with("blake3:"));
     drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+const PUBLISHES_SVC_AND_UI: &str = r#"
+function kb_on_activate(ctx)
+  ctx.service_publish('{"scope":["root"],"name":"svc"}', 1, '[]')
+  ctx.contribution_publish('{"kind":"ui","name":"panel","component":"panel_ui"}')
+end
+function kb_hot(x) return x end
+"#;
+
+/// A1/R-02: a forced (vm-timeout) retirement must unpublish the generation's
+/// services and contributions, not leave a dead generation's effects live.
+#[test]
+fn retire_unpublishes_generation_services_and_contributions() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("retire-unpublish", vm);
+    let id = Id128::generate();
+    let g = manager
+        .activate(&manifest(id, PUBLISHES_SVC_AND_UI, vec![]))
+        .unwrap();
+    let generation = g.generation;
+    assert_eq!(manager.services().lock().unwrap().snapshot().len(), 1);
+    assert_eq!(manager.published_contributions(generation).len(), 1);
+    assert_eq!(manager.ui_generation("panel_ui"), Some(generation));
+
+    manager.host().retire(generation, "test: forced retirement");
+
+    assert!(
+        manager.services().lock().unwrap().snapshot().is_empty(),
+        "a retired generation's service must not stay published"
+    );
+    assert!(
+        manager.published_contributions(generation).is_empty(),
+        "a retired generation's contributions must be dropped"
+    );
+    assert_eq!(manager.ui_generation("panel_ui"), None);
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// A1/R-02: direct disposal likewise must not leave the generation's effects
+/// published.
+#[test]
+fn dispose_unpublishes_generation_services_and_contributions() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("dispose-unpublish", vm);
+    let id = Id128::generate();
+    let g = manager
+        .activate(&manifest(id, PUBLISHES_SVC_AND_UI, vec![]))
+        .unwrap();
+    let generation = g.generation;
+
+    let rec = g.dispose();
+
+    assert_eq!(rec.generation, generation);
+    assert!(manager.services().lock().unwrap().snapshot().is_empty());
+    assert!(manager.published_contributions(generation).is_empty());
+    assert_eq!(manager.ui_generation("panel_ui"), None);
     drop(manager);
     cleanup(dir, queue);
 }

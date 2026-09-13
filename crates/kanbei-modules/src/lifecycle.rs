@@ -115,6 +115,9 @@ pub struct Generation {
     tokens: Arc<RwLock<HashMap<u64, TokenInfo>>>,
     instances: Arc<Mutex<HashMap<u64, Arc<Mutex<Instance>>>>>,
     tables: Arc<Mutex<LifecycleTables>>,
+    /// The kernel host, so direct disposal can retire the generation's published
+    /// effects through the same path as the vm's forced retirement.
+    host: Arc<ModuleHost>,
 }
 
 /// The `cleanup_forced` fact shape (R-24/C-04).
@@ -143,6 +146,9 @@ impl Generation {
     /// because M2 modules have no cancellable effects; `forced` is therefore
     /// always false (the routine drop IS the force and cannot fail).
     pub fn dispose(self) -> DisposalRecord {
+        // Fence against in-flight commits: hold the same gate `retire` uses so
+        // no mutating op can commit after this generation is displaced.
+        let _gate = self.host.lock_commit_gate();
         // A wedged worker may hold the lock; the token equals the generation id
         // (never reused), so disposal does not block on the instance lock. The
         // kernel tables touched below are held only briefly.
@@ -153,6 +159,7 @@ impl Generation {
             }
         };
         self.tokens.write().expect("tokens lock poisoned").remove(&token);
+        self.host.unpublish_generation(self.generation);
         self.instances
             .lock()
             .expect("instances lock poisoned")
@@ -342,6 +349,7 @@ impl ModuleManager {
             tokens: Arc::clone(&self.tokens),
             instances: Arc::clone(&self.instances),
             tables: Arc::clone(&self.tables),
+            host: Arc::clone(&self.host),
         })
     }
 

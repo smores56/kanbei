@@ -125,6 +125,11 @@ pub struct ModuleHost {
     /// UI component name → generation that mounted it (stale generations are
     /// removed on disposal, so a displaced mount cannot be resolved).
     ui_components: Mutex<HashMap<String, u64>>,
+    /// Serializes mutating commits against generation displacement. Held by
+    /// every mutating op across its write, and by `retire`/`dispose` before
+    /// they invalidate the token, so a commit and a retirement cannot interleave
+    /// (R-02/C-03: a displaced generation cannot act).
+    commit_gate: Mutex<()>,
 }
 
 impl ModuleHost {
@@ -150,7 +155,44 @@ impl ModuleHost {
             rejected_stale_effects,
             contributions: Mutex::new(HashMap::new()),
             ui_components: Mutex::new(HashMap::new()),
+            commit_gate: Mutex::new(()),
         }
+    }
+
+    /// Commit-time fence for a mutating op: the generation must still be
+    /// registered, and the returned guard must be held across the mutation so
+    /// the check and the write are atomic with respect to `retire`/`dispose`
+    /// (which take the same gate before invalidating the token).
+    fn commit_guard(&self, generation: u64) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+        let gate = self.commit_gate.lock().expect("commit gate poisoned");
+        if self
+            .tokens
+            .read()
+            .expect("tokens lock poisoned")
+            .contains_key(&generation)
+        {
+            Ok(gate)
+        } else {
+            self.rejected_stale_effects.fetch_add(1, Ordering::Relaxed);
+            Err(STALE_GENERATION.into())
+        }
+    }
+
+    /// Acquire the displacement gate without a currency check — for callers
+    /// that are themselves retiring the generation (see `Generation::dispose`).
+    pub(crate) fn lock_commit_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.commit_gate.lock().expect("commit gate poisoned")
+    }
+
+    /// Retire a generation's published effects: its service holdings and its
+    /// staged contributions/UI mounts (R-02/C-03/A1). Shared by the vm's forced
+    /// `retire` path and direct disposal.
+    pub(crate) fn unpublish_generation(&self, generation: u64) {
+        self.services
+            .lock()
+            .expect("services lock poisoned")
+            .remove_generation(generation);
+        self.drop_generation_contributions(generation);
     }
 
     pub fn session(&self) -> Id128 {
@@ -252,6 +294,7 @@ impl ModuleHost {
             bytes,
             generation: info.generation,
         };
+        let _commit = self.commit_guard(info.generation)?;
         let head = self
             .state
             .lock()
@@ -371,6 +414,7 @@ impl ModuleHost {
         let verbs = verbs_field(&v)?;
         let want = Capability::new(resource, verbs);
         let principal = self.principal(info);
+        let _commit = self.commit_guard(info.generation)?;
         let intent = self
             .broker
             .lock()
@@ -414,6 +458,7 @@ impl ModuleHost {
                 version,
             },
         };
+        let _commit = self.commit_guard(info.generation)?;
         let mut reg = self.services.lock().expect("services lock poisoned");
         let holder = reg
             .snapshot()
@@ -471,6 +516,7 @@ impl ModuleHost {
                 .map(String::from)
                 .ok_or_else(|| "contribution_publish: payload must carry a \"name\"".to_string())
         };
+        let _commit = self.commit_guard(info.generation)?;
         let contribution = match kind {
             "ui" => {
                 let name = name()?;
@@ -618,11 +664,108 @@ impl Host for ModuleHost {
     }
 
     fn retire(&self, generation_token: u64, _reason: &str) {
-        // Invalidate currency and drop the kernel's handle. Neither lock is an
-        // instance lock, so this is safe to call while a caller holds one.
+        // Wait out any in-flight commit before invalidating the token, so a
+        // mutating op that entered while the generation was current sees the
+        // stale token at its commit point instead of writing past retirement.
+        let _gate = self.commit_gate.lock().expect("commit gate poisoned");
+        // Neither lock below is an instance lock, so this is safe to call while
+        // a caller holds one.
         self.tokens.write().expect("tokens lock poisoned").remove(&generation_token);
+        self.unpublish_generation(generation_token);
         if let Some(map) = self.instances.upgrade() {
             map.lock().expect("instances lock poisoned").remove(&generation_token);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kanbei_core::queue::DurabilityQueue;
+    use std::path::PathBuf;
+
+    /// A host with generation 1 registered, sharing its token table with the
+    /// test so retirement can be simulated without a live wasm instance.
+    fn host_with_generation(tag: &str) -> (PathBuf, Arc<DurabilityQueue>, ModuleHost) {
+        let dir = std::env::temp_dir().join(format!("kb-host-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let queue = Arc::new(DurabilityQueue::start(&format!("kb-host-{tag}")));
+        let state = StateStore::open(&dir, Arc::clone(&queue), Arc::new(|_| true));
+        let tokens: Arc<RwLock<HashMap<u64, TokenInfo>>> = Arc::new(RwLock::new(HashMap::new()));
+        tokens.write().expect("tokens lock poisoned").insert(
+            1,
+            TokenInfo {
+                generation: 1,
+                module_id: Id128::generate(),
+                scope: ScopePath(vec!["root".into()]),
+                deps: Vec::new(),
+            },
+        );
+        let host = ModuleHost::new(
+            Id128::generate(),
+            tokens,
+            Weak::new(),
+            Arc::new(Mutex::new(ServiceRegistry::new())),
+            Arc::new(Mutex::new(state)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        (dir, queue, host)
+    }
+
+    fn teardown(dir: PathBuf, queue: Arc<DurabilityQueue>) {
+        let queue = Arc::try_unwrap(queue)
+            .unwrap_or_else(|_| panic!("durability queue Arc still shared"));
+        queue.shutdown().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn info() -> TokenInfo {
+        TokenInfo {
+            generation: 1,
+            module_id: Id128::generate(),
+            scope: ScopePath(vec!["root".into()]),
+            deps: Vec::new(),
+        }
+    }
+
+    /// R-02/C-03: once a generation is retired, a mutating op that entered while
+    /// it was still current must not commit. The entry-time check in `call`
+    /// cannot see this (the caller already holds a `TokenInfo`); the per-op
+    /// commit fence must.
+    #[test]
+    fn mutating_ops_reject_a_generation_retired_before_commit() {
+        let (dir, queue, host) = host_with_generation("commit-fence");
+        host.retire(1, "test: forced retirement");
+        assert_eq!(host.rejected_stale_effects(), 0);
+
+        let i = info();
+        let cases: [(&str, Result<String, String>); 4] = [
+            ("state_set", host.op_state_set(&i, r#"{"key":"k","schema":1,"value":1}"#)),
+            (
+                "require_approval",
+                host.op_require_approval(&i, r#"{"resource":"process.run","verbs":["start"]}"#),
+            ),
+            (
+                "service_publish",
+                host.op_service_publish(
+                    &i,
+                    r#"{"key":{"scope":["root"],"name":"svc"},"version":1,"deps":[]}"#,
+                ),
+            ),
+            (
+                "contribution_publish",
+                host.op_contribution_publish(&i, r#"{"kind":"theme","name":"t","overlay":{}}"#),
+            ),
+        ];
+        for (label, res) in cases {
+            assert_eq!(
+                res,
+                Err(STALE_GENERATION.into()),
+                "{label} must reject a generation retired before its commit point"
+            );
+        }
+        assert_eq!(host.rejected_stale_effects(), 4);
+        drop(host);
+        teardown(dir, queue);
     }
 }
