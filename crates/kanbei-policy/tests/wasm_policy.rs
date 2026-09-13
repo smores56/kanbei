@@ -2,9 +2,8 @@
 //! Luau policy sources hosted by kanbei-vm behind the empty capability
 //! import set ([`DenyAllHost`]).
 //!
-//! Run `cargo build -p kanbei-guest --target wasm32-wasip1 --release` from the
-//! workspace root first; without the embedded guest wasm every test prints
-//! `skip:` and passes (mirrors kanbei-vm's test skip pattern).
+//! A missing guest is a hard failure: build it with `cargo xtask build-guest`
+//! from the workspace root first.
 
 use std::sync::Arc;
 
@@ -13,13 +12,12 @@ use kanbei_policy::{
     Admission, Candidate, CandidateRole, PolicyError, PolicyPlugin, RetentionGate,
 };
 
-/// Skip when the guest wasm is absent (see kanbei-vm build.rs).
-fn load_plugin(source: &str, label: &'static str) -> Option<WasmPolicyPlugin> {
+/// Load a policy plugin; a missing guest wasm is a hard failure.
+fn load_plugin(source: &str, label: &'static str) -> WasmPolicyPlugin {
     match WasmPolicyPlugin::new(source, label) {
-        Ok(plugin) => Some(plugin),
+        Ok(plugin) => plugin,
         Err(PolicyError::Plugin(msg)) if msg.contains("guest wasm not built") => {
-            eprintln!("skip: guest wasm not built (see kanbei-vm build.rs)");
-            None
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root")
         }
         Err(e) => panic!("WasmPolicyPlugin::new failed: {e}"),
     }
@@ -110,7 +108,7 @@ end
 
 #[test]
 fn store_all_policy_admits_candidates() {
-    let Some(plugin) = load_plugin(STORE_ALL, "wasm:store-all") else { return };
+    let plugin = load_plugin(STORE_ALL, "wasm:store-all");
     let gate = RetentionGate::new(Arc::new(plugin));
     for content in [&b"first candidate"[..], &b"second candidate"[..]] {
         let admission = gate
@@ -127,7 +125,7 @@ fn store_all_policy_admits_candidates() {
 
 #[test]
 fn pattern_redaction_policy_transforms_bytes() {
-    let Some(plugin) = load_plugin(REDACT, "wasm:redact") else { return };
+    let plugin = load_plugin(REDACT, "wasm:redact");
     let gate = RetentionGate::new(Arc::new(plugin));
     let admission = gate
         .admit(candidate(CandidateRole::ToolOutput, b"secret-42 and token=abc"))
@@ -142,7 +140,7 @@ fn pattern_redaction_policy_transforms_bytes() {
 
 #[test]
 fn drop_policy_non_replay_relevant_is_dropped() {
-    let Some(plugin) = load_plugin(DROP, "wasm:drop") else { return };
+    let plugin = load_plugin(DROP, "wasm:drop");
     let gate = RetentionGate::new(Arc::new(plugin));
     let mut c = candidate(CandidateRole::ToolOutput, b"regenerable");
     c.replay_relevant = false;
@@ -157,7 +155,7 @@ fn drop_policy_non_replay_relevant_is_dropped() {
 
 #[test]
 fn drop_policy_replay_relevant_is_non_resumable_boundary() {
-    let Some(plugin) = load_plugin(DROP, "wasm:drop") else { return };
+    let plugin = load_plugin(DROP, "wasm:drop");
     let gate = RetentionGate::new(Arc::new(plugin));
     let mut c = candidate(CandidateRole::ModelContext, b"model-influential");
     c.replay_relevant = true;
@@ -172,7 +170,7 @@ fn drop_policy_replay_relevant_is_non_resumable_boundary() {
 
 #[test]
 fn host_call_is_denied_and_fails_explicitly() {
-    let Some(plugin) = load_plugin(HOST_CALL, "wasm:no-effects") else { return };
+    let plugin = load_plugin(HOST_CALL, "wasm:no-effects");
     let gate = RetentionGate::new(Arc::new(plugin));
     let mut c = candidate(CandidateRole::ModelContext, b"anything");
     c.media = Some("deny".into());
@@ -197,7 +195,7 @@ fn host_call_is_denied_and_fails_explicitly() {
 fn invalid_luau_source_fails_construction() {
     match WasmPolicyPlugin::new("local x = = 1", "wasm:bad") {
         Err(PolicyError::Plugin(msg)) if msg.contains("guest wasm not built") => {
-            eprintln!("skip: guest wasm not built (see kanbei-vm build.rs)");
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root");
         }
         Err(PolicyError::Plugin(msg)) => {
             assert!(msg.contains("compile"), "message: {msg}");
@@ -211,7 +209,7 @@ fn invalid_luau_source_fails_construction() {
 fn source_without_kb_hot_fails_construction() {
     match WasmPolicyPlugin::new("local x = 1", "wasm:no-hot") {
         Err(PolicyError::Plugin(msg)) if msg.contains("guest wasm not built") => {
-            eprintln!("skip: guest wasm not built (see kanbei-vm build.rs)");
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root");
         }
         Err(PolicyError::Plugin(_)) => {}
         Ok(_) => panic!("source without kb_hot must fail construction"),
@@ -221,7 +219,7 @@ fn source_without_kb_hot_fails_construction() {
 
 #[test]
 fn same_candidate_same_decision() {
-    let Some(plugin) = load_plugin(REDACT, "wasm:redact") else { return };
+    let plugin = load_plugin(REDACT, "wasm:redact");
     let gate = RetentionGate::new(Arc::new(plugin));
     let c = candidate(CandidateRole::ToolOutput, b"secret-42");
     let first = gate.admit(c.clone()).expect("first decide");
@@ -237,7 +235,7 @@ fn same_candidate_same_decision() {
 
 #[test]
 fn over_bound_candidate_fails_explicitly() {
-    let Some(plugin) = load_plugin(STORE_ALL, "wasm:store-all") else { return };
+    let plugin = load_plugin(STORE_ALL, "wasm:store-all");
     // The gate's 16 MiB phase-1 ceiling passes; the wasm path's tighter
     // bound fails explicitly instead of overrunning the guest scratch.
     let gate = RetentionGate::new(Arc::new(plugin));
@@ -256,7 +254,7 @@ function kb_hot(c)
     return { decision = "maybe" }
 end
 "#;
-    let Some(plugin) = load_plugin(source, "wasm:undecided") else { return };
+    let plugin = load_plugin(source, "wasm:undecided");
     let err = plugin
         .decide(&candidate(CandidateRole::ModelContext, b"data"))
         .expect_err("unknown decision must fail");
@@ -266,7 +264,7 @@ end
 
 #[test]
 fn name_and_no_effect_flags() {
-    let Some(plugin) = load_plugin(STORE_ALL, "wasm:store-all") else { return };
+    let plugin = load_plugin(STORE_ALL, "wasm:store-all");
     assert_eq!(plugin.name(), "wasm:store-all");
     assert!(plugin.is_no_effect(), "empty capability set must be declared");
 }

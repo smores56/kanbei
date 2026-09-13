@@ -1,7 +1,8 @@
 //! M5 gate: semantic workbench. Exercises the kernel terminal/fallback
 //! boundary (kanbei-ui), the built-in UI as an immutable module generation
 //! through the standard contribution contract, and the three R-27 fault
-//! classes. Skips are documented where the guest wasm is not built.
+//! classes. A missing guest wasm is a hard failure; build it with
+//! `cargo xtask build-guest` from the workspace root.
 
 use std::path::PathBuf;
 
@@ -23,18 +24,12 @@ fn engine() -> kanbei_vm::VmConfig {
     }
 }
 
-/// Module tests need the guest wasm; without it they skip with a note (the
-/// crash matrix skips too — its points fire inside the module lifecycle, so
-/// a wasm-less run would fail every point instead).
-fn require_guest() -> bool {
+/// Module tests need the guest wasm; a missing guest is a hard failure.
+fn require_guest() {
     match kanbei_vm::Vm::load(engine()) {
-        Ok(_) => true,
+        Ok(_) => {}
         Err(kanbei_vm::GuestError::NotBuilt) => {
-            eprintln!(
-                "skip: guest wasm not built (run `cargo build -p kanbei-guest \
-                 --target wasm32-wasip1 --release`)"
-            );
-            false
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root")
         }
         Err(e) => panic!("guest vm load: {e}"),
     }
@@ -72,10 +67,10 @@ fn open(tag: &str) -> (PathBuf, Session) {
 #[test]
 fn builtin_ui_end_to_end() {
     let (dir, mut session) = open("e2e");
-    if session.modules().is_none() {
-        eprintln!("skip: guest wasm not built (kanbei-vm NotBuilt)");
-        return;
-    }
+    assert!(
+        session.modules().is_some(),
+        "session has no module engine: build the guest with `cargo xtask build-guest` (or the session is in safe mode)"
+    );
     let epoch = session.activate_builtin_ui().unwrap();
     assert!(epoch > 0);
 
@@ -129,10 +124,10 @@ fn builtin_ui_end_to_end() {
 #[test]
 fn focus_and_reserved_keys() {
     let (dir, mut session) = open("reserved");
-    if session.modules().is_none() {
-        eprintln!("skip: guest wasm not built");
-        return;
-    }
+    assert!(
+        session.modules().is_some(),
+        "session has no module engine: build the guest with `cargo xtask build-guest` (or the session is in safe mode)"
+    );
     session.activate_builtin_ui().unwrap();
 
     // Type "a", then navigation + reserved keys, then "b": only a and b land.
@@ -210,10 +205,10 @@ fn capability_intersection_denies_ui_intents() {
         ..Default::default()
     })
     .unwrap();
-    if session.modules().is_none() {
-        eprintln!("skip: guest wasm not built");
-        return;
-    }
+    assert!(
+        session.modules().is_some(),
+        "session has no module engine: build the guest with `cargo xtask build-guest` (or the session is in safe mode)"
+    );
     session.activate_builtin_ui().unwrap();
     let outcome = session.ui_handle_input(b"secret\n").unwrap();
     assert_eq!(outcome.intents_applied, 0, "denied intent must not apply");
@@ -279,10 +274,10 @@ end
 #[test]
 fn runtime_component_fault_degrades() {
     let (_dir, mut session) = open("fault");
-    if session.modules().is_none() {
-        eprintln!("skip: guest wasm not built");
-        return;
-    }
+    assert!(
+        session.modules().is_some(),
+        "session has no module engine: build the guest with `cargo xtask build-guest` (or the session is in safe mode)"
+    );
     // Activate the flaky module FIRST so the host binds it (snapshot order).
     session.activate_ui(flaky_ui_manifest()).unwrap();
     assert_eq!(session.ui().unwrap().component, "flaky_ui");
@@ -328,10 +323,10 @@ fn runtime_component_fault_degrades() {
 #[test]
 fn composition_failure_retains_last_valid() {
     let (dir, mut session) = open("stale");
-    if session.modules().is_none() {
-        eprintln!("skip: guest wasm not built");
-        return;
-    }
+    assert!(
+        session.modules().is_some(),
+        "session has no module engine: build the guest with `cargo xtask build-guest` (or the session is in safe mode)"
+    );
     session.activate_builtin_ui().unwrap();
     let epoch_before = session.composition().epoch;
 
@@ -353,10 +348,10 @@ fn composition_failure_retains_last_valid() {
 #[test]
 fn kernel_render_fault_falls_back() {
     let (_dir, mut session) = open("render-fault");
-    if session.modules().is_none() {
-        eprintln!("skip: guest wasm not built");
-        return;
-    }
+    assert!(
+        session.modules().is_some(),
+        "session has no module engine: build the guest with `cargo xtask build-guest` (or the session is in safe mode)"
+    );
     session.activate_builtin_ui().unwrap();
     session.ui_handle_input(b"x").unwrap();
 
@@ -432,17 +427,12 @@ fn hot_path_structure() {
 /// no canonical gestures).
 #[test]
 fn crash_matrix_m5() {
+    require_guest();
     if std::env::var("KANBEI_SKIP_CRASH").is_ok() {
         eprintln!("skip: KANBEI_SKIP_CRASH set");
         return;
     }
-    // The M5 points fire inside the UI module lifecycle; without the guest
-    // wasm the child never activates a module and every point FAILS instead
-    // of skipping (every other m5 test guards on `modules().is_none()` — the
-    // matrix must too, or the suite is red on a clean tree).
-    if !require_guest() {
-        return;
-    }
+    // The M5 points fire inside the UI module lifecycle.
     let points = [
         FaultPoint::BeforeUiReduce,
         FaultPoint::AfterUiReduce,

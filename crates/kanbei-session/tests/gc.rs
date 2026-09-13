@@ -2,8 +2,8 @@
 //! GC — root capture over the session log + live roots, writer pins, the
 //! quarantine + grace sweep, the canonical `gc.run` record, the open-time
 //! automatic pass (crash safety across reopen), memory-store GC, and
-//! post-GC export honesty. Guest-wasm tests skip when the guest is not built
-//! (see m2.rs).
+//! post-GC export honesty. Guest-wasm tests need the guest; a missing guest is
+//! a hard failure (see m2.rs).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -94,16 +94,12 @@ fn gc_run_envelope(dir: &Path) -> Envelope {
     found.expect("a gc.run envelope is in the log")
 }
 
-/// Module tests need the guest wasm; without it they skip with a note.
-fn require_guest() -> bool {
+/// Module tests need the guest wasm; a missing guest is a hard failure.
+fn require_guest() {
     match Vm::load(no_epoch()) {
-        Ok(_) => true,
+        Ok(_) => {}
         Err(GuestError::NotBuilt) => {
-            eprintln!(
-                "skip: guest wasm not built (run `cargo build -p kanbei-guest \
-                 --target wasm32-wasip1 --release`)"
-            );
-            false
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root")
         }
         Err(e) => panic!("Vm::load failed: {e}"),
     }
@@ -495,9 +491,7 @@ fn memory_gc_sweeps_orphans_and_keeps_claims() {
 
 #[test]
 fn config_package_and_module_pin_survive_gc() {
-    if !require_guest() {
-        return;
-    }
+    require_guest();
     let tmp = TempDir::new("session-config");
     let dir = tmp.path().to_path_buf();
     let config = PackageManifest {

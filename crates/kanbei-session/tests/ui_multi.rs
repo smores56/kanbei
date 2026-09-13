@@ -3,8 +3,9 @@
 //! input fans out to every mount's reducer with per-mount capability
 //! isolation; focus navigates across mounts; a fault degrades only the
 //! faulting mount; composition stays atomic with the existing fallback
-//! classes; mid-session deactivation unbinds cleanly. Skips when the guest
-//! wasm is not built (require_guest pattern).
+//! classes; mid-session deactivation unbinds cleanly. Guest-wasm tests need
+//! the guest; a missing guest is a hard failure (require_guest pattern; build
+//! with `cargo xtask build-guest` from the workspace root).
 
 use kanbei_capabilities::{
     Broker, Capability, Grant, GrantScope, PolicyTemplate, Principal, TrustClass,
@@ -69,9 +70,7 @@ fn body(session: &Session) -> String {
 #[test]
 fn two_mount_composition() {
     let (dir, mut session) = open("compose");
-    if !require_guest() {
-        return;
-    }
+    require_guest();
     session
         .activate_ui(ui_module("aux_ui", "aux_comp", "aux", TrustClass::Builtin, false))
         .unwrap();
@@ -121,9 +120,7 @@ fn two_mount_composition() {
 #[test]
 fn fan_out_reducers() {
     let (dir, mut session) = open("fanout");
-    if !require_guest() {
-        return;
-    }
+    require_guest();
     session
         .activate_ui(ui_module("aux_ui", "aux_comp", "aux", TrustClass::Builtin, false))
         .unwrap();
@@ -168,9 +165,7 @@ fn per_mount_grants() {
         ..Default::default()
     })
     .unwrap();
-    if !require_guest() {
-        return;
-    }
+    require_guest();
     // generation 1: granted mount; generation 2: no grant.
     session
         .activate_ui(ui_module("granted", "granted_comp", "main", TrustClass::Builtin, false))
@@ -224,9 +219,7 @@ fn per_mount_grants() {
 #[test]
 fn focus_cycles_mounts() {
     let (dir, mut session) = open("focus");
-    if !require_guest() {
-        return;
-    }
+    require_guest();
     session
         .activate_ui(ui_module("aux_ui", "aux_comp", "aux", TrustClass::Builtin, false))
         .unwrap();
@@ -273,9 +266,7 @@ fn focus_cycles_mounts() {
 #[test]
 fn deactivation_unbinds_replaced_mount() {
     let (dir, mut session) = open("deactivate");
-    if !require_guest() {
-        return;
-    }
+    require_guest();
     let main = ui_module("main_ui", "main_comp", "main", TrustClass::Builtin, false);
     let stat = ui_module("stat_ui", "stat_comp", "status", TrustClass::Builtin, false);
     session.activate_ui(main.clone()).unwrap();
@@ -329,9 +320,7 @@ fn fault_isolation() {
         ..Default::default()
     })
     .unwrap();
-    if !require_guest() {
-        return;
-    }
+    require_guest();
     session
         .activate_ui(ui_module("good", "good_comp", "main", TrustClass::Builtin, false))
         .unwrap();
@@ -386,9 +375,7 @@ fn fault_isolation() {
 #[test]
 fn atomic_fallback_two_mounts() {
     let (dir, mut session) = open("atomic");
-    if !require_guest() {
-        return;
-    }
+    require_guest();
     session
         .activate_ui(ui_module("aux_ui", "aux_comp", "aux", TrustClass::Builtin, false))
         .unwrap();

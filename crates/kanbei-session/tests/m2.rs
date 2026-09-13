@@ -3,9 +3,8 @@
 //! module-state head updates, the retention gate, safe mode, trap
 //! containment, M2 fault points, and schema-2 manifest pinning.
 //!
-//! Run `cargo build -p kanbei-guest --target wasm32-wasip1 --release` from the
-//! workspace root first; module-dependent tests print `skip:` and pass without
-//! it (the suite must stay green either way).
+//! A missing guest is a hard failure: build it with `cargo xtask build-guest`
+//! from the workspace root first.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -57,16 +56,12 @@ impl Drop for TempDir {
     }
 }
 
-/// Module tests need the guest wasm; without it they skip with a note.
-fn require_guest() -> bool {
+/// Module tests need the guest wasm; a missing guest is a hard failure.
+fn require_guest() {
     match Vm::load(no_epoch()) {
-        Ok(_) => true,
+        Ok(_) => {}
         Err(GuestError::NotBuilt) => {
-            eprintln!(
-                "skip: guest wasm not built (run `cargo build -p kanbei-guest \
-                 --target wasm32-wasip1 --release`)"
-            );
-            false
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root")
         }
         Err(e) => panic!("Vm::load failed: {e}"),
     }
@@ -202,9 +197,7 @@ end
 /// the module pin + composition digest (schema 2).
 #[test]
 fn activate_config_publishes_service_and_composition() {
-    if !require_guest() {
-        return;
-    };
+    require_guest();
     let dir = TempDir::new("activate");
     let id = Id128::generate();
     let m = manifest(id, PUBLISHER, vec![]);
@@ -272,9 +265,7 @@ fn activate_config_publishes_service_and_composition() {
 /// no composition_changed event, the failing module never registers.
 #[test]
 fn activate_config_conflict_retains_epoch() {
-    if !require_guest() {
-        return;
-    };
+    require_guest();
     let dir = TempDir::new("conflict");
     let mut session = Session::open(SessionConfig {
         dir: dir.path().to_path_buf(),
@@ -320,9 +311,7 @@ fn activate_config_conflict_retains_epoch() {
 /// composition_changed delta records removed + added.
 #[test]
 fn replace_module_swaps_generation_and_records_delta() {
-    if !require_guest() {
-        return;
-    };
+    require_guest();
     let dir = TempDir::new("replace");
     let id = Id128::generate();
     let mut session = Session::open(SessionConfig {
@@ -377,9 +366,7 @@ fn replace_module_swaps_generation_and_records_delta() {
 /// the provider generation's kb_hot; stale caller generations are rejected.
 #[test]
 fn effect_dispatch_routes_to_provider_kb_hot() {
-    if !require_guest() {
-        return;
-    };
+    require_guest();
     let dir = TempDir::new("dispatch");
     let id_prov = Id128::generate();
     let mut session = Session::open(SessionConfig {
@@ -419,9 +406,7 @@ fn effect_dispatch_routes_to_provider_kb_hot() {
 /// generations and oversize updates fail closed.
 #[test]
 fn module_state_cas_heads_and_fail_closed() {
-    if !require_guest() {
-        return;
-    };
+    require_guest();
     let dir = TempDir::new("head");
     let id = Id128::generate();
     let mut session = Session::open(SessionConfig {
@@ -609,9 +594,7 @@ fn retain_candidate_drop_boundary_commits_fact() {
 /// log; the session remains usable with storage only (R-01/C-02).
 #[test]
 fn invalid_config_opens_safe_mode() {
-    if !require_guest() {
-        return;
-    };
+    require_guest();
     let dir = TempDir::new("safe-mode");
     let id = Id128::generate();
     let mut session = Session::open(SessionConfig {
@@ -645,9 +628,7 @@ fn invalid_config_opens_safe_mode() {
 /// recovery stays clean.
 #[test]
 fn wasm_trap_contained_session_survives() {
-    if !require_guest() {
-        return;
-    };
+    require_guest();
     let dir = TempDir::new("trap");
     let id_trap = Id128::generate();
     let mut session = Session::open(SessionConfig {
@@ -693,9 +674,7 @@ fn wasm_trap_contained_session_survives() {
 /// and module_state_cas.
 #[test]
 fn m2_fault_points_recorded() {
-    if !require_guest() {
-        return;
-    };
+    require_guest();
     let dir = TempDir::new("fault-points");
     let (recorder, points) = Recorder::new();
     let id_prov = Id128::generate();
@@ -757,9 +736,7 @@ fn m2_fault_points_recorded() {
 /// module pins and the composition digest.
 #[test]
 fn committed_manifests_are_schema_2() {
-    if !require_guest() {
-        return;
-    };
+    require_guest();
     let dir = TempDir::new("schema2");
     let id = Id128::generate();
     let mut session = Session::open(SessionConfig {

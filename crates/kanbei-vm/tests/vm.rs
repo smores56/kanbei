@@ -1,7 +1,7 @@
 //! Integration tests for kanbei-vm against the built kanbei-guest wasm.
 //!
-//! Run `cargo build -p kanbei-guest --target wasm32-wasip1 --release` from the
-//! workspace root first; without it every test prints `skip:` and passes.
+//! A missing guest is a hard failure: build it with `cargo xtask build-guest`
+//! from the workspace root first.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,12 +40,11 @@ impl Host for StaleHost {
     }
 }
 
-fn load_vm(config: VmConfig) -> Option<Vm> {
+fn load_vm(config: VmConfig) -> Vm {
     match Vm::load(config) {
-        Ok(vm) => Some(vm),
+        Ok(vm) => vm,
         Err(GuestError::NotBuilt) => {
-            eprintln!("skip: guest wasm not built (see build.rs)");
-            None
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root")
         }
         Err(e) => panic!("Vm::load failed: {e}"),
     }
@@ -65,7 +64,7 @@ const BUSY: &str = "local x = 0 for i = 1, 1000000000 do x = x + i end";
 
 #[test]
 fn load_and_digest_is_stable() {
-    let Some(vm) = load_vm(VmConfig::default()) else { return };
+    let vm = load_vm(VmConfig::default());
     let d1 = vm.engine_digest();
     let vm2 = Vm::load(VmConfig::default()).expect("second load");
     assert_eq!(d1, vm2.engine_digest());
@@ -75,7 +74,7 @@ fn load_and_digest_is_stable() {
 
 #[test]
 fn compile_ok_and_syntax_error() {
-    let Some(vm) = load_vm(VmConfig::default()) else { return };
+    let vm = load_vm(VmConfig::default());
     let compiled = vm.compile(&config_source()).expect("config-style source compiles");
     drop(compiled);
     let err = vm.compile("local x = = 1").expect_err("syntax error must fail");
@@ -87,9 +86,7 @@ fn compile_ok_and_syntax_error() {
 
 #[test]
 fn instantiate_and_run_script_host_double() {
-    let Some(vm) = load_vm(VmConfig { epoch_deadline: NO_EPOCH, ..Default::default() }) else {
-        return;
-    };
+    let vm = load_vm(VmConfig { epoch_deadline: NO_EPOCH, ..Default::default() });
     let compiled = vm.compile("function kb_hot(x) return x end").expect("compile");
     let mut inst = vm
         .instantiate(&compiled, 7, Arc::new(TestHost))
@@ -101,9 +98,7 @@ fn instantiate_and_run_script_host_double() {
 
 #[test]
 fn hot_call_json_roundtrip() {
-    let Some(vm) = load_vm(VmConfig { epoch_deadline: NO_EPOCH, ..Default::default() }) else {
-        return;
-    };
+    let vm = load_vm(VmConfig { epoch_deadline: NO_EPOCH, ..Default::default() });
     let compiled = vm
         .compile("function kb_hot(x) return x * 2 end")
         .expect("compile");
@@ -143,7 +138,7 @@ fn fuel_trip_and_respawn() {
         epoch_deadline: NO_EPOCH,
         ..Default::default()
     };
-    let Some(vm) = load_vm(config) else { return };
+    let vm = load_vm(config);
     let busy = vm
         .compile(&format!("function kb_hot(x) {BUSY} return x end"))
         .expect("compile");
@@ -171,7 +166,7 @@ fn epoch_trip_with_watchdog() {
         fuel_per_call: u64::MAX,
         ..Default::default()
     };
-    let Some(vm) = load_vm(config) else { return };
+    let vm = load_vm(config);
     let busy = vm
         .compile(&format!("function kb_hot(x) {BUSY} return x end"))
         .expect("compile");
@@ -201,7 +196,7 @@ fn memory_limit_trip() {
         epoch_deadline: NO_EPOCH,
         ..Default::default()
     };
-    let Some(vm) = load_vm(config) else { return };
+    let vm = load_vm(config);
     let compiled = vm
         .compile("function kb_hot(x) local t = {} for i = 1, 10000000 do t[i] = i end return t end")
         .expect("compile");
@@ -222,9 +217,7 @@ fn memory_limit_trip() {
 
 #[test]
 fn stale_generation_maps_to_guest_error() {
-    let Some(vm) = load_vm(VmConfig { epoch_deadline: NO_EPOCH, ..Default::default() }) else {
-        return;
-    };
+    let vm = load_vm(VmConfig { epoch_deadline: NO_EPOCH, ..Default::default() });
     let compiled = vm.compile("function kb_hot(x) return x end").expect("compile");
     let mut inst = vm
         .instantiate(&compiled, 99, Arc::new(StaleHost))
@@ -240,9 +233,7 @@ fn stale_generation_maps_to_guest_error() {
 
 #[test]
 fn host_call_payload_roundtrip() {
-    let Some(vm) = load_vm(VmConfig { epoch_deadline: NO_EPOCH, ..Default::default() }) else {
-        return;
-    };
+    let vm = load_vm(VmConfig { epoch_deadline: NO_EPOCH, ..Default::default() });
     let compiled = vm.compile("function kb_hot(x) return x end").expect("compile");
     let mut inst = vm
         .instantiate(&compiled, 1, Arc::new(TestHost))
@@ -255,9 +246,7 @@ fn host_call_payload_roundtrip() {
 
 #[test]
 fn trap_containment_fresh_instance_still_works() {
-    let Some(vm) = load_vm(VmConfig { epoch_deadline: NO_EPOCH, ..Default::default() }) else {
-        return;
-    };
+    let vm = load_vm(VmConfig { epoch_deadline: NO_EPOCH, ..Default::default() });
     let compiled = vm.compile("function kb_hot(x) return x end").expect("compile");
     let mut inst = vm
         .instantiate(&compiled, 1, Arc::new(StaleHost))
@@ -279,14 +268,7 @@ fn trap_containment_fresh_instance_still_works() {
 }
 
 #[test]
-fn not_built_when_stub_embedded() {
-    match Vm::load(VmConfig::default()) {
-        Err(GuestError::NotBuilt) => {
-            eprintln!("note: guest wasm absent — stub embedded, NotBuilt confirmed");
-        }
-        Ok(_) => {
-            eprintln!("skip: guest wasm present — NotBuilt path not exercised");
-        }
-        Err(e) => panic!("unexpected load error: {e:?}"),
-    }
+fn guest_is_built() {
+    Vm::load(VmConfig::default())
+        .expect("guest wasm not built: run `cargo xtask build-guest` from the workspace root");
 }

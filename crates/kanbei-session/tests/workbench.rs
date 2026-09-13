@@ -1,8 +1,8 @@
 //! M7 workbench smoke test: the dogfooding binary over a real (piped)
 //! stdin — bracketed paste, a mouse escape, Enter (submit), Ctrl-C (clean
 //! exit). Asserts the canonical user_message is durable in the session log
-//! and that the session reopens cleanly. Skips when the guest wasm is not
-//! built (require_guest pattern, see m6.rs).
+//! and that the session reopens cleanly. A missing guest wasm is a hard
+//! failure (require_guest pattern, see m6.rs).
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -15,20 +15,16 @@ use kanbei_log::for_each_frame;
 use kanbei_session::{Session, SessionConfig};
 use kanbei_vm::{GuestError, Vm, VmConfig};
 
-/// Module tests need the guest wasm; without it they skip with a note.
-fn require_guest() -> bool {
+/// Module tests need the guest wasm; a missing guest is a hard failure.
+fn require_guest() {
     match Vm::load(VmConfig {
         fuel_per_call: u64::MAX,
         epoch_deadline: u64::MAX,
         ..Default::default()
     }) {
-        Ok(_) => true,
+        Ok(_) => {}
         Err(GuestError::NotBuilt) => {
-            eprintln!(
-                "skip: guest wasm not built (run `cargo build -p kanbei-guest \
-                 --target wasm32-wasip1 --release`)"
-            );
-            false
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root")
         }
         Err(e) => panic!("Vm::load failed: {e}"),
     }
@@ -46,9 +42,7 @@ fn tempdir(tag: &str) -> PathBuf {
 
 #[test]
 fn workbench_stdin_e2e() {
-    if !require_guest() {
-        return;
-    }
+    require_guest();
     let dir = tempdir("e2e");
 
     // Piped stdin: the binary must skip raw mode and read bytes directly.

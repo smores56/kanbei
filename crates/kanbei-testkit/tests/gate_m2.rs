@@ -6,9 +6,8 @@
 //! reload publishes atomically (640) — and consistency tests 1 Owner, 2
 //! Authority, 9 Privacy, 10 Replay honesty, 15 Scope.
 //!
-//! Run `cargo build -p kanbei-guest --target wasm32-wasip1 --release` from
-//! the workspace root first; module-dependent tests print `skip:` and pass
-//! without it (the suite must stay green either way).
+//! A missing guest is a hard failure: build it with `cargo xtask build-guest`
+//! from the workspace root first.
 
 use std::path::{Path, PathBuf};
 use std::os::unix::process::ExitStatusExt;
@@ -70,16 +69,12 @@ fn shutdown_store(store: ObjectStore, queue: Arc<DurabilityQueue>) {
     q.shutdown().unwrap();
 }
 
-/// Module tests need the guest wasm; without it they skip with a note.
-fn require_guest() -> bool {
+/// Module tests need the guest wasm; a missing guest is a hard failure.
+fn require_guest() {
     match Vm::load(no_epoch()) {
-        Ok(_) => true,
+        Ok(_) => {}
         Err(GuestError::NotBuilt) => {
-            eprintln!(
-                "skip: guest wasm not built (run `cargo build -p kanbei-guest \
-                 --target wasm32-wasip1 --release`)"
-            );
-            false
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root")
         }
         Err(e) => panic!("Vm::load failed: {e}"),
     }
@@ -206,7 +201,7 @@ end
 
 #[test]
 fn acceptance_generation_replacement_leaves_no_stale_state() {
-    if !require_guest() { return; }
+    require_guest();
     let dir = fresh_session_dir("m2-owner");
     let _guard = DirGuard(dir.clone());
     let id = Id128::generate();
@@ -288,7 +283,7 @@ fn acceptance_generation_replacement_leaves_no_stale_state() {
 
 #[test]
 fn acceptance_wasm_traps_do_not_corrupt_session() {
-    if !require_guest() { return; }
+    require_guest();
     let dir = fresh_session_dir("m2-trap");
     let _guard = DirGuard(dir.clone());
     let id_trap = Id128::generate();
@@ -329,7 +324,7 @@ fn acceptance_wasm_traps_do_not_corrupt_session() {
 
 #[test]
 fn acceptance_capabilities_attenuate_and_stale_cannot_act() {
-    if !require_guest() { return; }
+    require_guest();
     let dir = fresh_session_dir("m2-authority");
     let _guard = DirGuard(dir.clone());
     let id = Id128::generate();
@@ -427,7 +422,7 @@ fn acceptance_capabilities_attenuate_and_stale_cannot_act() {
 
 #[test]
 fn acceptance_config_reload_publishes_atomically() {
-    if !require_guest() { return; }
+    require_guest();
     let dir = fresh_session_dir("m2-config");
     let _guard = DirGuard(dir.clone());
     let mut session = Session::open(SessionConfig {
@@ -595,7 +590,7 @@ fn acceptance_retention_policy_no_effect() {
 
 #[test]
 fn acceptance_crash_m2_points() {
-    if !require_guest() { return; }
+    require_guest();
     const POINTS: [FaultPoint; 6] = [
         FaultPoint::BeforeConfigActivation,
         FaultPoint::AfterConfigActivation,

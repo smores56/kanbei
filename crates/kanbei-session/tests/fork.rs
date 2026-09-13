@@ -5,11 +5,9 @@
 //! replay, post-checkpoint transitions truncated out), the read-only fork
 //! floor, config activation, source non-interference (no quiesce, no events),
 //! validation errors, determinism, and workspace restore. Guest-wasm tests
-//! skip when the guest is not built (see m2.rs).
+//! need the guest wasm; a missing guest is a hard failure (see m2.rs).
 //!
-//! Run `cargo build -p kanbei-guest --target wasm32-wasip1 --release` from
-//! the workspace root first; the module-dependent test prints `skip:` and
-//! passes without it.
+//! Build it with `cargo xtask build-guest` from the workspace root first.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -64,16 +62,12 @@ impl Drop for TempDir {
     }
 }
 
-/// Module tests need the guest wasm; without it they skip with a note.
-fn require_guest() -> bool {
+/// Module tests need the guest wasm; a missing guest is a hard failure.
+fn require_guest() {
     match Vm::load(no_epoch()) {
-        Ok(_) => true,
+        Ok(_) => {}
         Err(GuestError::NotBuilt) => {
-            eprintln!(
-                "skip: guest wasm not built (run `cargo build -p kanbei-guest \
-                 --target wasm32-wasip1 --release`)"
-            );
-            false
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root")
         }
         Err(e) => panic!("Vm::load failed: {e}"),
     }
@@ -466,9 +460,7 @@ fn fork_broker_is_read_only_floor() {
 
 #[test]
 fn fork_with_config_activates_same_digest() {
-    if !require_guest() {
-        return;
-    }
+    require_guest();
     let dir = TempDir::new("config");
     let source_id = Id128::generate();
     let config = PackageManifest {

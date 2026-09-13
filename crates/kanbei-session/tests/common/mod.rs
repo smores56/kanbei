@@ -22,16 +22,12 @@ pub fn engine() -> VmConfig {
     }
 }
 
-/// Module tests need the guest wasm; without it they skip with a note.
-pub fn require_guest() -> bool {
+/// Module tests need the guest wasm; a missing guest is a hard failure.
+pub fn require_guest() {
     match Vm::load(engine()) {
-        Ok(_) => true,
+        Ok(_) => {}
         Err(GuestError::NotBuilt) => {
-            eprintln!(
-                "skip: guest wasm not built (run `cargo build -p kanbei-guest \
-                 --target wasm32-wasip1 --release`)"
-            );
-            false
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root")
         }
         Err(e) => panic!("Vm::load failed: {e}"),
     }

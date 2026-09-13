@@ -27,10 +27,12 @@ members = [
     "crates/kanbei-tools",
     "crates/kanbei-ui",
     "crates/kanbei-workspace",
+    "xtask",
 ]
-# kanbei-guest builds only for wasm32-wasip1 with special link args; exclude it
-# from implicit `--workspace` selection (build explicitly with
-# `cargo build -p kanbei-guest --target wasm32-wasip1 --release`).
+# kanbei-guest builds only for wasm32-wasip1 with special link args, so it is
+# excluded from `default-members` (implicit selection at the workspace root);
+# build it explicitly with `cargo xtask build-guest`. `--workspace` still
+# includes it.
 default-members = [
     "crates/kanbei-core",
     "crates/kanbei-log",

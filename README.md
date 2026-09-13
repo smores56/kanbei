@@ -54,9 +54,9 @@ Embedding: `kanbei_driver::Driver::user_turn(text)` returns
 `Turn { answer, runs, last_outcome }`; the gates in `crates/kanbei-testkit`
 and the `workbench` binary (M7 input-path dogfood) are reference drivers.
 
-Building the guest wasm (`cargo build -p kanbei-guest --target
-wasm32-wasip1 --release`) enables live Luau modules and the built-in UI;
-without it, module-bound features skip.
+Building the guest wasm (`cargo xtask build-guest`) enables live Luau modules
+and the built-in UI; a checkout without it FAILS the module tests rather than
+skipping them.
 
 ## Design documents
 

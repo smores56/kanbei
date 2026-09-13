@@ -396,7 +396,8 @@ function kb_hot(x) return {{ from = "{service}", got = x }} end
 
 /// 5 — the branch record's config choice: `current` is the live config
 /// manifest digest at the branch point, `historical` the checkpoint
-/// manifest's provider_config pin. Skips when the guest wasm is not built.
+/// manifest's provider_config pin. Requires the guest wasm (hard failure if
+/// missing).
 #[test]
 fn config_choice_records_current_vs_historical() {
     let dir = fresh_session_dir("config-choice");
@@ -413,10 +414,10 @@ fn config_choice_records_current_vs_historical() {
         ..Default::default()
     })
     .unwrap();
-    if session.modules().is_none() {
-        eprintln!("skip: guest wasm not built (kanbei-vm NotBuilt)");
-        return;
-    }
+    assert!(
+        session.modules().is_some(),
+        "session has no module engine: build the guest with `cargo xtask build-guest` (or the session is in safe mode)"
+    );
     session
         .activate_config(PackageManifest {
             schema: 1,

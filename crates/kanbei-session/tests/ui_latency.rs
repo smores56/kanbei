@@ -65,9 +65,7 @@ fn broker_with_append_grant(session_id: Id128, generation: u64) -> kanbei_capabi
 
 #[test]
 fn multi_mount_input_ack_p99_within_budget_under_background_flood() {
-    if !require_guest() {
-        return;
-    }
+    require_guest();
     // The granted mount is the first activation = generation 1 (generations
     // are deterministic counters from 1, M2), so the submit round-trip
     // completes.

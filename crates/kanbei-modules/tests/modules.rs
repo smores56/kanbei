@@ -1,8 +1,8 @@
 //! Integration tests for kanbei-modules against the built kanbei-guest wasm.
 //!
-//! Run `cargo build -p kanbei-guest --target wasm32-wasip1 --release` from the
-//! workspace root first; guest tests print `skip:` and pass without it. The
-//! pure state/package tests (1, 3, 7, 8, 9) never need the guest.
+//! A missing guest is a hard failure: build it with `cargo xtask build-guest`
+//! from the workspace root first. The pure state/package tests (1, 3, 7, 8, 9)
+//! never need the guest.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -44,15 +44,11 @@ fn no_epoch() -> VmConfig {
     }
 }
 
-fn load_vm() -> Option<Vm> {
+fn load_vm() -> Vm {
     match Vm::load(no_epoch()) {
-        Ok(vm) => Some(vm),
+        Ok(vm) => vm,
         Err(GuestError::NotBuilt) => {
-            eprintln!(
-                "skip: guest wasm not built (run `cargo build -p kanbei-guest \
-                 --target wasm32-wasip1 --release`)"
-            );
-            None
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root")
         }
         Err(e) => panic!("Vm::load failed: {e}"),
     }
@@ -204,7 +200,7 @@ fn install_package_roundtrip_and_dedup() {
 
 #[test]
 fn activate_runs_kb_on_activate_log_and_state() {
-    let Some(vm) = load_vm() else { return };
+    let vm = load_vm();
     let (dir, mut manager, queue) = manager_setup("activate", vm);
     let id = Id128::generate();
     let g = manager.activate(&manifest(id, T2_ACTIVATE, vec![])).unwrap();
@@ -316,7 +312,7 @@ fn stale_generation_rejected() {
     cleanup(dir, queue);
 
     // guest path: after deactivate the old token traps as StaleGeneration
-    let Some(vm) = load_vm() else { return };
+    let vm = load_vm();
     let (dir, mut manager, queue) = manager_setup("stale-guest", vm);
     let id = Id128::generate();
     let g = manager.activate(&manifest(id, T4_HOST_CALL, vec![])).unwrap();
@@ -348,7 +344,7 @@ fn stale_generation_rejected() {
 
 #[test]
 fn generation_replacement_rebinds_and_stales_old_token() {
-    let Some(vm) = load_vm() else { return };
+    let vm = load_vm();
     let (dir, mut manager, queue) = manager_setup("replace", vm);
     let id = Id128::generate();
     let a = manager.activate(&manifest(id, A_PUBLISH_S1, vec![])).unwrap();
@@ -402,7 +398,7 @@ fn generation_replacement_rebinds_and_stales_old_token() {
 
 #[test]
 fn service_call_routes_to_provider_kb_hot() {
-    let Some(vm) = load_vm() else { return };
+    let vm = load_vm();
     let (dir, mut manager, queue) = manager_setup("svc-call", vm);
     let id_a = Id128::generate();
     manager.activate(&manifest(id_a, A_SVC_RESPONDER, vec![])).unwrap();
@@ -575,7 +571,7 @@ fn state_overflow_rejected_atomically() {
 
 #[test]
 fn syntax_error_activation_fails_nothing_registered() {
-    let Some(vm) = load_vm() else { return };
+    let vm = load_vm();
     let (dir, mut manager, queue) = manager_setup("syntax", vm);
     let id = Id128::generate();
     let err = manager
@@ -590,7 +586,7 @@ fn syntax_error_activation_fails_nothing_registered() {
 
 #[test]
 fn disposal_record_and_vm_containment() {
-    let Some(vm) = load_vm() else { return };
+    let vm = load_vm();
     let (dir, mut manager, queue) = manager_setup("dispose", vm);
     let id = Id128::generate();
     let a = manager.activate(&manifest(id, TRIVIAL_HOT, vec![])).unwrap();
@@ -618,7 +614,7 @@ fn disposal_record_and_vm_containment() {
 
 #[test]
 fn require_approval_returns_intent_shape() {
-    let Some(vm) = load_vm() else { return };
+    let vm = load_vm();
     let (dir, mut manager, queue) = manager_setup("approval", vm);
     manager
         .host()
