@@ -17,8 +17,15 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        Some("check-kernel-boundary") => match xtask::check_kernel_boundary(&workspace_root()) {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        },
         _ => {
-            eprintln!("usage: cargo xtask build-guest");
+            eprintln!("usage: cargo xtask <build-guest|check-kernel-boundary>");
             std::process::exit(2);
         }
     }

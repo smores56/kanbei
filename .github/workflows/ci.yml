@@ -28,6 +28,8 @@ jobs:
           tool: nextest
       - name: Build guest wasm (hard prerequisite)
         run: cargo xtask build-guest
+      - name: Kernel tier boundary
+        run: cargo xtask check-kernel-boundary
       - name: Clippy
         run: cargo clippy --workspace --locked -- -D warnings
       - name: Test

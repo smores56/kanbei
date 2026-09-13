@@ -9,6 +9,7 @@ kanbei-capabilities.workspace = true
 kanbei-context.workspace = true
 kanbei-core.workspace = true
 kanbei-gc.workspace = true
+kanbei-kernel.workspace = true
 kanbei-log.workspace = true
 kanbei-memory.workspace = true
 kanbei-modules.workspace = true

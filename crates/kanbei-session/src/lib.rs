@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use kanbei_core::digest::Digest;
-use kanbei_core::envelope::{ENVELOPE_SCHEMA, Envelope, EnvelopeError};
+use kanbei_core::envelope::{Envelope, EnvelopeError};
 use kanbei_core::id::{BranchId, Id128};
 use kanbei_core::queue::DurabilityQueue;
 use kanbei_log::{AppendLog, Profile, Recovered};
@@ -224,91 +224,21 @@ impl Default for SessionConfig {
     }
 }
 
-// ---------- fault injection ----------
+// ---------- kernel types (tier-1 re-exports) ----------
 
-/// Crash-injection points on the commit path and the M2 subsystem seams. The
-/// testkit's injector aborts the process at a configured point; `None` (the
-/// default) is a no-op.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FaultPoint {
-    BeforeObjectInstall,
-    AfterObjectInstall,
-    BeforeFrameAppend,
-    AfterFrameAppend,
-    BeforeEffectDispatch,
-    AfterEffectDispatch,
-    BeforeConfigActivation,
-    AfterConfigActivation,
-    BeforeHeadUpdate,
-    AfterHeadUpdate,
-    // --- M3 agent spine points ---
-    BeforeWakeAccept,
-    AfterWakeAccept,
-    BeforeRunStart,
-    AfterRunStart,
-    BeforeModelCall,
-    AfterModelCall,
-    BeforeToolIntentCommit,
-    AfterToolIntentCommit,
-    BeforeToolDispatch,
-    AfterToolDispatch,
-    BeforeToolOutcomeCommit,
-    AfterToolOutcomeCommit,
-    BeforeRunOutcome,
-    AfterRunOutcome,
-    // --- M4 memory proposal points ---
-    BeforeMemoryProposal,
-    AfterMemoryProposal,
-    // --- M5 semantic workbench points ---
-    BeforeUiReduce,
-    AfterUiReduce,
-    BeforeUiRender,
-    AfterUiRender,
-    // --- M6 historical-correction points ---
-    BeforeCheckpointCommit,
-    AfterCheckpointCommit,
-    BeforeBranchTransition,
-    AfterBranchTransition,
-    BeforeSessionHeadAdvance,
-    AfterSessionHeadAdvance,
-}
+pub use kanbei_kernel::commit::{CommitError, PostManifest};
+pub use kanbei_kernel::event::{CommitReceipt, NewEvent};
+pub use kanbei_kernel::fault::{FaultInjector, FaultPoint};
 
-pub trait FaultInjector: Send + Sync {
-    fn inject(&self, point: FaultPoint);
-}
-
-// ---------- commit types ----------
-
-/// One caller-authored event, not yet sequenced or validated.
-pub struct NewEvent {
-    pub kind: String,
-    pub payload_schema: u32,
-    pub payload: serde_json::Value,
-    /// Installed as objects before the frame is appended; their digests are
-    /// appended to `refs` (R-10).
-    pub objects: Vec<Vec<u8>>,
-    /// Must already exist in the store — a commit never creates a dangling
-    /// reference.
-    pub refs: Vec<Digest>,
-}
-
-/// What a committed batch consumed: sequence span, frame size, installed
-/// object digests, and the manifest digests bracketing the commit.
-#[derive(Debug)]
-pub struct CommitReceipt {
-    pub first_seq: u64,
-    pub last_seq: u64,
-    pub count: u64,
-    pub frame_len: u64,
-    /// Digests installed by this commit's step-2 object phase (event objects
-    /// + promoted payloads; the post-state manifest, if any, is excluded).
-    pub objects: Vec<Digest>,
-    /// The manifest digest every envelope in this commit references (R-08);
-    /// None when the session resumed without manifest state (M1).
-    pub pre_snapshot: Option<Digest>,
-    /// The manifest pinned because this commit changed state; None for pure
-    /// commits (unchanged manifests dedup via content addressing).
-    pub post_snapshot: Option<Digest>,
+impl From<CommitError> for SessionError {
+    fn from(e: CommitError) -> Self {
+        match e {
+            CommitError::InvalidInput(msg) => SessionError::InvalidInput(msg),
+            CommitError::MissingObject { digest } => SessionError::MissingObject { digest },
+            CommitError::Io(e) => SessionError::Io(e),
+            CommitError::Object(e) => SessionError::Object(e),
+        }
+    }
 }
 
 /// The outcome of an atomic config activation (R-01/C-01): the module's
@@ -1171,72 +1101,30 @@ impl Session {
             }
         }
 
-        // step 2 — objects first: the object dirsync is enqueued before the
-        // referencing frame's fsync, so the object is durable before the
-        // frame (ratification-packet §3, R-10). Every digest installed here
-        // is writer-pinned before install and unpinned on guard drop (after
-        // the append) — GC never quarantines an object a commit has in
-        // flight.
-        self.fault(FaultPoint::BeforeObjectInstall);
-        let mut objects: Vec<Digest> = Vec::new();
-        let mut payload_schemas: Vec<u32> = Vec::new();
-        let mut pins = crate::gc::GcPinGuard::new(&self.gc_pins);
-        for ev in &mut events {
-            for bytes in &ev.objects {
-                pins.pin(Digest::new(bytes));
-                let digest = self.store.install(bytes)?;
-                self.fault(FaultPoint::AfterObjectInstall);
-                ev.refs.push(digest);
-                objects.push(digest);
-            }
-            // explicit refs must already exist — never commit a newly created
-            // dangling reference (R-10)
-            for r in &ev.refs {
-                if !self.store.exists(r) {
-                    return Err(SessionError::MissingObject { digest: *r });
-                }
-            }
-            // payload classification (§7): > inline_max → object reference;
-            // the 1–8 KB middle band stays inline (M1 default), so object_min
-            // is not consulted
-            let serialized = serde_json::to_string(&ev.payload)
-                .map_err(|e| SessionError::InvalidInput(format!("payload serialization: {e}")))?;
-            if serialized.len() > self.cfg.inline_max {
-                pins.pin(Digest::new(serialized.as_bytes()));
-                let digest = self.store.install(serialized.as_bytes())?;
-                self.fault(FaultPoint::AfterObjectInstall);
-                ev.payload = json!({ "$object": digest.to_string() });
-                ev.refs.push(digest);
-                objects.push(digest);
-            }
-            payload_schemas.push(ev.payload_schema);
-        }
-
-        // step 3 — envelopes: every canonical event references its pre-event
-        // commit-snapshot digest (R-08)
-        let first_seq = self.next_seq;
-        let pre_snapshot = self.current_snapshot;
-        let envelopes: Vec<Envelope> = events
-            .iter()
-            .enumerate()
-            .map(|(i, ev)| Envelope {
-                env: ENVELOPE_SCHEMA,
-                seq: first_seq + i as u64,
-                evt: Id128::generate().to_string(),
-                kind: ev.kind.clone(),
-                payload_schema: ev.payload_schema,
-                payload: ev.payload.clone(),
-                refs: ev.refs.clone(),
-                snapshot: pre_snapshot,
-            })
-            .collect();
-
-        // step 4 — one frame through the durability queue
-        self.fault(FaultPoint::BeforeFrameAppend);
-        let plan = self.log.append(&envelopes, self.cfg.profile)?;
-        self.fault(FaultPoint::AfterFrameAppend);
+        // steps 2–4 — the tier-1 commit path (objects-first install, ref
+        // verification, payload classification, one appended frame) lives in
+        // the enforcement kernel; the session owns the tier-2 post-manifest
+        // and its own bookkeeping below.
+        let fault = self.cfg.fault.clone();
+        let outcome = {
+            let mut path = kanbei_kernel::commit::CommitPath::new(
+                &mut self.log,
+                &mut self.store,
+                &self.gc_pins,
+            );
+            path.commit(
+                &mut events,
+                kanbei_kernel::commit::CommitParams {
+                    profile: self.cfg.profile,
+                    next_seq: self.next_seq,
+                    current_snapshot: self.current_snapshot,
+                    inline_max: self.cfg.inline_max,
+                },
+                fault.as_deref(),
+            )?
+        };
         self.fault(FaultPoint::BeforeSessionHeadAdvance);
-        self.next_seq = plan.last_seq + 1;
+        self.next_seq = outcome.last_seq + 1;
         self.fault(FaultPoint::AfterSessionHeadAdvance);
 
         // The bounded recent-event ring (the trajectory render source):
@@ -1244,7 +1132,7 @@ impl Session {
         // RECENT_RING entries.
         for (i, ev) in events.iter().enumerate() {
             self.recent_events.push_back((
-                first_seq + i as u64,
+                outcome.first_seq + i as u64,
                 ev.kind.clone(),
                 ev.payload.clone(),
             ));
@@ -1256,7 +1144,7 @@ impl Session {
         // committed envelopes (R-19), and promoted payloads must reach it
         // resolved — a `$object` marker is dereferenced to the full record.
         if let Some(listener) = &self.commit_listener {
-            for env in &envelopes {
+            for env in &outcome.envelopes {
                 let mut resolved = env.clone();
                 resolved.payload = self.resolved_payload(env);
                 listener(&resolved);
@@ -1293,44 +1181,36 @@ impl Session {
             }
         }
 
-        // step 5 — state-changing commits pin a post-event manifest; pure
-        // commits leave the manifest unchanged (content addressing dedups
-        // identical manifests)
+        // step 5 — state-changing commits pin a post-event manifest; the
+        // composition/config objects install first so the closure verifies
+        // (R-10). The manifest is built here, after the frame append.
         let post_snapshot = match state_head {
             Some(head) => {
-                let manifest = self.build_manifest(Some(head), &payload_schemas);
-                // the composition's canonical bytes must exist as an object
-                // for the manifest's composition ref to be closure-valid
-                // (R-10); install dedups when the publish already pinned them
-                let comp_bytes = self.composition.current().to_canonical_bytes();
-                pins.pin(Digest::new(&comp_bytes));
-                self.store.install(&comp_bytes)?;
-                // the tool-registry/provider-config objects the manifest pins
-                // (M6 wave 2) — installed before the pin, same as the
-                // composition object.
-                for bytes in self.manifest_config_objects() {
-                    pins.pin(Digest::new(&bytes));
-                    self.store.install(&bytes)?;
-                }
-                pins.pin(Digest::new(&manifest.to_bytes()));
-                let (digest, _deduped) = kanbei_snapshot::pin(&mut self.store, &manifest)?;
+                let payload_schemas: Vec<u32> =
+                    events.iter().map(|e| e.payload_schema).collect();
+                let post = PostManifest {
+                    manifest: self.build_manifest(Some(head), &payload_schemas),
+                    composition_bytes: self.composition.current().to_canonical_bytes(),
+                    config_objects: self.manifest_config_objects(),
+                };
+                let digest = kanbei_kernel::commit::pin_post_manifest(
+                    &mut self.store,
+                    &self.gc_pins,
+                    post,
+                )?;
                 self.current_snapshot = Some(digest);
                 Some(digest)
             }
             None => None,
         };
-        // The append + pin are complete: every installed digest is now
-        // referenced by a durable frame or the live current_snapshot — the
-        // writer pins can fall away (the guard drop also covers error paths).
-        drop(pins);
 
         let receipt = CommitReceipt {
-            first_seq: plan.first_seq,
-            last_seq: plan.last_seq,
-            count: plan.count,
-            frame_len: plan.frame_len,
-            objects,
-            pre_snapshot,
+            first_seq: outcome.first_seq,
+            last_seq: outcome.last_seq,
+            count: outcome.count,
+            frame_len: outcome.frame_len,
+            objects: outcome.objects,
+            pre_snapshot: outcome.pre_snapshot,
             post_snapshot,
         };
         #[cfg(feature = "otel")]
@@ -3467,21 +3347,16 @@ pub enum SessionError {
 // ---------- helpers ----------
 
 /// `recover` errors on a missing file; a fresh dir is a valid genesis state.
+/// The tier-1 mechanism lives in the kernel; this maps its error into the
+/// session error surface.
 fn recover_or_fresh(log_path: &Path) -> Result<Recovered, SessionError> {
-    match std::fs::metadata(log_path) {
-        Ok(m) if m.is_file() => Ok(kanbei_log::recover(log_path)?),
-        Ok(_) => Err(SessionError::InvalidInput(format!(
-            "log path is not a file: {}",
-            log_path.display()
-        ))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Recovered {
-            events: 0,
-            frames: 0,
-            truncated: false,
-            last_seq: 0,
-        }),
-        Err(e) => Err(e.into()),
-    }
+    kanbei_kernel::recovery::recover_or_fresh(log_path).map_err(|e| match e {
+        kanbei_kernel::recovery::RecoveryError::NotAFile(p) => {
+            SessionError::InvalidInput(format!("log path is not a file: {}", p.display()))
+        }
+        kanbei_kernel::recovery::RecoveryError::Log(e) => SessionError::Log(e),
+        kanbei_kernel::recovery::RecoveryError::Io(e) => SessionError::Io(e),
+    })
 }
 
 /// Best-effort worker cleanup on a failed open, when no other Arc clones

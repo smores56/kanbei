@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/kanbei-core",
+    "crates/kanbei-kernel",
     "crates/kanbei-log",
     "crates/kanbei-memory",
     "crates/kanbei-objects",
@@ -35,6 +36,7 @@ members = [
 # includes it.
 default-members = [
     "crates/kanbei-core",
+    "crates/kanbei-kernel",
     "crates/kanbei-log",
     "crates/kanbei-memory",
     "crates/kanbei-objects",
@@ -68,6 +70,7 @@ publish = false
 
 [workspace.dependencies]
 kanbei-core = { path = "crates/kanbei-core" }
+kanbei-kernel = { path = "crates/kanbei-kernel" }
 kanbei-log = { path = "crates/kanbei-log" }
 kanbei-memory = { path = "crates/kanbei-memory" }
 kanbei-objects = { path = "crates/kanbei-objects" }

@@ -3,9 +3,7 @@
 //! engine (architecture.md: "A later GC requires coordinated root capture,
 //! writer pins, quarantine, and a grace period from last reference").
 
-use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use kanbei_core::digest::Digest;
 use kanbei_core::envelope::Envelope;
@@ -254,37 +252,3 @@ fn collect_payload_digests(
     }
 }
 
-/// Registers every digest commit installs with the writer-pin set and
-/// unregisters them on drop — including every error return path — so a
-/// failed commit never leaks pins.
-pub(crate) struct GcPinGuard<'a> {
-    pins: &'a Mutex<HashSet<Digest>>,
-    added: Vec<Digest>,
-}
-
-impl<'a> GcPinGuard<'a> {
-    pub(crate) fn new(pins: &'a Mutex<HashSet<Digest>>) -> Self {
-        Self {
-            pins,
-            added: Vec::new(),
-        }
-    }
-
-    /// Registers `digest` before its install (idempotent).
-    pub(crate) fn pin(&mut self, digest: Digest) {
-        self.pins
-            .lock()
-            .expect("gc pins lock poisoned")
-            .insert(digest);
-        self.added.push(digest);
-    }
-}
-
-impl Drop for GcPinGuard<'_> {
-    fn drop(&mut self) {
-        let mut pins = self.pins.lock().expect("gc pins lock poisoned");
-        for digest in &self.added {
-            pins.remove(digest);
-        }
-    }
-}
