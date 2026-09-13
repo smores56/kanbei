@@ -347,21 +347,18 @@ impl ServiceRegistry {
 
     /// Removes every publication owned by `generation`, ignoring dependents:
     /// the generation is being retired or forced out, so leaving its services
-    /// resolvable would let callers reach a dead instance (R-02/C-03). Returns
-    /// the removed keys in deterministic order.
-    pub fn remove_generation(&mut self, generation: u64) -> Vec<ServiceKey> {
-        let mut keys: Vec<ServiceKey> = self
+    /// resolvable would let callers reach a dead instance (R-02/C-03).
+    pub fn remove_generation(&mut self, generation: u64) {
+        let keys: Vec<ServiceKey> = self
             .holders
             .iter()
             .filter(|(_, provider)| provider.generation == generation)
             .map(|(key, _)| key.clone())
             .collect();
-        keys.sort_by(|a, b| (&a.scope.0, &a.name).cmp(&(&b.scope.0, &b.name)));
-        for key in &keys {
-            self.holders.remove(key);
-            self.deps.remove(key);
+        for key in keys {
+            self.holders.remove(&key);
+            self.deps.remove(&key);
         }
-        keys
     }
 
     /// Full registry state as `(key, provider, declared dependencies)` in

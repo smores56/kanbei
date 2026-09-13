@@ -125,11 +125,11 @@ pub struct ModuleHost {
     /// UI component name → generation that mounted it (stale generations are
     /// removed on disposal, so a displaced mount cannot be resolved).
     ui_components: Mutex<HashMap<String, u64>>,
-    /// Serializes mutating commits against generation displacement. Held by
-    /// every mutating op across its write, and by `retire`/`dispose` before
-    /// they invalidate the token, so a commit and a retirement cannot interleave
-    /// (R-02/C-03: a displaced generation cannot act).
-    commit_gate: Mutex<()>,
+    /// The kernel's canonical generation-currency predicate (shared with the
+    /// `StateStore`). Mutating ops re-read it at their commit point so a
+    /// generation retired mid-op cannot commit (R-02/C-03); the check is
+    /// non-blocking, so retirement never waits on an in-flight op.
+    current: Arc<dyn Fn(u64) -> bool + Send + Sync>,
 }
 
 impl ModuleHost {
@@ -143,6 +143,7 @@ impl ModuleHost {
         services: Arc<Mutex<ServiceRegistry>>,
         state: Arc<Mutex<StateStore>>,
         rejected_stale_effects: Arc<AtomicU64>,
+        current: Arc<dyn Fn(u64) -> bool + Send + Sync>,
     ) -> Self {
         Self {
             session: Mutex::new(session),
@@ -155,33 +156,27 @@ impl ModuleHost {
             rejected_stale_effects,
             contributions: Mutex::new(HashMap::new()),
             ui_components: Mutex::new(HashMap::new()),
-            commit_gate: Mutex::new(()),
+            current,
         }
     }
 
+    /// Whether a generation is still registered. Delegates to the shared
+    /// predicate so the fence, `StateStore::cas`, and `ModuleManager` agree.
+    pub(crate) fn is_current(&self, generation: u64) -> bool {
+        (self.current)(generation)
+    }
+
     /// Commit-time fence for a mutating op: the generation must still be
-    /// registered, and the returned guard must be held across the mutation so
-    /// the check and the write are atomic with respect to `retire`/`dispose`
-    /// (which take the same gate before invalidating the token).
-    fn commit_guard(&self, generation: u64) -> Result<std::sync::MutexGuard<'_, ()>, String> {
-        let gate = self.commit_gate.lock().expect("commit gate poisoned");
-        if self
-            .tokens
-            .read()
-            .expect("tokens lock poisoned")
-            .contains_key(&generation)
-        {
-            Ok(gate)
+    /// current at the moment it writes. Called adjacent to the mutation (under
+    /// the target lock where one exists) so a generation retired while the op
+    /// was blocked is rejected rather than committing.
+    fn ensure_current(&self, generation: u64) -> Result<(), String> {
+        if self.is_current(generation) {
+            Ok(())
         } else {
             self.rejected_stale_effects.fetch_add(1, Ordering::Relaxed);
             Err(STALE_GENERATION.into())
         }
-    }
-
-    /// Acquire the displacement gate without a currency check — for callers
-    /// that are themselves retiring the generation (see `Generation::dispose`).
-    pub(crate) fn lock_commit_gate(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.commit_gate.lock().expect("commit gate poisoned")
     }
 
     /// Retire a generation's published effects: its service holdings and its
@@ -294,7 +289,9 @@ impl ModuleHost {
             bytes,
             generation: info.generation,
         };
-        let _commit = self.commit_guard(info.generation)?;
+        // Uniform commit fence for the four mutating ops; `StateStore::cas` also
+        // re-checks currency under the state lock (defense in depth).
+        self.ensure_current(info.generation)?;
         let head = self
             .state
             .lock()
@@ -414,11 +411,9 @@ impl ModuleHost {
         let verbs = verbs_field(&v)?;
         let want = Capability::new(resource, verbs);
         let principal = self.principal(info);
-        let _commit = self.commit_guard(info.generation)?;
-        let intent = self
-            .broker
-            .lock()
-            .expect("broker lock poisoned")
+        let broker = self.broker.lock().expect("broker lock poisoned");
+        self.ensure_current(info.generation)?;
+        let intent = broker
             .require_approval(&principal, &want)
             .map_err(|e| format!("require_approval: {e}"))?;
         Ok(json!({ "intent": intent_json(&intent) }).to_string())
@@ -458,8 +453,8 @@ impl ModuleHost {
                 version,
             },
         };
-        let _commit = self.commit_guard(info.generation)?;
         let mut reg = self.services.lock().expect("services lock poisoned");
+        self.ensure_current(info.generation)?;
         let holder = reg
             .snapshot()
             .into_iter()
@@ -516,7 +511,6 @@ impl ModuleHost {
                 .map(String::from)
                 .ok_or_else(|| "contribution_publish: payload must carry a \"name\"".to_string())
         };
-        let _commit = self.commit_guard(info.generation)?;
         let contribution = match kind {
             "ui" => {
                 let name = name()?;
@@ -531,10 +525,12 @@ impl ModuleHost {
                 // by the registry at publish); charset is kernel-validated in
                 // the registry validate pass.
                 let slot = v.get("slot").and_then(Value::as_str).map(String::from);
-                self.ui_components
+                let mut ui_components = self
+                    .ui_components
                     .lock()
-                    .expect("ui components lock poisoned")
-                    .insert(component.clone(), info.generation);
+                    .expect("ui components lock poisoned");
+                self.ensure_current(info.generation)?;
+                ui_components.insert(component.clone(), info.generation);
                 Contribution {
                     scope: info.scope.clone(),
                     kind: ContributionKind::UiMount(UiMountContribution {
@@ -556,9 +552,9 @@ impl ModuleHost {
             }
             other => return Err(format!("contribution_publish: unknown kind {other:?}")),
         };
-        self.contributions
-            .lock()
-            .expect("contributions lock poisoned")
+        let mut contributions = self.contributions.lock().expect("contributions lock poisoned");
+        self.ensure_current(info.generation)?;
+        contributions
             .entry(info.generation)
             .or_default()
             .push(contribution);
@@ -664,12 +660,8 @@ impl Host for ModuleHost {
     }
 
     fn retire(&self, generation_token: u64, _reason: &str) {
-        // Wait out any in-flight commit before invalidating the token, so a
-        // mutating op that entered while the generation was current sees the
-        // stale token at its commit point instead of writing past retirement.
-        let _gate = self.commit_gate.lock().expect("commit gate poisoned");
-        // Neither lock below is an instance lock, so this is safe to call while
-        // a caller holds one.
+        // Invalidate currency and drop the kernel's handle. Neither lock below
+        // is an instance lock, so this is safe to call while a caller holds one.
         self.tokens.write().expect("tokens lock poisoned").remove(&generation_token);
         self.unpublish_generation(generation_token);
         if let Some(map) = self.instances.upgrade() {
@@ -690,7 +682,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kb-host-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let queue = Arc::new(DurabilityQueue::start(&format!("kb-host-{tag}")));
-        let state = StateStore::open(&dir, Arc::clone(&queue), Arc::new(|_| true));
         let tokens: Arc<RwLock<HashMap<u64, TokenInfo>>> = Arc::new(RwLock::new(HashMap::new()));
         tokens.write().expect("tokens lock poisoned").insert(
             1,
@@ -701,6 +692,11 @@ mod tests {
                 deps: Vec::new(),
             },
         );
+        let currency: Arc<dyn Fn(u64) -> bool + Send + Sync> = {
+            let tokens = Arc::clone(&tokens);
+            Arc::new(move |g| tokens.read().expect("tokens lock poisoned").contains_key(&g))
+        };
+        let state = StateStore::open(&dir, Arc::clone(&queue), Arc::clone(&currency));
         let host = ModuleHost::new(
             Id128::generate(),
             tokens,
@@ -708,6 +704,7 @@ mod tests {
             Arc::new(Mutex::new(ServiceRegistry::new())),
             Arc::new(Mutex::new(state)),
             Arc::new(AtomicU64::new(0)),
+            currency,
         );
         (dir, queue, host)
     }
@@ -765,6 +762,28 @@ mod tests {
             );
         }
         assert_eq!(host.rejected_stale_effects(), 4);
+        drop(host);
+        teardown(dir, queue);
+    }
+
+    /// The fence must not over-reject: a current generation's mutations commit
+    /// normally.
+    #[test]
+    fn mutating_ops_commit_for_a_current_generation() {
+        let (dir, queue, host) = host_with_generation("commit-ok");
+        let i = info();
+        host.op_state_set(&i, r#"{"key":"k","schema":1,"value":1}"#)
+            .unwrap();
+        host.op_service_publish(
+            &i,
+            r#"{"key":{"scope":["root"],"name":"svc"},"version":1,"deps":[]}"#,
+        )
+        .unwrap();
+        host.op_contribution_publish(&i, r#"{"kind":"theme","name":"t","overlay":{}}"#)
+            .unwrap();
+        assert_eq!(host.rejected_stale_effects(), 0);
+        assert_eq!(host.services.lock().unwrap().snapshot().len(), 1);
+        assert_eq!(host.published_contributions(1).len(), 1);
         drop(host);
         teardown(dir, queue);
     }

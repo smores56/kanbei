@@ -146,9 +146,6 @@ impl Generation {
     /// because M2 modules have no cancellable effects; `forced` is therefore
     /// always false (the routine drop IS the force and cannot fail).
     pub fn dispose(self) -> DisposalRecord {
-        // Fence against in-flight commits: hold the same gate `retire` uses so
-        // no mutating op can commit after this generation is displaced.
-        let _gate = self.host.lock_commit_gate();
         // A wedged worker may hold the lock; the token equals the generation id
         // (never reused), so disposal does not block on the instance lock. The
         // kernel tables touched below are held only briefly.
@@ -232,7 +229,7 @@ impl ModuleManager {
             Arc::new(move |g| tokens.read().expect("tokens lock poisoned").contains_key(&g))
         };
         let max_state_bytes = state.max_state_bytes();
-        let mut state = StateStore::open(state.dir(), state.queue(), currency);
+        let mut state = StateStore::open(state.dir(), state.queue(), Arc::clone(&currency));
         state.set_max_state_bytes(max_state_bytes);
         let state = Arc::new(Mutex::new(state));
         let instances: Arc<Mutex<HashMap<u64, Arc<Mutex<Instance>>>>> =
@@ -249,6 +246,7 @@ impl ModuleManager {
             Arc::clone(&services),
             Arc::clone(&state),
             Arc::clone(&rejected_stale_effects),
+            currency,
         ));
         Ok(Self {
             vm,
@@ -513,7 +511,7 @@ impl ModuleManager {
     /// while it is registered (generation ids are never reused, so being
     /// registered = current).
     pub fn generation_current(&self, generation: u64) -> bool {
-        self.tokens.read().expect("tokens lock poisoned").contains_key(&generation)
+        self.host.is_current(generation)
     }
 
     /// `(module_id, generation, package digest)` for the execution-snapshot
