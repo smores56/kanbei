@@ -725,10 +725,10 @@ mod tests {
         }
     }
 
-    /// R-02/C-03: once a generation is retired, a mutating op that entered while
-    /// it was still current must not commit. The entry-time check in `call`
-    /// cannot see this (the caller already holds a `TokenInfo`); the per-op
-    /// commit fence must.
+    /// R-02/C-03: a mutating op must re-read generation currency at its commit
+    /// point, not trust the `TokenInfo` captured at `call` entry. Retirement
+    /// removes the token, so an op that reaches its commit after retirement is
+    /// rejected (the entry check in `call` cannot see this race).
     #[test]
     fn mutating_ops_reject_a_generation_retired_before_commit() {
         let (dir, queue, host) = host_with_generation("commit-fence");
