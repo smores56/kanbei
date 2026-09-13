@@ -81,7 +81,7 @@ mod commit;
 mod elements;
 mod recovery;
 mod switch;
-use recovery::{recover_or_fresh, shutdown_queue};
+use recovery::{decode_record, recover_or_fresh, shutdown_queue};
 pub use ui::{UiHost, UiIntent, UiOutcome, UI_INTENT_RESOURCE};
 
 /// The bounded recent-event ring size: the trajectory render covers the
@@ -390,12 +390,29 @@ pub struct BranchRecord {
 /// checkpoint manifest pinned (`historical` — its `provider_config` digest),
 /// and the live epoch composition. Module-state/config restoration is out of
 /// scope (architecture.md §M6) — the record is the deliverable.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConfigChoiceRecord {
     pub mode: String,
     pub current: Option<Digest>,
     pub historical: Option<Digest>,
     pub composition: Option<Digest>,
+}
+
+/// The wire shape of a `branch_transition` payload (as written by
+/// `branch.rs`). Only the load-bearing fields D-F-Q names — branch identity,
+/// `follow`, `config_choice`, `quiesce`, plus `from_branch`/`frontier_seq` —
+/// are typed here; the rest (`checkpoint_event`, `memory_root`, …) are
+/// ignored. Decoding through serde makes "malformed → `CorruptRecord`" fall
+/// out of the type, and `Option` on the wave-1-nullable fields keeps their
+/// documented defaults when absent.
+#[derive(serde::Deserialize)]
+struct BranchTransitionWire {
+    branch: BranchId,
+    from_branch: Option<BranchId>,
+    frontier_seq: u64,
+    follow: Option<kanbei_memory::MemoryFollowPolicy>,
+    config_choice: Option<ConfigChoiceRecord>,
+    quiesce: Option<QuiesceRecord>,
 }
 
 /// The memory roots pinned by the checkpoint a branch continues from (M6;
@@ -833,81 +850,50 @@ impl Session {
         // branch — the M1/M2 genesis path commits no genesis event, so the
         // root id is session-lifetime state (wave 1).
         let mut branch_records: Vec<BranchRecord> = Vec::new();
+        let mut branch_error: Option<SessionError> = None;
         kanbei_log::for_each_frame(&log_path, |info| {
             for line in &info.events {
-                let Ok(env) = Envelope::from_line(line) else {
-                    continue;
-                };
-                if env.kind != "branch_transition" {
-                    continue;
+                if branch_error.is_some() {
+                    return;
                 }
-                let Some(branch) = env
-                    .payload
-                    .get("branch")
-                    .and_then(|b| b.as_str())
-                    .and_then(|b| b.parse::<BranchId>().ok())
-                else {
-                    continue;
-                };
-                let from = env
-                    .payload
-                    .get("from_branch")
-                    .and_then(|f| f.as_str())
-                    .and_then(|f| f.parse::<BranchId>().ok());
-                let Some(frontier) = env.payload.get("frontier_seq").and_then(|f| f.as_u64()) else {
-                    continue;
-                };
-                let follow = env
-                    .payload
-                    .get("follow")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                // Wave-1 transitions recorded follow/config_choice as null;
-                // null follow means the branch could not pin (FollowHead) and
-                // a null choice is the empty record.
-                let follow = if follow.is_null() {
-                    kanbei_memory::MemoryFollowPolicy::FollowHead
-                } else {
-                    serde_json::from_value(follow)
-                        .unwrap_or(kanbei_memory::MemoryFollowPolicy::FollowHead)
-                };
-                let config_choice = env
-                    .payload
-                    .get("config_choice")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let config_choice = if config_choice.is_null() {
-                    ConfigChoiceRecord {
-                        mode: String::new(),
-                        current: None,
-                        historical: None,
-                        composition: None,
+                let env = match decode_record(line, &["branch_transition"]) {
+                    Ok(Some(env)) => env,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        branch_error = Some(e);
+                        return;
                     }
-                } else {
-                    serde_json::from_value(config_choice)
-                        .unwrap_or(ConfigChoiceRecord {
-                            mode: String::new(),
-                            current: None,
-                            historical: None,
-                            composition: None,
-                        })
                 };
-                let quiesce = env
-                    .payload
-                    .get("quiesce")
-                    .and_then(|q| serde_json::from_value(q.clone()).ok())
-                    .unwrap_or_default();
+                let seq = env.seq;
+                // Wave-1 transitions recorded follow/config_choice as null and
+                // omitted from_branch on a root; null/absent take the field's
+                // documented default. A present-but-malformed value is codec
+                // drift and fails loud through the wire decode (decision 15).
+                let wire: BranchTransitionWire = match serde_json::from_value(env.payload) {
+                    Ok(wire) => wire,
+                    Err(e) => {
+                        branch_error = Some(SessionError::CorruptRecord(format!(
+                            "branch_transition at seq {seq}: malformed payload: {e}"
+                        )));
+                        return;
+                    }
+                };
                 branch_records.push(BranchRecord {
-                    id: branch,
-                    from,
-                    frontier_seq: frontier,
-                    transition_seq: env.seq,
-                    follow,
-                    config_choice,
-                    quiesce,
+                    id: wire.branch,
+                    from: wire.from_branch,
+                    frontier_seq: wire.frontier_seq,
+                    transition_seq: seq,
+                    follow: wire
+                        .follow
+                        .unwrap_or(kanbei_memory::MemoryFollowPolicy::FollowHead),
+                    config_choice: wire.config_choice.unwrap_or_default(),
+                    quiesce: wire.quiesce.unwrap_or_default(),
                 });
             }
         })?;
+        if let Some(err) = branch_error {
+            return Err(err);
+        }
         let branch = branch_records
             .last()
             .map(|r| r.id)
@@ -919,20 +905,43 @@ impl Session {
         // `cognition_resumed`. The trip payload is the canonical event
         // payload, so it deserializes straight back into a BreakerTrip.
         let mut unresumed_trip: Option<kanbei_scheduler::BreakerTrip> = None;
+        let mut trip_error: Option<SessionError> = None;
         kanbei_log::for_each_frame(&log_path, |info| {
             for line in &info.events {
-                let Ok(env) = Envelope::from_line(line) else {
-                    continue;
+                if trip_error.is_some() {
+                    return;
+                }
+                let env = match decode_record(line, &["breaker_tripped", "cognition_resumed"]) {
+                    Ok(Some(env)) => env,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        trip_error = Some(e);
+                        return;
+                    }
                 };
                 match env.kind.as_str() {
                     "breaker_tripped" => {
-                        unresumed_trip = serde_json::from_value(env.payload).ok();
+                        // The pause state is load-bearing: a corrupt record
+                        // must not silently unpause the session (decision 15).
+                        match serde_json::from_value(env.payload) {
+                            Ok(trip) => unresumed_trip = Some(trip),
+                            Err(e) => {
+                                trip_error = Some(SessionError::CorruptRecord(format!(
+                                    "breaker_tripped at seq {}: malformed payload: {e}",
+                                    env.seq
+                                )));
+                                return;
+                            }
+                        }
                     }
                     "cognition_resumed" => unresumed_trip = None,
                     _ => {}
                 }
             }
         })?;
+        if let Some(err) = trip_error {
+            return Err(err);
+        }
 
         let config_manifest = cfg.config.clone();
         let mut session = Self {
@@ -1541,6 +1550,8 @@ pub enum SessionError {
     Context(#[from] kanbei_context::ProjectionError),
     #[error("compaction violation: event references compacted fragment {0}")]
     CompactionViolation(String),
+    #[error("corrupt canonical record: {0}")]
+    CorruptRecord(String),
     #[error(transparent)]
     Gc(#[from] kanbei_gc::GcError),
     #[error(transparent)]

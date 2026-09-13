@@ -23,6 +23,35 @@ pub(crate) fn recover_or_fresh(log_path: &Path) -> Result<Recovered, SessionErro
     })
 }
 
+/// Decode one canonical log line for a load-bearing recovery scan. `Ok(None)`
+/// means the line is not one of `kinds`; a line that *declares* one of `kinds`
+/// but does not decode is codec drift and fails loud (decision 15) rather than
+/// being silently skipped.
+pub(crate) fn decode_record(
+    line: &str,
+    kinds: &[&str],
+) -> Result<Option<Envelope>, SessionError> {
+    match Envelope::from_line(line) {
+        Ok(env) => Ok(kinds.contains(&env.kind.as_str()).then_some(env)),
+        Err(e) => match declared_kind(line).as_deref() {
+            Some(k) if kinds.contains(&k) => Err(SessionError::CorruptRecord(format!(
+                "{k} record does not decode: {e}"
+            ))),
+            _ => Ok(None),
+        },
+    }
+}
+
+/// The `kind` a raw canonical line declares, if it is readable. Only consulted
+/// to decide whether an undecodable line belonged to a load-bearing kind.
+fn declared_kind(line: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("kind")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// Best-effort worker cleanup on a failed open, when no other Arc clones
 /// exist. Only reachable while returning an error, so a secondary shutdown
 /// failure is not propagated.
@@ -164,4 +193,30 @@ pub(crate) fn recover_bound_project(source_dir: &Path) -> Result<Option<Id128>, 
         }
     })?;
     Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_load_bearing_envelope_fails_loud() {
+        // Declares a load-bearing kind but the envelope does not decode
+        // (`refs` is not the digest array the record schema requires).
+        let line = r#"{"env":1,"seq":1,"evt":"e","kind":"breaker_tripped","schema":1,"payload":{},"refs":"nope"}"#;
+        let err = decode_record(line, &["breaker_tripped"]).unwrap_err();
+        assert!(matches!(err, SessionError::CorruptRecord(_)));
+    }
+
+    #[test]
+    fn malformed_unrelated_envelope_is_skipped() {
+        let line = r#"{"env":1,"seq":1,"evt":"e","kind":"tool_outcome","schema":1,"payload":{},"refs":"nope"}"#;
+        assert!(decode_record(line, &["breaker_tripped"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn well_formed_other_kind_is_none() {
+        let line = r#"{"env":1,"seq":1,"evt":"e","kind":"tool_outcome","schema":1,"payload":{},"refs":[],"snapshot":null}"#;
+        assert!(decode_record(line, &["breaker_tripped"]).unwrap().is_none());
+    }
 }
