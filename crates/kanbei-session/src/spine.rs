@@ -69,8 +69,9 @@ impl Session {
 
     /// Accept the next wake under the policy, committing the canonical
     /// `wake_acceptance` (or `wake_denied` with the responsible constraint)
-    /// record. Responder priority: a responder batch outranks a pending
-    /// cognition batch (built-in policy).
+    /// record. Coalescing priority: when several batches are pending, a
+    /// responder batch outranks background cognition (built-in policy); a
+    /// running command is never preempted.
     pub fn accept_wake(&mut self) -> Result<Option<AcceptedRun>, SessionError> {
         self.fault(crate::FaultPoint::BeforeWakeAccept);
         let decision = self.scheduler.accept_wake(false);
@@ -231,20 +232,43 @@ impl Session {
         Ok(())
     }
 
-    /// Responder priority (R-09/E-10): an in-flight cognition run is
-    /// cancelled at the stream boundary, classified `Failed(UserCancelled)`;
-    /// committed intents are never rolled back. Returns the cancelled run's
-    /// outcome record when one was active.
+    /// Explicit cancellation (R-09/E-10): records the in-flight run's
+    /// terminal outcome immediately as `Failed(UserCancelled)` — no boundary
+    /// wait — and releases the run slot; committed intents are never rolled
+    /// back. The Ctrl-C path is the
+    /// [`SessionConfig::cancel_flag`] checked at stream/step boundaries in
+    /// `cognition_loop`; this method is the immediate form (UI teardown,
+    /// driver error cleanup). Single-owner-at-a-time — a wake arriving during
+    /// a run is queued, never preempted. Returns the cancelled run's outcome
+    /// record when one was active.
     pub fn cancel_active_run(&mut self) -> Result<Option<RunOutcome>, SessionError> {
+        self.fail_active_run(
+            kanbei_scheduler::FailureKind::UserCancelled,
+            "cancelled by user".into(),
+        )
+    }
+
+    /// Records the active run's terminal outcome with an explicit failure
+    /// kind and reason, releasing the run slot. Used when a mid-run error is
+    /// not a user cancel (e.g. a provider failure) so the canonical record
+    /// classifies it truthfully rather than as `UserCancelled`. Returns the
+    /// run's outcome record when one was active.
+    pub fn fail_active_run(
+        &mut self,
+        kind: kanbei_scheduler::FailureKind,
+        reason: String,
+    ) -> Result<Option<RunOutcome>, SessionError> {
         let Some(run_id) = self.scheduler.active_run() else {
             return Ok(None);
         };
         let usage = self.scheduler.current_usage(run_id);
-        let (record, _) = self.scheduler.record_outcome(
+        let outcome = TerminalOutcome::Failed(kind);
+        let (record, _) = self.scheduler.record_outcome_reason(
             run_id,
-            TerminalOutcome::Failed(kanbei_scheduler::FailureKind::UserCancelled),
+            outcome,
             usage,
             &[],
+            Some(reason),
         )?;
         self.commit(
             vec![NewEvent {
@@ -258,10 +282,7 @@ impl Session {
             None,
         )?;
         #[cfg(feature = "otel")]
-        self.telemetry_close_run(
-            TerminalOutcome::Failed(kanbei_scheduler::FailureKind::UserCancelled),
-            usage,
-        );
+        self.telemetry_close_run(outcome, usage);
         Ok(Some(record))
     }
 
@@ -375,9 +396,25 @@ impl Session {
             },
             tool_calls: Vec::new(),
         };
+        // Streaming call (decision 13): the provider reads its SSE stream
+        // incrementally so a user cancel lands at a stream boundary, rather
+        // than waiting for the whole (blocking) response. Engines without a
+        // stream fall back to one `complete` call via the trait default.
+        let cancel = self.cancel_flag.clone();
+        let no_cancel = std::sync::atomic::AtomicBool::new(false);
+        let cancel_ref = cancel.as_deref().unwrap_or(&no_cancel);
+        let listener = self.delta_listener.clone();
+        let mut on_delta = |fragment: &str| {
+            if let Some(listener) = &listener {
+                listener(fragment);
+            }
+        };
         let response = engine
-            .complete(&request)
-            .map_err(|e| SessionError::InvalidInput(format!("provider error: {e}")))?;
+            .complete_stream(&request, cancel_ref, &mut on_delta)
+            .map_err(|e| match e {
+                kanbei_provider::ProviderError::Cancelled { .. } => SessionError::Cancelled,
+                e => SessionError::Provider(e.to_string()),
+            })?;
         self.fault(crate::FaultPoint::AfterModelCall);
 
         let result = json!({
@@ -1977,12 +2014,16 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
         context.budget = self.scheduler.budgets();
         let mut last: Option<StepResult> = None;
         let outcome = loop {
-            // External cancel (UI seam): a user-requested cancel lands at the
-            // next step boundary — the same canonical path as
-            // `cancel_active_run` (Failed(UserCancelled) + run_outcome).
-            if let Some(flag) = &self.cancel_flag
-                && flag.load(std::sync::atomic::Ordering::SeqCst)
-            {
+            // External cancel (UI seam, decision 13): a user-requested cancel
+            // lands at the next model-call stream boundary or step boundary,
+            // taking the canonical `Failed(UserCancelled)` path. The flag is
+            // one-shot — clear it once consumed so it does not cancel the
+            // following turn.
+            let cancel_tripped = self
+                .cancel_flag
+                .as_ref()
+                .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst));
+            if cancel_tripped {
                 let usage = self.scheduler.current_usage(run_id);
                 self.run_outcome_with_reason(
                     run_id,
@@ -1991,6 +2032,9 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                     &[],
                     Some("cancelled by user".into()),
                 )?;
+                if let Some(flag) = &self.cancel_flag {
+                    flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
                 return Ok(TerminalOutcome::Failed(FailureKind::UserCancelled));
             }
             // Wake deadline/budget at each host-command boundary.
@@ -2031,7 +2075,27 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                             }]
                         });
                     let selected = context.selected_events.clone();
-                    let result = self.model_call(run_id, messages, selected, &context.rendered)?;
+                    let result = match self.model_call(run_id, messages, selected, &context.rendered) {
+                        Ok(result) => result,
+                        // A user cancel observed at a model-call stream
+                        // boundary takes the same canonical path as the
+                        // step-boundary check above (decision 13).
+                        Err(SessionError::Cancelled) => {
+                            let usage = self.scheduler.current_usage(run_id);
+                            self.run_outcome_with_reason(
+                                run_id,
+                                TerminalOutcome::Failed(FailureKind::UserCancelled),
+                                usage,
+                                &[],
+                                Some("cancelled by user".into()),
+                            )?;
+                            if let Some(flag) = &self.cancel_flag {
+                                flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            return Ok(TerminalOutcome::Failed(FailureKind::UserCancelled));
+                        }
+                        Err(e) => return Err(e),
+                    };
                     last = Some(StepResult::Model(result));
                 }
                 StepCommand::ToolIntent { tool, arguments } => {

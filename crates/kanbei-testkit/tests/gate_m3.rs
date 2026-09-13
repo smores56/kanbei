@@ -339,10 +339,10 @@ fn breaker_trips_within_budget_and_is_canonical() {
     );
 }
 
-// --- differentiator: responder priority (R-09/E-10) -------------------------
+// --- explicit user cancellation + single-owner-at-a-time (R-09/E-10) --------
 
 #[test]
-fn responder_priority_cancels_background_cognition() {
+fn single_owner_cancel_then_queued_wake_accepted() {
     let dir = fresh_session_dir("responder");
     let _guard = DirGuard(dir.clone());
     let (mut session, _id) = spine_session(
@@ -366,7 +366,17 @@ fn responder_priority_cancels_background_cognition() {
     });
     let run = session.accept_wake().unwrap().unwrap();
     session.run_start(run.run_id).unwrap();
-    // Responder wake arrives; priority cancels the in-flight cognition run.
+    // Single-owner-at-a-time: a responder wake offered while the run is
+    // active is denied, not preempted; its trigger stays queued.
+    session.observe_trigger(Trigger {
+        kind: TriggerKind::UserMessage,
+        referent: None,
+    });
+    assert!(
+        session.accept_wake().unwrap().is_none(),
+        "a wake during an active run must be denied, not preempted"
+    );
+    // User cancels the in-flight run (Ctrl-C path); no wake preempts it.
     let cancelled = session
         .cancel_active_run()
         .unwrap()
@@ -375,8 +385,7 @@ fn responder_priority_cancels_background_cognition() {
         cancelled.outcome,
         TerminalOutcome::Failed(FailureKind::UserCancelled)
     );
-    // The responder wake is then accepted (responder commands never queue
-    // behind cognition).
+    // The queued wake is accepted only after the run slot frees.
     session.observe_trigger(Trigger {
         kind: TriggerKind::UserMessage,
         referent: None,

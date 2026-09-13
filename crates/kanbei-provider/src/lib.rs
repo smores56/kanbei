@@ -5,6 +5,7 @@
 //! canonical).
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kanbei_core::digest::Digest;
@@ -165,6 +166,32 @@ pub struct CompletionResponse {
 /// trip.
 pub trait ProviderEngine: Send + Sync {
     fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ProviderError>;
+    /// Streaming variant (M9 wave 3): engines that speak SSE override this;
+    /// the default calls [`complete`](ProviderEngine::complete) once and emits
+    /// the whole content as a single delta, so non-streaming engines
+    /// (FakeEngine) keep working unchanged. Overrides poll `cancel` at stream
+    /// boundaries so a cancel interrupts an in-flight call; the default can
+    /// only check it before and after the single blocking call, so
+    /// mid-call cancellation requires an SSE override (both HTTP engines
+    /// provide one). When the token trips, the call fails with
+    /// [`ProviderError::Cancelled`].
+    fn complete_stream(
+        &self,
+        req: &CompletionRequest,
+        cancel: &std::sync::atomic::AtomicBool,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<CompletionResponse, ProviderError> {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ProviderError::Cancelled {
+                provider: self.identity().to_string(),
+            });
+        }
+        let resp = self.complete(req)?;
+        if let Some(content) = &resp.content {
+            on_delta(content);
+        }
+        Ok(resp)
+    }
     /// Provider identity recorded in egress entries.
     fn identity(&self) -> &str;
     fn as_any(&self) -> &dyn std::any::Any;
@@ -188,6 +215,8 @@ pub enum ProviderError {
     Rejected { provider: String, message: String },
     #[error("provider {provider}: timed out after {secs}s")]
     Timeout { provider: String, secs: u64 },
+    #[error("provider {provider}: cancelled")]
+    Cancelled { provider: String },
 }
 
 /// Resolve the configured key at call time — the only place credentials are
@@ -200,6 +229,187 @@ pub fn resolve_key(cfg: &ProviderConfig) -> Result<String, ProviderError> {
         }),
         KeySource::Inline(key) => Ok(key.clone()),
     }
+}
+
+// ---------- provider HTTP plumbing ----------
+
+/// The auth header shape for a provider's API.
+enum AuthHeader<'a> {
+    /// OpenAI-compatible `Authorization: Bearer <key>`.
+    Bearer(&'a str),
+    /// Messages API `x-api-key: <key>` plus the required version headers.
+    Anthropic(&'a str),
+}
+
+/// Send one JSON POST with the provider's timeout and auth, mapping the ureq
+/// send errors onto [`ProviderError`]. The caller reads the body from the
+/// returned response.
+fn send_json(
+    cfg: &ProviderConfig,
+    url: &str,
+    auth: AuthHeader<'_>,
+    body: &Value,
+) -> Result<ureq::http::Response<ureq::Body>, ProviderError> {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(cfg.timeout))
+            .build(),
+    );
+    let request = match auth {
+        AuthHeader::Bearer(key) => agent
+            .post(url)
+            .header("Authorization", &format!("Bearer {key}")),
+        AuthHeader::Anthropic(key) => agent
+            .post(url)
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json"),
+    };
+    request.send_json(body).map_err(|e| match e {
+        ureq::Error::Timeout(_) => ProviderError::Timeout {
+            provider: cfg.provider.clone(),
+            secs: cfg.timeout.as_secs(),
+        },
+        // ureq v3's default `http_status_as_error` turns 4xx/5xx into this
+        // variant, so the response body is not available here.
+        ureq::Error::StatusCode(code) => ProviderError::Http {
+            provider: cfg.provider.clone(),
+            status: code,
+            body: String::new(),
+        },
+        e => ProviderError::Transport {
+            provider: cfg.provider.clone(),
+            message: e.to_string(),
+        },
+    })
+}
+
+/// Read a response body to a string, mapping I/O errors to `Malformed`.
+fn read_body(
+    cfg: &ProviderConfig,
+    mut resp: ureq::http::Response<ureq::Body>,
+) -> Result<String, ProviderError> {
+    resp.body_mut()
+        .read_to_string()
+        .map_err(|e| ProviderError::Malformed {
+            provider: cfg.provider.clone(),
+            message: e.to_string(),
+        })
+}
+
+/// Read a non-streaming JSON response: read the body, surface a non-200 as
+/// [`ProviderError::Http`], and parse the JSON.
+fn read_response_json(
+    cfg: &ProviderConfig,
+    resp: ureq::http::Response<ureq::Body>,
+) -> Result<Value, ProviderError> {
+    let status = resp.status();
+    let text = read_body(cfg, resp)?;
+    if status != 200 {
+        return Err(ProviderError::Http {
+            provider: cfg.provider.clone(),
+            status: status.into(),
+            body: text,
+        });
+    }
+    serde_json::from_str(&text).map_err(|e| ProviderError::Malformed {
+        provider: cfg.provider.clone(),
+        message: e.to_string(),
+    })
+}
+
+/// Send a streaming POST: like [`send_json`], but surface a non-200 (reading
+/// its body) before handing the response back for SSE consumption.
+fn send_stream(
+    cfg: &ProviderConfig,
+    url: &str,
+    auth: AuthHeader<'_>,
+    body: &Value,
+) -> Result<ureq::http::Response<ureq::Body>, ProviderError> {
+    let resp = send_json(cfg, url, auth, body)?;
+    let status = resp.status();
+    if status != 200 {
+        let text = read_body(cfg, resp)?;
+        return Err(ProviderError::Http {
+            provider: cfg.provider.clone(),
+            status: status.into(),
+            body: text,
+        });
+    }
+    Ok(resp)
+}
+
+// ---------- SSE consumption (M9 wave 3 streaming) ----------
+
+/// Consume an SSE byte stream, dispatching each event's `data:` payload.
+///
+/// Lines are read one at a time; consecutive `data:` payloads accumulate
+/// (the single space after `data:` is stripped) and dispatch on the blank
+/// line that ends an event, joined with "\n". `event:`, `id:`, `retry:`, and
+/// `:` comment lines are ignored. `cancel` is polled every line and after
+/// every dispatched event, so a cancellation surfaces promptly. Reader I/O
+/// errors map to [`ProviderError::Malformed`]; non-UTF8 lines are skipped.
+pub(crate) fn consume_sse<R: std::io::BufRead>(
+    provider: &str,
+    reader: R,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut on_event: impl FnMut(&str) -> Result<(), ProviderError>,
+) -> Result<(), ProviderError> {
+    let mut data = String::new();
+    for line in reader.lines() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ProviderError::Cancelled {
+                provider: provider.to_string(),
+            });
+        }
+        let line = match line {
+            Ok(line) => line,
+            // `BufRead::lines` rejects non-UTF8 lines; the SSE contract only
+            // needs the ASCII field names, so skip them rather than fail.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(e) => {
+                return Err(ProviderError::Malformed {
+                    provider: provider.to_string(),
+                    message: e.to_string(),
+                });
+            }
+        };
+        if line.is_empty() {
+            if data.is_empty() {
+                continue;
+            }
+            let payload = std::mem::take(&mut data);
+            on_event(&payload)?;
+            if cancel.load(Ordering::SeqCst) {
+                return Err(ProviderError::Cancelled {
+                    provider: provider.to_string(),
+                });
+            }
+            continue;
+        }
+        if line.starts_with(':') {
+            // SSE comment / keep-alive.
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            let payload = rest.strip_prefix(' ').unwrap_or(rest);
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(payload);
+        }
+        // `event:`, `id:`, `retry:`, and unknown fields are ignored.
+    }
+    // A stream may end without a trailing blank line; flush the last event.
+    if !data.is_empty() {
+        on_event(&data)?;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ProviderError::Cancelled {
+                provider: provider.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 // ---------- OpenAI-compatible HTTP engine ----------
@@ -277,57 +487,34 @@ impl ProviderEngine for HttpEngine {
             self.cfg.base_url.trim_end_matches('/')
         );
         let body = openai_body(&self.cfg, req)?;
-        let agent = ureq::Agent::new_with_config(
-            ureq::Agent::config_builder()
-                .timeout_global(Some(self.cfg.timeout))
-                .build(),
+        let resp = send_json(&self.cfg, &url, AuthHeader::Bearer(&key), &body)?;
+        parse_openai_response(&self.cfg.provider, read_response_json(&self.cfg, resp)?)
+    }
+
+    fn complete_stream(
+        &self,
+        req: &CompletionRequest,
+        cancel: &AtomicBool,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<CompletionResponse, ProviderError> {
+        let key = resolve_key(&self.cfg)?;
+        let url = format!(
+            "{}/chat/completions",
+            self.cfg.base_url.trim_end_matches('/')
         );
-        let mut resp = match agent
-            .post(&url)
-            .header("Authorization", &format!("Bearer {key}"))
-            .send_json(&body)
+        let mut body = openai_body(&self.cfg, req)?;
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({"include_usage": true});
+        let mut resp = send_stream(&self.cfg, &url, AuthHeader::Bearer(&key), &body)?;
+        let provider = self.cfg.provider.as_str();
+        let mut state = OpenAiStreamState::default();
         {
-            Ok(r) => r,
-            Err(ureq::Error::Timeout(_)) => {
-                return Err(ProviderError::Timeout {
-                    provider: self.cfg.provider.clone(),
-                    secs: self.cfg.timeout.as_secs(),
-                });
-            }
-            Err(ureq::Error::StatusCode(code)) => {
-                return Err(ProviderError::Http {
-                    provider: self.cfg.provider.clone(),
-                    status: code,
-                    body: String::new(),
-                });
-            }
-            Err(e) => {
-                return Err(ProviderError::Transport {
-                    provider: self.cfg.provider.clone(),
-                    message: e.to_string(),
-                });
-            }
-        };
-        let status = resp.status();
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| ProviderError::Malformed {
-                provider: self.cfg.provider.clone(),
-                message: e.to_string(),
+            let reader = std::io::BufReader::new(resp.body_mut().as_reader());
+            consume_sse(provider, reader, cancel, |payload| {
+                state.handle(provider, payload, &mut *on_delta)
             })?;
-        if status != 200 {
-            return Err(ProviderError::Http {
-                provider: self.cfg.provider.clone(),
-                status: status.into(),
-                body: text,
-            });
         }
-        let v: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Malformed {
-            provider: self.cfg.provider.clone(),
-            message: e.to_string(),
-        })?;
-        parse_openai_response(&self.cfg.provider, v)
+        state.finish(provider)
     }
 
     fn identity(&self) -> &str {
@@ -343,6 +530,15 @@ impl ProviderEngine for HttpEngine {
 /// response shape. Accepts both the `tool_calls` and the plain `content`
 /// shapes; tool-call arguments arrive as a JSON string and are re-parsed to
 /// canonical values.
+fn openai_finish_reason(s: Option<&str>) -> FinishReason {
+    match s {
+        Some("tool_calls") => FinishReason::ToolCalls,
+        Some("length") => FinishReason::Length,
+        Some("content_filter") => FinishReason::ContentFilter,
+        _ => FinishReason::Stop,
+    }
+}
+
 pub fn parse_openai_response(
     provider: &str,
     v: Value,
@@ -381,12 +577,7 @@ pub fn parse_openai_response(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let finish = match choice.get("finish_reason").and_then(|f| f.as_str()) {
-        Some("tool_calls") => FinishReason::ToolCalls,
-        Some("length") => FinishReason::Length,
-        Some("content_filter") => FinishReason::ContentFilter,
-        _ => FinishReason::Stop,
-    };
+    let finish = openai_finish_reason(choice.get("finish_reason").and_then(|f| f.as_str()));
     let usage = v.get("usage").map(|u| Usage {
         input_tokens: u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
         output_tokens: u
@@ -408,6 +599,144 @@ pub fn parse_openai_response(
         discontinuity: None,
         opaque_artifacts: None,
     })
+}
+
+/// Streaming tool-call accumulator shared by both protocol states: fragments
+/// keyed by provider `index`, assembled in index order.
+#[derive(Default)]
+struct ToolAccumulator {
+    parts: std::collections::BTreeMap<u64, ToolPart>,
+}
+
+/// One tool call under assembly: `id`/`name` arrive once, the JSON
+/// `arguments` arrive as fragments concatenated per index.
+#[derive(Default)]
+struct ToolPart {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl ToolAccumulator {
+    fn entry(&mut self, index: u64) -> &mut ToolPart {
+        self.parts.entry(index).or_default()
+    }
+
+    /// Ordered canonical tool calls. Incomplete entries (no `id` or `name`)
+    /// are dropped, mirroring the non-streaming parsers' `filter_map`.
+    fn finish(self) -> Vec<ToolCall> {
+        self.parts
+            .into_values()
+            .filter(|part| !part.id.is_empty() && !part.name.is_empty())
+            .map(|part| ToolCall {
+                id: part.id,
+                name: part.name,
+                arguments: serde_json::from_str::<Value>(&part.arguments).unwrap_or(Value::Null),
+            })
+            .collect()
+    }
+}
+
+/// Mutable accumulation state for one OpenAI streaming completion. The SSE
+/// deltas carry a different shape than the non-streaming `message` (the
+/// "delta" object); this consumes chunk payloads and folds them into the
+/// canonical [`CompletionResponse`].
+#[derive(Default)]
+struct OpenAiStreamState {
+    content: String,
+    tools: ToolAccumulator,
+    finish_reason: Option<FinishReason>,
+    usage: Option<Usage>,
+    done: bool,
+}
+
+impl OpenAiStreamState {
+    /// Fold one `data:` payload. `[DONE]` marks the terminal sentinel; later
+    /// chunks are still folded because a usage chunk may follow it. Text
+    /// fragments flow to `on_delta` as they arrive.
+    fn handle(
+        &mut self,
+        provider: &str,
+        payload: &str,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<(), ProviderError> {
+        if payload.trim() == "[DONE]" {
+            self.done = true;
+            return Ok(());
+        }
+        let v: Value = serde_json::from_str(payload).map_err(|e| ProviderError::Malformed {
+            provider: provider.to_string(),
+            message: e.to_string(),
+        })?;
+        // `stream_options.include_usage` sends a terminal chunk whose only
+        // content is `usage` (choices is empty).
+        if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+            self.usage = Some(Usage {
+                input_tokens: u.get("prompt_tokens").and_then(|t| t.as_u64()).unwrap_or(0),
+                output_tokens: u
+                    .get("completion_tokens")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(0),
+            });
+        }
+        let Some(choice) = v.pointer("/choices/0") else {
+            return Ok(());
+        };
+        if let Some(delta) = choice.get("delta") {
+            if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
+                self.content.push_str(c);
+                on_delta(c);
+            }
+            if let Some(arr) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                for tc in arr {
+                    let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                    let entry = self.tools.entry(index);
+                    if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                        entry.id = id.to_string();
+                    }
+                    if let Some(name) = tc.pointer("/function/name").and_then(|n| n.as_str()) {
+                        entry.name = name.to_string();
+                    }
+                    if let Some(args) = tc.pointer("/function/arguments").and_then(|a| a.as_str())
+                    {
+                        entry.arguments.push_str(args);
+                    }
+                }
+            }
+        }
+        if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
+            self.finish_reason = Some(openai_finish_reason(Some(fr)));
+        }
+        Ok(())
+    }
+
+    /// Fold the accumulated state into the canonical response shape. Fails if
+    /// the stream ended without `[DONE]` or without a `usage` chunk.
+    fn finish(self, provider: &str) -> Result<CompletionResponse, ProviderError> {
+        if !self.done {
+            return Err(ProviderError::Malformed {
+                provider: provider.to_string(),
+                message: "stream ended without a terminal sentinel".into(),
+            });
+        }
+        let usage = self.usage.ok_or_else(|| ProviderError::Malformed {
+            provider: provider.to_string(),
+            message: "missing usage".into(),
+        })?;
+        let content = if self.content.is_empty() {
+            None
+        } else {
+            Some(self.content)
+        };
+        Ok(CompletionResponse {
+            content,
+            tool_calls: self.tools.finish(),
+            finish_reason: self.finish_reason.unwrap_or(FinishReason::Stop),
+            usage,
+            discontinuity: None,
+            opaque_artifacts: None,
+        })
+    }
 }
 
 // ---------- Anthropic Messages API engine (M9 wave 3) ----------
@@ -435,59 +764,30 @@ impl ProviderEngine for AnthropicEngine {
         let key = resolve_key(&self.cfg)?;
         let url = format!("{}/v1/messages", self.cfg.base_url.trim_end_matches('/'));
         let body = anthropic_body(&self.cfg, req)?;
-        let agent = ureq::Agent::new_with_config(
-            ureq::Agent::config_builder()
-                .timeout_global(Some(self.cfg.timeout))
-                .build(),
-        );
-        let mut resp = match agent
-            .post(&url)
-            .header("x-api-key", &key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .send_json(&body)
+        let resp = send_json(&self.cfg, &url, AuthHeader::Anthropic(&key), &body)?;
+        parse_anthropic_response(&self.cfg.provider, read_response_json(&self.cfg, resp)?)
+    }
+
+    fn complete_stream(
+        &self,
+        req: &CompletionRequest,
+        cancel: &AtomicBool,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<CompletionResponse, ProviderError> {
+        let key = resolve_key(&self.cfg)?;
+        let url = format!("{}/v1/messages", self.cfg.base_url.trim_end_matches('/'));
+        let mut body = anthropic_body(&self.cfg, req)?;
+        body["stream"] = json!(true);
+        let mut resp = send_stream(&self.cfg, &url, AuthHeader::Anthropic(&key), &body)?;
+        let provider = self.cfg.provider.as_str();
+        let mut state = AnthropicStreamState::default();
         {
-            Ok(r) => r,
-            Err(ureq::Error::Timeout(_)) => {
-                return Err(ProviderError::Timeout {
-                    provider: self.cfg.provider.clone(),
-                    secs: self.cfg.timeout.as_secs(),
-                });
-            }
-            Err(ureq::Error::StatusCode(code)) => {
-                return Err(ProviderError::Http {
-                    provider: self.cfg.provider.clone(),
-                    status: code,
-                    body: String::new(),
-                });
-            }
-            Err(e) => {
-                return Err(ProviderError::Transport {
-                    provider: self.cfg.provider.clone(),
-                    message: e.to_string(),
-                });
-            }
-        };
-        let status = resp.status();
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| ProviderError::Malformed {
-                provider: self.cfg.provider.clone(),
-                message: e.to_string(),
+            let reader = std::io::BufReader::new(resp.body_mut().as_reader());
+            consume_sse(provider, reader, cancel, |payload| {
+                state.handle(provider, payload, &mut *on_delta)
             })?;
-        if status != 200 {
-            return Err(ProviderError::Http {
-                provider: self.cfg.provider.clone(),
-                status: status.into(),
-                body: text,
-            });
         }
-        let v: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Malformed {
-            provider: self.cfg.provider.clone(),
-            message: e.to_string(),
-        })?;
-        parse_anthropic_response(&self.cfg.provider, v)
+        state.finish(provider)
     }
 
     fn identity(&self) -> &str {
@@ -659,6 +959,14 @@ fn anthropic_tools(provider: &str, tools: &[Value]) -> Result<Vec<Value>, Provid
 /// tool calls (Anthropic `input` arrives as a JSON object, unlike OpenAI's
 /// string arguments). `stop_reason` maps `tool_use` → ToolCalls and
 /// `max_tokens` → Length; Anthropic has no content-filter equivalent.
+fn anthropic_finish_reason(s: Option<&str>) -> FinishReason {
+    match s {
+        Some("tool_use") => FinishReason::ToolCalls,
+        Some("max_tokens") => FinishReason::Length,
+        _ => FinishReason::Stop,
+    }
+}
+
 pub fn parse_anthropic_response(
     provider: &str,
     v: Value,
@@ -699,11 +1007,7 @@ pub fn parse_anthropic_response(
             })
         })
         .collect::<Vec<_>>();
-    let finish = match v.get("stop_reason").and_then(|s| s.as_str()) {
-        Some("tool_use") => FinishReason::ToolCalls,
-        Some("max_tokens") => FinishReason::Length,
-        _ => FinishReason::Stop,
-    };
+    let finish = anthropic_finish_reason(v.get("stop_reason").and_then(|s| s.as_str()));
     let usage = v.get("usage").ok_or_else(|| ProviderError::Malformed {
         provider: provider.into(),
         message: "missing usage".into(),
@@ -727,6 +1031,140 @@ pub fn parse_anthropic_response(
         discontinuity: None,
         opaque_artifacts: None,
     })
+}
+
+/// Mutable accumulation state for one Anthropic streaming completion.
+struct AnthropicStreamState {
+    content: String,
+    tools: ToolAccumulator,
+    stop_reason: Option<String>,
+    usage: Usage,
+    usage_seen: bool,
+    done: bool,
+}
+
+impl Default for AnthropicStreamState {
+    fn default() -> Self {
+        Self {
+            content: String::new(),
+            tools: ToolAccumulator::default(),
+            stop_reason: None,
+            usage: Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+            usage_seen: false,
+            done: false,
+        }
+    }
+}
+
+impl AnthropicStreamState {
+    /// Fold one `data:` payload (one Messages API SSE event). Text deltas flow
+    /// to `on_delta` as they arrive.
+    fn handle(
+        &mut self,
+        provider: &str,
+        payload: &str,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<(), ProviderError> {
+        let v: Value = serde_json::from_str(payload).map_err(|e| ProviderError::Malformed {
+            provider: provider.to_string(),
+            message: e.to_string(),
+        })?;
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("content_block_start") => {
+                let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                if let Some(cb) = v
+                    .get("content_block")
+                    .filter(|cb| cb.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                {
+                    let entry = self.tools.entry(index);
+                    if let Some(id) = cb.get("id").and_then(|i| i.as_str()) {
+                        entry.id = id.to_string();
+                    }
+                    if let Some(name) = cb.get("name").and_then(|n| n.as_str()) {
+                        entry.name = name.to_string();
+                    }
+                }
+            }
+            Some("content_block_delta") => {
+                let index = v.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                if let Some(delta) = v.get("delta") {
+                    match delta.get("type").and_then(|t| t.as_str()) {
+                        Some("text_delta") => {
+                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                self.content.push_str(text);
+                                on_delta(text);
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if let Some(partial) =
+                                delta.get("partial_json").and_then(|p| p.as_str())
+                            {
+                                self.tools.entry(index).arguments.push_str(partial);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("message_start") => {
+                if let Some(t) = v
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(|t| t.as_u64())
+                {
+                    self.usage.input_tokens = t;
+                }
+            }
+            Some("message_delta") => {
+                if let Some(sr) = v.pointer("/delta/stop_reason").and_then(|s| s.as_str()) {
+                    self.stop_reason = Some(sr.to_string());
+                }
+                if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+                    if let Some(t) = u.get("output_tokens").and_then(|t| t.as_u64()) {
+                        self.usage.output_tokens = t;
+                    }
+                    self.usage_seen = true;
+                }
+            }
+            // `message_stop` is the terminal sentinel; `ping` and
+            // `content_block_stop` carry nothing we accumulate.
+            Some("message_stop") => self.done = true,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Fold the accumulated state into the canonical response shape. Fails if
+    /// the stream ended without `message_stop` or without usage.
+    fn finish(self, provider: &str) -> Result<CompletionResponse, ProviderError> {
+        if !self.done {
+            return Err(ProviderError::Malformed {
+                provider: provider.to_string(),
+                message: "stream ended without a terminal sentinel".into(),
+            });
+        }
+        if !self.usage_seen {
+            return Err(ProviderError::Malformed {
+                provider: provider.to_string(),
+                message: "missing usage".into(),
+            });
+        }
+        let content = if self.content.is_empty() {
+            None
+        } else {
+            Some(self.content)
+        };
+        Ok(CompletionResponse {
+            content,
+            tool_calls: self.tools.finish(),
+            finish_reason: anthropic_finish_reason(self.stop_reason.as_deref()),
+            usage: self.usage,
+            discontinuity: None,
+            opaque_artifacts: None,
+        })
+    }
 }
 
 /// Build the engine for a protocol: OpenAI → [`HttpEngine`], Anthropic →
@@ -1592,5 +2030,372 @@ mod tests {
         let anthropic = engine_for(&cfg(), WireProtocol::Anthropic);
         assert!(anthropic.as_any().downcast_ref::<AnthropicEngine>().is_some());
         assert_eq!(anthropic.identity(), "fake");
+    }
+
+    // ---------- M9 wave 3: provider streaming (SSE) ----------
+
+    fn user_req() -> CompletionRequest {
+        CompletionRequest {
+            model: "test-model".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: "x".into(),
+                tool_call_id: None,
+            }],
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            tool_calls: vec![],
+            opaque_artifacts: None,
+        }
+    }
+
+    fn text_response(content: &str) -> CompletionResponse {
+        CompletionResponse {
+            content: Some(content.into()),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+            discontinuity: None,
+            opaque_artifacts: None,
+        }
+    }
+
+    #[test]
+    fn consume_sse_dispatches_data_in_order() {
+        let bytes = "data: one\n\ndata: two\n\ndata: three\n\n";
+        let cancel = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        consume_sse("fake", std::io::Cursor::new(bytes), &cancel, |payload| {
+            seen.push(payload.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn consume_sse_joins_multiline_and_ignores_other_fields() {
+        let bytes = ": comment\nevent: message\nid: 1\ndata: a\ndata: b\nretry: 5\n\ndata:c\n\n";
+        let cancel = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        consume_sse("fake", std::io::Cursor::new(bytes), &cancel, |payload| {
+            seen.push(payload.to_string());
+            Ok(())
+        })
+        .unwrap();
+        // Consecutive data lines join with "\n"; the optional single space
+        // after `data:` is stripped; other fields are ignored.
+        assert_eq!(seen, vec!["a\nb", "c"]);
+    }
+
+    #[test]
+    fn consume_sse_blank_and_reader_errors() {
+        // Blank lines and comment-only events dispatch nothing.
+        let cancel = AtomicBool::new(false);
+        let mut count = 0;
+        consume_sse(
+            "fake",
+            std::io::Cursor::new("\n\n: keep-alive\n\n"),
+            &cancel,
+            |_| {
+                count += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 0);
+
+        // A reader I/O error maps to Malformed(provider).
+        struct FailingReader;
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
+            }
+        }
+        impl std::io::BufRead for FailingReader {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "boom"))
+            }
+            fn consume(&mut self, _amt: usize) {}
+        }
+        let err = consume_sse("fake", FailingReader, &cancel, |_| Ok(())).unwrap_err();
+        match err {
+            ProviderError::Malformed { provider, message } => {
+                assert_eq!(provider, "fake");
+                assert!(message.contains("boom"));
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consume_sse_cancel_mid_stream() {
+        let cancel = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        let err = consume_sse(
+            "fake",
+            std::io::Cursor::new("data: one\n\ndata: two\n\n"),
+            &cancel,
+            |payload| {
+                seen.push(payload.to_string());
+                cancel.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        // The first event dispatched; the flag trip stops before the second.
+        assert_eq!(seen, vec!["one"]);
+        match err {
+            ProviderError::Cancelled { provider } => assert_eq!(provider, "fake"),
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_stream_accumulates_content_and_tool_calls() {
+        let mut state = OpenAiStreamState::default();
+        let mut deltas = Vec::new();
+        let mut on_delta = |s: &str| deltas.push(s.to_string());
+        let chunks = [
+            r#"{"choices":[{"delta":{"content":"Hel"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"lo","tool_calls":[{"index":0,"id":"call_a","function":{"name":"fs_read","arguments":"{\"path\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"fs_write","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"/a\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4}}"#,
+            "[DONE]",
+        ];
+        for chunk in chunks {
+            state.handle("fake", chunk, &mut on_delta).unwrap();
+        }
+        let r = state.finish("fake").unwrap();
+        assert_eq!(r.content.as_deref(), Some("Hello"));
+        assert_eq!(deltas, vec!["Hel", "lo"]);
+        assert_eq!(r.tool_calls.len(), 2);
+        assert_eq!(r.tool_calls[0].id, "call_a");
+        assert_eq!(r.tool_calls[0].name, "fs_read");
+        assert_eq!(r.tool_calls[0].arguments, json!({"path": "/a"}));
+        assert_eq!(r.tool_calls[1].id, "call_b");
+        assert_eq!(r.tool_calls[1].name, "fs_write");
+        assert_eq!(r.tool_calls[1].arguments, json!({}));
+        assert_eq!(r.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(
+            r.usage,
+            Usage {
+                input_tokens: 9,
+                output_tokens: 4
+            }
+        );
+    }
+
+    #[test]
+    fn openai_stream_truncated_and_missing_usage_fail() {
+        let mut noop = |_: &str| {};
+        // Ends without the [DONE] sentinel: truncated stream.
+        let mut state = OpenAiStreamState::default();
+        state
+            .handle(
+                "fake",
+                r#"{"choices":[{"delta":{"content":"hi"}}]}"#,
+                &mut noop,
+            )
+            .unwrap();
+        let err = state.finish("fake").unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed { ref message, .. } if message.contains("sentinel"))
+        );
+
+        // [DONE] arrived but no usage chunk was ever seen.
+        let mut state = OpenAiStreamState::default();
+        state.handle("fake", "[DONE]", &mut noop).unwrap();
+        let err = state.finish("fake").unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed { ref message, .. } if message.contains("usage"))
+        );
+    }
+
+    #[test]
+    fn openai_stream_usage_after_done_is_captured() {
+        let mut state = OpenAiStreamState::default();
+        let mut n = 0;
+        let mut on_delta = |_: &str| n += 1;
+        state.handle("fake", "[DONE]", &mut on_delta).unwrap();
+        // A usage chunk that trails [DONE] must still be folded.
+        state
+            .handle(
+                "fake",
+                r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":5}}"#,
+                &mut on_delta,
+            )
+            .unwrap();
+        let r = state.finish("fake").unwrap();
+        assert_eq!(
+            r.usage,
+            Usage {
+                input_tokens: 3,
+                output_tokens: 5
+            }
+        );
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn openai_stream_drops_incomplete_tool_call() {
+        let mut state = OpenAiStreamState::default();
+        let mut noop = |_: &str| {};
+        state.handle("fake", "[DONE]", &mut noop).unwrap();
+        state
+            .handle(
+                "fake",
+                r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+                &mut noop,
+            )
+            .unwrap();
+        // An entry carrying only argument fragments (no id/name) is dropped.
+        state
+            .handle(
+                "fake",
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}}]}"#,
+                &mut noop,
+            )
+            .unwrap();
+        let r = state.finish("fake").unwrap();
+        assert!(r.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn openai_stream_malformed_payload() {
+        let mut state = OpenAiStreamState::default();
+        let mut noop = |_: &str| {};
+        let err = state.handle("fake", "not json", &mut noop).unwrap_err();
+        assert!(matches!(err, ProviderError::Malformed { .. }));
+    }
+
+    #[test]
+    fn anthropic_stream_accumulates_text_and_tool_use() {
+        let mut state = AnthropicStreamState::default();
+        let mut deltas = Vec::new();
+        let mut on_delta = |s: &str| deltas.push(s.to_string());
+        let events = [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":0}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"He"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"llo"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu1","name":"fs_read"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"/a\"}"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        for event in events {
+            state.handle("fake", event, &mut on_delta).unwrap();
+        }
+        let r = state.finish("fake").unwrap();
+        assert_eq!(r.content.as_deref(), Some("Hello"));
+        assert_eq!(deltas, vec!["He", "llo"]);
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0].id, "tu1");
+        assert_eq!(r.tool_calls[0].name, "fs_read");
+        assert_eq!(r.tool_calls[0].arguments, json!({"path": "/a"}));
+        assert_eq!(r.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(
+            r.usage,
+            Usage {
+                input_tokens: 7,
+                output_tokens: 5
+            }
+        );
+    }
+
+    #[test]
+    fn anthropic_stream_truncated_and_missing_usage_fail() {
+        let mut noop = |_: &str| {};
+        // Ends without `message_stop`: truncated stream.
+        let mut state = AnthropicStreamState::default();
+        state
+            .handle(
+                "fake",
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+                &mut noop,
+            )
+            .unwrap();
+        let err = state.finish("fake").unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed { ref message, .. } if message.contains("sentinel"))
+        );
+
+        // `message_stop` arrived but no `message_delta` usage was ever seen.
+        let mut state = AnthropicStreamState::default();
+        state
+            .handle("fake", r#"{"type":"message_stop"}"#, &mut noop)
+            .unwrap();
+        let err = state.finish("fake").unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Malformed { ref message, .. } if message.contains("usage"))
+        );
+    }
+
+    #[test]
+    fn anthropic_stream_drops_incomplete_tool_use() {
+        let mut state = AnthropicStreamState::default();
+        let mut noop = |_: &str| {};
+        state
+            .handle("fake", r#"{"type":"message_stop"}"#, &mut noop)
+            .unwrap();
+        state
+            .handle(
+                "fake",
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+                &mut noop,
+            )
+            .unwrap();
+        // `partial_json` with no preceding `content_block_start` has no
+        // id/name and is dropped.
+        state
+            .handle(
+                "fake",
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+                &mut noop,
+            )
+            .unwrap();
+        let r = state.finish("fake").unwrap();
+        assert!(r.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn default_complete_stream_emits_whole_content() {
+        let engine = FakeEngine::new(cfg(), vec![text_response("whole")]);
+        let cancel = AtomicBool::new(false);
+        let mut deltas = Vec::new();
+        let mut on_delta = |s: &str| deltas.push(s.to_string());
+        let r = engine
+            .complete_stream(&user_req(), &cancel, &mut on_delta)
+            .unwrap();
+        assert_eq!(r.content.as_deref(), Some("whole"));
+        // The default emits the whole content as one delta.
+        assert_eq!(deltas, vec!["whole"]);
+    }
+
+    #[test]
+    fn default_complete_stream_pre_cancelled() {
+        let engine = FakeEngine::new(cfg(), vec![text_response("nope")]);
+        let cancel = AtomicBool::new(true);
+        let mut called = false;
+        let mut on_delta = |_: &str| called = true;
+        let err = engine
+            .complete_stream(&user_req(), &cancel, &mut on_delta)
+            .unwrap_err();
+        match err {
+            ProviderError::Cancelled { provider } => assert_eq!(provider, "fake"),
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        assert!(!called);
+        // The engine never reached `complete`.
+        assert_eq!(engine.request_count(), 0);
     }
 }

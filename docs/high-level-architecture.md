@@ -126,7 +126,9 @@ Tools, providers, cognition, scheduling, memory, retention, UI, state, and servi
 
 Luau policy chooses trigger priority, coalescing, backoff, expected utility, cognitive-step selection, and proposed wake timing.
 
-Rust enforces pause/shutdown, cancellation, deadlines, responder priority, concurrency, budgets, queue/timer limits, stale-generation rejection, and circuit breakers.
+Rust enforces pause/shutdown, user-initiated cancellation, deadlines, concurrency, budgets, queue/timer limits, stale-generation rejection, and circuit breakers.
+
+Runs are single-owner-at-a-time: a wake arriving during an active run is denied and queued, never preempting the running command. Only the user cancels a running command (Ctrl-C), and it lands at the next stream or host-command boundary.
 
 Normal child agents are bounded. Persistent children require explicit authority, lifecycle, and budget.
 

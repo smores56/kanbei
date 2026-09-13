@@ -113,10 +113,10 @@ Greenfield is required. Maki moves toward the desired design but inherits global
 ### Scheduler
 
 - Luau policy proposes triggers, priority, coalescing, backoff, expected utility, cognitive step selection, and next wake.
-- Rust enforces pause/shutdown, cancellation, deadlines, global/per-run concurrency, token/cost/tool/time budgets, stale-generation rejection, bounded queues/timers, responder priority, and circuit breakers.
+- Rust enforces pause/shutdown, user-initiated cancellation, deadlines, global/per-run concurrency, token/cost/tool/time budgets, stale-generation rejection, bounded queues/timers, and circuit breakers.
 - Canonical scheduler surface (R-09/E-09): canonical records are the wake-acceptance decision (coalesced triggers referenced as digest lists inside it), denials/circuit-breaks with the responsible constraint, run start, and terminal outcome; raw observed triggers and expected-utility scores are policy-private module state or ephemeral.
 - Wake = Run (R-09/E-10): every accepted wake creates exactly one RunId with a kind discriminator (`CognitionStep | ResponderTurn | Child`) and typed trigger provenance; wake/outcome pairing is the run FSM lifecycle.
-- Responder priority: responder commands never queue behind cognition at the session actor; an in-flight cognition model call may be cancelled at the stream boundary, classifying the run `Failed(UserCancelled)`; committed intents are never rolled back.
+- Single-owner-at-a-time: the session actor runs one command at a time. A wake arriving during an active run is denied `ConcurrencyLimit` and its trigger queued — it never preempts the running command. Cancellation is user-initiated (Ctrl-C): the cancel flag is checked at stream boundaries inside an in-flight model call and between host commands, classifying the run `Failed(UserCancelled)`; committed intents are never rolled back.
 - Circuit breakers (R-17/E-02): kernel-owned breakers on canonical counters — consecutive `Failed`; consecutive `NoProgress`/`Waiting` without new causal events; N identical action digests within a window; spend per wall-clock window; kernel enforces minimum floors, policy tunes only above floors; a trip appends canonical `BreakerTripped` (responsible counter) and pauses cognition until explicit user resume.
 - Reactive-only scheduling remains possible as a policy even though perpetual cognition is the experiment.
 

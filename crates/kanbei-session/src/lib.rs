@@ -98,6 +98,12 @@ const CHECKPOINT_LABEL_MAX: usize = 200;
 /// commit path.
 pub type CommitListener = Arc<dyn Fn(&Envelope) + Send + Sync>;
 
+/// Streaming delta observer (UI seam): called with each content fragment as
+/// the provider streams a model response. Runs on the calling thread; the
+/// observer must not block. None = deltas are consumed (cancellation still
+/// works) but not observed.
+pub type DeltaListener = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Session configuration. `dir` is the session layout root: `<dir>/log.zst`
 /// (append log), `<dir>/objects/` (object store), and `<dir>/state/` (module
 /// state heads).
@@ -160,11 +166,15 @@ pub struct SessionConfig {
     /// block the commit path. None = no observer.
     pub commit_listener: Option<CommitListener>,
     /// External cancel flag (UI seam): when set, the cognition loop ends the
-    /// active run at the next step boundary with `Failed(UserCancelled)` —
-    /// the same canonical path as [`Session::cancel_active_run`]. Shared
-    /// with the caller so the UI can set it without session access.
-    /// None = no external cancel.
+    /// active run at the next model-call stream boundary (or step boundary)
+    /// with `Failed(UserCancelled)`. The flag is one-shot — the session
+    /// clears it once the cancel is consumed, so it never cancels a later
+    /// turn. Shared with the caller so the UI can set it without session
+    /// access. None = no external cancel.
     pub cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Streaming delta observer (UI seam): called per content fragment as the
+    /// provider streams a model response. None = deltas are not observed.
+    pub delta_listener: Option<DeltaListener>,
     // --- M4 memory substrate + context projection ---
     /// Memory substrate root (canonical XDG state). None = cfg.dir.join("memory").
     pub memory_root: Option<PathBuf>,
@@ -216,6 +226,7 @@ impl Default for SessionConfig {
             session_id: None,
             commit_listener: None,
             cancel_flag: None,
+            delta_listener: None,
             memory_root: None,
             project: None,
             memory_fault: None,
@@ -517,6 +528,8 @@ pub struct Session {
     commit_listener: Option<CommitListener>,
     /// External cancel flag (UI seam); checked at each cognition step.
     cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Streaming delta observer (UI seam); called per streamed content fragment.
+    delta_listener: Option<DeltaListener>,
     fs_root: PathBuf,
     session_id: Id128,
     // --- M4 memory substrate + context projection ---
@@ -686,6 +699,7 @@ impl Session {
         let approval_resolver = cfg.approval_resolver.clone();
         let commit_listener = cfg.commit_listener.clone();
         let cancel_flag = cfg.cancel_flag.clone();
+        let delta_listener = cfg.delta_listener.clone();
         let budgets = cfg.budgets;
         let breaker_floors = cfg.breaker_floors;
         let provider_config = cfg.provider.clone();
@@ -974,6 +988,7 @@ impl Session {
             approval_resolver,
             commit_listener,
             cancel_flag,
+            delta_listener,
             fs_root,
             session_id,
             memory_lifetime,
@@ -1508,6 +1523,14 @@ impl Session {
 
 #[derive(Debug, Error)]
 pub enum SessionError {
+    /// The user cancelled the in-flight run (Ctrl-C) at a model-call stream
+    /// boundary; the cognition loop maps this to `Failed(UserCancelled)`.
+    #[error("run cancelled by user")]
+    Cancelled,
+    /// The provider call failed (transport/HTTP/malformed response); the
+    /// driver maps this to `Failed(Provider)`, never `UserCancelled`.
+    #[error("provider error: {0}")]
+    Provider(String),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]

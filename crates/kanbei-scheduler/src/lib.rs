@@ -316,8 +316,9 @@ pub trait SchedulerPolicy {
     fn priority(&self, kind: RunKind) -> u8;
 }
 
-/// Built-in default: responder turns always outrank cognition; cognition
-/// coalesces by trigger kind; children are lowest.
+/// Built-in default: pending triggers coalesce by kind, with responder turns
+/// ranked ahead of background cognition; children are lowest. A running
+/// command is never preempted (single-owner-at-a-time) — only the user cancels.
 pub struct DefaultPolicy;
 
 impl DefaultPolicy {
@@ -522,10 +523,9 @@ impl Scheduler {
     }
 
     /// Accept the next wake batch under the policy, or deny with the
-    /// responsible constraint. Responder priority: when a responder batch is
-    /// pending and a cognition run is active, the active run is cancelled
-    /// (the session classifies it `Failed(UserCancelled)` at the model-call
-    /// boundary).
+    /// responsible constraint. Single-owner-at-a-time: while a run is active
+    /// a wake is denied `ConcurrencyLimit` and its trigger stays pending; it
+    /// is never preempted (only a user cancel ends the running command).
     pub fn accept_wake(&mut self, force_manual: bool) -> WakeDecision {
         if let Some(trip) = self.paused {
             return WakeDecision::Denied(Denial {

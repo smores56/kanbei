@@ -24,7 +24,7 @@
 
 use kanbei_provider::ToolCall;
 use kanbei_scheduler::{
-    CognitionProvider, ModelCallSpec, StepCommand, StepContext, StepError, StepResult,
+    CognitionProvider, FailureKind, ModelCallSpec, StepCommand, StepContext, StepError, StepResult,
     TerminalOutcome, Trigger, TriggerKind,
 };
 use kanbei_session::{NewEvent, Session, SessionError};
@@ -176,12 +176,26 @@ impl Driver {
             ) {
                 Ok(outcome) => outcome,
                 Err(e) => {
-                    // A mid-run error (provider failure, projection error)
-                    // leaves the run active; without a terminal outcome the
-                    // active slot denies every later wake (ConcurrencyLimit).
-                    // Cancel it — a canonical Failed record — then surface
-                    // the error so the caller can retry or report.
-                    self.session.cancel_active_run()?;
+                    // A mid-run error leaves the run active; without a
+                    // terminal outcome the active slot denies every later
+                    // wake (ConcurrencyLimit). Close it with a truthful
+                    // classification — a user cancel is `Failed(UserCancelled)`,
+                    // a provider failure `Failed(Provider)`, anything else
+                    // `Failed(Internal)` — never rewriting a failure as a
+                    // user cancel — then surface the error.
+                    match &e {
+                        SessionError::Cancelled => {
+                            self.session.cancel_active_run()?;
+                        }
+                        SessionError::Provider(message) => {
+                            self.session
+                                .fail_active_run(FailureKind::Provider, message.clone())?;
+                        }
+                        other => {
+                            self.session
+                                .fail_active_run(FailureKind::Internal, other.to_string())?;
+                        }
+                    }
                     return Err(e);
                 }
             };
