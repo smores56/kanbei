@@ -83,6 +83,20 @@ pub struct VmConfig {
     /// at this ceiling further imports fail closed instead of spawning
     /// unbounded threads (B-F2/R-24).
     pub max_inflight_host_calls: u32,
+    /// Ceiling on concurrently in-flight supervised host-import workers for a
+    /// *single* generation (T21). Fairness/defense-in-depth: enforced by an
+    /// admission counter the instance owns and drops with its store. NOTE: with
+    /// the current single-threaded actor this can never bind — a generation
+    /// blocks inside one import and a timed-out import retires it, so it holds
+    /// at most one permit (kept for a future re-entrant/multi-threaded guest
+    /// path, T9).
+    pub max_inflight_host_calls_per_generation: u32,
+    /// Ceiling across the `Vm` on abandoned (timed-out, still-running)
+    /// host-import workers (T21). A wedged thread stays counted against
+    /// `max_inflight_host_calls` forever, so this stricter budget stops a few
+    /// permanent wedges from consuming the whole shared budget. Clamped to at
+    /// least 1; keep it below `max_inflight_host_calls`.
+    pub max_abandoned_host_calls: u32,
     /// Per-instance cumulative wall-clock budget (includes time blocked in
     /// host imports). Enforced at instance entry and after every call; an
     /// exhausted instance is retired (B-F3/R-24).
@@ -102,6 +116,8 @@ impl Default for VmConfig {
             epoch_deadline: 1,
             call_timeout: Duration::from_secs(5),
             max_inflight_host_calls: 32,
+            max_inflight_host_calls_per_generation: 8,
+            max_abandoned_host_calls: 4,
             generation_budget: Duration::from_secs(300),
             watchdog_tick: Duration::from_millis(10),
         }
@@ -294,7 +310,7 @@ pub struct Vm {
     module: Module,
     config: VmConfig,
     digest: Digest,
-    host_limiter: Arc<HostCallLimiter>,
+    admission: Arc<HostAdmission>,
     _watchdog: Watchdog,
 }
 
@@ -434,8 +450,11 @@ impl Vm {
         let module = load_or_compile_guest(&engine)?;
         let digest = Digest::new(GUEST_WASM);
         let watchdog = Watchdog::spawn(engine.clone(), config.watchdog_tick);
-        let host_limiter = HostCallLimiter::new(config.max_inflight_host_calls);
-        Ok(Self { engine, module, config, digest, host_limiter, _watchdog: watchdog })
+        let admission = HostAdmission::new(
+            config.max_inflight_host_calls,
+            config.max_abandoned_host_calls,
+        );
+        Ok(Self { engine, module, config, digest, admission, _watchdog: watchdog })
     }
 
     /// blake3 digest of the embedded guest wasm bytes (execution-snapshot
@@ -561,10 +580,15 @@ impl Vm {
         let mut linker = Linker::new(&self.engine);
         wasi_p1::add_to_linker_sync(&mut linker, |c: &mut Ctx| &mut c.wasi)
             .map_err(|e| api_error("wasi linker", e))?;
+        // Per-generation admission is owned by the instance's linker closures
+        // and drops with the store (T21) — no registry, no cleanup hook.
+        let generation_admission =
+            GenerationAdmission::new(self.config.max_inflight_host_calls_per_generation);
         link_host_dispatchers(
             &mut linker,
             host,
-            Arc::clone(&self.host_limiter),
+            Arc::clone(&self.admission),
+            generation_admission,
             generation_token,
             self.config.call_timeout,
         )?;
@@ -596,38 +620,108 @@ impl Vm {
     }
 }
 
-/// Per-`Vm` ceiling on concurrently in-flight supervised host-import workers.
-/// A worker abandoned past the timeout keeps its permit forever (a blocked
-/// thread cannot be killed), so `inflight` doubles as a circuit breaker: at
-/// the ceiling, further imports fail closed rather than spawning more threads.
-struct HostCallLimiter {
+/// Per-`Vm` admission for supervised host-import workers. Two global ceilings:
+/// `live` (active + abandoned workers — the hard bound on threads) and
+/// `abandoned` (timed-out workers still running — a stricter circuit breaker, so
+/// a few permanent wedges cannot consume the whole live budget). Per-generation
+/// fairness is the caller's [`GenerationAdmission`], which each instance owns
+/// and drops with its store (T21, decision 26).
+struct HostAdmission {
+    live: AtomicU64,
+    max_live: u64,
+    abandoned: AtomicU64,
+    max_abandoned: u64,
+}
+
+impl HostAdmission {
+    fn new(max_live: u32, max_abandoned: u32) -> Arc<Self> {
+        Arc::new(Self {
+            live: AtomicU64::new(0),
+            max_live: max_live.max(1) as u64,
+            abandoned: AtomicU64::new(0),
+            // At least 1: a ceiling of 0 would fail closed even with no wedges.
+            max_abandoned: max_abandoned.max(1) as u64,
+        })
+    }
+
+    /// Acquire one worker slot on `generation`, failing closed at the abandoned
+    /// budget, the global live ceiling, or the generation's own ceiling (cheapest
+    /// rejection first). The abandoned read is racy — a concurrent `abandon` may
+    /// push the count just past the budget — which is fine for a soft breaker.
+    fn try_acquire(
+        self: &Arc<Self>,
+        generation: &Arc<GenerationAdmission>,
+    ) -> Result<Arc<HostPermit>, &'static str> {
+        if self.abandoned.load(Ordering::Acquire) >= self.max_abandoned {
+            return Err("host import capacity exhausted (abandoned-worker budget)");
+        }
+        if self.live.fetch_add(1, Ordering::AcqRel) >= self.max_live {
+            self.live.fetch_sub(1, Ordering::AcqRel);
+            return Err("host import capacity exhausted (vm ceiling)");
+        }
+        if generation.inflight.fetch_add(1, Ordering::AcqRel) >= generation.max {
+            generation.inflight.fetch_sub(1, Ordering::AcqRel);
+            self.live.fetch_sub(1, Ordering::AcqRel);
+            return Err("host import capacity exhausted (per-generation ceiling)");
+        }
+        Ok(Arc::new(HostPermit {
+            admission: Arc::clone(self),
+            generation: Arc::clone(generation),
+            abandoned: AtomicBool::new(false),
+        }))
+    }
+}
+
+/// One generation's share of host-import workers (T21). Owned by the instance's
+/// linker closures, so it drops when the generation's store drops on its actor
+/// thread — accounting cleanup is by ownership, not by a registry or hook. A
+/// wedged worker keeps a clone alive until it exits, pinning only this (dead)
+/// generation's counter, never accumulating across generations.
+///
+/// Currently unreachable ceiling: a single-threaded actor holds at most one
+/// permit and a wedged import retires the instance, so the cap never binds. It
+/// is retained as a bound for a future re-entrant/multi-threaded guest path.
+struct GenerationAdmission {
     inflight: AtomicU64,
     max: u64,
 }
 
-impl HostCallLimiter {
+impl GenerationAdmission {
     fn new(max: u32) -> Arc<Self> {
-        Arc::new(Self { inflight: AtomicU64::new(0), max: max.max(1) as u64 })
+        Arc::new(Self {
+            inflight: AtomicU64::new(0),
+            max: max.max(1) as u64,
+        })
     }
+}
 
-    fn try_acquire(self: &Arc<Self>) -> Option<HostCallPermit> {
-        if self.inflight.fetch_add(1, Ordering::AcqRel) >= self.max {
-            self.inflight.fetch_sub(1, Ordering::AcqRel);
-            return None;
+/// Holds one in-flight slot until the worker finishes. Shared as `Arc` so the
+/// supervisor can mark it abandoned (`abandon`) without taking it from the
+/// worker; `Drop` runs once, at the last reference, and reclaims the counts.
+struct HostPermit {
+    admission: Arc<HostAdmission>,
+    generation: Arc<GenerationAdmission>,
+    abandoned: AtomicBool,
+}
+
+impl HostPermit {
+    /// Record that the worker did not answer in time. It keeps running (a blocked
+    /// thread cannot be killed) and stays counted against both the live and
+    /// abandoned ceilings until it exits and the last reference drops.
+    fn abandon(&self) {
+        if !self.abandoned.swap(true, Ordering::AcqRel) {
+            self.admission.abandoned.fetch_add(1, Ordering::AcqRel);
         }
-        Some(HostCallPermit { limiter: Arc::clone(self) })
     }
 }
 
-/// Holds one in-flight slot until the worker thread finishes (or forever, if
-/// the worker is abandoned on timeout — the intended circuit-breaker leak).
-struct HostCallPermit {
-    limiter: Arc<HostCallLimiter>,
-}
-
-impl Drop for HostCallPermit {
+impl Drop for HostPermit {
     fn drop(&mut self) {
-        self.limiter.inflight.fetch_sub(1, Ordering::AcqRel);
+        self.admission.live.fetch_sub(1, Ordering::AcqRel);
+        self.generation.inflight.fetch_sub(1, Ordering::AcqRel);
+        if self.abandoned.load(Ordering::Acquire) {
+            self.admission.abandoned.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -676,12 +770,14 @@ fn map_dispatched(label: &str, op: u32, d: Dispatched) -> Result<String, WasmErr
 
 /// Run one host import under the timeout wrapper (B-F2/R-24). On a worker
 /// thread the call runs inline (the top-level wrapper already bounds the whole
-/// nested chain); elsewhere it is offloaded to a bounded worker and awaited
-/// with `recv_timeout`. On timeout the worker is abandoned, its permit is
-/// consumed (fail-closed at the ceiling), and the generation is retired.
+/// nested chain); elsewhere it is offloaded to a worker admitted by the vm's
+/// [`HostAdmission`] and the generation's [`GenerationAdmission`], and awaited
+/// with `recv_timeout`. On timeout the worker is marked abandoned (it stays
+/// counted until it exits), and the generation is retired.
 fn supervise_host_call(
     host: &Arc<dyn Host>,
-    limiter: &Arc<HostCallLimiter>,
+    admission: &Arc<HostAdmission>,
+    generation: &Arc<GenerationAdmission>,
     timeout: Duration,
     generation_token: u64,
     op: u32,
@@ -690,27 +786,31 @@ fn supervise_host_call(
     if on_supervised_host_call() {
         return classify(host.call(generation_token, op, payload));
     }
-    let Some(permit) = limiter.try_acquire() else {
-        return Dispatched::Failed(
-            "host import capacity exhausted (too many in-flight host calls)".into(),
-        );
+    let permit = match admission.try_acquire(generation) {
+        Ok(permit) => permit,
+        Err(why) => return Dispatched::Failed(why.into()),
     };
     let (tx, rx) = mpsc::channel();
     let worker_host = Arc::clone(host);
     let payload = payload.to_owned();
     let spawned = std::thread::Builder::new()
         .name("kb-host-call".into())
-        .spawn(move || {
-            let _permit = permit;
-            SUPERVISED_HOST_CALL.with(|c| c.set(true));
-            let _ = tx.send(worker_host.call(generation_token, op, &payload));
+        .spawn({
+            let permit = Arc::clone(&permit);
+            move || {
+                let _permit = permit;
+                SUPERVISED_HOST_CALL.with(|c| c.set(true));
+                let _ = tx.send(worker_host.call(generation_token, op, &payload));
+            }
         });
     if let Err(e) = spawned {
+        // `permit` (and the closure's clone) drop here, releasing the slots.
         return Dispatched::Failed(format!("host import worker spawn failed: {e}"));
     }
     match rx.recv_timeout(timeout) {
         Ok(res) => classify(res),
         Err(mpsc::RecvTimeoutError::Timeout) => {
+            permit.abandon();
             host.retire(generation_token, "host import timeout");
             Dispatched::TimedOut { elapsed: timeout }
         }
@@ -721,26 +821,36 @@ fn supervise_host_call(
 }
 
 /// Link the two dispatcher imports. Both run `host.call(token, ..)` under the
-/// supervised host-import wrapper (B-F2/R-24): offloaded to a bounded worker
+/// supervised host-import wrapper (B-F2/R-24): offloaded to an admitted worker
 /// and awaited with `recv_timeout`, or inline when already on a worker (nested
 /// imports). A stale token traps with `StaleGeneration`, a timeout with
 /// `HostCallTimeout`, any other `Err` with `HostFailure`.
 fn link_host_dispatchers(
     linker: &mut Linker<Ctx>,
     host: Arc<dyn Host>,
-    limiter: Arc<HostCallLimiter>,
+    admission: Arc<HostAdmission>,
+    generation_admission: Arc<GenerationAdmission>,
     generation_token: u64,
     timeout: Duration,
 ) -> Result<(), GuestError> {
     let host_buf = Arc::clone(&host);
-    let limiter_buf = Arc::clone(&limiter);
+    let admission_buf = Arc::clone(&admission);
+    let gen_buf = Arc::clone(&generation_admission);
     linker
         .func_wrap("env", "kb_host", move |op: i32, x: i32| -> Result<i32, WasmError> {
             let payload = x.to_string();
             let s = map_dispatched(
                 "kb_host",
                 op as u32,
-                supervise_host_call(&host, &limiter, timeout, generation_token, op as u32, &payload),
+                supervise_host_call(
+                    &host,
+                    &admission,
+                    &generation_admission,
+                    timeout,
+                    generation_token,
+                    op as u32,
+                    &payload,
+                ),
             )?;
             s.parse::<i32>().map_err(|e| {
                 WasmError::new(HostFailure(format!(
@@ -780,7 +890,8 @@ fn link_host_dispatchers(
                     op as u32,
                     supervise_host_call(
                         &host_buf,
-                        &limiter_buf,
+                        &admission_buf,
+                        &gen_buf,
                         timeout,
                         generation_token,
                         op as u32,
@@ -990,5 +1101,53 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<Instance>();
         assert_send::<Store<Ctx>>();
+    }
+
+    /// T21: one generation's ceiling is independent of another's, so a
+    /// saturated generation cannot starve a fresh one.
+    #[test]
+    fn host_admission_per_generation_ceiling_is_independent() {
+        let global = HostAdmission::new(32, 4);
+        let a = GenerationAdmission::new(1);
+        let b = GenerationAdmission::new(1);
+        let permit_a = global.try_acquire(&a).expect("a's first import");
+        assert!(global.try_acquire(&a).is_err(), "a is at its own ceiling");
+        let permit_b = global
+            .try_acquire(&b)
+            .expect("b must be unaffected by a's saturation");
+        drop(permit_a);
+        assert!(global.try_acquire(&a).is_ok(), "a's slot is reclaimed on drop");
+        drop(permit_b);
+    }
+
+    /// T21: the global ceiling binds across generations.
+    #[test]
+    fn host_admission_global_ceiling_bounds_live_workers() {
+        let global = HostAdmission::new(1, 4);
+        let a = GenerationAdmission::new(8);
+        let b = GenerationAdmission::new(8);
+        let permit = global.try_acquire(&a).expect("a");
+        assert!(global.try_acquire(&b).is_err(), "global ceiling binds");
+        drop(permit);
+        assert!(global.try_acquire(&b).is_ok(), "slot reclaimed on drop");
+    }
+
+    /// T21: a bounded abandoned budget fails closed before the live ceiling
+    /// would, and is reclaimed when the wedged worker finally exits.
+    #[test]
+    fn host_admission_abandoned_budget_fails_closed_then_recovers() {
+        let global = HostAdmission::new(32, 1);
+        let a = GenerationAdmission::new(8);
+        let permit = global.try_acquire(&a).expect("first");
+        permit.abandon();
+        assert!(
+            global.try_acquire(&a).is_err(),
+            "the abandoned budget binds well below the live ceiling"
+        );
+        drop(permit);
+        assert!(
+            global.try_acquire(&a).is_ok(),
+            "a wedged worker that exits reclaims its abandoned slot"
+        );
     }
 }
