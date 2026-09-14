@@ -444,6 +444,13 @@ impl Vm {
         self.digest
     }
 
+    /// Host-import workers abandoned past `call_timeout` and still running
+    /// (T21). They cannot be reclaimed until they exit, so this is the session's
+    /// permanent thread-loss signal — observability only; it never fails closed.
+    pub fn abandoned_host_workers(&self) -> u64 {
+        self.host_limiter.abandoned()
+    }
+
     /// Compile `source` to deterministic Luau bytecode in a fresh throwaway
     /// instance (unlimited fuel; the epoch deadline is off during compile).
     pub fn compile(&self, source: &str) -> Result<CompiledModule, GuestError> {
@@ -603,31 +610,66 @@ impl Vm {
 struct HostCallLimiter {
     inflight: AtomicU64,
     max: u64,
+    /// Workers abandoned past `call_timeout` and still running (T21). They are
+    /// already counted in `inflight` and cannot be reclaimed until the thread
+    /// exits, so this is *observability only* — a signal of permanent thread
+    /// loss for the session, deliberately not a second fail-closed budget
+    /// (failing closed early on it would be a guest-triggerable denial of every
+    /// module's host imports).
+    abandoned: AtomicU64,
 }
 
 impl HostCallLimiter {
     fn new(max: u32) -> Arc<Self> {
-        Arc::new(Self { inflight: AtomicU64::new(0), max: max.max(1) as u64 })
+        Arc::new(Self {
+            inflight: AtomicU64::new(0),
+            max: max.max(1) as u64,
+            abandoned: AtomicU64::new(0),
+        })
     }
 
-    fn try_acquire(self: &Arc<Self>) -> Option<HostCallPermit> {
+    fn try_acquire(self: &Arc<Self>) -> Option<Arc<HostCallPermit>> {
         if self.inflight.fetch_add(1, Ordering::AcqRel) >= self.max {
             self.inflight.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
-        Some(HostCallPermit { limiter: Arc::clone(self) })
+        Some(Arc::new(HostCallPermit {
+            limiter: Arc::clone(self),
+            abandoned: AtomicBool::new(false),
+        }))
+    }
+
+    /// Abandoned (timed-out, still-running) workers right now.
+    fn abandoned(&self) -> u64 {
+        self.abandoned.load(Ordering::Acquire)
     }
 }
 
 /// Holds one in-flight slot until the worker thread finishes (or forever, if
 /// the worker is abandoned on timeout — the intended circuit-breaker leak).
+/// Shared as `Arc` so the supervisor can mark it abandoned without taking it
+/// from the worker; `Drop` runs once, at the last reference.
 struct HostCallPermit {
     limiter: Arc<HostCallLimiter>,
+    abandoned: AtomicBool,
+}
+
+impl HostCallPermit {
+    /// Record that the worker did not answer in time (observability). It keeps
+    /// running and stays counted until it exits and the last reference drops.
+    fn abandon(&self) {
+        if !self.abandoned.swap(true, Ordering::AcqRel) {
+            self.limiter.abandoned.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl Drop for HostCallPermit {
     fn drop(&mut self) {
         self.limiter.inflight.fetch_sub(1, Ordering::AcqRel);
+        if self.abandoned.load(Ordering::Acquire) {
+            self.limiter.abandoned.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -677,8 +719,8 @@ fn map_dispatched(label: &str, op: u32, d: Dispatched) -> Result<String, WasmErr
 /// Run one host import under the timeout wrapper (B-F2/R-24). On a worker
 /// thread the call runs inline (the top-level wrapper already bounds the whole
 /// nested chain); elsewhere it is offloaded to a bounded worker and awaited
-/// with `recv_timeout`. On timeout the worker is abandoned, its permit is
-/// consumed (fail-closed at the ceiling), and the generation is retired.
+/// with `recv_timeout`. On timeout the worker is marked abandoned (it stays
+/// counted until it exits) and the generation is retired.
 fn supervise_host_call(
     host: &Arc<dyn Host>,
     limiter: &Arc<HostCallLimiter>,
@@ -700,17 +742,22 @@ fn supervise_host_call(
     let payload = payload.to_owned();
     let spawned = std::thread::Builder::new()
         .name("kb-host-call".into())
-        .spawn(move || {
-            let _permit = permit;
-            SUPERVISED_HOST_CALL.with(|c| c.set(true));
-            let _ = tx.send(worker_host.call(generation_token, op, &payload));
+        .spawn({
+            let permit = Arc::clone(&permit);
+            move || {
+                let _permit = permit;
+                SUPERVISED_HOST_CALL.with(|c| c.set(true));
+                let _ = tx.send(worker_host.call(generation_token, op, &payload));
+            }
         });
     if let Err(e) = spawned {
+        // `permit` (and the closure's clone) drop here, releasing the slots.
         return Dispatched::Failed(format!("host import worker spawn failed: {e}"));
     }
     match rx.recv_timeout(timeout) {
         Ok(res) => classify(res),
         Err(mpsc::RecvTimeoutError::Timeout) => {
+            permit.abandon();
             host.retire(generation_token, "host import timeout");
             Dispatched::TimedOut { elapsed: timeout }
         }

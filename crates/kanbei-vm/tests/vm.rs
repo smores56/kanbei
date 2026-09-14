@@ -355,7 +355,7 @@ fn host_import_hang_times_out() {
 }
 
 #[test]
-fn host_import_capacity_bounds_abandoned_workers() {
+fn host_import_capacity_fails_closed_at_the_ceiling() {
     let config = VmConfig {
         epoch_deadline: NO_EPOCH,
         call_timeout: Duration::from_millis(100),
@@ -366,7 +366,7 @@ fn host_import_capacity_bounds_abandoned_workers() {
     let compiled = vm
         .compile("function kb_hot(x) return kb_host_call(7, '{}') end")
         .expect("compile");
-    // Two hangs leak both permits; the third import must fail closed at the
+    // Two hangs hold both permits; the third import must fail closed at the live
     // ceiling instead of spawning another worker.
     for i in 0..2 {
         let (host, _) = HangHost::new();
@@ -377,6 +377,11 @@ fn host_import_capacity_bounds_abandoned_workers() {
             "call {i}: {err:?}"
         );
     }
+    assert_eq!(
+        vm.abandoned_host_workers(),
+        2,
+        "both wedged workers are observed"
+    );
     let (host, _) = HangHost::new();
     let mut inst = vm.instantiate(&compiled, 1, host).expect("instantiate");
     let err = inst.call_json("kb_hot", "0").expect_err("capacity exhausted");
@@ -384,6 +389,35 @@ fn host_import_capacity_bounds_abandoned_workers() {
         panic!("expected Host (capacity), got {err:?}");
     };
     assert!(msg.contains("capacity exhausted"), "msg: {msg}");
+}
+
+/// T21: a wedged worker is counted for observability but must NOT fail the
+/// session closed — a fresh generation's imports stay admitted (the abandoned
+/// count is a signal, not a second budget).
+#[test]
+fn abandoned_workers_are_observed_without_failing_the_vm_closed() {
+    let config = VmConfig {
+        epoch_deadline: NO_EPOCH,
+        call_timeout: Duration::from_millis(150),
+        ..Default::default()
+    };
+    let vm = load_vm(config);
+    let compiled = vm
+        .compile("function kb_hot(x) return kb_host_call(7, '{}') end")
+        .expect("compile");
+    let (hang, _) = HangHost::new();
+    let mut inst_a = vm.instantiate(&compiled, 1, hang).expect("instantiate");
+    let err = inst_a.call_json("kb_hot", "0").expect_err("hang times out");
+    assert!(matches!(err, GuestError::HostTimeout { .. }), "{err:?}");
+    assert_eq!(vm.abandoned_host_workers(), 1, "the wedged worker is observed");
+    // A different generation is still admitted: a wedge is not session-wide
+    // fail-closed.
+    let mut inst_b = vm
+        .instantiate(&compiled, 2, Arc::new(SlowHost))
+        .expect("instantiate");
+    inst_b
+        .call_json("kb_hot", "0")
+        .expect("a wedge must not fail the whole vm closed");
 }
 
 #[test]
