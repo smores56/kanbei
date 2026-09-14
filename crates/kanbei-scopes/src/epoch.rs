@@ -27,9 +27,11 @@ pub struct Composition {
 
 impl Composition {
     /// The canonical bytes the epoch digest is computed over (R-01): the
-    /// session pins them as an object so the digest ref is closure-valid.
+    /// session pins them as an object so the digest ref is closure-valid. The
+    /// epoch counter is deliberately NOT included, so identical compositions
+    /// digest identically across epochs and manifests dedup (C-F5).
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
-        composition_canonical_bytes(self.epoch, &self.contributions)
+        composition_canonical_bytes(&self.contributions)
     }
 }
 
@@ -53,7 +55,7 @@ impl CompositionStore {
     /// A store whose current composition is the registry's state at epoch 0.
     pub fn new(registry: &ContributionRegistry) -> Self {
         let contributions = registry.snapshot();
-        let digest = composition_digest(0, &contributions);
+        let digest = composition_digest(&contributions);
         Self {
             current: Composition {
                 epoch: 0,
@@ -114,7 +116,7 @@ impl CompositionStore {
     fn commit(&mut self, registry: &ContributionRegistry) {
         let epoch = self.current.epoch + 1;
         let contributions = registry.snapshot();
-        let digest = composition_digest(epoch, &contributions);
+        let digest = composition_digest(&contributions);
         self.current = Composition {
             epoch,
             digest,
@@ -123,18 +125,18 @@ impl CompositionStore {
     }
 }
 
-/// Digest over the canonical JSON of `(domain, epoch, sorted contributions)`
-/// (R-01): the epoch digest is a pure function of epoch + contribution set,
-/// so identical compositions digest identically and any contribution change
-/// changes the digest.
-fn composition_digest(epoch: u64, contributions: &[Contribution]) -> Digest {
-    Digest::new(&composition_canonical_bytes(epoch, contributions))
+/// Digest over the canonical JSON of `(domain, sorted contributions)` (R-01):
+/// the epoch digest is a pure function of the contribution set, so identical
+/// compositions digest identically and any contribution change changes the
+/// digest. The epoch counter is intentionally excluded (C-F5/R-01): including
+/// it made a no-op publish change EpochId and defeated manifest dedup.
+fn composition_digest(contributions: &[Contribution]) -> Digest {
+    Digest::new(&composition_canonical_bytes(contributions))
 }
 
-fn composition_canonical_bytes(epoch: u64, contributions: &[Contribution]) -> Vec<u8> {
+fn composition_canonical_bytes(contributions: &[Contribution]) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "domain": COMPOSITION_DOMAIN,
-        "epoch": epoch,
         "contributions": contributions,
     }))
     .expect("contribution kinds are always serializable")
@@ -391,16 +393,46 @@ mod tests {
         let mut store = CompositionStore::new(&registry);
         let s = scope("app");
         store.stage_publish(&full_set(&s), &mut registry).unwrap();
-        let epoch = store.current().epoch;
-        assert_eq!(epoch, 1);
+        assert_eq!(store.current().epoch, 1);
 
-        // the same epoch + contributions WITHOUT the composition-v1 domain
-        // marker must not produce the same digest (R-01 domain separation)
+        // the same contributions WITHOUT the composition-v1 domain marker must
+        // not produce the same digest (R-01 domain separation)
         let unprefixed = serde_json::to_vec(&json!({
-            "epoch": epoch,
             "contributions": store.current().contributions,
         }))
         .unwrap();
         assert_ne!(store.current().digest, Digest::new(&unprefixed));
+    }
+
+    #[test]
+    fn epoch_is_not_mixed_into_the_composition_digest() {
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let mut store = CompositionStore::new(&registry);
+        let s = scope("app");
+        let set = full_set(&s);
+        store.stage_publish(&set, &mut registry).unwrap();
+        let first = store.current().digest;
+        let contributions = store.current().contributions.clone();
+
+        // A no-op publish (empty set) advances the epoch counter without
+        // changing the contribution set. The digest (EpochId) must not change,
+        // or identical compositions digest differently and manifest dedup
+        // breaks (R-01/C-F5).
+        store.stage_publish(&[], &mut registry).unwrap();
+        assert_eq!(store.current().epoch, 2);
+        assert_eq!(store.current().contributions, contributions);
+        assert_eq!(
+            store.current().digest,
+            first,
+            "identical compositions must digest identically across epochs"
+        );
+
+        // Canonical bytes pinned by the session must also be epoch-free.
+        let committed = store.current().to_canonical_bytes();
+        assert!(
+            !String::from_utf8_lossy(&committed).contains("epoch"),
+            "canonical composition bytes must not embed the epoch: {}",
+            String::from_utf8_lossy(&committed)
+        );
     }
 }
