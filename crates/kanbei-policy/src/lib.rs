@@ -437,8 +437,6 @@ pub mod wasm {
         epoch_deadline: 500,
         call_timeout: Duration::from_secs(5),
         max_inflight_host_calls: 8,
-        max_inflight_host_calls_per_generation: 8,
-        max_abandoned_host_calls: 4,
         generation_budget: Duration::from_secs(300),
         watchdog_tick: Duration::from_millis(10),
     };

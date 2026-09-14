@@ -386,48 +386,6 @@ fn host_import_capacity_bounds_abandoned_workers() {
     assert!(msg.contains("capacity exhausted"), "msg: {msg}");
 }
 
-/// T21: per-generation admission is wired per instance, and a generation that
-/// wedges a worker cannot starve a fresh generation.
-///
-/// NOTE: the per-generation ceiling is currently unreachable through a real
-/// instance — an actor thread blocks inside a host import, so a generation holds
-/// at most one permit, and a wedged import retires the instance (`call_json`
-/// marks it dead on `HostTimeout`, lib.rs:922). It is retained deliberately as a
-/// defensive bound for a future re-entrant/multi-threaded guest path (T9 hook
-/// seams), and its *policy* is pinned by the `host_admission_*` unit tests.
-#[test]
-fn host_import_per_generation_admission_is_isolated() {
-    let config = VmConfig {
-        epoch_deadline: NO_EPOCH,
-        call_timeout: Duration::from_millis(200),
-        max_inflight_host_calls: 32,
-        max_inflight_host_calls_per_generation: 1,
-        max_abandoned_host_calls: 32,
-        ..Default::default()
-    };
-    let vm = load_vm(config);
-    let compiled = vm
-        .compile("function kb_hot(x) return kb_host_call(7, '{}') end")
-        .expect("compile");
-    // Generation 1 wedges its single slot, then the vm retires the instance.
-    let (hang, _) = HangHost::new();
-    let mut inst_a = vm.instantiate(&compiled, 1, hang).expect("instantiate");
-    let err = inst_a.call_json("kb_hot", "0").expect_err("hang times out");
-    assert!(matches!(err, GuestError::HostTimeout { .. }), "{err:?}");
-    let err = inst_a.call_json("kb_hot", "0").expect_err("a retired instance");
-    assert!(
-        matches!(err, GuestError::Retired { .. }),
-        "the instance is retired, not re-admitted: {err:?}"
-    );
-    // A different generation is admitted regardless of a's wedged worker.
-    let mut inst_b = vm
-        .instantiate(&compiled, 2, Arc::new(SlowHost))
-        .expect("instantiate");
-    inst_b
-        .call_json("kb_hot", "0")
-        .expect("a fresh generation must not be starved by a saturated one");
-}
-
 #[test]
 fn host_import_capacity_recovers_after_a_slow_call() {
     let config = VmConfig {
