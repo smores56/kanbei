@@ -142,6 +142,9 @@ enum Drain {
     /// the table and a non-blocking stop requested), so this drain could not
     /// join it.
     AlreadyRetired,
+    /// The actor thread panicked; its store was dropped during unwinding, so
+    /// this is not a leak, but it is not a clean quiesce either.
+    Panicked,
 }
 
 impl Drain {
@@ -149,8 +152,16 @@ impl Drain {
     fn of(runtime: Option<Arc<GenerationRuntime>>) -> Self {
         match runtime {
             None => Drain::AlreadyRetired,
-            Some(runtime) if runtime.shutdown(DRAIN_DEADLINE) => Drain::Joined,
-            Some(_) => Drain::Detached,
+            Some(runtime) => {
+                let joined = runtime.shutdown(DRAIN_DEADLINE);
+                if runtime.panicked() {
+                    Drain::Panicked
+                } else if joined {
+                    Drain::Joined
+                } else {
+                    Drain::Detached
+                }
+            }
         }
     }
 
@@ -176,6 +187,11 @@ impl Drain {
                 reason: format!(
                     "{verb}: the vm had already retired this generation (non-blocking stop requested; not joined by this drain)"
                 ),
+            },
+            Drain::Panicked => DisposalRecord {
+                generation,
+                forced: false,
+                reason: format!("{verb}: actor panicked during shutdown; its store was dropped"),
             },
         }
     }
@@ -217,12 +233,7 @@ impl Generation {
             tables.packages.remove(&self.generation);
             tables.current.retain(|_, g| *g != self.generation);
         }
-        let drain = if self.runtime.shutdown(DRAIN_DEADLINE) {
-            Drain::Joined
-        } else {
-            Drain::Detached
-        };
-        drain.record(self.generation, "dispose")
+        Drain::of(Some(Arc::clone(&self.runtime))).record(self.generation, "dispose")
     }
 }
 
@@ -679,9 +690,10 @@ impl ModuleManager {
 }
 
 impl Drop for ModuleManager {
-    /// Teardown: invalidate every remaining generation's token and drain its
-    /// actor, so no store (and no thread) outlives the manager. A `Generation`
-    /// handle that outlives the manager becomes inert (`ActorError::Gone`).
+    /// Teardown: invalidate every remaining generation's token and drain every
+    /// actor still in the table. A wedged actor is detached after
+    /// `DRAIN_DEADLINE` (its thread can outlive the manager); generations the vm
+    /// already retired were removed from the table and could not be joined.
     fn drop(&mut self) {
         // A detached actor keeps `Arc<ModuleHost>` alive; clear the token table
         // so it cannot commit further host ops after teardown.

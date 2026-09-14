@@ -19,7 +19,7 @@
 pub mod host;
 pub mod lifecycle;
 pub mod package;
-pub mod runtime;
+mod runtime;
 pub mod state;
 
 pub use host::ModuleHost;

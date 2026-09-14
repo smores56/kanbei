@@ -16,7 +16,7 @@
 //! still executes. Callers must treat `ActorError::Wedged` as "outcome
 //! unknown", not "did not happen".
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -85,6 +85,9 @@ pub struct GenerationRuntime {
     in_flight: Arc<AtomicUsize>,
     /// Shared abandoned-drain counter; incremented once per timed-out drain.
     abandoned: Arc<AtomicU64>,
+    /// Set when the actor thread panicked (so a disposal does not claim a clean
+    /// quiesce). Its store was still dropped during unwinding.
+    panicked: AtomicBool,
 }
 
 impl GenerationRuntime {
@@ -115,6 +118,7 @@ impl GenerationRuntime {
             join: Mutex::new(Some(join)),
             in_flight,
             abandoned,
+            panicked: AtomicBool::new(false),
         }))
     }
 
@@ -125,7 +129,7 @@ impl GenerationRuntime {
 
     /// Run the activation script on the actor thread, waiting up to the
     /// runtime's default reply deadline.
-    pub fn run_script(&self, source: &str) -> Result<Result<(), GuestError>, ActorError> {
+    pub(crate) fn run_script(&self, source: &str) -> Result<Result<(), GuestError>, ActorError> {
         self.run_script_within(source, self.reply_timeout)
     }
 
@@ -166,6 +170,11 @@ impl GenerationRuntime {
             args: args.to_string(),
             reply,
         })
+    }
+
+    /// Whether the actor thread panicked (only known after a join).
+    pub(crate) fn panicked(&self) -> bool {
+        self.panicked.load(Ordering::Acquire)
     }
 
     /// Best-effort, non-blocking stop request (for the vm's `retire` path, which
@@ -216,8 +225,10 @@ impl GenerationRuntime {
     }
 
     fn join(&self) -> bool {
-        if let Some(handle) = self.join.lock().expect("actor join lock poisoned").take() {
-            let _ = handle.join();
+        if let Some(handle) = self.join.lock().expect("actor join lock poisoned").take()
+            && handle.join().is_err()
+        {
+            self.panicked.store(true, Ordering::Release);
         }
         true
     }

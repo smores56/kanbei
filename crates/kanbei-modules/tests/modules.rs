@@ -789,3 +789,31 @@ fn shutdown_after_a_nonblocking_retire_is_a_clean_join() {
     drop(manager);
     cleanup(dir, queue);
 }
+
+/// T19: deactivating a generation the vm already retired must report the truth
+/// — this drain did not join it — rather than a clean join.
+#[test]
+fn deactivate_after_a_vm_retire_reports_already_retired() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("deactivate-after-retire", vm);
+    let id = Id128::generate();
+    let g = manager.activate(&manifest(id, TRIVIAL_HOT, vec![])).unwrap();
+    let runtime = Arc::clone(&g.runtime);
+
+    // The vm's forced-retirement path removes the actor from the table and
+    // requests a stop without joining.
+    manager.host().retire(g.generation, "test: forced retirement");
+
+    let rec = manager.deactivate(id).unwrap();
+    assert_eq!(rec.generation, g.generation);
+    assert!(!rec.forced);
+    assert!(rec.reason.contains("already retired"), "got: {}", rec.reason);
+
+    // The actor still exits cleanly on the queued stop request.
+    assert!(runtime.shutdown(Duration::from_secs(5)));
+    assert_eq!(manager.leaked_threads(), 0);
+
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
