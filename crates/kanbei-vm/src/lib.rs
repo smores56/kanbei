@@ -979,4 +979,13 @@ mod tests {
         assert!(l.table_growing(0, 10, Some(10)).unwrap());
         assert!(l.table_growing(0, 10, Some(50)).unwrap());
     }
+
+    /// T19: the per-generation actor moves a live instance onto its own thread
+    /// and drops the store there. Compile-time guard for that invariant.
+    #[test]
+    fn instance_and_store_are_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Instance>();
+        assert_send::<Store<Ctx>>();
+    }
 }

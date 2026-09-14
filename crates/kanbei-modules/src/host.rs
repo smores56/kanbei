@@ -36,7 +36,6 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::{Duration, Instant};
 
 use kanbei_capabilities::{ApprovalIntent, Broker, Capability, GrantScope, Principal};
 use kanbei_core::id::Id128;
@@ -45,9 +44,10 @@ use kanbei_services::{
     ReplaceIntent, ScopePath, ServiceContract, ServiceDependency, ServiceError, ServiceKey,
     ServiceProvider, ServiceRegistry,
 };
-use kanbei_vm::{Host, Instance};
+use kanbei_vm::Host;
 use serde_json::{json, Value};
 
+use crate::runtime::GenerationRuntime;
 use crate::state::{StateStore, StateUpdate};
 
 /// The exact string kanbei-vm maps to `GuestError::StaleGeneration`
@@ -56,31 +56,12 @@ use crate::state::{StateStore, StateUpdate};
 const STALE_GENERATION: &str = "stale generation";
 
 /// `service_call` recursion cap (one hop per level; M2 is shallow).
+///
+/// NOTE (T20): once cross-generation calls hop to another generation's actor
+/// thread, this thread-local no longer tracks the chain — the scope
+/// `{depth, visited, deadline}` must ride in the op-3 message. T19 leaves the
+/// cap as-is; T20 replaces it.
 const MAX_SERVICE_DEPTH: u32 = 8;
-
-/// Upper bound on waiting for a provider instance lock inside `service_call`.
-/// Kept below the vm's host-import timeout so a supervised worker returns (and
-/// releases its permit) rather than being abandoned; the coupling is not
-/// enforced here because the vm's timeout is not visible to this crate.
-pub(crate) const HOST_LOCK_WAIT: Duration = Duration::from_secs(4);
-
-/// Acquire `m` without blocking past `wait`; `None` means the current holder is
-/// wedged (or the lock is poisoned).
-pub(crate) fn acquire_bounded<'a, T>(
-    m: &'a Mutex<T>,
-    wait: Duration,
-) -> Option<std::sync::MutexGuard<'a, T>> {
-    let deadline = Instant::now() + wait;
-    loop {
-        if let Ok(g) = m.try_lock() {
-            return Some(g);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
 
 thread_local! {
     static SERVICE_DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -110,7 +91,7 @@ pub struct ModuleHost {
     /// Weak: the manager owns the instance table. A strong edge here would
     /// create the cycle host → table → instance → host (each instance
     /// captures the host Arc), leaking every generation's Wasm store.
-    instances: Weak<Mutex<HashMap<u64, Arc<Mutex<Instance>>>>>,
+    instances: Weak<Mutex<HashMap<u64, Arc<GenerationRuntime>>>>,
     services: Arc<Mutex<ServiceRegistry>>,
     state: Arc<Mutex<StateStore>>,
     broker: Mutex<Broker>,
@@ -139,7 +120,7 @@ impl ModuleHost {
     pub(crate) fn new(
         session: Id128,
         tokens: Arc<RwLock<HashMap<u64, TokenInfo>>>,
-        instances: Weak<Mutex<HashMap<u64, Arc<Mutex<Instance>>>>>,
+        instances: Weak<Mutex<HashMap<u64, Arc<GenerationRuntime>>>>,
         services: Arc<Mutex<ServiceRegistry>>,
         state: Arc<Mutex<StateStore>>,
         rejected_stale_effects: Arc<AtomicU64>,
@@ -331,8 +312,7 @@ impl ModuleHost {
             .map_err(|e| format!("service_call: {e}"))?;
         if provider.generation == info.generation {
             return Err(
-                "service_call: a generation may not call its own service (re-entrant instance lock)"
-                    .into(),
+                "service_call: a generation may not call its own service (mailbox self-hop)".into(),
             );
         }
         if SERVICE_DEPTH.with(|d| d.get()) >= MAX_SERVICE_DEPTH {
@@ -345,7 +325,10 @@ impl ModuleHost {
             let map = self.instances.upgrade().ok_or_else(|| {
                 "service_call: kernel module table is gone (hosting shut down)".to_string()
             })?;
-            let instance = map
+            // Resolve the provider's actor, then release the table lock before
+            // the cross-actor hop (never hold a kernel lock across a mailbox
+            // send).
+            let runtime = map
                 .lock()
                 .expect("instances lock poisoned")
                 .get(&provider.generation)
@@ -357,21 +340,20 @@ impl ModuleHost {
                     )
                 })?;
             drop(map);
-            let mut inst = acquire_bounded(&instance, HOST_LOCK_WAIT).ok_or_else(|| {
-                // Contention is not proof of a wedge (a provider call may simply
-                // be slow); never retire a generation on a lock wait — only the
-                // vm's own timeout path retires.
-                format!(
-                    "service_call: provider generation {} is busy (lock wait exceeded)",
-                    provider.generation
-                )
-            })?;
-            inst.call_json("kb_hot", &args.to_string()).map_err(|e| {
-                format!(
-                    "service_call: provider generation {} failed: {e}",
-                    provider.generation
-                )
-            })
+            runtime
+                .hot("kb_hot", &args.to_string())
+                .map_err(|e| {
+                    format!(
+                        "service_call: provider generation {} is unavailable: {e}",
+                        provider.generation
+                    )
+                })?
+                .map_err(|e| {
+                    format!(
+                        "service_call: provider generation {} failed: {e}",
+                        provider.generation
+                    )
+                })
         })();
         SERVICE_DEPTH.with(|d| d.set(d.get() - 1));
         result
@@ -660,12 +642,20 @@ impl Host for ModuleHost {
     }
 
     fn retire(&self, generation_token: u64, _reason: &str) {
-        // Invalidate currency and drop the kernel's handle. Neither lock below
-        // is an instance lock, so this is safe to call while a caller holds one.
+        // Invalidate currency first so the T18 commit fence rejects any
+        // in-flight mutating op at its commit point. `retire` runs on a vm
+        // worker and must not block: it only asks the generation's actor to stop
+        // (the store drops on the actor thread when it processes the request).
         self.tokens.write().expect("tokens lock poisoned").remove(&generation_token);
         self.unpublish_generation(generation_token);
         if let Some(map) = self.instances.upgrade() {
-            map.lock().expect("instances lock poisoned").remove(&generation_token);
+            let runtime = map
+                .lock()
+                .expect("instances lock poisoned")
+                .remove(&generation_token);
+            if let Some(runtime) = runtime {
+                runtime.request_shutdown();
+            }
         }
     }
 }

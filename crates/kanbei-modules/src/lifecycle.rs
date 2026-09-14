@@ -40,11 +40,12 @@ use kanbei_services::{
     replacement, ReplaceIntent, ScopePath, ServiceDependency, ServiceError, ServiceKey,
     ServiceProvider, ServiceRegistry,
 };
-use kanbei_vm::{GuestError, Instance, Vm};
+use kanbei_vm::{GuestError, Vm};
 use thiserror::Error;
 
 use crate::host::{ModuleHost, TokenInfo};
 use crate::package::{install_package, PackageManifest};
+use crate::runtime::{DRAIN_DEADLINE, GenerationRuntime, REPLY_TIMEOUT};
 use crate::state::{StateError, StateStore};
 
 /// The Luau activation shim: builds the `ctx` handle over `kb_host_call` and
@@ -100,20 +101,21 @@ struct LifecycleTables {
     packages: HashMap<u64, Digest>,
 }
 
-/// A live module generation. The instance is shared with the kernel's
-/// generation table (`Arc`), so service routing can reach it; the Wasm store
-/// is dropped when the last handle drops.
+/// A live module generation. The generation's Wasmtime store is owned by a
+/// dedicated actor thread ([`GenerationRuntime`]); the kernel's generation
+/// table holds an `Arc` to the same actor, so service routing reaches it. The
+/// store is dropped on that thread when the actor shuts down.
 pub struct Generation {
     pub generation: u64,
     pub module_id: Id128,
     /// Immutable package digest.
     pub package: Digest,
-    /// Shared instance handle; `dispose` drops the kernel's handle (the
-    /// session's handle keeps the store alive, but its token is stale).
-    pub instance: Arc<Mutex<Instance>>,
+    /// The generation's store-owning actor (custody boundary); `dispose` drains
+    /// and joins it.
+    pub runtime: Arc<GenerationRuntime>,
     pub scope: ScopePath,
     tokens: Arc<RwLock<HashMap<u64, TokenInfo>>>,
-    instances: Arc<Mutex<HashMap<u64, Arc<Mutex<Instance>>>>>,
+    instances: Arc<Mutex<HashMap<u64, Arc<GenerationRuntime>>>>,
     tables: Arc<Mutex<LifecycleTables>>,
     /// The kernel host, so direct disposal can retire the generation's published
     /// effects through the same path as the vm's forced retirement.
@@ -140,36 +142,40 @@ impl std::fmt::Debug for Generation {
 }
 
 impl Generation {
-    /// Force-terminate: invalidate the generation token, drop the kernel's
-    /// instance handle, and drop this handle. The drain protocol is a
-    /// documented stub — quiesce (no-op) → deadline (0 elapsed) → force —
-    /// because M2 modules have no cancellable effects; `forced` is therefore
-    /// always false (the routine drop IS the force and cannot fail).
+    /// Force-terminate: drain the generation's actor (quiesce → deadline →
+    /// force), invalidate the generation token, unpublish its effects, drop the
+    /// kernel's handle, and drop this handle. The store is dropped on the actor
+    /// thread; a wedged actor is detached and reported as `forced`.
     pub fn dispose(self) -> DisposalRecord {
-        // A wedged worker may hold the lock; the token equals the generation id
-        // (never reused), so disposal does not block on the instance lock. The
-        // kernel tables touched below are held only briefly.
-        let token = match self.instance.try_lock() {
-            Ok(i) => i.generation_token(),
-            Err(std::sync::TryLockError::WouldBlock | std::sync::TryLockError::Poisoned(_)) => {
-                self.generation
-            }
-        };
-        self.tokens.write().expect("tokens lock poisoned").remove(&token);
+        // Invalidate the token and tear down the kernel's handles FIRST (the
+        // T18 commit fence makes in-flight mutating ops reject once the token is
+        // gone), then drain the actor — never holding a kernel lock across the
+        // mailbox send/join.
+        self.tokens
+            .write()
+            .expect("tokens lock poisoned")
+            .remove(&self.generation);
         self.host.unpublish_generation(self.generation);
         self.instances
             .lock()
             .expect("instances lock poisoned")
             .remove(&self.generation);
-        let mut tables = self.tables.lock().expect("lifecycle tables lock poisoned");
-        tables.generation_token.remove(&self.generation);
-        tables.packages.remove(&self.generation);
-        tables.current.retain(|_, g| *g != self.generation);
+        {
+            let mut tables = self.tables.lock().expect("lifecycle tables lock poisoned");
+            tables.generation_token.remove(&self.generation);
+            tables.packages.remove(&self.generation);
+            tables.current.retain(|_, g| *g != self.generation);
+        }
+        let joined = self.runtime.shutdown(DRAIN_DEADLINE);
         DisposalRecord {
             generation: self.generation,
-            forced: false,
-            reason: "clean dispose (no cancellable effects; R-24/C-04 drain protocol is a stub)"
-                .into(),
+            forced: !joined,
+            reason: if joined {
+                "clean dispose (actor quiesced and joined)".into()
+            } else {
+                "forced dispose: actor wedged past the drain deadline; thread detached (leak ledger incremented)"
+                    .into()
+            },
         }
     }
 }
@@ -207,8 +213,11 @@ pub struct ModuleManager {
     next_generation: u64,
     tables: Arc<Mutex<LifecycleTables>>,
     tokens: Arc<RwLock<HashMap<u64, TokenInfo>>>,
-    instances: Arc<Mutex<HashMap<u64, Arc<Mutex<Instance>>>>>,
+    instances: Arc<Mutex<HashMap<u64, Arc<GenerationRuntime>>>>,
     rejected_stale_effects: Arc<AtomicU64>,
+    /// Leak ledger: generations whose actor could not be drained within the
+    /// deadline and were detached (shared with every generation's actor).
+    leaked_threads: Arc<AtomicU64>,
 }
 
 impl ModuleManager {
@@ -232,9 +241,10 @@ impl ModuleManager {
         let mut state = StateStore::open(state.dir(), state.queue(), Arc::clone(&currency));
         state.set_max_state_bytes(max_state_bytes);
         let state = Arc::new(Mutex::new(state));
-        let instances: Arc<Mutex<HashMap<u64, Arc<Mutex<Instance>>>>> =
+        let instances: Arc<Mutex<HashMap<u64, Arc<GenerationRuntime>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let rejected_stale_effects = Arc::new(AtomicU64::new(0));
+        let leaked_threads = Arc::new(AtomicU64::new(0));
         let tables = Arc::new(Mutex::new(LifecycleTables::default()));
         let host = Arc::new(ModuleHost::new(
             // The session lane binds the real session id via
@@ -259,6 +269,7 @@ impl ModuleManager {
             tokens,
             instances,
             rejected_stale_effects,
+            leaked_threads,
         })
     }
 
@@ -295,6 +306,13 @@ impl ModuleManager {
         self.rejected_stale_effects.load(Ordering::Relaxed)
     }
 
+    /// Generations whose actor was detached past its drain deadline (the shared
+    /// leak ledger). A non-zero value means a store is still resident on a
+    /// thread that could not be joined.
+    pub fn leaked_threads(&self) -> u64 {
+        self.leaked_threads.load(Ordering::Relaxed)
+    }
+
     /// Installs the package (content-deduped), compiles the source, assigns a
     /// fresh generation id (= vm token), instantiates, registers, and runs the
     /// activation entry. On any failure nothing is registered (fail-closed).
@@ -304,9 +322,14 @@ impl ModuleManager {
         let generation = self.next_generation;
         self.next_generation += 1;
         let dyn_host: Arc<dyn kanbei_vm::Host> = self.host.clone();
-        let instance = Arc::new(Mutex::new(
-            self.vm.instantiate(&compiled, generation, dyn_host)?,
-        ));
+        let instance = self.vm.instantiate(&compiled, generation, dyn_host)?;
+        // The generation's store now has a single owner: its actor thread.
+        let runtime = GenerationRuntime::spawn(
+            generation,
+            instance,
+            REPLY_TIMEOUT,
+            Arc::clone(&self.leaked_threads),
+        );
         let info = TokenInfo {
             generation,
             module_id: manifest.module_id,
@@ -317,19 +340,20 @@ impl ModuleManager {
         self.instances
             .lock()
             .expect("instances lock poisoned")
-            .insert(generation, Arc::clone(&instance));
+            .insert(generation, Arc::clone(&runtime));
         {
             let mut tables = self.tables.lock().expect("lifecycle tables lock poisoned");
             tables.current.insert(manifest.module_id, generation);
             tables.generation_token.insert(generation, generation);
             tables.packages.insert(generation, package);
         }
-        if let Err(e) = self.run_activation(&instance, &manifest.source) {
+        if let Err(e) = self.run_activation(&runtime, &manifest.source) {
             // Roll back: nothing registered on activation failure. (A failed
             // activation may have published services via the host before
             // failing; those registry entries point at the dead generation and
             // are re-taken by the next same-module publish — M2 documents this
             // rather than rolling the registry back.)
+            let _ = runtime.shutdown(DRAIN_DEADLINE);
             self.tokens.write().expect("tokens lock poisoned").remove(&generation);
             self.instances.lock().expect("instances lock poisoned").remove(&generation);
             let mut tables = self.tables.lock().expect("lifecycle tables lock poisoned");
@@ -342,7 +366,7 @@ impl ModuleManager {
             generation,
             module_id: manifest.module_id,
             package,
-            instance,
+            runtime,
             scope: manifest.scope.clone(),
             tokens: Arc::clone(&self.tokens),
             instances: Arc::clone(&self.instances),
@@ -351,16 +375,17 @@ impl ModuleManager {
         })
     }
 
-    /// Runs the activation entry in the generation's sandbox (see the module
+    /// Runs the activation entry on the generation's actor (see the module
     /// docs: `run_script` of `source + ACTIVATION_SHIM`).
     fn run_activation(
         &self,
-        instance: &Arc<Mutex<Instance>>,
+        runtime: &Arc<GenerationRuntime>,
         source: &str,
     ) -> Result<(), ModuleError> {
         let script = format!("{source}\n{ACTIVATION_SHIM}");
-        let mut inst = instance.lock().expect("instance lock poisoned");
-        inst.run_script(&script)
+        runtime
+            .run_script(&script)
+            .map_err(|e| ModuleError::Activation(format!("activation entry failed: {e}")))?
             .map_err(|e| ModuleError::Activation(format!("activation entry failed: {e}")))
     }
 
@@ -398,12 +423,16 @@ impl ModuleManager {
                 }
             }
         }
-        self.drop_generation(module_id, generation);
+        let joined = self.drop_generation(module_id, generation);
         Ok(DisposalRecord {
             generation,
-            forced: false,
-            reason: "clean deactivation (no cancellable effects; R-24/C-04 drain protocol is a stub)"
-                .into(),
+            forced: !joined,
+            reason: if joined {
+                "clean deactivation (actor quiesced and joined)".into()
+            } else {
+                "forced deactivation: actor wedged past the drain deadline; thread detached (leak ledger incremented)"
+                    .into()
+            },
         })
     }
 
@@ -439,7 +468,7 @@ impl ModuleManager {
             .ok_or(ModuleError::NotActivated { module_id })?;
         let old_entries = self.service_entries(old_generation);
         let new_gen = self.activate(new_manifest)?;
-        self.drop_generation(module_id, old_generation);
+        let old_joined = self.drop_generation(module_id, old_generation);
         let mut rebind = Vec::new();
         let mut restart = Vec::new();
         for (key, old_provider) in old_entries {
@@ -498,8 +527,13 @@ impl ModuleManager {
         Ok(ReplacementOutcome {
             old: DisposalRecord {
                 generation: old_generation,
-                forced: false,
-                reason: "replaced: old generation disposed, token invalidated".into(),
+                forced: !old_joined,
+                reason: if old_joined {
+                    "replaced: old generation drained and joined, token invalidated".into()
+                } else {
+                    "replaced: old generation actor wedged past the drain deadline; thread detached (leak ledger incremented)"
+                        .into()
+                },
             },
             new: new_gen,
             rebind,
@@ -531,20 +565,16 @@ impl ModuleManager {
     /// Direct kernel-side call of a generation's `kb_hot` (the kernel side of
     /// `service_call`; used by the UI host). Generation must be live.
     pub fn call_generation(&self, generation: u64, args: &str) -> Result<String, ModuleError> {
-        let instance = self
+        let runtime = self
             .instances
             .lock()
             .expect("instances lock poisoned")
             .get(&generation)
             .cloned()
             .ok_or_else(|| ModuleError::Call(format!("generation {generation} is not live")))?;
-        let mut inst = crate::host::acquire_bounded(&instance, crate::host::HOST_LOCK_WAIT)
-            .ok_or_else(|| {
-                ModuleError::Call(format!(
-                    "generation {generation} is wedged (lock wait exceeded)"
-                ))
-            })?;
-        inst.call_json("kb_hot", args)
+        runtime
+            .hot("kb_hot", args)
+            .map_err(|e| ModuleError::Call(format!("generation {generation} is unavailable: {e}")))?
             .map_err(|e| ModuleError::Call(format!("generation {generation} failed: {e}")))
     }
 
@@ -590,21 +620,51 @@ impl ModuleManager {
         out
     }
 
-    /// Removes a generation from every kernel table (token → stale, instance
-    /// dropped, packages/current cleared). Services are untouched — callers
-    /// decide their fate first. The `current` entry is removed only when it
-    /// still names this generation (a replacement may already have registered
-    /// the next generation under the same module id).
-    fn drop_generation(&mut self, module_id: Id128, generation: u64) {
-        let mut tables = self.tables.lock().expect("lifecycle tables lock poisoned");
-        if let Some(token) = tables.generation_token.remove(&generation) {
-            self.tokens.write().expect("tokens lock poisoned").remove(&token);
+    /// Removes a generation from every kernel table (token → stale, actor
+    /// drained and joined, packages/current cleared). Services are untouched —
+    /// callers decide their fate first. The `current` entry is removed only
+    /// when it still names this generation (a replacement may already have
+    /// registered the next generation under the same module id). Returns
+    /// whether the actor joined within the drain deadline (false = detached).
+    fn drop_generation(&mut self, module_id: Id128, generation: u64) -> bool {
+        // Invalidate the token first (T18's commit fence then rejects any
+        // further mutating op), and clear the tables — all without an actor lock.
+        {
+            let mut tables = self.tables.lock().expect("lifecycle tables lock poisoned");
+            if let Some(token) = tables.generation_token.remove(&generation) {
+                self.tokens.write().expect("tokens lock poisoned").remove(&token);
+            }
+            self.host.drop_generation_contributions(generation);
+            tables.packages.remove(&generation);
+            if tables.current.get(&module_id) == Some(&generation) {
+                tables.current.remove(&module_id);
+            }
         }
-        self.instances.lock().expect("instances lock poisoned").remove(&generation);
-        self.host.drop_generation_contributions(generation);
-        tables.packages.remove(&generation);
-        if tables.current.get(&module_id) == Some(&generation) {
-            tables.current.remove(&module_id);
+        // Then drain the actor outside every kernel lock: the mailbox send and
+        // join must not run while holding the tables lock (T20's no-lock-across-
+        // mailbox rule).
+        let runtime = self.instances.lock().expect("instances lock poisoned").remove(&generation);
+        match runtime {
+            Some(runtime) => runtime.shutdown(DRAIN_DEADLINE),
+            None => true,
+        }
+    }
+}
+
+impl Drop for ModuleManager {
+    /// Teardown: drain every still-registered generation's actor so no store
+    /// (and no thread) outlives the manager. A `Generation` handle that
+    /// outlives the manager becomes inert (`ActorError::Gone`).
+    fn drop(&mut self) {
+        let runtimes: Vec<_> = self
+            .instances
+            .lock()
+            .expect("instances lock poisoned")
+            .drain()
+            .map(|(_, runtime)| runtime)
+            .collect();
+        for runtime in runtimes {
+            let _ = runtime.shutdown(DRAIN_DEADLINE);
         }
     }
 }

@@ -7,13 +7,13 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kanbei_capabilities::{Capability, PolicyTemplate, TrustClass};
 use kanbei_core::queue::DurabilityQueue;
 use kanbei_core::{Digest, Id128};
 use kanbei_modules::{
-    install_package, HeadFile, ModuleError, ModuleManager, ModuleOrigin, PackageError,
+    install_package, ActorError, HeadFile, ModuleError, ModuleManager, ModuleOrigin, PackageError,
     PackageManifest, StateError, StateStore, StateUpdate,
 };
 use kanbei_objects::ObjectStore;
@@ -312,32 +312,25 @@ fn stale_generation_rejected() {
     drop(state);
     cleanup(dir, queue);
 
-    // guest path: after deactivate the old token traps as StaleGeneration
+    // guest path: after deactivate the generation's actor is drained and gone,
+    // so the retired generation cannot act at all (a stronger guarantee than a
+    // stale token trap; the token-level fence is covered by host.rs unit tests)
     let vm = load_vm();
     let (dir, mut manager, queue) = manager_setup("stale-guest", vm);
     let id = Id128::generate();
     let g = manager.activate(&manifest(id, T4_HOST_CALL, vec![])).unwrap();
     assert!(manager.generation_current(g.generation));
+    let runtime = Arc::clone(&g.runtime);
     assert_eq!(
-        g.instance
-            .lock()
-            .unwrap()
-            .call_json("kb_hot", "{}")
-            .unwrap(),
+        runtime.hot("kb_hot", "{}").unwrap().unwrap(),
         // kb_hot returns the host-call result as a Lua string, so call_json
         // JSON-encodes it once more.
         r#""{\"ok\":true,\"value\":null}""#
     );
     manager.deactivate(id).unwrap();
     assert!(!manager.generation_current(g.generation));
-    let err = g
-        .instance
-        .lock()
-        .unwrap()
-        .call_json("kb_hot", "{}")
-        .unwrap_err();
-    assert!(matches!(err, GuestError::StaleGeneration), "got {err:?}");
-    assert_eq!(manager.rejected_stale_effects(), 1);
+    assert!(matches!(runtime.hot("kb_hot", "{}"), Err(ActorError::Gone)));
+    assert_eq!(manager.leaked_threads(), 0);
     drop(g);
     drop(manager);
     cleanup(dir, queue);
@@ -366,14 +359,11 @@ fn generation_replacement_rebinds_and_stales_old_token() {
         .clone();
     assert_eq!(provider.module_id, id);
     assert_eq!(provider.generation, outcome.new.generation);
-    // the old generation's token is stale
-    let err = a
-        .instance
-        .lock()
-        .unwrap()
-        .call_json("kb_hot", "{}")
-        .unwrap_err();
-    assert!(matches!(err, GuestError::StaleGeneration), "got {err:?}");
+    // the old generation's actor was drained by the replacement
+    assert!(matches!(
+        a.runtime.hot("kb_hot", "{}"),
+        Err(ActorError::Gone)
+    ));
     // deactivating B with the dependent C still attached fails without
     // mutating anything
     let err = manager.deactivate(id).unwrap_err();
@@ -624,7 +614,7 @@ fn disposal_record_and_vm_containment() {
     let id2 = Id128::generate();
     let b = manager.activate(&manifest(id2, TRIVIAL_HOT, vec![])).unwrap();
     assert_eq!(
-        b.instance.lock().unwrap().call_json("kb_hot", "5").unwrap(),
+        b.runtime.hot("kb_hot", "5").unwrap().unwrap(),
         "10"
     );
     let rec2 = manager.deactivate(id2).unwrap();
@@ -730,6 +720,47 @@ fn dispose_unpublishes_generation_services_and_contributions() {
     assert!(manager.services().lock().unwrap().snapshot().is_empty());
     assert!(manager.published_contributions(generation).is_empty());
     assert_eq!(manager.ui_generation("panel_ui"), None);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// T19/R-24/C-04: a generation whose actor is wedged (blocked in a host op)
+/// cannot be force-killed — the drain detaches it, the shared leak ledger
+/// records it, and the store stays resident on the abandoned thread.
+#[test]
+fn wedged_generation_actor_is_detached_and_recorded() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("wedged", vm);
+    let id = Id128::generate();
+    // `T4_HOST_CALL`'s `kb_hot` issues a `state_get` host op; holding the state
+    // lock wedges the actor inside that call (the host import runs on a bounded
+    // T6 worker, so the actor is blocked awaiting its reply).
+    let g = manager.activate(&manifest(id, T4_HOST_CALL, vec![])).unwrap();
+    let runtime = Arc::clone(&g.runtime);
+    let state = manager.state();
+    let guard = state.lock().unwrap();
+
+    let caller = std::thread::spawn({
+        let runtime = Arc::clone(&runtime);
+        move || runtime.hot("kb_hot", "{}")
+    });
+    // Wait until the actor is executing the call before draining.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while runtime.in_flight() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(runtime.in_flight() > 0, "actor never picked up the call");
+
+    // The drain deadline elapses while the actor is blocked: detach + record.
+    assert!(!runtime.shutdown(Duration::from_millis(100)));
+    assert_eq!(manager.leaked_threads(), 1);
+
+    // Unblock; the actor finishes the call, then exits on the queued Shutdown.
+    drop(guard);
+    assert!(caller.join().unwrap().unwrap().is_ok());
+    drop(state);
+
+    drop(g);
     drop(manager);
     cleanup(dir, queue);
 }

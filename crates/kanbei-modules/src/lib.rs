@@ -6,9 +6,10 @@
 //! [`kanbei_vm::Host`] impl routing vm host calls.
 //!
 //! Files: [`package`] (immutable packages), [`state`] (host-owned module
-//! state), [`lifecycle`] (the `ModuleManager`), [`host`] (the kernel host
-//! ABI). The M2 guest ABI is the Luau contract in `lifecycle::ACTIVATION_SHIM`
-//! plus the op table documented on `host::ModuleHost`.
+//! state), [`lifecycle`] (the `ModuleManager`), [`runtime`] (the per-generation
+//! actor that owns each Wasmtime store), [`host`] (the kernel host ABI). The M2
+//! guest ABI is the Luau contract in `lifecycle::ACTIVATION_SHIM` plus the op
+//! table documented on `host::ModuleHost`.
 //!
 //! `ModuleError` embeds `kanbei_services::ServiceError` whose variants carry
 //! unboxed `ServiceProvider`/`ServiceKey` values (a fixed public contract,
@@ -18,9 +19,11 @@
 pub mod host;
 pub mod lifecycle;
 pub mod package;
+pub mod runtime;
 pub mod state;
 
 pub use host::ModuleHost;
 pub use lifecycle::{DisposalRecord, Generation, ModuleError, ModuleManager, ReplacementOutcome};
 pub use package::{install_package, ModuleOrigin, PackageError, PackageManifest, PACKAGE_SCHEMA};
+pub use runtime::{ActorError, GenerationRuntime};
 pub use state::{HeadFile, StateError, StateStore, StateUpdate};
