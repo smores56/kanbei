@@ -6,9 +6,15 @@
 //! instances off the main thread").
 //!
 //! Host imports do NOT run on this thread. kanbei-vm offloads every top-level
-//! host import to a bounded `kb-host-call` worker and awaits it with
-//! `recv_timeout`, so the actor thread only ever blocks on a bounded reply
-//! deadline — a blocking host import cannot wedge it.
+//! host import to a bounded `kb-host-call` worker and awaits it, so a *host
+//! op* cannot wedge the actor. In-guest work (including a blocking WASI
+//! syscall) runs on this thread and is bounded only by the guest's fuel/epoch
+//! limits — wasmtime 48 has no cross-thread cancel — so a guest that blocks
+//! outside those limits does wedge the actor and the drain detaches it.
+//!
+//! A request that hits its reply deadline is NOT cancelled: the queued command
+//! still executes. Callers must treat `ActorError::Wedged` as "outcome
+//! unknown", not "did not happen".
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -25,10 +31,11 @@ pub(crate) type GenerationId = u64;
 /// before detaching it (architecture.md:233).
 pub(crate) const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Default caller-side reply deadline. It must exceed the vm's host-import
-/// `call_timeout` (default 5s) so a legitimately slow host op is not reported
-/// as a wedged actor; it bounds a guest that keeps executing past its
-/// fuel/epoch limits.
+/// Caller-side reply deadline for a direct (supervisor-free) call. It must
+/// exceed the vm's host-import `call_timeout` (default 5s) so a legitimately
+/// slow host op is not reported as wedged. Cross-generation `service_call`
+/// does NOT use this — it runs inside the caller's host-import supervision and
+/// uses `host::SERVICE_CALL_WAIT` instead.
 pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum Cmd {
@@ -65,8 +72,9 @@ impl std::fmt::Display for ActorError {
 }
 
 /// A handle to a generation's store-owning thread. The `Instance` (and its
-/// `Store`) lives and drops on that thread; the shared `abandoned` counter is
-/// the process's leaked-thread ledger, incremented whenever a drain gives up.
+/// `Store`) lives and drops on that thread; the shared `abandoned` counter
+/// counts drains that gave up (an abandoned-drain event counter — a later
+/// clean exit does not decrement it, so it is not a live-leak gauge).
 pub struct GenerationRuntime {
     generation: GenerationId,
     tx: Sender<Cmd>,
@@ -75,42 +83,39 @@ pub struct GenerationRuntime {
     /// Work commands the actor is currently executing (0 while idle). A status
     /// seam: it proves the actor has picked up a request before a drain.
     in_flight: Arc<AtomicUsize>,
-    /// Shared ledger; incremented once per abandoned drain.
+    /// Shared abandoned-drain counter; incremented once per timed-out drain.
     abandoned: Arc<AtomicU64>,
 }
 
 impl GenerationRuntime {
     /// Spawn the actor that owns `instance`. `reply_timeout` bounds every
     /// caller's wait for a guest result (the guest's own fuel/epoch/budget
-    /// limits are enforced inside `Instance`); `abandoned` is the shared leak
-    /// ledger.
+    /// limits are enforced inside `Instance`); `abandoned` is the shared
+    /// abandoned-drain counter.
     pub(crate) fn spawn(
         generation: GenerationId,
         instance: Instance,
         reply_timeout: Duration,
         abandoned: Arc<AtomicU64>,
-    ) -> Arc<Self> {
+    ) -> std::io::Result<Arc<Self>> {
         let (tx, rx) = mpsc::channel();
         let in_flight = Arc::new(AtomicUsize::new(0));
+        // Fail closed on thread exhaustion: activation reports the io error
+        // rather than aborting the process.
         let join = thread::Builder::new()
             .name(format!("kb-gen-{generation}"))
             .spawn({
                 let in_flight = Arc::clone(&in_flight);
                 move || run(instance, rx, &in_flight)
-            })
-            .expect("spawn generation actor");
-        Arc::new(Self {
+            })?;
+        Ok(Arc::new(Self {
             generation,
             tx,
             reply_timeout,
             join: Mutex::new(Some(join)),
             in_flight,
             abandoned,
-        })
-    }
-
-    pub fn generation(&self) -> GenerationId {
-        self.generation
+        }))
     }
 
     /// Number of work commands the actor is executing right now (0 = idle).
@@ -118,21 +123,45 @@ impl GenerationRuntime {
         self.in_flight.load(Ordering::Acquire)
     }
 
-    /// Run the activation script on the actor thread.
+    /// Run the activation script on the actor thread, waiting up to the
+    /// runtime's default reply deadline.
     pub fn run_script(&self, source: &str) -> Result<Result<(), GuestError>, ActorError> {
-        self.request(|reply| Cmd::RunScript {
-            source: source.to_string(),
-            reply,
-        })
+        self.run_script_within(source, self.reply_timeout)
     }
 
-    /// Call the generation's `kb_hot` on the actor thread.
+    /// Call the generation's `kb_hot` on the actor thread, waiting up to the
+    /// runtime's default reply deadline.
     pub fn hot(
         &self,
         entry: &str,
         args: &str,
     ) -> Result<Result<String, GuestError>, ActorError> {
-        self.request(|reply| Cmd::Hot {
+        self.hot_within(entry, args, self.reply_timeout)
+    }
+
+    /// Run the activation script, waiting up to `deadline` for the reply.
+    pub(crate) fn run_script_within(
+        &self,
+        source: &str,
+        deadline: Duration,
+    ) -> Result<Result<(), GuestError>, ActorError> {
+        self.request(deadline, |reply| Cmd::RunScript {
+            source: source.to_string(),
+            reply,
+        })
+    }
+
+    /// Call `kb_hot`, waiting up to `deadline` for the reply. A cross-generation
+    /// `service_call` uses a deadline below the caller's host-import supervision
+    /// window (see `host::SERVICE_CALL_WAIT`), so a slow provider cannot cause
+    /// the vm to retire the caller.
+    pub(crate) fn hot_within(
+        &self,
+        entry: &str,
+        args: &str,
+        deadline: Duration,
+    ) -> Result<Result<String, GuestError>, ActorError> {
+        self.request(deadline, |reply| Cmd::Hot {
             entry: entry.to_string(),
             args: args.to_string(),
             reply,
@@ -148,26 +177,42 @@ impl GenerationRuntime {
 
     /// Quiesce → deadline → force. Returns `true` when the actor exited within
     /// `deadline` (the store was dropped on the actor thread); `false` when it
-    /// was abandoned — the thread is detached, the shared leak ledger records
-    /// it, and the caller marks the disposal `forced`. Force cannot acquire a
-    /// wedged thread: wasmtime 48 has no cross-thread cancel.
+    /// was abandoned — the thread is detached, the shared abandoned-drain
+    /// counter records it, and the caller marks the disposal `forced`. A
+    /// `Disconnected` reply means the actor already exited (a preceding
+    /// `request_shutdown` or drain), which is a clean join, not a wedge. Force
+    /// cannot acquire a wedged thread: wasmtime 48 has no cross-thread cancel.
     pub fn shutdown(&self, deadline: Duration) -> bool {
         let (done, wait) = mpsc::sync_channel(1);
         if self.tx.send(Cmd::Shutdown { done }).is_err() {
             // The actor already exited; joining is immediate.
             return self.join();
         }
-        if wait.recv_timeout(deadline).is_err() {
-            self.abandoned.fetch_add(1, Ordering::Relaxed);
-            return false;
+        match wait.recv_timeout(deadline) {
+            Ok(()) => self.join(),
+            // The actor is still executing a command past the deadline.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.abandoned.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            // The actor exited before answering (its receiver is gone).
+            Err(mpsc::RecvTimeoutError::Disconnected) => self.join(),
         }
-        self.join()
     }
 
-    fn request<T>(&self, make: impl FnOnce(SyncSender<T>) -> Cmd) -> Result<T, ActorError> {
+    fn request<T>(
+        &self,
+        deadline: Duration,
+        make: impl FnOnce(SyncSender<T>) -> Cmd,
+    ) -> Result<T, ActorError> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.tx.send(make(tx)).map_err(|_| ActorError::Gone)?;
-        rx.recv_timeout(self.reply_timeout).map_err(|_| ActorError::Wedged)
+        match rx.recv_timeout(deadline) {
+            Ok(value) => Ok(value),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ActorError::Wedged),
+            // The actor dropped the reply (went away mid-request).
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ActorError::Gone),
+        }
     }
 
     fn join(&self) -> bool {

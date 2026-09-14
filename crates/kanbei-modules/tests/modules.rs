@@ -725,8 +725,8 @@ fn dispose_unpublishes_generation_services_and_contributions() {
 }
 
 /// T19/R-24/C-04: a generation whose actor is wedged (blocked in a host op)
-/// cannot be force-killed — the drain detaches it, the shared leak ledger
-/// records it, and the store stays resident on the abandoned thread.
+/// cannot be force-killed — the drain detaches it, the shared abandoned-drain
+/// counter records it, and the store stays resident on the abandoned thread.
 #[test]
 fn wedged_generation_actor_is_detached_and_recorded() {
     let vm = load_vm();
@@ -759,6 +759,31 @@ fn wedged_generation_actor_is_detached_and_recorded() {
     drop(guard);
     assert!(caller.join().unwrap().unwrap().is_ok());
     drop(state);
+
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// T19: the vm's `retire` is a non-blocking stop request; a later drain must
+/// report a clean join (the actor left on its own), not a phantom wedge.
+#[test]
+fn shutdown_after_a_nonblocking_retire_is_a_clean_join() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("retire-then-drain", vm);
+    let id = Id128::generate();
+    let g = manager.activate(&manifest(id, TRIVIAL_HOT, vec![])).unwrap();
+    let runtime = Arc::clone(&g.runtime);
+
+    // The vm's retire path: invalidate the token, unpublish, remove from the
+    // table, and ask the actor to stop without waiting.
+    manager.host().retire(g.generation, "test: non-blocking retire");
+    assert!(!manager.generation_current(g.generation));
+
+    // Whatever the actor's timing, this drain rejoins it cleanly.
+    assert!(runtime.shutdown(Duration::from_secs(5)));
+    assert_eq!(manager.leaked_threads(), 0);
+    assert!(matches!(runtime.hot("kb_hot", "{}"), Err(ActorError::Gone)));
 
     drop(g);
     drop(manager);

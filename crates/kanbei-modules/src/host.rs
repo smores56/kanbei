@@ -23,8 +23,8 @@
 //! | 6 | `service_publish` | `{"key": <ServiceKey>, "version": <u32>, "deps": [<ServiceDependency>]}` | `"ok"` |
 //!
 //! M2 keeps state bytes as the compact JSON encoding of the value the module
-//! wrote. `service_call` is synchronous and shallow: one hop to the provider
-//! generation's cached `kb_hot`, recursion depth cap 8, no delegation.
+//! wrote. `service_call` is synchronous and shallow: one mailbox hop to the
+//! provider generation's `kb_hot`, recursion depth cap 8, no delegation.
 //! `service_publish` is an M2 extension of the kernel op set (the module
 //! publishes its services during `kb_on_activate`; R-25/C-06 publication is
 //! the key free or an explicit same-module replace intent).
@@ -36,6 +36,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::Duration;
 
 use kanbei_capabilities::{ApprovalIntent, Broker, Capability, GrantScope, Principal};
 use kanbei_core::id::Id128;
@@ -54,6 +55,13 @@ use crate::state::{StateStore, StateUpdate};
 /// (kanbei-vm's `STALE_GENERATION` const is crate-private; the contract is
 /// frozen).
 const STALE_GENERATION: &str = "stale generation";
+
+/// Upper bound on waiting for a provider generation's actor inside
+/// `service_call`. Kept below the vm's host-import timeout (default 5s) so the
+/// caller's supervised worker returns (and releases its permit) rather than
+/// being abandoned and retiring the caller; the coupling is not enforced here
+/// because the vm's timeout is not visible to this crate.
+pub(crate) const SERVICE_CALL_WAIT: Duration = Duration::from_secs(4);
 
 /// `service_call` recursion cap (one hop per level; M2 is shallow).
 ///
@@ -340,8 +348,10 @@ impl ModuleHost {
                     )
                 })?;
             drop(map);
+            // Wait below the caller's host-import supervision window so a slow
+            // provider cannot make the vm retire the caller.
             runtime
-                .hot("kb_hot", &args.to_string())
+                .hot_within("kb_hot", &args.to_string(), SERVICE_CALL_WAIT)
                 .map_err(|e| {
                     format!(
                         "service_call: provider generation {} is unavailable: {e}",

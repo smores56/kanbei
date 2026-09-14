@@ -130,6 +130,57 @@ pub struct DisposalRecord {
     pub reason: String,
 }
 
+/// How a generation's actor ended during a drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drain {
+    /// The actor exited and was joined within the deadline.
+    Joined,
+    /// The actor was still executing past the deadline; detached and recorded
+    /// in the shared abandoned-drain counter.
+    Detached,
+    /// The vm had already retired the generation (its actor was removed from
+    /// the table and a non-blocking stop requested), so this drain could not
+    /// join it.
+    AlreadyRetired,
+}
+
+impl Drain {
+    /// Drain a generation's actor, if the table still holds it.
+    fn of(runtime: Option<Arc<GenerationRuntime>>) -> Self {
+        match runtime {
+            None => Drain::AlreadyRetired,
+            Some(runtime) if runtime.shutdown(DRAIN_DEADLINE) => Drain::Joined,
+            Some(_) => Drain::Detached,
+        }
+    }
+
+    /// Build the disposal record for a drain of `generation` described by
+    /// `verb` (e.g. "dispose", "deactivation", "replacement").
+    fn record(self, generation: u64, verb: &str) -> DisposalRecord {
+        match self {
+            Drain::Joined => DisposalRecord {
+                generation,
+                forced: false,
+                reason: format!("{verb}: actor quiesced and joined"),
+            },
+            Drain::Detached => DisposalRecord {
+                generation,
+                forced: true,
+                reason: format!(
+                    "{verb}: actor wedged past the drain deadline; thread detached (abandoned-drain counter incremented)"
+                ),
+            },
+            Drain::AlreadyRetired => DisposalRecord {
+                generation,
+                forced: false,
+                reason: format!(
+                    "{verb}: the vm had already retired this generation (non-blocking stop requested; not joined by this drain)"
+                ),
+            },
+        }
+    }
+}
+
 impl std::fmt::Debug for Generation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Generation")
@@ -166,17 +217,12 @@ impl Generation {
             tables.packages.remove(&self.generation);
             tables.current.retain(|_, g| *g != self.generation);
         }
-        let joined = self.runtime.shutdown(DRAIN_DEADLINE);
-        DisposalRecord {
-            generation: self.generation,
-            forced: !joined,
-            reason: if joined {
-                "clean dispose (actor quiesced and joined)".into()
-            } else {
-                "forced dispose: actor wedged past the drain deadline; thread detached (leak ledger incremented)"
-                    .into()
-            },
-        }
+        let drain = if self.runtime.shutdown(DRAIN_DEADLINE) {
+            Drain::Joined
+        } else {
+            Drain::Detached
+        };
+        drain.record(self.generation, "dispose")
     }
 }
 
@@ -215,8 +261,8 @@ pub struct ModuleManager {
     tokens: Arc<RwLock<HashMap<u64, TokenInfo>>>,
     instances: Arc<Mutex<HashMap<u64, Arc<GenerationRuntime>>>>,
     rejected_stale_effects: Arc<AtomicU64>,
-    /// Leak ledger: generations whose actor could not be drained within the
-    /// deadline and were detached (shared with every generation's actor).
+    /// Abandoned-drain counter: drains that gave up on an actor within the
+    /// deadline and detached it (shared with every generation's actor).
     leaked_threads: Arc<AtomicU64>,
 }
 
@@ -306,9 +352,10 @@ impl ModuleManager {
         self.rejected_stale_effects.load(Ordering::Relaxed)
     }
 
-    /// Generations whose actor was detached past its drain deadline (the shared
-    /// leak ledger). A non-zero value means a store is still resident on a
-    /// thread that could not be joined.
+    /// Count of drains that gave up on an actor past their deadline (the shared
+    /// abandoned-drain counter). This is an event counter, not a live-leak
+    /// gauge: an abandoned actor may still exit later, and the count is never
+    /// decremented. A persistently rising value is the signal to investigate.
     pub fn leaked_threads(&self) -> u64 {
         self.leaked_threads.load(Ordering::Relaxed)
     }
@@ -329,7 +376,8 @@ impl ModuleManager {
             instance,
             REPLY_TIMEOUT,
             Arc::clone(&self.leaked_threads),
-        );
+        )
+        .map_err(ModuleError::Io)?;
         let info = TokenInfo {
             generation,
             module_id: manifest.module_id,
@@ -392,8 +440,8 @@ impl ModuleManager {
     /// Deactivates a module: fails without mutating anything when any of the
     /// generation's published services still has dependents
     /// ([`ModuleError::DependentsRemain`]); otherwise removes the services,
-    /// invalidates the token (stale → the host rejects its effects), drops the
-    /// instance, and records the disposal.
+    /// invalidates the token (stale → the host rejects its effects), drains and
+    /// joins the generation's actor, and records the disposal.
     pub fn deactivate(&mut self, module_id: Id128) -> Result<DisposalRecord, ModuleError> {
         let generation = *self
             .tables
@@ -423,17 +471,8 @@ impl ModuleManager {
                 }
             }
         }
-        let joined = self.drop_generation(module_id, generation);
-        Ok(DisposalRecord {
-            generation,
-            forced: !joined,
-            reason: if joined {
-                "clean deactivation (actor quiesced and joined)".into()
-            } else {
-                "forced deactivation: actor wedged past the drain deadline; thread detached (leak ledger incremented)"
-                    .into()
-            },
-        })
+        let drain = self.drop_generation(module_id, generation);
+        Ok(drain.record(generation, "deactivation"))
     }
 
     /// Generation replacement (R-25/C-05): activates the new generation first
@@ -468,7 +507,7 @@ impl ModuleManager {
             .ok_or(ModuleError::NotActivated { module_id })?;
         let old_entries = self.service_entries(old_generation);
         let new_gen = self.activate(new_manifest)?;
-        let old_joined = self.drop_generation(module_id, old_generation);
+        let old_drain = self.drop_generation(module_id, old_generation);
         let mut rebind = Vec::new();
         let mut restart = Vec::new();
         for (key, old_provider) in old_entries {
@@ -525,16 +564,7 @@ impl ModuleManager {
             });
         }
         Ok(ReplacementOutcome {
-            old: DisposalRecord {
-                generation: old_generation,
-                forced: !old_joined,
-                reason: if old_joined {
-                    "replaced: old generation drained and joined, token invalidated".into()
-                } else {
-                    "replaced: old generation actor wedged past the drain deadline; thread detached (leak ledger incremented)"
-                        .into()
-                },
-            },
+            old: old_drain.record(old_generation, "replacement"),
             new: new_gen,
             rebind,
             restart,
@@ -621,12 +651,12 @@ impl ModuleManager {
     }
 
     /// Removes a generation from every kernel table (token → stale, actor
-    /// drained and joined, packages/current cleared). Services are untouched —
-    /// callers decide their fate first. The `current` entry is removed only
-    /// when it still names this generation (a replacement may already have
-    /// registered the next generation under the same module id). Returns
-    /// whether the actor joined within the drain deadline (false = detached).
-    fn drop_generation(&mut self, module_id: Id128, generation: u64) -> bool {
+    /// drained, packages/current cleared). Services are untouched — callers
+    /// decide their fate first. The `current` entry is removed only when it
+    /// still names this generation (a replacement may already have registered
+    /// the next generation under the same module id). Returns how the actor
+    /// drain ended ([`Drain`]).
+    fn drop_generation(&mut self, module_id: Id128, generation: u64) -> Drain {
         // Invalidate the token first (T18's commit fence then rejects any
         // further mutating op), and clear the tables — all without an actor lock.
         {
@@ -644,18 +674,18 @@ impl ModuleManager {
         // join must not run while holding the tables lock (T20's no-lock-across-
         // mailbox rule).
         let runtime = self.instances.lock().expect("instances lock poisoned").remove(&generation);
-        match runtime {
-            Some(runtime) => runtime.shutdown(DRAIN_DEADLINE),
-            None => true,
-        }
+        Drain::of(runtime)
     }
 }
 
 impl Drop for ModuleManager {
-    /// Teardown: drain every still-registered generation's actor so no store
-    /// (and no thread) outlives the manager. A `Generation` handle that
-    /// outlives the manager becomes inert (`ActorError::Gone`).
+    /// Teardown: invalidate every remaining generation's token and drain its
+    /// actor, so no store (and no thread) outlives the manager. A `Generation`
+    /// handle that outlives the manager becomes inert (`ActorError::Gone`).
     fn drop(&mut self) {
+        // A detached actor keeps `Arc<ModuleHost>` alive; clear the token table
+        // so it cannot commit further host ops after teardown.
+        self.tokens.write().expect("tokens lock poisoned").clear();
         let runtimes: Vec<_> = self
             .instances
             .lock()
