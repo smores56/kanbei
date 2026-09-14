@@ -566,6 +566,9 @@ pub struct Session {
     /// digest `install_package` computes); None when no config activated
     /// (storage-only sessions). The config-choice record's `current` field.
     config_digest: Option<Digest>,
+    /// The live config manifest, retained for `module reset-state`'s
+    /// state-key binding (R-07/C-F1); None when no config activated.
+    config_manifest: Option<PackageManifest>,
     /// The memory roots pinned by the checkpoint this branch continues from
     /// (wave 2 consumes them).
     pinned_roots: Option<PinnedRoots>,
@@ -1004,6 +1007,7 @@ impl Session {
             branch,
             branch_records,
             config_digest: None,
+            config_manifest: None,
             pinned_roots: None,
             child_provider,
             #[cfg(feature = "otel")]

@@ -153,6 +153,7 @@ impl Session {
             return Err(e);
         }
         self.config_digest = Some(package);
+        self.config_manifest = Some(manifest.clone());
         Ok(ConfigActivation {
             module_id: manifest.module_id,
             generation: generation.generation,
@@ -392,6 +393,52 @@ impl Session {
             })?;
         self.fault(FaultPoint::AfterHeadUpdate);
         Ok(head)
+    }
+
+    /// `module reset-state` (R-07/C-07): start a fresh state head for a tracked
+    /// module's bound `state_key`, discarding the current head, and record the
+    /// reinitialization as a canonical `state_reinitialized` fact. M2 tracks
+    /// only the activated config module. Returns the discarded head, if any.
+    pub fn reset_module_state(
+        &mut self,
+        module_id: Id128,
+    ) -> Result<Option<HeadFile>, SessionError> {
+        let manifest = self
+            .config_manifest
+            .as_ref()
+            .filter(|m| m.module_id == module_id)
+            .cloned()
+            .ok_or_else(|| {
+                SessionError::InvalidInput(format!("no tracked module {module_id} to reset"))
+            })?;
+        let key = manifest.state_key.clone().ok_or_else(|| {
+            SessionError::InvalidInput(format!("module {module_id} binds no state_key (R-07/C-F1)"))
+        })?;
+        let Some(manager) = self.modules.as_ref() else {
+            return Err(SessionError::ModulesDisabled);
+        };
+        let previous = manager
+            .state()
+            .lock()
+            .expect("state lock poisoned")
+            .reset_head(&key)?;
+        // A fresh head means no state_head pin; the discarded snapshot objects
+        // fall out of the head and become GC-eligible.
+        self.commit(
+            vec![NewEvent {
+                kind: "state_reinitialized".into(),
+                payload_schema: 1,
+                payload: json!({
+                    "module_id": module_id.to_string(),
+                    "state_key": key,
+                    "previous_head": previous.as_ref().map(|h| h.digest.to_string()),
+                }),
+                objects: vec![],
+                refs: vec![],
+            }],
+            None,
+        )?;
+        Ok(previous)
     }
 
     /// Retention admission (architecture.md line 604): the gate runs BEFORE

@@ -464,7 +464,7 @@ fn fork_with_config_activates_same_digest() {
     let dir = TempDir::new("config");
     let source_id = Id128::generate();
     let config = PackageManifest {
-        schema: 1,
+        schema: kanbei_modules::PACKAGE_SCHEMA,
         module_id: Id128::generate(),
         origin: ModuleOrigin::UserConfig,
         trust_class: kanbei_capabilities::TrustClass::User,
@@ -473,6 +473,7 @@ fn fork_with_config_activates_same_digest() {
         capabilities: vec![],
         source: "function kb_on_activate(ctx) ctx.service_publish('{\"scope\":[],\"name\":\"fork-greeter\"}', 1, '[]') end\nfunction kb_hot(x) return x end".into(),
         state_schema: None,
+        state_key: None,
     };
     // the package digest is the canonical content digest (install_package)
     let config_digest = Digest::new(&serde_json::to_vec(&config).unwrap());

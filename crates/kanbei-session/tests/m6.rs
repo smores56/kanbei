@@ -658,7 +658,7 @@ fn continue_from_records_live_config_digest() {
     let session_id = Id128::generate();
     seed_lifetime_claim(&memory_root, session_id, "choice seed");
     let config = PackageManifest {
-        schema: 1,
+        schema: kanbei_modules::PACKAGE_SCHEMA,
         module_id: Id128::generate(),
         origin: ModuleOrigin::UserConfig,
         trust_class: TrustClass::User,
@@ -667,6 +667,7 @@ fn continue_from_records_live_config_digest() {
         capabilities: vec![],
         source: "function kb_on_activate(ctx) ctx.service_publish('{\"scope\":[],\"name\":\"m6-greeter\"}', 1, '[]') end\nfunction kb_hot(x) return x end".into(),
         state_schema: None,
+        state_key: None,
     };
     // the package digest is the canonical content digest (install_package)
     let config_digest = Digest::new(&serde_json::to_vec(&config).unwrap());

@@ -114,7 +114,6 @@ pub struct Generation {
     /// and joins it.
     pub runtime: Arc<GenerationRuntime>,
     pub scope: ScopePath,
-    tokens: Arc<RwLock<HashMap<u64, TokenInfo>>>,
     instances: Arc<Mutex<HashMap<u64, Arc<GenerationRuntime>>>>,
     tables: Arc<Mutex<LifecycleTables>>,
     /// The kernel host, so direct disposal can retire the generation's published
@@ -214,15 +213,11 @@ impl Generation {
     /// kernel's handle, and drop this handle. The store is dropped on the actor
     /// thread; a wedged actor is detached and reported as `forced`.
     pub fn dispose(self) -> DisposalRecord {
-        // Invalidate the token and tear down the kernel's handles FIRST (the
-        // T18 commit fence makes in-flight mutating ops reject once the token is
-        // gone), then drain the actor — never holding a kernel lock across the
-        // mailbox send/join.
-        self.tokens
-            .write()
-            .expect("tokens lock poisoned")
-            .remove(&self.generation);
-        self.host.unpublish_generation(self.generation);
+        // Canonical teardown (T7): invalidate the token, unpublish effects, then
+        // drop the kernel's handles and drain the actor — never holding a kernel
+        // lock across the mailbox send/join. Token-first is load-bearing (the
+        // T18 fence rejects in-flight mutating ops once the token is gone).
+        self.host.teardown_generation(self.generation, true);
         self.instances
             .lock()
             .expect("instances lock poisoned")
@@ -371,10 +366,47 @@ impl ModuleManager {
         self.leaked_threads.load(Ordering::Relaxed)
     }
 
+    /// R-07/C-F1: activation-time state-schema validation. When the manifest
+    /// binds a state key with a declared schema, the existing head for that key
+    /// must match — a mismatch rejects activation atomically with a typed
+    /// [`StateError::SchemaMismatch`] and the old head stays untouched.
+    /// `state_key` and `state_schema` are set together (or neither).
+    fn validate_state_schema(
+        state: &Mutex<StateStore>,
+        manifest: &PackageManifest,
+    ) -> Result<(), ModuleError> {
+        match (&manifest.state_key, manifest.state_schema) {
+            (Some(key), Some(expected)) => {
+                let store = state.lock().expect("state lock poisoned");
+                if let Some((head, _)) = store.get(key)?
+                    && head.schema != expected
+                {
+                    return Err(StateError::SchemaMismatch {
+                        key: key.clone(),
+                        expected,
+                        actual: head.schema,
+                    }
+                    .into());
+                }
+                Ok(())
+            }
+            // No binding declared: nothing to validate (M2's per-write CAS still
+            // enforces continuity against the head).
+            (None, None) => Ok(()),
+            _ => Err(ModuleError::InvalidInput(
+                "state_key and state_schema must be set together (R-07/C-F1)".into(),
+            )),
+        }
+    }
+
     /// Installs the package (content-deduped), compiles the source, assigns a
     /// fresh generation id (= vm token), instantiates, registers, and runs the
     /// activation entry. On any failure nothing is registered (fail-closed).
     pub fn activate(&mut self, manifest: &PackageManifest) -> Result<Generation, ModuleError> {
+        // R-07/C-F1: validate the declared state schema against the existing
+        // head BEFORE any side effect, so an incompatible generation is rejected
+        // atomically and the old head (and object store) stay untouched.
+        Self::validate_state_schema(&self.state, manifest)?;
         let (package, _deduped) = install_package(&mut self.store, manifest)?;
         let compiled = self.vm.compile(&manifest.source)?;
         let generation = self.next_generation;
@@ -407,18 +439,20 @@ impl ModuleManager {
             tables.packages.insert(generation, package);
         }
         if let Err(e) = self.run_activation(&runtime, &manifest.source) {
-            // Roll back: nothing registered on activation failure. (A failed
-            // activation may have published services via the host before
-            // failing; those registry entries point at the dead generation and
-            // are re-taken by the next same-module publish — M2 documents this
-            // rather than rolling the registry back.)
-            let _ = runtime.shutdown(DRAIN_DEADLINE);
-            self.tokens.write().expect("tokens lock poisoned").remove(&generation);
+            // Roll back atomically (C-F2): invalidate the token and unpublish
+            // anything the failed activation staged (services, contributions, UI
+            // mounts) BEFORE shutting the actor down, so no in-flight op can
+            // re-publish against a generation we are tearing down. Then drop the
+            // kernel's handles and drain.
+            self.host.teardown_generation(generation, true);
             self.instances.lock().expect("instances lock poisoned").remove(&generation);
-            let mut tables = self.tables.lock().expect("lifecycle tables lock poisoned");
-            tables.current.remove(&manifest.module_id);
-            tables.generation_token.remove(&generation);
-            tables.packages.remove(&generation);
+            {
+                let mut tables = self.tables.lock().expect("lifecycle tables lock poisoned");
+                tables.current.remove(&manifest.module_id);
+                tables.generation_token.remove(&generation);
+                tables.packages.remove(&generation);
+            }
+            let _ = runtime.shutdown(DRAIN_DEADLINE);
             return Err(e);
         }
         Ok(Generation {
@@ -427,7 +461,6 @@ impl ModuleManager {
             package,
             runtime,
             scope: manifest.scope.clone(),
-            tokens: Arc::clone(&self.tokens),
             instances: Arc::clone(&self.instances),
             tables: Arc::clone(&self.tables),
             host: Arc::clone(&self.host),
@@ -469,19 +502,11 @@ impl ModuleManager {
                 dependents,
             });
         }
-        {
-            let mut reg = self.services.lock().expect("services lock poisoned");
-            for key in &published {
-                if let Err(e) = reg.remove(key, module_id) {
-                    return Err(match e {
-                        ServiceError::DependentsExist { dependents, .. } => {
-                            ModuleError::DependentsRemain { module_id, dependents }
-                        }
-                        other => ModuleError::Service(other),
-                    });
-                }
-            }
-        }
+        // Invalidate the token and unpublish the generation's effects BEFORE
+        // dropping it. Token-first (T7): the old order removed services while
+        // the token was still current, so an in-flight op could pass
+        // `ensure_current` and re-publish a key we had just removed.
+        self.host.teardown_generation(generation, true);
         let drain = self.drop_generation(module_id, generation);
         Ok(drain.record(generation, "deactivation"))
     }
@@ -661,21 +686,20 @@ impl ModuleManager {
         out
     }
 
-    /// Removes a generation from every kernel table (token → stale, actor
-    /// drained, packages/current cleared). Services are untouched — callers
-    /// decide their fate first. The `current` entry is removed only when it
-    /// still names this generation (a replacement may already have registered
-    /// the next generation under the same module id). Returns how the actor
-    /// drain ended ([`Drain`]).
+    /// Removes a generation from every kernel table via the canonical teardown
+    /// (token → stale, contributions dropped, actor drained, packages/current
+    /// cleared). Services are untouched — callers decide their fate (`replace`
+    /// rebinds them). The `current` entry is removed only when it still names
+    /// this generation (a replacement may already have registered the next
+    /// generation under the same module id). Returns how the actor drain ended
+    /// ([`Drain`]).
     fn drop_generation(&mut self, module_id: Id128, generation: u64) -> Drain {
-        // Invalidate the token first (T18's commit fence then rejects any
-        // further mutating op), and clear the tables — all without an actor lock.
+        // Canonical teardown outside the tables lock (never nest it under the
+        // host's own locks).
+        self.host.teardown_generation(generation, false);
         {
             let mut tables = self.tables.lock().expect("lifecycle tables lock poisoned");
-            if let Some(token) = tables.generation_token.remove(&generation) {
-                self.tokens.write().expect("tokens lock poisoned").remove(&token);
-            }
-            self.host.drop_generation_contributions(generation);
+            tables.generation_token.remove(&generation);
             tables.packages.remove(&generation);
             if tables.current.get(&module_id) == Some(&generation) {
                 tables.current.remove(&module_id);

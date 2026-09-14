@@ -226,7 +226,7 @@ fn capability_intersection_denies_ui_intents() {
 /// host binds it.
 fn flaky_ui_manifest() -> PackageManifest {
     PackageManifest {
-        schema: 1,
+        schema: kanbei_modules::PACKAGE_SCHEMA,
         module_id: Id128::generate(),
         origin: ModuleOrigin::UserConfig,
         trust_class: TrustClass::Builtin,
@@ -265,6 +265,7 @@ end
 "#
         .to_string(),
         state_schema: None,
+        state_key: None,
     }
 }
 

@@ -112,7 +112,7 @@ fn manifest_trust(
     trust_class: TrustClass,
 ) -> PackageManifest {
     PackageManifest {
-        schema: 1,
+        schema: kanbei_modules::PACKAGE_SCHEMA,
         module_id: id,
         origin: ModuleOrigin::UserConfig,
         trust_class,
@@ -121,6 +121,7 @@ fn manifest_trust(
         capabilities: vec![],
         source: source.to_string(),
         state_schema: None,
+        state_key: None,
     }
 }
 

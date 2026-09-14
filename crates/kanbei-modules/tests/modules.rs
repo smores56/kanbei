@@ -57,7 +57,7 @@ fn load_vm() -> Vm {
 
 fn manifest(id: Id128, source: &str, deps: Vec<ServiceDependency>) -> PackageManifest {
     PackageManifest {
-        schema: 1,
+        schema: kanbei_modules::PACKAGE_SCHEMA,
         module_id: id,
         origin: ModuleOrigin::UserConfig,
         trust_class: TrustClass::User,
@@ -66,6 +66,7 @@ fn manifest(id: Id128, source: &str, deps: Vec<ServiceDependency>) -> PackageMan
         capabilities: vec![],
         source: source.to_string(),
         state_schema: None,
+        state_key: None,
     }
 }
 
@@ -221,16 +222,17 @@ fn install_package_roundtrip_and_dedup() {
     assert_eq!(back, m);
     // schema guard
     let bad = PackageManifest {
-        schema: 2,
+        schema: kanbei_modules::PACKAGE_SCHEMA + 1,
         ..m.clone()
     };
     let err = install_package(&mut store, &bad).unwrap_err();
     assert!(matches!(
         err,
         PackageError::SchemaMismatch {
-            expected: 1,
-            actual: 2
-        }
+            expected,
+            actual
+        } if expected == kanbei_modules::PACKAGE_SCHEMA
+            && actual == kanbei_modules::PACKAGE_SCHEMA + 1
     ));
     drop(store);
     cleanup(dir, queue);
@@ -776,6 +778,44 @@ end
 function kb_hot(x) return x end
 "#;
 
+/// Publishes a service and a UI mount, then fails the activation entry — the
+/// C-F2 rollback case (effects staged before the failure).
+const PUBLISHES_THEN_FAILS: &str = r#"
+function kb_on_activate(ctx)
+  ctx.service_publish('{"scope":["root"],"name":"svc"}', 1, '[]')
+  ctx.contribution_publish('{"kind":"ui","name":"panel","component":"panel_ui"}')
+  error("activation boom")
+end
+function kb_hot(x) return x end
+"#;
+
+/// C-F2/R-02: a failed activation may publish services/contributions before
+/// failing; rollback must unpublish them, not leave a dead generation's
+/// effects live.
+#[test]
+fn failed_activation_does_not_leak_services_or_contributions() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("activate-rollback", vm);
+    let id = Id128::generate();
+    let err = manager
+        .activate(&manifest(id, PUBLISHES_THEN_FAILS, vec![]))
+        .expect_err("activation must fail");
+    assert!(matches!(err, ModuleError::Activation(_)), "{err:?}");
+
+    assert!(
+        manager.services().lock().unwrap().snapshot().is_empty(),
+        "a failed activation must not leave services published"
+    );
+    assert_eq!(
+        manager.ui_generation("panel_ui"),
+        None,
+        "a failed activation must not leave UI mounts live"
+    );
+    assert!(manager.snapshot().is_empty(), "nothing may stay registered");
+    drop(manager);
+    cleanup(dir, queue);
+}
+
 /// A1/R-02: a forced (vm-timeout) retirement must unpublish the generation's
 /// services and contributions, not leave a dead generation's effects live.
 #[test]
@@ -920,5 +960,121 @@ fn deactivate_after_a_vm_retire_reports_already_retired() {
 
     drop(g);
     drop(manager);
+    cleanup(dir, queue);
+}
+
+/// R-07/C-F1: activation validates the manifest's declared state schema against
+/// the existing head for its bound `state_key` — incompatible ⇒ rejected
+/// atomically (typed error, old head untouched, nothing registered).
+#[test]
+fn activation_rejects_an_incompatible_state_schema() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("state-schema-reject", vm);
+    // A first generation binds "planner" at schema 1 and writes a head.
+    let mut first = manifest(Id128::generate(), TRIVIAL_HOT, vec![]);
+    first.state_key = Some("planner".into());
+    first.state_schema = Some(1);
+    let g = manager.activate(&first).unwrap();
+    manager
+        .state()
+        .lock()
+        .unwrap()
+        .cas(StateUpdate {
+            key: "planner".into(),
+            schema: 1,
+            bytes: br#"{"attempts":3}"#.to_vec(),
+            generation: g.generation,
+        })
+        .unwrap();
+
+    // A later generation declaring schema 2 must be rejected before it registers.
+    let mut second = manifest(Id128::generate(), TRIVIAL_HOT, vec![]);
+    second.state_key = Some("planner".into());
+    second.state_schema = Some(2);
+    let err = manager
+        .activate(&second)
+        .expect_err("schema 2 vs head 1 must reject");
+    assert!(
+        matches!(err, ModuleError::State(StateError::SchemaMismatch { ref key, expected: 2, actual: 1 }) if key == "planner"),
+        "{err:?}"
+    );
+    // The old head is untouched and only the first module is registered.
+    let head = manager.state().lock().unwrap().get("planner").unwrap().unwrap().0;
+    assert_eq!(head.schema, 1);
+    assert_eq!(manager.snapshot().len(), 1);
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// R-07/C-F1: a matching schema activates; `state_key` and `state_schema` must
+/// be declared together.
+#[test]
+fn activation_accepts_a_matching_state_schema() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("state-schema-accept", vm);
+    let mut first = manifest(Id128::generate(), TRIVIAL_HOT, vec![]);
+    first.state_key = Some("planner".into());
+    first.state_schema = Some(1);
+    let g = manager.activate(&first).unwrap();
+    manager
+        .state()
+        .lock()
+        .unwrap()
+        .cas(StateUpdate {
+            key: "planner".into(),
+            schema: 1,
+            bytes: br#"{"attempts":3}"#.to_vec(),
+            generation: g.generation,
+        })
+        .unwrap();
+
+    let mut compatible = manifest(Id128::generate(), TRIVIAL_HOT, vec![]);
+    compatible.state_key = Some("planner".into());
+    compatible.state_schema = Some(1);
+    manager
+        .activate(&compatible)
+        .expect("a matching schema must activate");
+
+    // A declared schema without a bound key is a typed rejection, not a silently
+    // dead field.
+    let mut unbound = manifest(Id128::generate(), TRIVIAL_HOT, vec![]);
+    unbound.state_schema = Some(1);
+    let err = manager.activate(&unbound).unwrap_err();
+    assert!(matches!(err, ModuleError::InvalidInput(_)), "{err:?}");
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// R-07/C-07: `reset_head` starts a fresh head, returns the discarded one, and
+/// resets the sequence; an absent head is a no-op.
+#[test]
+fn reset_head_starts_fresh_and_returns_the_old_head() {
+    let (dir, mut state, queue) = state_store("reset-head");
+    let h1 = state
+        .cas(StateUpdate {
+            key: "k".into(),
+            schema: 1,
+            bytes: br#"{"a":1}"#.to_vec(),
+            generation: 1,
+        })
+        .unwrap();
+    let old = state.reset_head("k").unwrap().expect("an existing head");
+    assert_eq!(old.digest, h1.digest);
+    assert!(state.get("k").unwrap().is_none(), "reset starts a fresh head");
+    // The next CAS starts at sequence 1 again.
+    let h2 = state
+        .cas(StateUpdate {
+            key: "k".into(),
+            schema: 1,
+            bytes: br#"{"b":2}"#.to_vec(),
+            generation: 1,
+        })
+        .unwrap();
+    assert_eq!(h2.seq, 1);
+    // Resetting an absent head is a no-op.
+    assert!(state.reset_head("absent").unwrap().is_none());
+    drop(state);
     cleanup(dir, queue);
 }

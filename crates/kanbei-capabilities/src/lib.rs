@@ -317,6 +317,25 @@ impl Broker {
         Ok(())
     }
 
+    /// Forget a retired generation's grants and budget consumption (T7/R-02):
+    /// a displaced generation's parked intents must not recheck OK (`NoGrant`),
+    /// and its budget entries must not accumulate forever / inflate
+    /// `grants_version`. Mirrors the module host's generation teardown.
+    pub fn retire_generation(&mut self, generation: u64) {
+        let retired: Vec<Digest> = self
+            .grants
+            .iter()
+            .filter(|g| g.principal.generation == generation || g.module_generation == generation)
+            .map(|g| g.grant_digest)
+            .collect();
+        self.grants
+            .retain(|g| g.principal.generation != generation && g.module_generation != generation);
+        let mut spent = self.spent.borrow_mut();
+        for digest in retired {
+            spent.remove(&digest);
+        }
+    }
+
     /// The intersection check: caller grant ∩ policy templates ∩ budget.
     ///
     /// Guard order: no grant → `NoGrant`; tampered grant → `StaleGrant`;
@@ -663,6 +682,28 @@ mod tests {
         broker.add_grant(grant(&p, "fs.read", &["write"], None, None)).unwrap();
         let err = broker.check(&p, &want, 1).unwrap_err();
         assert!(matches!(err, BrokerError::NoGrant { .. }));
+    }
+
+    #[test]
+    fn retiring_a_generation_prunes_its_grants_and_spent() {
+        let mut broker = Broker::new();
+        broker.add_template(template(&["fs.read"], &[], &[])).unwrap();
+        let p = principal(None); // generation 1
+        let mut other = principal(None);
+        other.generation = 2;
+        broker.add_grant(grant(&p, "fs.read", &["read"], Some(2), None)).unwrap();
+        broker.add_grant(grant(&other, "fs.read", &["read"], None, None)).unwrap();
+        let want = Capability::new("fs.read".into(), vec!["read".into()]);
+        assert_eq!(broker.check(&p, &want, 1).unwrap().remaining_budget, Some(1));
+
+        // T7/R-02: retiring generation 1 drops only its grant; a displaced
+        // generation can no longer be granted (so a parked intent fails
+        // recheck), and gen-2 is unaffected.
+        broker.retire_generation(1);
+        let err = broker.check(&p, &want, 1).unwrap_err();
+        assert!(matches!(err, BrokerError::NoGrant { .. }), "{err:?}");
+        assert!(broker.check(&other, &want, 1).is_ok());
+        assert_eq!(broker.grants_version(), 1);
     }
 
     #[test]

@@ -157,14 +157,28 @@ impl ModuleHost {
         }
     }
 
-    /// Retire a generation's published effects: its service holdings and its
-    /// staged contributions/UI mounts (R-02/C-03/A1). Shared by the vm's forced
-    /// `retire` path and direct disposal.
-    pub(crate) fn unpublish_generation(&self, generation: u64) {
-        self.services
+    /// Canonical generation teardown (T7). Invalidate the token, then (when
+    /// `services`) remove the generation's service holdings, then forget its
+    /// staged contributions/UI mounts (R-02/C-03/A1), and prune its broker
+    /// grants/budget. Token-first ordering is load-bearing: the T18 commit fence
+    /// rejects any in-flight mutating op the moment the token is gone, so
+    /// nothing can re-publish or write after its effects are torn down. The
+    /// broker is taken first, in the same order the broker ops take it, so
+    /// grant pruning and budget consumption cannot interleave. `services =
+    /// false` is only for `replace`, which rebinds the old generation's service
+    /// keys under the new one and must not drop them.
+    pub(crate) fn teardown_generation(&self, generation: u64, services: bool) {
+        self.broker
             .lock()
-            .expect("services lock poisoned")
-            .remove_generation(generation);
+            .expect("broker lock poisoned")
+            .retire_generation(generation);
+        self.tokens.write().expect("tokens lock poisoned").remove(&generation);
+        if services {
+            self.services
+                .lock()
+                .expect("services lock poisoned")
+                .remove_generation(generation);
+        }
         self.drop_generation_contributions(generation);
     }
 
@@ -391,9 +405,13 @@ impl ModuleHost {
         let want = Capability::new(resource, verbs);
         let principal = self.principal(info);
         let version = self.policy_version();
-        self.broker
-            .lock()
-            .expect("broker lock poisoned")
+        // Hold the broker lock across the currency fence and the budget
+        // consumption (T7): `teardown_generation` prunes grants under the same
+        // lock, so a generation retired mid-check cannot consume budget or be
+        // granted past retirement.
+        let broker = self.broker.lock().expect("broker lock poisoned");
+        self.ensure_current(info.generation)?;
+        broker
             .check(&principal, &want, version)
             .map_err(|e| format!("check: {e}"))?;
         Ok(r#"{"allowed":true}"#.into())
@@ -662,12 +680,12 @@ impl Host for ModuleHost {
     }
 
     fn retire(&self, generation_token: u64, _reason: &str) {
-        // Invalidate currency first so the T18 commit fence rejects any
-        // in-flight mutating op at its commit point. `retire` runs on a vm
-        // worker and must not block: it only asks the generation's actor to stop
-        // (the store drops on the actor thread when it processes the request).
-        self.tokens.write().expect("tokens lock poisoned").remove(&generation_token);
-        self.unpublish_generation(generation_token);
+        // Canonical teardown: invalidate currency first so the T18 commit fence
+        // rejects any in-flight mutating op at its commit point, then unpublish
+        // the generation's effects. `retire` runs on a vm worker and must not
+        // block: it only asks the generation's actor to stop (the store drops on
+        // the actor thread when it processes the request).
+        self.teardown_generation(generation_token, true);
         if let Some(map) = self.instances.upgrade() {
             let runtime = map
                 .lock()

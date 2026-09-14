@@ -14,8 +14,8 @@ use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-/// Package manifest schema version (M2: 1).
-pub const PACKAGE_SCHEMA: u32 = 1;
+/// Package manifest schema version. 2 adds `state_key` (R-07/C-F1).
+pub const PACKAGE_SCHEMA: u32 = 2;
 
 /// Where a module came from (metadata only; trust enforcement is the
 /// capability broker's job). Wire form is the snake_case variant name.
@@ -95,6 +95,12 @@ pub struct PackageManifest {
     /// Declared module-state schema; M2 enforces schema continuity on the
     /// state head at CAS time (fail-closed, R-07/C-07).
     pub state_schema: Option<u32>,
+    /// The module's designated state head key (R-07/C-F1). Activation validates
+    /// the existing head's schema against `state_schema` (fail-closed, atomic,
+    /// old head untouched); `module reset-state` reinitializes this head and
+    /// records a canonical fact. `state_key` and `state_schema` are set
+    /// together (or neither).
+    pub state_key: Option<String>,
 }
 
 /// Wire form of a `Capability` (that crate has no serde impls): the
@@ -116,7 +122,7 @@ impl Serialize for PackageManifest {
                 verbs: &c.verbs,
             })
             .collect();
-        let mut st = ser.serialize_struct("PackageManifest", 9)?;
+        let mut st = ser.serialize_struct("PackageManifest", 10)?;
         st.serialize_field("schema", &self.schema)?;
         st.serialize_field("module_id", &self.module_id)?;
         st.serialize_field("origin", &self.origin.name())?;
@@ -126,6 +132,7 @@ impl Serialize for PackageManifest {
         st.serialize_field("capabilities", &capabilities)?;
         st.serialize_field("source", &self.source)?;
         st.serialize_field("state_schema", &self.state_schema)?;
+        st.serialize_field("state_key", &self.state_key)?;
         st.end()
     }
 }
@@ -144,6 +151,8 @@ impl<'de> Deserialize<'de> for PackageManifest {
             capabilities: Vec<Capability>,
             source: String,
             state_schema: Option<u32>,
+            #[serde(default)]
+            state_key: Option<String>,
         }
         let wire = Wire::deserialize(de)?;
         Ok(PackageManifest {
@@ -156,6 +165,7 @@ impl<'de> Deserialize<'de> for PackageManifest {
             capabilities: wire.capabilities,
             source: wire.source,
             state_schema: wire.state_schema,
+            state_key: wire.state_key,
         })
     }
 }
@@ -228,6 +238,7 @@ mod tests {
             capabilities: vec![Capability::new("fs.read".into(), vec!["read".into()])],
             source: "function kb_hot(x) return x end".into(),
             state_schema: Some(1),
+            state_key: Some("planner".into()),
         };
         let bytes = serde_json::to_vec(&m).unwrap();
         let back: PackageManifest = serde_json::from_slice(&bytes).unwrap();

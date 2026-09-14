@@ -219,7 +219,7 @@ fn run_m2(dir: String, point: Option<FaultPoint>, after_acks: u64, events: u64, 
     }
 
     let manifest = PackageManifest {
-        schema: 1,
+        schema: kanbei_modules::PACKAGE_SCHEMA,
         module_id: Id128::generate(),
         origin: ModuleOrigin::Builtin,
         trust_class: TrustClass::Builtin,
@@ -228,6 +228,7 @@ fn run_m2(dir: String, point: Option<FaultPoint>, after_acks: u64, events: u64, 
         capabilities: vec![],
         source: CONFIG_SOURCE.into(),
         state_schema: None,
+        state_key: None,
     };
     let mut session = match Session::open(SessionConfig {
         dir: PathBuf::from(&dir),

@@ -256,7 +256,7 @@ impl Session {
     /// standard capability intersection until the user grants them.
     pub fn activate_builtin_ui(&mut self) -> Result<u64, SessionError> {
         let manifest = PackageManifest {
-            schema: 1,
+            schema: kanbei_modules::PACKAGE_SCHEMA,
             module_id: Id128::generate(),
             origin: ModuleOrigin::Builtin,
             trust_class: kanbei_capabilities::TrustClass::Builtin,
@@ -265,6 +265,7 @@ impl Session {
             capabilities: Vec::new(),
             source: kanbei_ui::BUILTIN_UI_SOURCE.to_string(),
             state_schema: None,
+            state_key: None,
         };
         let activation = self.activate_config(manifest)?;
         self.rebind_ui(activation.generation)?;

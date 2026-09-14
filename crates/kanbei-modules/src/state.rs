@@ -257,14 +257,40 @@ impl StateStore {
             old.as_ref().and_then(|h| h.last_pinned),
             old.map(|h| h.seq + 1).unwrap_or(1),
         );
+        // Re-check currency immediately before the head commit (T7): retirement
+        // does not take the state lock, so this narrows the entry→commit window
+        // to the head write itself (the installed snapshot object is
+        // content-addressed and GC-eligible if this rejects).
+        if !(self.generation_current)(update.generation) {
+            return Err(StateError::StaleGeneration {
+                generation: update.generation,
+            });
+        }
         self.write_head(&update.key, &head)?;
         Ok(head)
     }
 
+    /// `module reset-state` (R-07): start a fresh head for `key` by removing the
+    /// existing head pointer (durability: unlink + dirsync), returning the old
+    /// head so the caller can record the reinitialization fact. Snapshot objects
+    /// are left for GC. `Ok(None)` when no head existed (nothing to reset).
+    pub fn reset_head(&mut self, key: &str) -> Result<Option<HeadFile>, StateError> {
+        Self::validate_key(key)?;
+        let Some(old) = self.read_head(key)? else {
+            return Ok(None);
+        };
+        match std::fs::remove_file(self.head_path(key)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        self.queue.enqueue(SyncOp::Dirsync(self.state_root()))?;
+        Ok(Some(old))
+    }
+
     /// Reads the head file (checksum-verified) and the snapshot object.
     /// `Ok(None)` when no head exists for `key`.
-    pub fn get(&self, key: &str) -> Result<Option<(HeadFile, Vec<u8>)>, StateError> {
-        Self::validate_key(key)?;
+    pub fn get(&self, key: &str) -> Result<Option<(HeadFile, Vec<u8>)>, StateError> {        Self::validate_key(key)?;
         let Some(head) = self.read_head(key)? else {
             return Ok(None);
         };

@@ -420,7 +420,7 @@ fn config_choice_records_current_vs_historical() {
     );
     session
         .activate_config(PackageManifest {
-            schema: 1,
+            schema: kanbei_modules::PACKAGE_SCHEMA,
             module_id: Id128::generate(),
             origin: ModuleOrigin::UserConfig,
             trust_class: TrustClass::Builtin,
@@ -429,6 +429,7 @@ fn config_choice_records_current_vs_historical() {
             capabilities: vec![],
             source: config_source("svc_a"),
             state_schema: None,
+            state_key: None,
         })
         .unwrap();
     session.commit(vec![user_message("a")], None).unwrap();
@@ -436,7 +437,7 @@ fn config_choice_records_current_vs_historical() {
     // The config change between checkpoint and branch point.
     session
         .activate_config(PackageManifest {
-            schema: 1,
+            schema: kanbei_modules::PACKAGE_SCHEMA,
             module_id: Id128::generate(),
             origin: ModuleOrigin::UserConfig,
             trust_class: TrustClass::Builtin,
@@ -445,6 +446,7 @@ fn config_choice_records_current_vs_historical() {
             capabilities: vec![],
             source: config_source("svc_b"),
             state_schema: None,
+            state_key: None,
         })
         .unwrap();
     let record = session.continue_from(&checkpoint).unwrap();

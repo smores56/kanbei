@@ -90,7 +90,7 @@ fn svc_key(name: &str) -> ServiceKey {
 
 fn manifest(id: Id128, source: &str, deps: Vec<ServiceDependency>) -> PackageManifest {
     PackageManifest {
-        schema: 1,
+        schema: kanbei_modules::PACKAGE_SCHEMA,
         module_id: id,
         origin: ModuleOrigin::UserConfig,
         trust_class: TrustClass::User,
@@ -99,6 +99,7 @@ fn manifest(id: Id128, source: &str, deps: Vec<ServiceDependency>) -> PackageMan
         capabilities: vec![],
         source: source.to_string(),
         state_schema: None,
+        state_key: None,
     }
 }
 
@@ -795,4 +796,66 @@ fn committed_manifests_are_schema_2() {
     assert_eq!(latest.composition, Some(session.composition().digest));
     assert_eq!(latest.modules[0].generation, 2);
     session.close().unwrap();
+}
+
+/// R-07/C-07: `module reset-state` starts a fresh head for the module's bound
+/// state key and records the reinitialization as a canonical fact.
+#[test]
+fn reset_module_state_starts_a_fresh_head_and_records_a_fact() {
+    require_guest();
+    let dir = TempDir::new("reset-state");
+    let id = Id128::generate();
+    let mut m = manifest(id, PUBLISHER, vec![]);
+    m.state_key = Some("planner".into());
+    m.state_schema = Some(1);
+    let mut session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config: Some(m),
+        ..Default::default()
+    })
+    .unwrap();
+    session
+        .module_state_cas("planner", 1, br#"{"attempts":1}"#.to_vec(), 1)
+        .unwrap();
+    assert!(
+        session
+            .modules()
+            .unwrap()
+            .state()
+            .lock()
+            .unwrap()
+            .get("planner")
+            .unwrap()
+            .is_some()
+    );
+
+    let old = session
+        .reset_module_state(id)
+        .unwrap()
+        .expect("an existing head to reset");
+    assert!(
+        session
+            .modules()
+            .unwrap()
+            .state()
+            .lock()
+            .unwrap()
+            .get("planner")
+            .unwrap()
+            .is_none(),
+        "reset starts a fresh head"
+    );
+
+    session.close().unwrap();
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert_eq!(envs.len(), 2, "activation + reinitialization");
+    assert_eq!(envs[1].kind, "state_reinitialized");
+    assert_eq!(envs[1].payload["module_id"], id.to_string());
+    assert_eq!(envs[1].payload["state_key"], "planner");
+    assert_eq!(
+        envs[1].payload["previous_head"],
+        old.digest.to_string(),
+        "the fact pins the discarded head"
+    );
 }

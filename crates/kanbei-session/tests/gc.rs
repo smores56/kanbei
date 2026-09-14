@@ -495,7 +495,7 @@ fn config_package_and_module_pin_survive_gc() {
     let tmp = TempDir::new("session-config");
     let dir = tmp.path().to_path_buf();
     let config = PackageManifest {
-        schema: 1,
+        schema: kanbei_modules::PACKAGE_SCHEMA,
         module_id: kanbei_core::id::Id128::generate(),
         origin: ModuleOrigin::UserConfig,
         trust_class: kanbei_capabilities::TrustClass::User,
@@ -504,6 +504,7 @@ fn config_package_and_module_pin_survive_gc() {
         capabilities: vec![],
         source: "function kb_on_activate(ctx) ctx.service_publish('{\"scope\":[],\"name\":\"gc-greeter\"}', 1, '[]') end\nfunction kb_hot(x) return x end".into(),
         state_schema: None,
+        state_key: None,
     };
     let package_digest = Digest::new(&serde_json::to_vec(&config).unwrap());
     let mut session = Session::open(SessionConfig {

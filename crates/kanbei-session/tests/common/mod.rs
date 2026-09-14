@@ -119,7 +119,7 @@ end
     .replace("{SLOT}", slot)
     .replace("{FLAKY}", if flaky { "true" } else { "false" });
     PackageManifest {
-        schema: 1,
+        schema: kanbei_modules::PACKAGE_SCHEMA,
         module_id: Id128::generate(),
         origin: ModuleOrigin::UserConfig,
         trust_class: trust,
@@ -128,6 +128,7 @@ end
         capabilities: Vec::new(),
         source,
         state_schema: None,
+        state_key: None,
     }
 }
 
@@ -135,7 +136,7 @@ end
 /// deactivation, M8).
 pub fn plain_module() -> PackageManifest {
     PackageManifest {
-        schema: 1,
+        schema: kanbei_modules::PACKAGE_SCHEMA,
         module_id: Id128::generate(),
         origin: ModuleOrigin::UserConfig,
         trust_class: TrustClass::Builtin,
@@ -148,6 +149,7 @@ function kb_hot(d) error("plain module has no entries") end
 "#
         .to_string(),
         state_schema: None,
+        state_key: None,
     }
 }
 
