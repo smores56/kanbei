@@ -704,6 +704,11 @@ mod tests {
         assert!(matches!(err, BrokerError::NoGrant { .. }), "{err:?}");
         assert!(broker.check(&other, &want, 1).is_ok());
         assert_eq!(broker.grants_version(), 1);
+
+        // Budget consumption is pruned too: re-adding the same grant starts
+        // from a full budget (a stale `spent` entry would show remaining 0).
+        broker.add_grant(grant(&p, "fs.read", &["read"], Some(2), None)).unwrap();
+        assert_eq!(broker.check(&p, &want, 1).unwrap().remaining_budget, Some(1));
     }
 
     #[test]

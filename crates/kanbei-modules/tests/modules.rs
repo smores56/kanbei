@@ -1042,7 +1042,36 @@ fn activation_accepts_a_matching_state_schema() {
     unbound.state_schema = Some(1);
     let err = manager.activate(&unbound).unwrap_err();
     assert!(matches!(err, ModuleError::InvalidInput(_)), "{err:?}");
+    // A bound key without a declared schema is likewise rejected.
+    let mut unbound2 = manifest(Id128::generate(), TRIVIAL_HOT, vec![]);
+    unbound2.state_key = Some("planner".into());
+    let err = manager.activate(&unbound2).unwrap_err();
+    assert!(matches!(err, ModuleError::InvalidInput(_)), "{err:?}");
     drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// R-07/C-F1: once a module binds a state key, its writes to that key must use
+/// the declared schema — a module cannot create a head its own manifest would
+/// reject at the next activation.
+#[test]
+fn declared_state_schema_is_authoritative_on_writes() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("state-schema-write", vm);
+    // T2_ACTIVATE writes `planner` at schema 1; declaring schema 2 must fail the
+    // activation write (and roll back).
+    let mut m = manifest(Id128::generate(), T2_ACTIVATE, vec![]);
+    m.state_key = Some("planner".into());
+    m.state_schema = Some(2);
+    let err = manager
+        .activate(&m)
+        .expect_err("a write at the wrong schema must fail activation");
+    assert!(
+        matches!(err, ModuleError::Activation(ref msg) if msg.contains("does not match the declared module schema")),
+        "{err:?}"
+    );
+    assert!(manager.snapshot().is_empty());
     drop(manager);
     cleanup(dir, queue);
 }
@@ -1075,6 +1104,30 @@ fn reset_head_starts_fresh_and_returns_the_old_head() {
     assert_eq!(h2.seq, 1);
     // Resetting an absent head is a no-op.
     assert!(state.reset_head("absent").unwrap().is_none());
+    drop(state);
+    cleanup(dir, queue);
+}
+
+/// R-07: `restore_head` puts a reset head back verbatim (the reset-rollback
+/// primitive), preserving digest and sequence.
+#[test]
+fn restore_head_puts_a_reset_head_back() {
+    let (dir, mut state, queue) = state_store("restore-head");
+    let h = state
+        .cas(StateUpdate {
+            key: "k".into(),
+            schema: 1,
+            bytes: br#"{"a":1}"#.to_vec(),
+            generation: 1,
+        })
+        .unwrap();
+    state.reset_head("k").unwrap();
+    assert!(state.get("k").unwrap().is_none());
+    state.restore_head("k", &h).unwrap();
+    let (back, bytes) = state.get("k").unwrap().unwrap();
+    assert_eq!(back.digest, h.digest);
+    assert_eq!(back.seq, h.seq);
+    assert_eq!(bytes, br#"{"a":1}"#.to_vec());
     drop(state);
     cleanup(dir, queue);
 }

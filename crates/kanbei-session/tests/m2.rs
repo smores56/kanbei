@@ -859,3 +859,25 @@ fn reset_module_state_starts_a_fresh_head_and_records_a_fact() {
         "the fact pins the discarded head"
     );
 }
+
+/// R-07/C-F1: `reset_module_state` rejects an untracked module and a tracked
+/// module that binds no state_key.
+#[test]
+fn reset_module_state_rejects_untracked_or_unbound_modules() {
+    require_guest();
+    let dir = TempDir::new("reset-errors");
+    let id = Id128::generate();
+    let m = manifest(id, PUBLISHER, vec![]); // no state_key
+    let mut session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config: Some(m),
+        ..Default::default()
+    })
+    .unwrap();
+    let err = session.reset_module_state(Id128::generate()).unwrap_err();
+    assert!(matches!(err, SessionError::InvalidInput(_)), "{err:?}");
+    let err = session.reset_module_state(id).unwrap_err();
+    assert!(matches!(err, SessionError::InvalidInput(_)), "{err:?}");
+    session.close().unwrap();
+}

@@ -327,6 +327,16 @@ impl Session {
         // (their components no longer resolve) and the remaining mounts
         // rebind in slot order.
         self.rebind_ui(new_generation)?;
+        // Keep the retained config manifest (and its digest) in step with the
+        // swap so `reset_module_state` reads the live binding (R-07/C-F1).
+        if self
+            .config_manifest
+            .as_ref()
+            .is_some_and(|m| m.module_id == module_id)
+        {
+            self.config_digest = Some(new_package);
+            self.config_manifest = Some(new_manifest);
+        }
         Ok(outcome)
     }
 
@@ -414,17 +424,17 @@ impl Session {
         let key = manifest.state_key.clone().ok_or_else(|| {
             SessionError::InvalidInput(format!("module {module_id} binds no state_key (R-07/C-F1)"))
         })?;
-        let Some(manager) = self.modules.as_ref() else {
-            return Err(SessionError::ModulesDisabled);
-        };
-        let previous = manager
-            .state()
-            .lock()
-            .expect("state lock poisoned")
-            .reset_head(&key)?;
+        let state = self
+            .modules
+            .as_ref()
+            .ok_or(SessionError::ModulesDisabled)?
+            .state();
+        let previous = state.lock().expect("state lock poisoned").reset_head(&key)?;
         // A fresh head means no state_head pin; the discarded snapshot objects
-        // fall out of the head and become GC-eligible.
-        self.commit(
+        // fall out of the head and become GC-eligible. Commit the canonical fact
+        // and, if it fails, restore the discarded head so the reset is
+        // all-or-nothing (mirrors activate_config's rollback).
+        let receipt = self.commit(
             vec![NewEvent {
                 kind: "state_reinitialized".into(),
                 payload_schema: 1,
@@ -437,7 +447,16 @@ impl Session {
                 refs: vec![],
             }],
             None,
-        )?;
+        );
+        if let Err(e) = receipt {
+            if let Some(head) = &previous {
+                let _ = state
+                    .lock()
+                    .expect("state lock poisoned")
+                    .restore_head(&key, head);
+            }
+            return Err(e);
+        }
         Ok(previous)
     }
 

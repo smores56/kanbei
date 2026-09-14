@@ -288,9 +288,18 @@ impl StateStore {
         Ok(Some(old))
     }
 
+    /// Restore a previously `reset_head`-ed head verbatim (temp+rename+dirsync).
+    /// Used to roll back a reset whose canonical reinitialization fact failed to
+    /// commit, so a reset is all-or-nothing.
+    pub fn restore_head(&mut self, key: &str, head: &HeadFile) -> Result<(), StateError> {
+        Self::validate_key(key)?;
+        self.write_head(key, head)
+    }
+
     /// Reads the head file (checksum-verified) and the snapshot object.
     /// `Ok(None)` when no head exists for `key`.
-    pub fn get(&self, key: &str) -> Result<Option<(HeadFile, Vec<u8>)>, StateError> {        Self::validate_key(key)?;
+    pub fn get(&self, key: &str) -> Result<Option<(HeadFile, Vec<u8>)>, StateError> {
+        Self::validate_key(key)?;
         let Some(head) = self.read_head(key)? else {
             return Ok(None);
         };

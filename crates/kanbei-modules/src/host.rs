@@ -75,6 +75,12 @@ pub(crate) struct TokenInfo {
     /// The module's declared service dependencies (manifest `deps`) — the
     /// caller-side version contract for `service_call`.
     pub deps: Vec<ServiceDependency>,
+    /// The manifest's state binding (R-07/C-F1), if declared: the module's
+    /// designated head key and its schema. Writes to the bound key must use the
+    /// declared schema, so a module cannot create a head its own manifest would
+    /// later reject at activation.
+    pub state_key: Option<String>,
+    pub state_schema: Option<u32>,
 }
 
 /// The kernel host: split shared fields (no `Arc<Mutex<ModuleManager>>` — a
@@ -157,16 +163,18 @@ impl ModuleHost {
         }
     }
 
-    /// Canonical generation teardown (T7). Invalidate the token, then (when
-    /// `services`) remove the generation's service holdings, then forget its
-    /// staged contributions/UI mounts (R-02/C-03/A1), and prune its broker
-    /// grants/budget. Token-first ordering is load-bearing: the T18 commit fence
-    /// rejects any in-flight mutating op the moment the token is gone, so
-    /// nothing can re-publish or write after its effects are torn down. The
-    /// broker is taken first, in the same order the broker ops take it, so
-    /// grant pruning and budget consumption cannot interleave. `services =
-    /// false` is only for `replace`, which rebinds the old generation's service
-    /// keys under the new one and must not drop them.
+    /// Canonical generation teardown (T7). Prune the generation's broker grants
+    /// and budget, invalidate its token, then (when `services`) remove its
+    /// service holdings, then forget its staged contributions/UI mounts
+    /// (R-02/C-03/A1).
+    ///
+    /// Ordering is load-bearing in two places: the broker is taken FIRST so the
+    /// prune is atomic against `op_check`'s currency fence + budget consumption
+    /// (both run under the broker lock), and the token is removed before
+    /// services/contributions so the T18 commit fence rejects any in-flight
+    /// mutating op before its effects disappear. `services = false` is only for
+    /// `replace`, which rebinds the old generation's service keys under the new
+    /// one and must not drop them.
     pub(crate) fn teardown_generation(&self, generation: u64, services: bool) {
         self.broker
             .lock()
@@ -275,6 +283,17 @@ impl ModuleHost {
             .ok_or_else(|| "state_set: payload must carry a \"value\"".to_string())?;
         let bytes = serde_json::to_vec(value)
             .map_err(|e| format!("state_set: value is not JSON-serializable: {e}"))?;
+        // R-07/C-F1: when the manifest binds a state key, writes to it must use
+        // the declared schema — otherwise a module could create a head its own
+        // manifest would reject at the next activation.
+        if info.state_key.as_deref() == Some(key)
+            && let Some(expected) = info.state_schema
+            && schema != expected
+        {
+            return Err(format!(
+                "state_set({key}): schema {schema} does not match the declared module schema {expected}"
+            ));
+        }
         let update = StateUpdate {
             key: key.to_string(),
             schema,
@@ -718,6 +737,8 @@ mod tests {
                 module_id: Id128::generate(),
                 scope: ScopePath(vec!["root".into()]),
                 deps: Vec::new(),
+                state_key: None,
+                state_schema: None,
             },
         );
         let currency: Arc<dyn Fn(u64) -> bool + Send + Sync> = {
@@ -750,6 +771,8 @@ mod tests {
             module_id: Id128::generate(),
             scope: ScopePath(vec!["root".into()]),
             deps: Vec::new(),
+            state_key: None,
+            state_schema: None,
         }
     }
 

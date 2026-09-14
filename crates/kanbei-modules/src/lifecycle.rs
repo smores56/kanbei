@@ -426,6 +426,8 @@ impl ModuleManager {
             module_id: manifest.module_id,
             scope: manifest.scope.clone(),
             deps: manifest.deps.clone(),
+            state_key: manifest.state_key.clone(),
+            state_schema: manifest.state_schema,
         };
         self.tokens.write().expect("tokens lock poisoned").insert(generation, info);
         self.instances
@@ -687,12 +689,12 @@ impl ModuleManager {
     }
 
     /// Removes a generation from every kernel table via the canonical teardown
-    /// (token → stale, contributions dropped, actor drained, packages/current
-    /// cleared). Services are untouched — callers decide their fate (`replace`
-    /// rebinds them). The `current` entry is removed only when it still names
-    /// this generation (a replacement may already have registered the next
-    /// generation under the same module id). Returns how the actor drain ended
-    /// ([`Drain`]).
+    /// (broker grants pruned, token → stale, contributions dropped, actor
+    /// drained, packages/current cleared). Services are untouched — callers
+    /// decide their fate (`replace` rebinds them). The `current` entry is
+    /// removed only when it still names this generation (a replacement may
+    /// already have registered the next generation under the same module id).
+    /// Returns how the actor drain ended ([`Drain`]).
     fn drop_generation(&mut self, module_id: Id128, generation: u64) -> Drain {
         // Canonical teardown outside the tables lock (never nest it under the
         // host's own locks).
