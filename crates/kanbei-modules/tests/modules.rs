@@ -178,6 +178,23 @@ function kb_hot(x)
 end
 "#;
 
+// T20: a non-cyclic multi-hop chain A→B→C. B forwards to C; C is the leaf.
+const B_FORWARDS_TO_SVC_C: &str = r#"
+function kb_on_activate(ctx)
+  ctx.service_publish('{"scope":["root"],"name":"b"}', 1, '[]')
+end
+function kb_hot(x)
+  return kb_host_call(3, '{"key":{"scope":["root"],"name":"c"},"args":{}}')
+end
+"#;
+
+const C_RETURNS_HOP: &str = r#"
+function kb_on_activate(ctx)
+  ctx.service_publish('{"scope":["root"],"name":"c"}', 1, '[]')
+end
+function kb_hot(x) return { hop = 3 } end
+"#;
+
 const T12_APPROVAL: &str = r#"
 function kb_on_activate(ctx)
   local r = ctx.require_approval("process.run", '["start"]')
@@ -454,6 +471,44 @@ fn mutually_recursive_service_call_is_rejected_not_deadlocked() {
         .expect_err("A→B→A must be rejected");
     let msg = format!("{err:?}");
     assert!(msg.contains("already on the call chain"), "{msg}");
+    drop(a);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// T20: a non-cyclic multi-hop chain (A→B→C) routes through every generation's
+/// actor and the deepest result propagates back to the root caller. Pins that
+/// the scope rides the mailbox and a legitimate 2-hop chain is not rejected.
+#[test]
+fn multi_hop_service_call_propagates_the_deepest_result() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("svc-3hop", vm);
+    let dep_b = ServiceDependency {
+        key: svc_key("b"),
+        required_version: 1,
+    };
+    let dep_c = ServiceDependency {
+        key: svc_key("c"),
+        required_version: 1,
+    };
+    manager
+        .activate(&manifest(Id128::generate(), C_RETURNS_HOP, vec![]))
+        .unwrap();
+    manager
+        .activate(&manifest(
+            Id128::generate(),
+            B_FORWARDS_TO_SVC_C,
+            vec![dep_c],
+        ))
+        .unwrap();
+    let a = manager
+        .activate(&manifest(Id128::generate(), A_CALLS_SVC_B, vec![dep_b]))
+        .unwrap();
+    let out = manager.call_generation(a.generation, "{}").unwrap();
+    assert!(
+        out.contains("hop") && out.contains('3'),
+        "deepest result must propagate to the root caller: {out}"
+    );
     drop(a);
     drop(manager);
     cleanup(dir, queue);

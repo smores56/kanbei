@@ -31,18 +31,24 @@ pub(crate) type GenerationId = u64;
 /// before detaching it (architecture.md:233).
 pub(crate) const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Caller-side reply deadline for a direct (supervisor-free) call. It must
-/// exceed the vm's host-import `call_timeout` (default 5s) so a legitimately
-/// slow host op is not reported as wedged. Cross-generation `service_call`
-/// does NOT use this — it runs inside the caller's host-import supervision and
-/// uses `host::SERVICE_CALL_WAIT` instead.
+/// Caller-side reply deadline for a direct (supervisor-free) call. It bounds
+/// how long `hot`/`run_script` wait for the actor, and it seeds the *chain*
+/// deadline of a cross-generation `service_call` scope (each hop inherits it).
+/// A hop's actual wait is further clamped to `host::SERVICE_CALL_WAIT`, below
+/// the vm's host-import supervision window, so no single host import outlives
+/// its supervisor.
 pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The service-call scope a generation is currently executing under (T20).
-/// `depth` counts hops from the root invocation; `visited` is the per-path set
-/// of generations already on the call chain (seeded with the root caller), so a
-/// cycle like A→B→A is rejected before it can deadlock two actors; `deadline`
-/// is the absolute instant the whole chain must finish by.
+/// `service_call` recursion cap: the maximum number of hops a chain may take.
+pub(crate) const MAX_SERVICE_DEPTH: u32 = 8;
+
+/// The service-call scope a generation is executing under (T20). `depth` counts
+/// hops from the root invocation; `visited` is the per-path set of generations
+/// already on the call chain (seeded with the root caller), so a cycle like
+/// A→B→A *within one call chain* is rejected before the hop instead of wedging
+/// the two actors on each other's mailboxes (a cycle across two independent
+/// root invocations is not seen by this per-chain rule); `deadline` is the
+/// absolute instant the whole chain must finish by.
 #[derive(Debug, Clone)]
 pub(crate) struct Scope {
     pub depth: u32,
@@ -60,6 +66,38 @@ impl Scope {
             visited: vec![generation],
             deadline,
         }
+    }
+
+    /// Advance across one hop to `provider`, enforcing the chain rules and
+    /// returning the child scope the provider's actor runs under: depth + 1,
+    /// the provider appended to the visited set, and the caller's absolute
+    /// deadline inherited. Pure, so the chain rules are testable without
+    /// spinning up actors.
+    pub(crate) fn hop(&self, provider: GenerationId) -> Result<Self, String> {
+        if self.depth >= MAX_SERVICE_DEPTH {
+            return Err(format!(
+                "service_call: recursion depth cap ({MAX_SERVICE_DEPTH}) exceeded"
+            ));
+        }
+        if self.visited.contains(&provider) {
+            return Err(format!(
+                "service_call: generation {provider} is already on the call chain (cycle rejected)"
+            ));
+        }
+        let mut visited = self.visited.clone();
+        visited.push(provider);
+        Ok(Self {
+            depth: self.depth + 1,
+            visited,
+            deadline: self.deadline,
+        })
+    }
+
+    /// The time left until the chain deadline from `now`, or `None` once it has
+    /// elapsed (the caller must then fail the hop rather than wait zero).
+    pub(crate) fn remaining_until(&self, now: Instant) -> Option<Duration> {
+        let remaining = self.deadline.saturating_duration_since(now);
+        (!remaining.is_zero()).then_some(remaining)
     }
 }
 
@@ -341,4 +379,56 @@ fn run(
         }
     }
     // `instance` (and its store) drops here, on the actor thread.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scope(depth: u32, visited: &[GenerationId]) -> Scope {
+        Scope {
+            depth,
+            visited: visited.to_vec(),
+            deadline: Instant::now() + Duration::from_secs(5),
+        }
+    }
+
+    /// A provider already on the chain is rejected before the hop, so a mutual
+    /// A→B→A chain within one invocation cannot wedge two actors on each other.
+    #[test]
+    fn hop_rejects_a_generation_already_on_the_chain() {
+        let err = scope(1, &[7, 9]).hop(7).unwrap_err();
+        assert!(err.contains("already on the call chain"), "{err}");
+    }
+
+    /// The cap is on `depth` (hops already taken): a call from a scope at the
+    /// cap is rejected; one below it advances to exactly the cap.
+    #[test]
+    fn hop_enforces_the_depth_cap() {
+        let err = scope(MAX_SERVICE_DEPTH, &[1]).hop(2).unwrap_err();
+        assert!(err.contains("depth cap"), "{err}");
+        let child = scope(MAX_SERVICE_DEPTH - 1, &[1]).hop(2).unwrap();
+        assert_eq!(child.depth, MAX_SERVICE_DEPTH);
+        assert_eq!(child.visited, vec![1, 2]);
+    }
+
+    /// The whole chain shares one absolute deadline; a hop inherits it rather
+    /// than starting a fresh window.
+    #[test]
+    fn hop_inherits_the_chain_deadline() {
+        let caller = scope(0, &[1]);
+        let child = caller.hop(2).unwrap();
+        assert_eq!(child.deadline, caller.deadline);
+    }
+
+    /// An elapsed deadline reports `None`, so the caller fails the hop instead
+    /// of waiting zero.
+    #[test]
+    fn remaining_until_is_none_once_the_deadline_passes() {
+        let mut s = scope(0, &[1]);
+        let now = Instant::now();
+        assert!(s.remaining_until(now).is_some());
+        s.deadline = now;
+        assert_eq!(s.remaining_until(now), None);
+    }
 }
