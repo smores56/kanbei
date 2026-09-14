@@ -306,6 +306,19 @@ impl Host for SlowHost {
     }
 }
 
+/// Host that outlives the caller's `call_timeout` and then returns, freeing its
+/// worker. Used to prove the abandoned gauge is reclaimed, not monotonic.
+struct LateHost {
+    delay: Duration,
+}
+
+impl Host for LateHost {
+    fn call(&self, _generation_token: u64, _op: u32, _payload: &str) -> Result<String, String> {
+        std::thread::sleep(self.delay);
+        Ok("ok".into())
+    }
+}
+
 /// Host that counts retirement calls without varying its dispatch behavior.
 struct CountHost {
     retires: Arc<AtomicUsize>,
@@ -391,33 +404,88 @@ fn host_import_capacity_fails_closed_at_the_ceiling() {
     assert!(msg.contains("capacity exhausted"), "msg: {msg}");
 }
 
-/// T21: a wedged worker is counted for observability but must NOT fail the
-/// session closed — a fresh generation's imports stay admitted (the abandoned
-/// count is a signal, not a second budget).
+/// T21: a wedged worker is observed but must NOT gate admission — the abandoned
+/// count is a signal, not a second fail-closed budget. With the live ceiling at
+/// 2 and one worker wedged, a second import is still admitted (so `inflight`
+/// reaches the ceiling even though `abandoned > 0`); the *ceiling* is what fails
+/// closed, one slot later.
 #[test]
-fn abandoned_workers_are_observed_without_failing_the_vm_closed() {
+fn abandoned_workers_do_not_gate_admission_below_the_live_ceiling() {
     let config = VmConfig {
         epoch_deadline: NO_EPOCH,
-        call_timeout: Duration::from_millis(150),
+        call_timeout: Duration::from_millis(100),
+        max_inflight_host_calls: 2,
         ..Default::default()
     };
     let vm = load_vm(config);
     let compiled = vm
         .compile("function kb_hot(x) return kb_host_call(7, '{}') end")
         .expect("compile");
+
+    // Slot 1: a hang wedges a worker.
     let (hang, _) = HangHost::new();
     let mut inst_a = vm.instantiate(&compiled, 1, hang).expect("instantiate");
     let err = inst_a.call_json("kb_hot", "0").expect_err("hang times out");
     assert!(matches!(err, GuestError::HostTimeout { .. }), "{err:?}");
     assert_eq!(vm.abandoned_host_workers(), 1, "the wedged worker is observed");
-    // A different generation is still admitted: a wedge is not session-wide
-    // fail-closed.
-    let mut inst_b = vm
-        .instantiate(&compiled, 2, Arc::new(SlowHost))
-        .expect("instantiate");
-    inst_b
+
+    // Slot 2 must still be admitted despite `abandoned > 0`: it hangs and times
+    // out (HostTimeout), not capacity-exhausted. A regression re-adding a
+    // fail-closed abandoned budget would reject this call.
+    let (hang, _) = HangHost::new();
+    let mut inst_b = vm.instantiate(&compiled, 2, hang).expect("instantiate");
+    let err = inst_b
         .call_json("kb_hot", "0")
-        .expect("a wedge must not fail the whole vm closed");
+        .expect_err("second hang times out");
+    assert!(
+        matches!(err, GuestError::HostTimeout { .. }),
+        "an abandoned worker must not subtract from live capacity: {err:?}"
+    );
+    assert_eq!(vm.abandoned_host_workers(), 2, "both wedged workers observed");
+
+    // At the live ceiling (2 in-flight) a third import fails closed: the ceiling
+    // gates, the abandoned count does not.
+    let (hang, _) = HangHost::new();
+    let mut inst_c = vm.instantiate(&compiled, 3, hang).expect("instantiate");
+    let err = inst_c
+        .call_json("kb_hot", "0")
+        .expect_err("capacity exhausted");
+    let GuestError::Host(msg) = err else {
+        panic!("expected Host (capacity), got {err:?}");
+    };
+    assert!(msg.contains("capacity exhausted"), "msg: {msg}");
+}
+
+/// T21: the abandoned gauge is reclaimed once a timed-out worker finally
+/// returns — it is a live gauge, not a permanent loss counter.
+#[test]
+fn abandoned_workers_are_reclaimed_when_a_late_worker_exits() {
+    let config = VmConfig {
+        epoch_deadline: NO_EPOCH,
+        call_timeout: Duration::from_millis(50),
+        ..Default::default()
+    };
+    let vm = load_vm(config);
+    let compiled = vm
+        .compile("function kb_hot(x) return kb_host_call(7, '{}') end")
+        .expect("compile");
+    let host = Arc::new(LateHost { delay: Duration::from_millis(300) });
+    let mut inst = vm.instantiate(&compiled, 1, host).expect("instantiate");
+    let err = inst
+        .call_json("kb_hot", "0")
+        .expect_err("a late call times out");
+    assert!(matches!(err, GuestError::HostTimeout { .. }), "{err:?}");
+    assert_eq!(vm.abandoned_host_workers(), 1, "the late worker is abandoned");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while vm.abandoned_host_workers() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "abandoned gauge never reclaimed: {}",
+            vm.abandoned_host_workers()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

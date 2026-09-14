@@ -445,8 +445,9 @@ impl Vm {
     }
 
     /// Host-import workers abandoned past `call_timeout` and still running
-    /// (T21). They cannot be reclaimed until they exit, so this is the session's
-    /// permanent thread-loss signal — observability only; it never fails closed.
+    /// (T21). A live gauge, not a monotonic loss counter: it drops when a
+    /// blocked worker eventually exits. Observability only — it never fails
+    /// closed. Scoped to this `Vm` (one loaded module), not the whole session.
     pub fn abandoned_host_workers(&self) -> u64 {
         self.host_limiter.abandoned()
     }
@@ -610,12 +611,13 @@ impl Vm {
 struct HostCallLimiter {
     inflight: AtomicU64,
     max: u64,
-    /// Workers abandoned past `call_timeout` and still running (T21). They are
-    /// already counted in `inflight` and cannot be reclaimed until the thread
-    /// exits, so this is *observability only* — a signal of permanent thread
-    /// loss for the session, deliberately not a second fail-closed budget
-    /// (failing closed early on it would be a guest-triggerable denial of every
-    /// module's host imports).
+    /// Workers abandoned past `call_timeout` and still running (T21). Counted in
+    /// `inflight` too, and *observability only* — deliberately not a second
+    /// fail-closed budget: a guest could wedge workers and deny host imports,
+    /// which the shared live ceiling already bounds. A live gauge, not a
+    /// monotonic loss counter: it drops when a blocked worker eventually
+    /// returns, and may briefly over-report a worker that finished as it was
+    /// timed out.
     abandoned: AtomicU64,
 }
 
