@@ -23,8 +23,10 @@
 //! | 6 | `service_publish` | `{"key": <ServiceKey>, "version": <u32>, "deps": [<ServiceDependency>]}` | `"ok"` |
 //!
 //! M2 keeps state bytes as the compact JSON encoding of the value the module
-//! wrote. `service_call` is synchronous and shallow: one mailbox hop to the
-//! provider generation's `kb_hot`, recursion depth cap 8, no delegation.
+//! wrote. `service_call` is synchronous: one mailbox hop to the provider
+//! generation's `kb_hot`, carrying a `{depth, visited, deadline}` scope so a
+//! chain is bounded in depth, cannot revisit a generation (a cycle like A→B→A
+//! is rejected before the hop), and shares one deadline across the whole chain.
 //! `service_publish` is an M2 extension of the kernel op set (the module
 //! publishes its services during `kb_on_activate`; R-25/C-06 publication is
 //! the key free or an explicit same-module replace intent).
@@ -32,11 +34,10 @@
 //! `check` passes the broker's current policy version (the highest version
 //! across registered templates; the session lane owns template mutations).
 
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kanbei_capabilities::{ApprovalIntent, Broker, Capability, GrantScope, Principal};
 use kanbei_core::id::Id128;
@@ -48,7 +49,7 @@ use kanbei_services::{
 use kanbei_vm::Host;
 use serde_json::{json, Value};
 
-use crate::runtime::GenerationRuntime;
+use crate::runtime::{GenerationRuntime, Scope, REPLY_TIMEOUT};
 use crate::state::{StateStore, StateUpdate};
 
 /// The exact string kanbei-vm maps to `GuestError::StaleGeneration`
@@ -63,16 +64,32 @@ const STALE_GENERATION: &str = "stale generation";
 /// because the vm's timeout is not visible to this crate.
 pub(crate) const SERVICE_CALL_WAIT: Duration = Duration::from_secs(4);
 
-/// `service_call` recursion cap (one hop per level; M2 is shallow).
-///
-/// NOTE (T20): once cross-generation calls hop to another generation's actor
-/// thread, this thread-local no longer tracks the chain — the scope
-/// `{depth, visited, deadline}` must ride in the op-3 message. T19 leaves the
-/// cap as-is; T20 replaces it.
+/// `service_call` recursion cap: the maximum number of hops a chain may take.
 const MAX_SERVICE_DEPTH: u32 = 8;
 
-thread_local! {
-    static SERVICE_DEPTH: Cell<u32> = const { Cell::new(0) };
+/// Advance the service-call scope across one hop to `provider`, enforcing the
+/// two chain rules and returning the child scope the provider's actor runs
+/// under (depth + 1, the provider appended to the visited set, the caller's
+/// absolute deadline inherited). Pure, so the chain rules are testable without
+/// spinning up actors.
+fn advance(caller: &Scope, provider: u64) -> Result<Scope, String> {
+    if caller.depth >= MAX_SERVICE_DEPTH {
+        return Err(format!(
+            "service_call: recursion depth cap ({MAX_SERVICE_DEPTH}) exceeded"
+        ));
+    }
+    if caller.visited.contains(&provider) {
+        return Err(format!(
+            "service_call: generation {provider} is already on the call chain (cycle rejected)"
+        ));
+    }
+    let mut visited = caller.visited.clone();
+    visited.push(provider);
+    Ok(Scope {
+        depth: caller.depth + 1,
+        visited,
+        deadline: caller.deadline,
+    })
 }
 
 /// Identity of a live generation, resolved from its vm token. The vm token
@@ -323,50 +340,58 @@ impl ModuleHost {
                 "service_call: a generation may not call its own service (mailbox self-hop)".into(),
             );
         }
-        if SERVICE_DEPTH.with(|d| d.get()) >= MAX_SERVICE_DEPTH {
-            return Err(format!(
-                "service_call: recursion depth cap ({MAX_SERVICE_DEPTH}) exceeded"
-            ));
+        // Resolve the caller's actor and the provider's actor from the shared
+        // table, then release the table lock before the cross-actor hop (never
+        // hold a kernel lock across a mailbox send).
+        let map = self
+            .instances
+            .upgrade()
+            .ok_or_else(|| "service_call: kernel module table is gone (hosting shut down)".to_string())?;
+        let (caller_scope, provider_runtime) = {
+            let guard = map.lock().expect("instances lock poisoned");
+            (
+                guard.get(&info.generation).and_then(|r| r.scope()),
+                guard.get(&provider.generation).cloned(),
+            )
+        };
+        drop(map);
+        // The actor publishes its scope for the call in flight, so the read
+        // above is the caller's current chain. Fall back to a fresh root scope
+        // if it is missing (e.g. the caller was retired mid-op): the chain
+        // rules still apply.
+        let caller_scope = caller_scope
+            .unwrap_or_else(|| Scope::root(info.generation, Instant::now() + REPLY_TIMEOUT));
+        let child = advance(&caller_scope, provider.generation)?;
+        // The chain shares one deadline: wait only until it elapses, and never
+        // longer than the caller's host-import supervision window (so a slow
+        // provider cannot make the vm retire the caller).
+        let wait = child
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(SERVICE_CALL_WAIT);
+        if wait.is_zero() {
+            return Err("service_call: the call chain deadline has already elapsed".into());
         }
-        SERVICE_DEPTH.with(|d| d.set(d.get() + 1));
-        let result = (|| {
-            let map = self.instances.upgrade().ok_or_else(|| {
-                "service_call: kernel module table is gone (hosting shut down)".to_string()
-            })?;
-            // Resolve the provider's actor, then release the table lock before
-            // the cross-actor hop (never hold a kernel lock across a mailbox
-            // send).
-            let runtime = map
-                .lock()
-                .expect("instances lock poisoned")
-                .get(&provider.generation)
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "service_call: provider generation {} is not live",
-                        provider.generation
-                    )
-                })?;
-            drop(map);
-            // Wait below the caller's host-import supervision window so a slow
-            // provider cannot make the vm retire the caller.
-            runtime
-                .hot_within("kb_hot", &args.to_string(), SERVICE_CALL_WAIT)
-                .map_err(|e| {
-                    format!(
-                        "service_call: provider generation {} is unavailable: {e}",
-                        provider.generation
-                    )
-                })?
-                .map_err(|e| {
-                    format!(
-                        "service_call: provider generation {} failed: {e}",
-                        provider.generation
-                    )
-                })
-        })();
-        SERVICE_DEPTH.with(|d| d.set(d.get() - 1));
-        result
+        let runtime = provider_runtime.ok_or_else(|| {
+            format!(
+                "service_call: provider generation {} is not live",
+                provider.generation
+            )
+        })?;
+        runtime
+            .hot_within("kb_hot", &args.to_string(), wait, child)
+            .map_err(|e| {
+                format!(
+                    "service_call: provider generation {} is unavailable: {e}",
+                    provider.generation
+                )
+            })?
+            .map_err(|e| {
+                format!(
+                    "service_call: provider generation {} failed: {e}",
+                    provider.generation
+                )
+            })
     }
 
     fn op_check(&self, info: &TokenInfo, payload: &str) -> Result<String, String> {
@@ -786,5 +811,41 @@ mod tests {
         assert_eq!(host.published_contributions(1).len(), 1);
         drop(host);
         teardown(dir, queue);
+    }
+
+    fn scope(depth: u32, visited: &[u64]) -> Scope {
+        Scope {
+            depth,
+            visited: visited.to_vec(),
+            deadline: Instant::now() + Duration::from_secs(5),
+        }
+    }
+
+    /// A provider already on the chain is rejected before the hop, so a mutual
+    /// A→B→A chain cannot deadlock two actors waiting on each other.
+    #[test]
+    fn advance_rejects_a_generation_already_on_the_chain() {
+        let err = advance(&scope(1, &[7, 9]), 7).unwrap_err();
+        assert!(err.contains("already on the call chain"), "{err}");
+    }
+
+    /// The cap is on `depth` (hops already taken): a call from a scope at the
+    /// cap is rejected; one below it advances to exactly the cap.
+    #[test]
+    fn advance_enforces_the_depth_cap() {
+        let err = advance(&scope(MAX_SERVICE_DEPTH, &[1]), 2).unwrap_err();
+        assert!(err.contains("depth cap"), "{err}");
+        let child = advance(&scope(MAX_SERVICE_DEPTH - 1, &[1]), 2).unwrap();
+        assert_eq!(child.depth, MAX_SERVICE_DEPTH);
+        assert_eq!(child.visited, vec![1, 2]);
+    }
+
+    /// The whole chain shares one absolute deadline; a hop inherits it rather
+    /// than starting a fresh window.
+    #[test]
+    fn advance_inherits_the_chain_deadline() {
+        let caller = scope(0, &[1]);
+        let child = advance(&caller, 2).unwrap();
+        assert_eq!(child.deadline, caller.deadline);
     }
 }

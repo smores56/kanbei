@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kanbei_vm::{GuestError, Instance};
 
@@ -38,15 +38,42 @@ pub(crate) const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 /// uses `host::SERVICE_CALL_WAIT` instead.
 pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The service-call scope a generation is currently executing under (T20).
+/// `depth` counts hops from the root invocation; `visited` is the per-path set
+/// of generations already on the call chain (seeded with the root caller), so a
+/// cycle like A→B→A is rejected before it can deadlock two actors; `deadline`
+/// is the absolute instant the whole chain must finish by.
+#[derive(Debug, Clone)]
+pub(crate) struct Scope {
+    pub depth: u32,
+    pub visited: Vec<GenerationId>,
+    pub deadline: Instant,
+}
+
+impl Scope {
+    /// The root scope for a top-level invocation of `generation`: no hops yet,
+    /// the caller is the only visited generation, and the chain must finish
+    /// within the runtime's reply deadline.
+    pub(crate) fn root(generation: GenerationId, deadline: Instant) -> Self {
+        Self {
+            depth: 0,
+            visited: vec![generation],
+            deadline,
+        }
+    }
+}
+
 enum Cmd {
     RunScript {
         source: String,
         reply: SyncSender<Result<(), GuestError>>,
+        scope: Option<Scope>,
     },
     Hot {
         entry: String,
         args: String,
         reply: SyncSender<Result<String, GuestError>>,
+        scope: Option<Scope>,
     },
     Shutdown {
         done: SyncSender<()>,
@@ -88,6 +115,11 @@ pub struct GenerationRuntime {
     /// Set when the actor thread panicked (so a disposal does not claim a clean
     /// quiesce). Its store was still dropped during unwinding.
     panicked: AtomicBool,
+    /// The scope of the command the actor is executing right now (T20). The
+    /// kernel host reads this for the calling generation in `service_call`;
+    /// the actor is blocked inside the call while it is set, so the read is
+    /// stable for the call's duration.
+    scope: Arc<Mutex<Option<Scope>>>,
 }
 
 impl GenerationRuntime {
@@ -103,13 +135,15 @@ impl GenerationRuntime {
     ) -> std::io::Result<Arc<Self>> {
         let (tx, rx) = mpsc::channel();
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let scope: Arc<Mutex<Option<Scope>>> = Arc::new(Mutex::new(None));
         // Fail closed on thread exhaustion: activation reports the io error
         // rather than aborting the process.
         let join = thread::Builder::new()
             .name(format!("kb-gen-{generation}"))
             .spawn({
                 let in_flight = Arc::clone(&in_flight);
-                move || run(instance, rx, &in_flight)
+                let scope = Arc::clone(&scope);
+                move || run(instance, rx, &in_flight, &scope)
             })?;
         Ok(Arc::new(Self {
             generation,
@@ -119,6 +153,7 @@ impl GenerationRuntime {
             in_flight,
             abandoned,
             panicked: AtomicBool::new(false),
+            scope,
         }))
     }
 
@@ -128,47 +163,66 @@ impl GenerationRuntime {
     }
 
     /// Run the activation script on the actor thread, waiting up to the
-    /// runtime's default reply deadline.
+    /// runtime's default reply deadline. The invocation runs under a fresh root
+    /// scope (this generation is the only hop on the chain).
     pub(crate) fn run_script(&self, source: &str) -> Result<Result<(), GuestError>, ActorError> {
-        self.run_script_within(source, self.reply_timeout)
+        let scope = Scope::root(self.generation, Instant::now() + self.reply_timeout);
+        self.request(self.reply_timeout, Some(scope), |reply, scope| {
+            Cmd::RunScript {
+                source: source.to_string(),
+                reply,
+                scope,
+            }
+        })
     }
 
-    /// Call the generation's `kb_hot` on the actor thread, waiting up to the
-    /// runtime's default reply deadline.
+    /// Call the generation's `kb_hot` on the actor thread under a fresh root
+    /// scope, waiting up to the runtime's default reply deadline. This is the
+    /// kernel/UI entry point; a cross-generation hop enters through
+    /// [`Self::hot_within`] with the caller's child scope instead.
     pub fn hot(
         &self,
         entry: &str,
         args: &str,
     ) -> Result<Result<String, GuestError>, ActorError> {
-        self.hot_within(entry, args, self.reply_timeout)
+        let scope = Scope::root(self.generation, Instant::now() + self.reply_timeout);
+        self.hot_request(entry, args, self.reply_timeout, scope)
     }
 
-    /// Run the activation script, waiting up to `deadline` for the reply.
-    pub(crate) fn run_script_within(
-        &self,
-        source: &str,
-        deadline: Duration,
-    ) -> Result<Result<(), GuestError>, ActorError> {
-        self.request(deadline, |reply| Cmd::RunScript {
-            source: source.to_string(),
-            reply,
-        })
+    /// The scope the actor is executing under right now, if any (T20). While a
+    /// scope is set the actor is blocked inside the guest call, so the
+    /// host-import worker running `service_call` reads the scope of the call in
+    /// flight, not a stale one.
+    pub(crate) fn scope(&self) -> Option<Scope> {
+        self.scope.lock().expect("scope lock poisoned").clone()
     }
 
-    /// Call `kb_hot`, waiting up to `deadline` for the reply. A cross-generation
-    /// `service_call` uses a deadline below the caller's host-import supervision
-    /// window (see `host::SERVICE_CALL_WAIT`), so a slow provider cannot cause
-    /// the vm to retire the caller.
+    /// Cross-generation hop: call `kb_hot` under `scope`, the caller's child
+    /// scope (which carries the chain's depth, visited set, and deadline). Wait
+    /// at most `wait` for the reply — bounded by the remaining chain deadline
+    /// (see `host::op_service_call`).
     pub(crate) fn hot_within(
         &self,
         entry: &str,
         args: &str,
-        deadline: Duration,
+        wait: Duration,
+        scope: Scope,
     ) -> Result<Result<String, GuestError>, ActorError> {
-        self.request(deadline, |reply| Cmd::Hot {
+        self.hot_request(entry, args, wait, scope)
+    }
+
+    fn hot_request(
+        &self,
+        entry: &str,
+        args: &str,
+        wait: Duration,
+        scope: Scope,
+    ) -> Result<Result<String, GuestError>, ActorError> {
+        self.request(wait, Some(scope), |reply, scope| Cmd::Hot {
             entry: entry.to_string(),
             args: args.to_string(),
             reply,
+            scope,
         })
     }
 
@@ -211,12 +265,13 @@ impl GenerationRuntime {
 
     fn request<T>(
         &self,
-        deadline: Duration,
-        make: impl FnOnce(SyncSender<T>) -> Cmd,
+        wait: Duration,
+        scope: Option<Scope>,
+        make: impl FnOnce(SyncSender<T>, Option<Scope>) -> Cmd,
     ) -> Result<T, ActorError> {
         let (tx, rx) = mpsc::sync_channel(1);
-        self.tx.send(make(tx)).map_err(|_| ActorError::Gone)?;
-        match rx.recv_timeout(deadline) {
+        self.tx.send(make(tx, scope)).map_err(|_| ActorError::Gone)?;
+        match rx.recv_timeout(wait) {
             Ok(value) => Ok(value),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ActorError::Wedged),
             // The actor dropped the reply (went away mid-request).
@@ -243,20 +298,40 @@ impl std::fmt::Debug for GenerationRuntime {
     }
 }
 
-/// The actor loop: sole owner of the store for the thread's lifetime.
-fn run(mut instance: Instance, rx: Receiver<Cmd>, in_flight: &AtomicUsize) {
+/// The actor loop: sole owner of the store for the thread's lifetime. It
+/// publishes the scope of the command it is running on `scope` for the duration
+/// of the call, then clears it.
+fn run(
+    mut instance: Instance,
+    rx: Receiver<Cmd>,
+    in_flight: &AtomicUsize,
+    scope: &Mutex<Option<Scope>>,
+) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            Cmd::RunScript { source, reply } => {
+            Cmd::RunScript {
+                source,
+                reply,
+                scope: cmd_scope,
+            } => {
+                *scope.lock().expect("scope lock poisoned") = cmd_scope;
                 in_flight.fetch_add(1, Ordering::AcqRel);
                 let result = instance.run_script(&source);
                 in_flight.fetch_sub(1, Ordering::AcqRel);
+                *scope.lock().expect("scope lock poisoned") = None;
                 let _ = reply.send(result);
             }
-            Cmd::Hot { entry, args, reply } => {
+            Cmd::Hot {
+                entry,
+                args,
+                reply,
+                scope: cmd_scope,
+            } => {
+                *scope.lock().expect("scope lock poisoned") = cmd_scope;
                 in_flight.fetch_add(1, Ordering::AcqRel);
                 let result = instance.call_json(&entry, &args);
                 in_flight.fetch_sub(1, Ordering::AcqRel);
+                *scope.lock().expect("scope lock poisoned") = None;
                 let _ = reply.send(result);
             }
             Cmd::Shutdown { done } => {

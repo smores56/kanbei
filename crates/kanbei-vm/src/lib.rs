@@ -632,10 +632,13 @@ impl Drop for HostCallPermit {
 }
 
 thread_local! {
-    /// True while inside a supervised host-import worker. Nested imports (a
-    /// provider's `service_call` re-entering wasm) then run inline on that
-    /// worker, so the thread count stays one per top-level import and the
-    /// thread-local `SERVICE_DEPTH` in kanbei-modules survives.
+    /// True while inside a supervised host-import worker. A host op that
+    /// synchronously re-enters the guest runs inline on that worker instead of
+    /// spawning a nested worker, so the thread count stays one per top-level
+    /// import. A cross-generation `service_call` does NOT re-enter here — it
+    /// hops to the provider generation's actor thread, and the call-chain scope
+    /// (depth/visited/deadline) rides in that mailbox message rather than in a
+    /// thread-local.
     static SUPERVISED_HOST_CALL: Cell<bool> = const { Cell::new(false) };
 }
 

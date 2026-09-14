@@ -158,6 +158,26 @@ end
 function kb_hot(x) return x end
 "#;
 
+// T20: a mutual pair — each publishes a service and, when hot-called, calls the
+// other's. The scope cycle rule must reject A→B→A before the second hop.
+const A_CALLS_SVC_B: &str = r#"
+function kb_on_activate(ctx)
+  ctx.service_publish('{"scope":["root"],"name":"a"}', 1, '[]')
+end
+function kb_hot(x)
+  return kb_host_call(3, '{"key":{"scope":["root"],"name":"b"},"args":{}}')
+end
+"#;
+
+const B_CALLS_SVC_A: &str = r#"
+function kb_on_activate(ctx)
+  ctx.service_publish('{"scope":["root"],"name":"b"}', 1, '[]')
+end
+function kb_hot(x)
+  return kb_host_call(3, '{"key":{"scope":["root"],"name":"a"},"args":{}}')
+end
+"#;
+
 const T12_APPROVAL: &str = r#"
 function kb_on_activate(ctx)
   local r = ctx.require_approval("process.run", '["start"]')
@@ -405,6 +425,36 @@ fn service_call_routes_to_provider_kb_hot() {
     assert_eq!(log.len(), 1);
     assert!(log[0].contains(r#""from":"A""#), "log entry: {}", log[0]);
     assert!(log[0].contains(r#""n":42"#), "log entry: {}", log[0]);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// T20: a mutual service-call chain (A→B→A) is rejected by the scope cycle
+/// rule before the second hop, so neither actor wedges waiting on the other.
+#[test]
+fn mutually_recursive_service_call_is_rejected_not_deadlocked() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("svc-cycle", vm);
+    let dep_a = ServiceDependency {
+        key: svc_key("a"),
+        required_version: 1,
+    };
+    let dep_b = ServiceDependency {
+        key: svc_key("b"),
+        required_version: 1,
+    };
+    let a = manager
+        .activate(&manifest(Id128::generate(), A_CALLS_SVC_B, vec![dep_b]))
+        .unwrap();
+    manager
+        .activate(&manifest(Id128::generate(), B_CALLS_SVC_A, vec![dep_a]))
+        .unwrap();
+    let err = manager
+        .call_generation(a.generation, "{}")
+        .expect_err("A→B→A must be rejected");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("already on the call chain"), "{msg}");
+    drop(a);
     drop(manager);
     cleanup(dir, queue);
 }
