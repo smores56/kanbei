@@ -590,6 +590,8 @@ pub struct Session {
     // --- M5 semantic workbench ---
     /// The bound UI host (None until the built-in UI is activated).
     ui_host: Option<UiHost>,
+    /// T9 lifecycle hook bindings (rebuilt on composition change).
+    hooks: crate::hooks::HookSet,
     // --- M3 agent spine ---
     scheduler: kanbei_scheduler::Scheduler,
     provider: Option<Box<dyn kanbei_provider::ProviderEngine>>,
@@ -1069,6 +1071,7 @@ impl Session {
             modules,
             vm_engine_digest,
             ui_host: None,
+            hooks: crate::hooks::HookSet::default(),
             scheduler: kanbei_scheduler::Scheduler::new(budgets, breaker_floors),
             provider: provider_engine,
             provider_config,
@@ -1695,6 +1698,9 @@ pub enum SessionError {
 // M3 agent spine: run lifecycle, model/tool commit paths, approvals, breakers,
 // and interrupted/ambiguous classification (spine.rs).
 mod spine;
+
+// T9 lifecycle hooks (decision parsing, ordered bindings, fault policy).
+mod hooks;
 
 // M8 wave 2: canonical-object GC (root capture, writer pins, quarantine +
 // grace sweep) over the session and memory stores (gc.rs).

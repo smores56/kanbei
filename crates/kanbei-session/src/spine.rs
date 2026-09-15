@@ -25,6 +25,7 @@ use kanbei_provider::{
     CacheOutcome, CachePlan, EgressEntry, FinishReason, Message, ModelCallRecord, Role,
 };
 use kanbei_retrieval::{ActiveMemoryProjector, SalienceInput, ScopeIndexInput, SearchQuery};
+use kanbei_scopes::contrib::HookKind;
 use kanbei_scheduler::{
     Budgets, FailureKind, RunId, RunKind, RunOutcome, RunStart, RunUsage, StepCommand, StepContext,
     StepResult, TerminalOutcome, Trigger, WakeDecision,
@@ -38,6 +39,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::{NewEvent, ProjectionState, Session, SessionError};
+use crate::hooks::Decision;
 
 /// Tools whose execution is a consequential side effect: the committed
 /// intent is flushed to durable storage before these run (fast/balanced
@@ -577,7 +579,7 @@ impl Session {
             .ok_or_else(|| SessionError::InvalidInput(format!("unknown tool {tool}")))?;
         let _ = schema;
         let call_id = tool_call_id();
-        let intent = ToolIntent {
+        let mut intent = ToolIntent {
             call_id,
             run_id,
             principal: principal.clone(),
@@ -586,7 +588,18 @@ impl Session {
             approval: None,
             origin_snapshot: self.current_snapshot,
             intent_event: None,
+            annotations: Vec::new(),
         };
+        // T9: `on_tool_intent` hooks run after intent construction and BEFORE
+        // the approval gate/dispatch. Annotations ride the committed intent;
+        // a deny short-circuits (the broker is never consulted).
+        let hook_context = json!({
+            "hook": HookKind::OnToolIntent.as_str(),
+            "tool": intent.tool,
+            "args": intent.args,
+        });
+        let hooks = self.evaluate_hooks(HookKind::OnToolIntent, &hook_context.to_string());
+        intent.annotations = hooks.annotations.clone();
         self.fault(crate::FaultPoint::BeforeToolIntentCommit);
         let intent_payload = serde_json::to_value(&intent)
             .map_err(|e| SessionError::InvalidInput(format!("tool intent payload: {e}")))?;
@@ -604,8 +617,30 @@ impl Session {
         // The committed intent's seq is the provenance anchor for the memory
         // proposal it leads to (R-11); the committed payload itself carries
         // null (the seq is unknowable before the commit).
-        let mut intent = intent;
         intent.intent_event = Some(receipt.last_seq);
+
+        // T9: a hook deny is terminal for the intent — commit the canonical
+        // denied outcome (kernel-authored reason, digest of the decision) and
+        // never touch the approval/dispatch path.
+        if let Decision::Deny { .. } = hooks.decision {
+            let reason = match &hooks.denier {
+                Some(denier) => format!("denied by hook {}", denier.name),
+                None => "denied by hook policy".to_string(),
+            };
+            let outcome = ToolOutcome {
+                call_id: intent.call_id,
+                tool: intent.tool,
+                result: Value::Null,
+                error: None,
+                classification: OutcomeClassification::Denied(reason),
+                origin_snapshot: intent.origin_snapshot,
+                commit_snapshot: self.current_snapshot,
+                retained: None,
+                hook_denied: Some(hooks.decision.digest()),
+            };
+            self.commit_tool_outcome(&outcome)?;
+            return Ok(outcome);
+        }
 
         // Approval gate: consequential tools require an approval intent;
         // the gate parks the intent-shaped approval (R-16/D-12: the digest
@@ -635,6 +670,7 @@ impl Session {
                 origin_snapshot: intent.origin_snapshot,
                 commit_snapshot: self.current_snapshot,
                 retained: None,
+                hook_denied: None,
             });
         }
         intent.approval = None;
@@ -880,6 +916,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                     origin_snapshot: intent.origin_snapshot,
                     commit_snapshot: self.current_snapshot,
                     retained: None,
+                    hook_denied: None,
                 });
             }
         };
@@ -908,6 +945,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
             origin_snapshot: intent.origin_snapshot,
             commit_snapshot: self.current_snapshot,
             retained: None,
+            hook_denied: None,
         })
     }
 
@@ -921,6 +959,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
             origin_snapshot: intent.origin_snapshot,
             commit_snapshot: self.current_snapshot,
             retained: None,
+            hook_denied: None,
         }
     }
 
@@ -1334,6 +1373,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
             origin_snapshot: intent.origin_snapshot,
             commit_snapshot: self.current_snapshot,
             retained: None,
+            hook_denied: None,
         }
     }
 
@@ -1509,6 +1549,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
             origin_snapshot: intent.origin_snapshot,
             commit_snapshot: self.current_snapshot,
             retained: None,
+            hook_denied: None,
         })
     }
 
@@ -1789,6 +1830,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                 origin_snapshot: intent.origin_snapshot,
                 commit_snapshot: self.current_snapshot,
                 retained: None,
+                hook_denied: None,
             });
         };
 
@@ -1849,6 +1891,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
             origin_snapshot: intent.origin_snapshot,
             commit_snapshot: self.current_snapshot,
             retained: None,
+            hook_denied: None,
         })
     }
 
@@ -1994,6 +2037,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
             origin_snapshot: intent.origin_snapshot,
             commit_snapshot: self.current_snapshot,
             retained: None,
+            hook_denied: None,
         })
     }
 
@@ -2010,6 +2054,65 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
         provider: &mut dyn kanbei_scheduler::CognitionProvider,
         render: impl Fn(&mut Session) -> Result<StepContext, SessionError>,
     ) -> Result<TerminalOutcome, SessionError> {
+        // T9: `on_turn_start` runs before the first model call/render of a
+        // run. A deny is terminal (canonical `turn_denied`, Blocked) with NO
+        // model call; annotations are committed before the projection renders
+        // so this turn sees them.
+        let hook_context = json!({
+            "hook": HookKind::OnTurnStart.as_str(),
+            "run": run_id.to_string(),
+        });
+        let hooks = self.evaluate_hooks(HookKind::OnTurnStart, &hook_context.to_string());
+        if let Decision::Deny { .. } = hooks.decision {
+            let reason = match &hooks.denier {
+                Some(denier) => format!("turn denied by hook {}", denier.name),
+                None => "turn denied by hook policy".to_string(),
+            };
+            self.commit(
+                vec![NewEvent {
+                    kind: "turn_denied".into(),
+                    payload_schema: 1,
+                    payload: json!({
+                        "run": run_id.to_string(),
+                        "hook": HookKind::OnTurnStart.as_str(),
+                        "package_digest": hooks
+                            .denier
+                            .as_ref()
+                            .map(|d| d.package_digest.to_string()),
+                        "decision_digest": hooks.decision.digest().to_string(),
+                    }),
+                    objects: Vec::new(),
+                    refs: Vec::new(),
+                }],
+                None,
+            )?;
+            let usage = self.scheduler.current_usage(run_id);
+            self.run_outcome_with_reason(
+                run_id,
+                TerminalOutcome::Blocked,
+                usage,
+                &[],
+                Some(reason),
+            )?;
+            return Ok(TerminalOutcome::Blocked);
+        }
+        for annotation in &hooks.annotations {
+            self.commit(
+                vec![NewEvent {
+                    kind: "hook_annotation".into(),
+                    payload_schema: 1,
+                    payload: json!({
+                        "run": run_id.to_string(),
+                        "hook": HookKind::OnTurnStart.as_str(),
+                        "key": annotation.key,
+                        "value": annotation.value,
+                    }),
+                    objects: Vec::new(),
+                    refs: Vec::new(),
+                }],
+                None,
+            )?;
+        }
         let mut context = render(self)?;
         context.budget = self.scheduler.budgets();
         let mut last: Option<StepResult> = None;
@@ -2123,6 +2226,11 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                                 serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
                             ));
                         }
+                    } else if tool_outcome.denied() {
+                        // T9: the deny outcome was already committed by tool_call.
+                        last = Some(StepResult::Tool(
+                            serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                        ));
                     } else {
                         self.commit_tool_outcome(&tool_outcome)?;
                         last = Some(StepResult::Tool(
@@ -2152,6 +2260,11 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                                 serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
                             ));
                         }
+                    } else if tool_outcome.denied() {
+                        // T9: the deny outcome was already committed by tool_call.
+                        last = Some(StepResult::Memory(
+                            serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                        ));
                     } else {
                         self.commit_tool_outcome(&tool_outcome)?;
                         last = Some(StepResult::Memory(
@@ -2181,6 +2294,11 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                                 serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
                             ));
                         }
+                    } else if tool_outcome.denied() {
+                        // T9: the deny outcome was already committed by tool_call.
+                        last = Some(StepResult::Memory(
+                            serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                        ));
                     } else {
                         self.commit_tool_outcome(&tool_outcome)?;
                         last = Some(StepResult::Memory(
@@ -2205,6 +2323,11 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                                 serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
                             ));
                         }
+                    } else if tool_outcome.denied() {
+                        // T9: the deny outcome was already committed by tool_call.
+                        last = Some(StepResult::Child(
+                            serde_json::to_value(&tool_outcome).unwrap_or(Value::Null),
+                        ));
                     } else {
                         self.commit_tool_outcome(&tool_outcome)?;
                         last = Some(StepResult::Child(

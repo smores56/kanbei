@@ -625,6 +625,8 @@ impl Session {
             package,
             manifest,
         });
+        // T9: bind this layer's hook contributions (if any).
+        self.rebind_hooks();
         Ok(ConfigActivation {
             module_id,
             generation: generation.generation,

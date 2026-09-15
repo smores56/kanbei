@@ -328,6 +328,9 @@ impl Session {
     /// remaining ones rebind in order. The theme merges every bound mount's
     /// overlay in bind order. An empty result unbinds the host.
     pub(crate) fn rebind_ui(&mut self, _generation: u64) -> Result<(), SessionError> {
+        // T9: a composition change rebinds the hook set too (same choke point
+        // as the UI mounts below).
+        self.rebind_hooks();
         let Some(manager) = self.modules.as_ref() else {
             return Ok(());
         };

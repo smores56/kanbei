@@ -194,6 +194,15 @@ impl ToolRegistry {
 
 // ---------- tool FSM records ----------
 
+/// One kernel-visible annotation a lifecycle hook (T9) attached to a
+/// decision. Generic on purpose: the session carries it into the intent
+/// payload and the canonical `hook_annotation` fact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolAnnotation {
+    pub key: String,
+    pub value: Value,
+}
+
 /// Committed tool intent (committed before dispatch — B-05). Carries the
 /// caller principal (R-14/D-02) and the origin snapshot (R-02/C-03).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -211,6 +220,10 @@ pub struct ToolIntent {
     /// memory proposals); None for pre-M4 records.
     #[serde(default)]
     pub intent_event: Option<u64>,
+    /// Annotations accumulated from `on_tool_intent` hooks (T9). Additive and
+    /// defaulted so pre-T9 records deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<ToolAnnotation>,
 }
 
 /// Canonical action digest: the committed intent's identity (used by the
@@ -235,6 +248,10 @@ pub enum OutcomeClassification {
     Normal,
     Interrupted(String),
     Ambiguous(String),
+    /// A lifecycle hook denied the intent before the approval gate/dispatch
+    /// (T9). The string is kernel-authored (never guest text); the decision's
+    /// content digest rides on [`ToolOutcome::hook_denied`].
+    Denied(String),
 }
 
 /// Committed tool outcome: references both the origin snapshot (the intent's
@@ -252,6 +269,11 @@ pub struct ToolOutcome {
     /// Output retention candidate decisions are applied by the session's
     /// retention gate; the outcome records the admission.
     pub retained: Option<bool>,
+    /// Digest of the denying hook's decision (T9); set only when the
+    /// classification is [`OutcomeClassification::Denied`]. Additive and
+    /// defaulted so pre-T9 records deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_denied: Option<Digest>,
 }
 
 /// Classification reason prefix marking an intent parked behind the
@@ -269,6 +291,13 @@ impl ToolOutcome {
             &self.classification,
             OutcomeClassification::Interrupted(reason) if reason.starts_with(AWAITING_APPROVAL)
         )
+    }
+
+    /// Whether a lifecycle hook denied the intent (T9); the canonical
+    /// `tool_outcome` is committed by `tool_call` before it returns, so
+    /// callers must not commit it again.
+    pub fn denied(&self) -> bool {
+        matches!(&self.classification, OutcomeClassification::Denied(_))
     }
 }
 
@@ -1173,6 +1202,7 @@ mod tests {
             approval: None,
             origin_snapshot: None,
             intent_event: None,
+            annotations: Vec::new(),
         };
         let i2 = ToolIntent {
             call_id: tool_call_id(),
@@ -1183,6 +1213,7 @@ mod tests {
             approval: None,
             origin_snapshot: None,
             intent_event: None,
+            annotations: Vec::new(),
         };
         assert_eq!(tool_action_digest(&i1), tool_action_digest(&i2));
     }
@@ -1202,6 +1233,7 @@ mod tests {
             approval: None,
             origin_snapshot: Some(Digest::new(b"s")),
             intent_event: Some(7),
+            annotations: Vec::new(),
         };
         let back: ToolIntent =
             serde_json::from_str(&serde_json::to_string(&intent).unwrap()).unwrap();
@@ -1222,6 +1254,7 @@ mod tests {
             origin_snapshot: Some(Digest::new(b"s")),
             commit_snapshot: Some(Digest::new(b"c")),
             retained: Some(true),
+            hook_denied: None,
         };
         let back: ToolOutcome =
             serde_json::from_str(&serde_json::to_string(&outcome).unwrap()).unwrap();
