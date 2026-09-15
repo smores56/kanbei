@@ -168,6 +168,9 @@ impl Session {
             current: self.config_digest,
             historical: manifest.provider_config,
             composition: Some(self.composition.current().digest),
+            // F5: the full ordered stack, so a later restore replays every
+            // layer (built-in defaults + user + project), not just the top.
+            layers: self.config_layer_digests(),
         };
         self.fault(FaultPoint::BeforeBranchTransition);
         let receipt = self.commit(
@@ -324,13 +327,16 @@ impl Session {
         })
     }
 
-    /// The config package digest chosen at `at_seq`: the last
-    /// `branch_transition` `config_choice.current` or `composition_changed`
-    /// added-package digest at or before that seq — the config active at the
-    /// checkpoint (None for sessions that never activated one).
-    pub(crate) fn config_choice_at(&self, at_seq: u64) -> Result<Option<Digest>, SessionError> {
+    /// The ORDERED (LOW→HIGH) config-layer package digests active at `at_seq`
+    /// (F5): replaying `composition_changed` `initiator: "config"` events —
+    /// `delta.added` upserts by module id (a replacement updates in place),
+    /// `delta.removed` drops the named module — and re-baselining at a
+    /// `branch_transition`'s recorded `config_choice`. None for sessions that
+    /// never activated a config layer.
+    pub(crate) fn config_choice_at(&self, at_seq: u64) -> Result<Option<Vec<Digest>>, SessionError> {
         let log_path = self.log_path.clone();
-        let mut chosen: Option<Digest> = None;
+        // (module-id key, package digest), in activation order.
+        let mut layers: Vec<(String, Digest)> = Vec::new();
         kanbei_log::for_each_frame(&log_path, |info| {
             for line in &info.events {
                 let Ok(env) = Envelope::from_line(line) else {
@@ -339,32 +345,74 @@ impl Session {
                 if env.seq > at_seq {
                     continue;
                 }
-                let digest = match env.kind.as_str() {
-                    // the branch-point record's live config digest
-                    "branch_transition" => env
-                        .payload
-                        .get("config_choice")
-                        .and_then(|c| c.get("current"))
-                        .and_then(|c| c.as_str())
-                        .and_then(|c| c.parse::<Digest>().ok()),
-                    // the package a config activation added
-                    "composition_changed" => env
-                        .payload
-                        .get("delta")
-                        .and_then(|d| d.get("added"))
-                        .and_then(|a| a.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|m| m.get("package"))
-                        .and_then(|p| p.as_str())
-                        .and_then(|p| p.parse::<Digest>().ok()),
-                    _ => None,
-                };
-                if let Some(digest) = digest {
-                    chosen = Some(digest);
+                match env.kind.as_str() {
+                    // A branch point re-baselines the stack it recorded (the
+                    // ordered `layers` when present, else the top `current`).
+                    "branch_transition" => {
+                        let Some(choice) = env.payload.get("config_choice") else {
+                            continue;
+                        };
+                        if let Some(arr) = choice.get("layers").and_then(|l| l.as_array()) {
+                            layers = arr
+                                .iter()
+                                .filter_map(|v| v.as_str())
+                                .filter_map(|s| s.parse::<Digest>().ok())
+                                .map(|d| (d.to_string(), d))
+                                .collect();
+                        } else if let Some(current) = choice
+                            .get("current")
+                            .and_then(|c| c.as_str())
+                            .and_then(|c| c.parse::<Digest>().ok())
+                        {
+                            layers = vec![(current.to_string(), current)];
+                        }
+                    }
+                    // Config-layer activation/replacement/removal deltas.
+                    "composition_changed" => {
+                        if env.payload.get("initiator").and_then(|i| i.as_str()) != Some("config") {
+                            continue;
+                        }
+                        let Some(delta) = env.payload.get("delta") else {
+                            continue;
+                        };
+                        if let Some(removed) = delta.get("removed").and_then(|r| r.as_array()) {
+                            for r in removed {
+                                let Some(id) = r.get("module_id").and_then(|m| m.as_str()) else {
+                                    continue;
+                                };
+                                layers.retain(|(k, _)| k != id);
+                            }
+                        }
+                        if let Some(added) = delta.get("added").and_then(|a| a.as_array()) {
+                            for a in added {
+                                let Some(pkg) = a
+                                    .get("package")
+                                    .and_then(|p| p.as_str())
+                                    .and_then(|p| p.parse::<Digest>().ok())
+                                else {
+                                    continue;
+                                };
+                                let key = a
+                                    .get("module_id")
+                                    .and_then(|m| m.as_str())
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| pkg.to_string());
+                                match layers.iter_mut().find(|(k, _)| *k == key) {
+                                    Some(existing) => existing.1 = pkg,
+                                    None => layers.push((key, pkg)),
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         })?;
-        Ok(chosen)
+        if layers.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(layers.into_iter().map(|(_, d)| d).collect()))
+        }
     }
 
     /// Switch the memory-follow policy (M6 wave 2): `FollowHead` releases the

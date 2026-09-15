@@ -1,6 +1,7 @@
 //! Module subsystem: config activation, generation replacement, effect dispatch, state-head CAS, retention, and UI staleness.
 
-use crate::{ConfigActivation, Session, FaultPoint, NewEvent, SessionError};
+use crate::{ConfigActivation, ConfigLayer, Session, FaultPoint, NewEvent, SessionError};
+use kanbei_core::digest::Digest;
 use kanbei_core::id::Id128;
 use kanbei_modules::HeadFile;
 use kanbei_modules::ModuleError;
@@ -74,6 +75,15 @@ impl Session {
             }
         }
         if let Some(reason) = safe_reason {
+            // The layers safe mode is about to drop: every activated
+            // non-builtin layer. Captured before the retain so the canonical
+            // removal event can name their generations/packages (F7/A1).
+            let dropped_layers: Vec<ConfigLayer> = self
+                .config_layers
+                .iter()
+                .filter(|l| l.rank != 0)
+                .cloned()
+                .collect();
             // Drop every activated non-builtin layer (best-effort: a layer with
             // dependents stays, but safe mode is still recorded).
             if let Some(manager) = self.modules.as_mut() {
@@ -87,7 +97,7 @@ impl Session {
             }
             // The dropped layers' generations are no longer active: forget their
             // precedence records so a later publish cannot try to override them.
-            self.active_config_layers.retain(|(rank, _, _)| *rank == 0);
+            self.config_layers.retain(|l| l.rank == 0);
             if !builtin_active {
                 let fallback = crate::builtin_config::builtin_config_manifest();
                 match self.activate_config(fallback.clone()) {
@@ -128,7 +138,7 @@ impl Session {
                 })
                 .collect();
             let to_remove: Vec<Contribution> = dropped
-                .into_iter()
+                .iter()
                 .filter(|c| {
                     !matches!(
                         c.kind,
@@ -137,10 +147,59 @@ impl Session {
                             | ContributionKind::Service(_)
                     )
                 })
+                .cloned()
                 .collect();
             let _ = self.registry.remove_contributions(&to_remove);
             self.registry
                 .recompose_overlays(&crate::builtin_config::root_scope(), &surviving_overlays);
+            // F7/A1: make the safe-mode drop CANONICAL. The registry mutation
+            // above cannot be expressed as an OCC publish (settings/theme
+            // overlays are merge-only and their removal needs a full-scope
+            // recompose), so re-seed `CompositionStore` from the post-mutation
+            // registry — its digest/contributions then match the registry —
+            // and commit one `composition_changed` recording the dropped
+            // generations. After this, the canonical log, the composition,
+            // and the config identity all agree: no later fork/branch can pin
+            // the stale pre-drop composition or restore a dropped layer.
+            self.composition.reseed(&self.registry);
+            self.config_digest = self.config_layers.last().map(|l| l.package);
+            self.config_manifest = self.config_layers.last().map(|l| l.manifest.clone());
+            if !dropped_layers.is_empty() {
+                let epoch = self.composition.current().epoch;
+                let composition_digest = self.composition.current().digest;
+                let comp_bytes = self.composition.current().to_canonical_bytes();
+                self.store.install(&comp_bytes)?;
+                let removed: Vec<serde_json::Value> = dropped_layers
+                    .iter()
+                    .map(|l| {
+                        json!({
+                            "module_id": l.module_id.to_string(),
+                            "generation": l.generation,
+                            "package": l.package.to_string(),
+                        })
+                    })
+                    .collect();
+                let refs: Vec<Digest> = dropped_layers
+                    .iter()
+                    .map(|l| l.package)
+                    .chain(std::iter::once(composition_digest))
+                    .collect();
+                self.commit(
+                    vec![NewEvent {
+                        kind: "composition_changed".into(),
+                        payload_schema: 1,
+                        payload: json!({
+                            "epoch": epoch,
+                            "delta": { "added": [], "removed": removed },
+                            "scope": crate::builtin_config::root_scope().to_string(),
+                            "initiator": "config",
+                        }),
+                        objects: Vec::new(),
+                        refs,
+                    }],
+                    Some(composition_digest),
+                )?;
+            }
             self.commit_safe_mode(&reason)?;
         }
         self.host_settings = self
@@ -193,7 +252,7 @@ impl Session {
     /// `auto_approve` would survive a swap to a benign generation. Replay the
     /// surviving layers' overlays from scratch (their settings AND themes, so
     /// the recompose does not drop a surviving theme), including the new
-    /// generation the caller already recorded in `active_config_layers`, then
+    /// generation the caller already recorded in `config_layers`, then
     /// re-resolve the runtime wiring. `old_settings_scopes` names the scopes
     /// the replaced generation contributed settings to, so a scope that no
     /// surviving layer touches is cleared too.
@@ -203,8 +262,8 @@ impl Session {
         };
         let mut overlays: Vec<Contribution> = Vec::new();
         let mut scopes = old_settings_scopes;
-        for (_, _, generation) in &self.active_config_layers {
-            for c in manager.published_contributions(*generation) {
+        for layer in &self.config_layers {
+            for c in manager.published_contributions(layer.generation) {
                 match &c.kind {
                     ContributionKind::Settings(_) => {
                         scopes.push(c.scope.clone());
@@ -292,9 +351,10 @@ impl Session {
         {
             let reg = self.services.lock().expect("services lock poisoned");
             for (key, provider, _) in reg.snapshot() {
-                let lower = self.active_config_layers.iter().any(|(rank, _, generation)| {
-                    *rank < my_rank && *generation == provider.generation
-                });
+                let lower = self
+                    .config_layers
+                    .iter()
+                    .any(|l| l.rank < my_rank && l.generation == provider.generation);
                 if lower {
                     supersede.insert(key.clone());
                     superseded.push((key, provider));
@@ -373,10 +433,10 @@ impl Session {
             .filter_map(contribution_override_key)
             .collect();
         let lower_generations: Vec<u64> = self
-            .active_config_layers
+            .config_layers
             .iter()
-            .filter(|(rank, _, _)| *rank < my_rank)
-            .map(|(_, _, generation)| *generation)
+            .filter(|l| l.rank < my_rank)
+            .map(|l| l.generation)
             .collect();
         for lower_generation in lower_generations {
             for c in manager.published_contributions(lower_generation) {
@@ -496,12 +556,20 @@ impl Session {
         self.config_digest = Some(package);
         self.config_manifest = Some(manifest.clone());
         // Track this layer for later precedence-driven implicit replacement
-        // (decision 28): its rank and generation resolve which of its
-        // contributions a higher-origin publish may take over.
-        self.active_config_layers
-            .push((my_rank, manifest.module_id, generation.generation));
+        // (decision 28) and as part of the ordered restore stack (F5): its
+        // rank and generation resolve which of its contributions a
+        // higher-origin publish may take over; its package digest is the
+        // restore identity.
+        let module_id = manifest.module_id;
+        self.config_layers.push(ConfigLayer {
+            rank: my_rank,
+            module_id,
+            generation: generation.generation,
+            package,
+            manifest,
+        });
         Ok(ConfigActivation {
-            module_id: manifest.module_id,
+            module_id,
             generation: generation.generation,
             epoch,
             event_seq: receipt.unwrap().last_seq,
@@ -636,10 +704,14 @@ impl Session {
         // from the surviving layers before the canonical commit (so the
         // post-manifest pins the refreshed wiring).
         let is_config_layer = self
-            .active_config_layers
+            .config_layers
             .iter_mut()
-            .find(|(_, id, _)| *id == module_id)
-            .map(|entry| entry.2 = new_generation)
+            .find(|l| l.module_id == module_id)
+            .map(|layer| {
+                layer.generation = new_generation;
+                layer.package = new_package;
+                layer.manifest = new_manifest.clone();
+            })
             .is_some();
         if is_config_layer {
             self.recompose_settings_after_replace(old_settings_scopes);

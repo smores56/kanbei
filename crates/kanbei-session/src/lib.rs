@@ -464,6 +464,12 @@ pub struct ConfigChoiceRecord {
     pub current: Option<Digest>,
     pub historical: Option<Digest>,
     pub composition: Option<Digest>,
+    /// The ORDERED (LOW→HIGH) config-layer package digests live at the branch
+    /// point (F5). `current` stays the TOP layer for existing consumers; the
+    /// full stack is the restore source of truth. Additive with `serde(default)`
+    /// so wave-1/older records decode.
+    #[serde(default)]
+    pub layers: Vec<Digest>,
 }
 
 /// The wire shape of a `branch_transition` payload (as written by
@@ -549,6 +555,19 @@ pub struct PendingIntent {
 pub type ApprovalResolver =
     std::sync::Arc<dyn Fn(&kanbei_tools::ApprovalParked) -> bool + Send + Sync>;
 
+/// One activated config layer in LOW→HIGH precedence order (decision 28, F5):
+/// its precedence rank, module identity, live generation, package digest, and
+/// manifest. The ordered vector of these is the config-identity source of
+/// truth for restore — `config_digest`/`config_manifest` are only its top.
+#[derive(Debug, Clone)]
+struct ConfigLayer {
+    rank: u8,
+    module_id: Id128,
+    generation: u64,
+    package: Digest,
+    manifest: PackageManifest,
+}
+
 pub struct Session {
     log: AppendLog,
     store: ObjectStore,
@@ -630,10 +649,11 @@ pub struct Session {
     /// layers (decision 28). Stored, not resolved live, so it survives
     /// generation teardown (safe mode reflects the built-in layer).
     host_settings: SettingsContribution,
-    /// Active config-layer precedence records `(rank, module_id, generation)`
-    /// in activation order (decision 28). A higher-rank publish consults these
-    /// to compute the lower-precedence contributions it implicitly replaces.
-    active_config_layers: Vec<(u8, Id128, u64)>,
+    /// The active config layers in LOW→HIGH precedence order (decision 28,
+    /// F5). A higher-rank publish consults these to compute the
+    /// lower-precedence contributions it implicitly replaces, and the ordered
+    /// package digests are the restore source of truth for fork/continue.
+    config_layers: Vec<ConfigLayer>,
     /// The memory roots pinned by the checkpoint this branch continues from
     /// (wave 2 consumes them).
     pinned_roots: Option<PinnedRoots>,
@@ -1076,7 +1096,7 @@ impl Session {
             config_digest: None,
             config_manifest: None,
             host_settings: SettingsContribution::default(),
-            active_config_layers: Vec::new(),
+            config_layers: Vec::new(),
             pinned_roots: None,
             child_provider,
             #[cfg(feature = "otel")]
@@ -1497,6 +1517,13 @@ impl Session {
     /// field); None for storage-only sessions and safe-mode opens.
     pub fn config_digest(&self) -> Option<Digest> {
         self.config_digest
+    }
+
+    /// The ORDERED (LOW→HIGH) package digests of the active config layers
+    /// (F5) — the restore source of truth. `config_digest` is its top
+    /// element (or `None` for a storage-only session).
+    pub fn config_layer_digests(&self) -> Vec<Digest> {
+        self.config_layers.iter().map(|l| l.package).collect()
     }
 
     /// The merged settings the config layers contributed at open (decision 28),

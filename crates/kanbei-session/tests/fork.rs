@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use kanbei_capabilities::{Capability, Principal};
+use kanbei_capabilities::{Capability, Principal, TrustClass};
 use kanbei_core::digest::Digest;
 use kanbei_core::envelope::Envelope;
 use kanbei_core::id::Id128;
@@ -28,7 +28,10 @@ use kanbei_modules::{ModuleOrigin, PackageManifest};
 use kanbei_objects::ObjectStore;
 use kanbei_policy::builtins::StoreAllPolicy;
 use kanbei_services::ScopePath;
-use kanbei_session::{CheckpointRef, ForkOptions, NewEvent, Session, SessionConfig, SessionError};
+use kanbei_session::{
+    CheckpointRef, ForkOptions, NewEvent, Session, SessionConfig, SessionError,
+    builtin_config_manifest,
+};
 use kanbei_vm::{GuestError, Vm, VmConfig};
 use kanbei_workspace::SnapshotOptions;
 use serde_json::{Value, json};
@@ -514,6 +517,183 @@ fn fork_with_config_activates_same_digest() {
             .unwrap()
     );
 
+    receipt.session.close().unwrap();
+    source.close().unwrap();
+}
+
+/// A settings-only config layer: `kb_on_activate` publishes one typed settings
+/// contribution (mirror of m2's helper).
+fn settings_manifest(
+    id: Id128,
+    origin: ModuleOrigin,
+    trust_class: TrustClass,
+    payload: &str,
+) -> PackageManifest {
+    PackageManifest {
+        schema: kanbei_modules::PACKAGE_SCHEMA,
+        module_id: id,
+        origin,
+        trust_class,
+        scope: ScopePath(vec![]),
+        deps: vec![],
+        capabilities: vec![],
+        source: format!(
+            "function kb_on_activate(ctx) ctx.contribution_publish('{payload}') end\nfunction kb_hot(x) return x end"
+        ),
+        state_schema: None,
+        state_key: None,
+    }
+}
+
+fn package_digest(m: &PackageManifest) -> Digest {
+    Digest::new(&serde_json::to_vec(m).unwrap())
+}
+
+/// F5: forking a session opened with built-in + user + project config layers
+/// restores the FULL ordered layer stack — not just the top layer — so the
+/// fork's merged settings and active composition reflect every layer.
+#[test]
+fn fork_restores_full_config_layer_stack() {
+    require_guest();
+    let dir = TempDir::new("config-stack");
+    let source_id = Id128::generate();
+    let builtin = builtin_config_manifest();
+    let user = settings_manifest(
+        Id128::generate(),
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
+        r#"{"kind":"settings","provider":{"model":"user-model","base_url":"https://user"},"approval":{"auto_approve":true}}"#,
+    );
+    let project = settings_manifest(
+        Id128::generate(),
+        ModuleOrigin::WorkspaceConfig,
+        TrustClass::Workspace,
+        r#"{"kind":"settings","provider":{"model":"project-model"}}"#,
+    );
+    let expected = vec![
+        package_digest(&builtin),
+        package_digest(&user),
+        package_digest(&project),
+    ];
+    let mut source = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        memory_root: Some(dir.path().join("memory")),
+        session_id: Some(source_id),
+        config_layers: vec![builtin, user, project],
+        engine: Some(no_epoch()),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        source.config_layer_digests(),
+        expected,
+        "the source keeps the full ordered stack"
+    );
+    let cp = source.create_checkpoint(None).unwrap();
+
+    let fork_dir = dir.path().join("fork");
+    let mut opts = fork_options(&fork_dir);
+    opts.config.engine = Some(no_epoch());
+    let receipt = source.fork(&cp, opts).unwrap();
+
+    assert_eq!(
+        receipt.session.config_layer_digests(),
+        expected,
+        "the fork restores the full ordered stack, not just the top layer"
+    );
+    let settings = receipt.session.host_settings();
+    let p = settings.provider.as_ref().expect("merged provider");
+    assert_eq!(
+        p.protocol.as_deref(),
+        Some("openai"),
+        "built-in default restored"
+    );
+    assert_eq!(
+        p.base_url.as_deref(),
+        Some("https://user"),
+        "user layer restored"
+    );
+    assert_eq!(
+        p.model.as_deref(),
+        Some("project-model"),
+        "project layer restored"
+    );
+    let a = settings.approval.as_ref().expect("merged approval");
+    assert_eq!(a.auto_approve, Some(true), "user approval restored");
+    assert_eq!(
+        receipt.session.composition().digest,
+        source.composition().digest,
+        "the fork's active composition reflects every restored layer"
+    );
+
+    receipt.session.close().unwrap();
+    source.close().unwrap();
+}
+
+/// F7(c): a session that dropped a user layer in safe mode keeps only the
+/// built-in config identity, so a later fork restores ONLY the built-in layer
+/// (not the dropped one).
+#[test]
+fn fork_after_safe_mode_restores_only_builtin_layer() {
+    require_guest();
+    let dir = TempDir::new("safe-fork");
+    let source_id = Id128::generate();
+    let builtin = builtin_config_manifest();
+    let builtin_digest = package_digest(&builtin);
+    let user = settings_manifest(
+        Id128::generate(),
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
+        r#"{"kind":"settings","provider":{"model":"user-model"}}"#,
+    );
+    let bad_project = PackageManifest {
+        schema: kanbei_modules::PACKAGE_SCHEMA,
+        module_id: Id128::generate(),
+        origin: ModuleOrigin::WorkspaceConfig,
+        trust_class: TrustClass::Workspace,
+        scope: ScopePath(vec![]),
+        deps: vec![],
+        capabilities: vec![],
+        source: "local x = = 1".to_string(),
+        state_schema: None,
+        state_key: None,
+    };
+    let mut source = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        memory_root: Some(dir.path().join("memory")),
+        session_id: Some(source_id),
+        config_layers: vec![builtin, user, bad_project],
+        engine: Some(no_epoch()),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        source.config_layer_digests(),
+        vec![builtin_digest],
+        "safe mode leaves only the built-in config identity"
+    );
+    let cp = source.create_checkpoint(None).unwrap();
+
+    let fork_dir = dir.path().join("fork");
+    let mut opts = fork_options(&fork_dir);
+    opts.config.engine = Some(no_epoch());
+    let receipt = source.fork(&cp, opts).unwrap();
+
+    assert_eq!(
+        receipt.session.config_layer_digests(),
+        vec![builtin_digest],
+        "the fork restores only the surviving built-in layer"
+    );
+    assert_eq!(
+        receipt
+            .session
+            .host_settings()
+            .provider
+            .as_ref()
+            .and_then(|p| p.model.as_deref()),
+        None,
+        "the dropped user layer's model does not come back"
+    );
     receipt.session.close().unwrap();
     source.close().unwrap();
 }

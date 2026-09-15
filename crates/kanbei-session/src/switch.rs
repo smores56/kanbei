@@ -210,21 +210,31 @@ impl Session {
             }
         }
 
-        // The config choice at the checkpoint: the chosen package manifest is
-        // activated at open (None = storage-only fork).
-        let config_manifest: Option<PackageManifest> =
-            match self.config_choice_at(checkpoint.seq)? {
-                Some(digest) => match self.store.get(&digest) {
-                    Ok(bytes) => serde_json::from_slice(&bytes).ok(),
-                    Err(_) => None,
-                },
-                None => None,
-            };
-        let config_digest = config_manifest.as_ref().map(|m| {
-            Digest::new(
-                &serde_json::to_vec(m).expect("package manifest serialization cannot fail"),
-            )
-        });
+        // The config choice at the checkpoint: the FULL ordered layer stack is
+        // activated at open (F5) — not just the top layer — so the fork's
+        // merged settings/composition reflect built-in defaults + every user/
+        // project layer. A digest missing from the source store is skipped
+        // (best-effort); the top survives as the `config` payload/ref meaning.
+        let layer_digests: Vec<Digest> =
+            self.config_choice_at(checkpoint.seq)?.unwrap_or_default();
+        let config_layers: Vec<PackageManifest> = layer_digests
+            .iter()
+            .filter_map(|digest| {
+                self.store
+                    .get(digest)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            })
+            .collect();
+        let loaded_digests: Vec<Digest> = config_layers
+            .iter()
+            .map(|m| {
+                Digest::new(
+                    &serde_json::to_vec(m).expect("package manifest serialization cannot fail"),
+                )
+            })
+            .collect();
+        let config_digest = loaded_digests.last().copied();
 
         // Open the forked session: the overridden lane fields (dir, identity,
         // policy, broker, memory root, config layers, project) beat anything
@@ -239,7 +249,7 @@ impl Session {
         target_cfg.policy = options.policy;
         target_cfg.broker = broker;
         target_cfg.memory_root = None;
-        target_cfg.config_layers = config_manifest.into_iter().collect();
+        target_cfg.config_layers = config_layers;
         target_cfg.gc = None;
         if source_project.is_some() {
             target_cfg.project = source_project;
@@ -257,9 +267,9 @@ impl Session {
         if let Some(project_root) = facts.project_memory_root {
             refs.push(project_root);
         }
-        if let Some(d) = config_digest {
-            refs.push(d);
-        }
+        // every restored config-layer package joins the refs, so all of them
+        // stay GC-rooted on the fork (F5).
+        refs.extend(loaded_digests.iter().copied());
         refs.extend(ws_manifests.iter().copied());
         let commit_result = fork.commit(
             vec![NewEvent {

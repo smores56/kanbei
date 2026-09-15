@@ -137,6 +137,18 @@ impl CompositionStore {
         self.stage_publish_planned(&staged.contributions, registry, plan)
     }
 
+    /// Re-seeds the current composition from the registry's live state after
+    /// an out-of-band registry mutation. The safe-mode rollback (R-01/C-02)
+    /// cannot be expressed as an OCC publish — settings/theme overlays are
+    /// merge-only and a dropped layer's residue needs a full-scope recompose —
+    /// so the caller mutates the registry directly and re-seeds here, keeping
+    /// `current()` (digest + contributions) in step with the registry before
+    /// committing the matching canonical `composition_changed`. Recomputes the
+    /// digest and advances the epoch exactly like an atomic publish.
+    pub fn reseed(&mut self, registry: &ContributionRegistry) {
+        self.commit(registry);
+    }
+
     fn commit(&mut self, registry: &ContributionRegistry) {
         let epoch = self.current.epoch + 1;
         let contributions = registry.snapshot();

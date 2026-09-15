@@ -22,9 +22,9 @@ impl Session {
         if let Some(snapshot) = self.current_snapshot {
             roots.push(snapshot);
         }
-        if let Some(config) = self.config_digest {
-            roots.push(config);
-        }
+        // Every live config-layer package (the ordered stack, F5), so a
+        // higher layer's package is rooted as well as the top `config_digest`.
+        roots.extend(self.config_layers.iter().map(|l| l.package));
         if let Some(pinned) = &self.pinned_roots {
             roots.push(pinned.lifetime);
             if let Some(project) = pinned.project {
@@ -41,6 +41,7 @@ impl Session {
             if let Some(composition) = record.config_choice.composition {
                 roots.push(composition);
             }
+            roots.extend(record.config_choice.layers.iter().copied());
         }
         for range in &self.compacted {
             roots.push(range.summary_digest);
@@ -249,6 +250,119 @@ fn collect_payload_digests(
         if key == "snapshot" {
             manifests.push(digest);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SessionConfig, builtin_config_manifest};
+    use kanbei_capabilities::TrustClass;
+    use kanbei_core::id::Id128;
+    use kanbei_modules::{ModuleOrigin, PackageManifest};
+    use kanbei_services::ScopePath;
+    use kanbei_vm::{GuestError, Vm, VmConfig};
+    use std::path::PathBuf;
+
+    fn no_epoch() -> VmConfig {
+        VmConfig {
+            fuel_per_call: u64::MAX,
+            epoch_deadline: u64::MAX,
+            ..Default::default()
+        }
+    }
+
+    fn root() -> ScopePath {
+        ScopePath(vec![])
+    }
+
+    fn settings_manifest(
+        id: Id128,
+        origin: ModuleOrigin,
+        trust_class: TrustClass,
+        payload: &str,
+    ) -> PackageManifest {
+        PackageManifest {
+            schema: kanbei_modules::PACKAGE_SCHEMA,
+            module_id: id,
+            origin,
+            trust_class,
+            scope: root(),
+            deps: vec![],
+            capabilities: vec![],
+            source: format!(
+                "function kb_on_activate(ctx) ctx.contribution_publish('{payload}') end\nfunction kb_hot(x) return x end"
+            ),
+            state_schema: None,
+            state_key: None,
+        }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kb-session-gc-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// F7(d)/A1: after a safe-mode drop the session's live GC roots name only
+    /// the surviving built-in config package — the dropped layer's package is
+    /// no longer rooted by the stale `config_digest`.
+    #[test]
+    fn safe_mode_gc_roots_exclude_dropped_layer() {
+        match Vm::load(no_epoch()) {
+            Ok(_) => {}
+            Err(GuestError::NotBuilt) => {
+                panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root")
+            }
+            Err(e) => panic!("Vm::load failed: {e}"),
+        }
+        let dir = temp_dir("safe-roots");
+        let builtin = builtin_config_manifest();
+        let builtin_digest = Digest::new(&serde_json::to_vec(&builtin).unwrap());
+        let user = settings_manifest(
+            Id128::generate(),
+            ModuleOrigin::UserConfig,
+            TrustClass::User,
+            r#"{"kind":"settings","provider":{"model":"user-model"}}"#,
+        );
+        let user_digest = Digest::new(&serde_json::to_vec(&user).unwrap());
+        let bad_project = PackageManifest {
+            schema: kanbei_modules::PACKAGE_SCHEMA,
+            module_id: Id128::generate(),
+            origin: ModuleOrigin::WorkspaceConfig,
+            trust_class: TrustClass::Workspace,
+            scope: root(),
+            deps: vec![],
+            capabilities: vec![],
+            source: "local x = = 1".to_string(),
+            state_schema: None,
+            state_key: None,
+        };
+        let session = Session::open(SessionConfig {
+            dir: dir.clone(),
+            engine: Some(no_epoch()),
+            config_layers: vec![builtin, user, bad_project],
+            ..Default::default()
+        })
+        .unwrap();
+        let roots = session.gc_live_roots();
+        assert!(
+            roots.contains(&builtin_digest),
+            "the surviving built-in config stays a live root"
+        );
+        assert!(
+            !roots.contains(&user_digest),
+            "the dropped user layer's package is not a live root"
+        );
+        session.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

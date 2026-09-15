@@ -689,6 +689,7 @@ fn continue_from_records_live_config_digest() {
         current: Some(config_digest),
         historical: Some(Digest::new(&provider_cfg.to_canonical_bytes())),
         composition: Some(session.composition().digest),
+        layers: vec![config_digest],
     };
     assert_eq!(record.config_choice, expected);
     session.close().unwrap();

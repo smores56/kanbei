@@ -1182,6 +1182,8 @@ fn safe_mode_drops_activated_user_layer_settings_residue() {
         state_schema: None,
         state_key: None,
     };
+    let user_digest = Digest::new(&serde_json::to_vec(&user).unwrap());
+    let builtin_digest = Digest::new(&serde_json::to_vec(&builtin_config_manifest()).unwrap());
     let session = Session::open(SessionConfig {
         dir: dir.path().to_path_buf(),
         engine: Some(no_epoch()),
@@ -1191,6 +1193,34 @@ fn safe_mode_drops_activated_user_layer_settings_residue() {
     .unwrap();
     // only the built-in generation survives
     assert_eq!(session.modules().unwrap().snapshot().len(), 1);
+    // F7/A1: the safe-mode drop is canonical — the config identity and the
+    // ordered layer stack name only the surviving built-in layer, and the
+    // live composition matches the registry (not the pre-drop stack).
+    assert_eq!(session.config_digest(), Some(builtin_digest));
+    assert_eq!(session.config_layer_digests(), vec![builtin_digest]);
+    assert!(
+        !session.config_layer_digests().contains(&user_digest),
+        "the dropped user layer is gone from the stack"
+    );
+    let reference_dir = TempDir::new("settings-safe-residue-ref");
+    let reference = Session::open(SessionConfig {
+        dir: reference_dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest()],
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        session.composition().digest,
+        reference.composition().digest,
+        "the live composition matches the built-in-only registry after the drop"
+    );
+    assert_eq!(
+        session.composition().contributions.len(),
+        reference.composition().contributions.len(),
+        "no dropped-layer contributions linger in the composition"
+    );
+    reference.close().unwrap();
     let settings = session.host_settings();
     let approval = settings
         .approval
@@ -1217,6 +1247,62 @@ fn safe_mode_drops_activated_user_layer_settings_residue() {
             .and_then(|p| p.protocol.as_deref()),
         Some("openai"),
         "built-in provider default survives"
+    );
+    // the drop is recorded canonically: a `composition_changed` whose
+    // `delta.removed` names the dropped user layer.
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert!(
+        envs.iter().any(|e| e.kind == "composition_changed"
+            && e.payload["delta"]["removed"]
+                .as_array()
+                .is_some_and(|r| !r.is_empty())),
+        "the safe-mode drop publishes a canonical composition_changed"
+    );
+    assert!(envs.iter().any(|e| e.kind == "safe_mode_activated"));
+    session.close().unwrap();
+}
+
+/// F5: `continue_from` records the FULL ordered config-layer stack (not just
+/// the top digest), so a later restore can replay every layer.
+#[test]
+fn continue_from_records_full_config_layer_stack() {
+    require_guest();
+    let dir = TempDir::new("continue-stack");
+    let builtin = builtin_config_manifest();
+    let user = settings_manifest(
+        Id128::generate(),
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
+        r#"{"kind":"settings","provider":{"base_url":"https://user"}}"#,
+    );
+    let project = settings_manifest(
+        Id128::generate(),
+        ModuleOrigin::WorkspaceConfig,
+        TrustClass::Workspace,
+        r#"{"kind":"settings","provider":{"model":"project-model"}}"#,
+    );
+    let expected = vec![
+        Digest::new(&serde_json::to_vec(&builtin).unwrap()),
+        Digest::new(&serde_json::to_vec(&user).unwrap()),
+        Digest::new(&serde_json::to_vec(&project).unwrap()),
+    ];
+    let mut session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin, user, project],
+        ..Default::default()
+    })
+    .unwrap();
+    let cp = session.create_checkpoint(None).unwrap();
+    let record = session.continue_from(&cp).unwrap();
+    assert_eq!(
+        record.config_choice.layers, expected,
+        "the branch point records the full ordered stack"
+    );
+    assert_eq!(
+        record.config_choice.current,
+        expected.last().copied(),
+        "current stays the top layer"
     );
     session.close().unwrap();
 }
