@@ -442,7 +442,10 @@ impl Session {
             let class = self
                 .ui_host
                 .as_mut()
-                .map(|host| host.classifier.classify(&event))
+                .map(|host| {
+                    let modal_active = host.focus.boundary().is_some();
+                    host.classifier.classify(&event, modal_active)
+                })
                 .unwrap_or(InputClass::Forward);
             match class {
                 InputClass::Reserved(ReservedAction::CancelRun) => {
@@ -453,6 +456,17 @@ impl Session {
                 InputClass::Reserved(ReservedAction::SafeModeChord) => {
                     self.enter_ui_safe_mode()?;
                     outcome.safe_mode = true;
+                    outcome.repaint = true;
+                }
+                InputClass::Reserved(ReservedAction::ModalEscape) => {
+                    // Reserved Escape leaves the active modal boundary; the
+                    // module never sees it (modal closure is not canonical).
+                    if let Some(host) = self.ui_host.as_mut()
+                        && let Some(tree) = host.last_tree.clone()
+                    {
+                        host.focus.escape_modal(&tree);
+                        host.focus.revalidate(&tree);
+                    }
                     outcome.repaint = true;
                 }
                 InputClass::Consumed => {}
@@ -789,6 +803,9 @@ impl Session {
         };
         host.last_status = status.clone();
         host.sync_summary();
+        // The tree is authoritative for modal containment: enter/leave the
+        // topmost modal boundary and clamp focus before rendering.
+        host.focus.sync_modal_boundary(&tree);
         let ctx = RenderContext {
             tree: &tree,
             theme: &host.theme,

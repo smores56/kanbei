@@ -12,6 +12,7 @@ use kanbei_capabilities::{
 };
 use kanbei_core::digest::Digest;
 use kanbei_core::id::Id128;
+use kanbei_modules::package::{ModuleOrigin, PackageManifest};
 use kanbei_scopes::contrib::ContributionKind;
 use kanbei_session::{Session, SessionConfig};
 
@@ -403,5 +404,69 @@ fn atomic_fallback_two_mounts() {
     let frame = session.ui().unwrap().last_frame().unwrap().clone();
     assert!(frame.row_text(0).starts_with("composition stale"), "banner rendered");
     assert!(body(&session).contains("panel stat_ui"), "last-valid composite still renders");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A single-mount UI fixture whose tree carries a non-modal button, a
+/// non-modal overlay button, and a higher-z modal `layer` holding an input +
+/// button: the kernel confines the focus ring to the modal.
+fn modal_module() -> PackageManifest {
+    let source = r#"
+function kb_on_activate(ctx)
+  ctx.contribution_publish('{"kind":"ui","name":"modal_ui","component":"modal_comp","slot":"main"}')
+end
+function kb_hot(d)
+  if d.entry == "ui_reduce" then
+    return { state = d.state, intents = {} }
+  elseif d.entry == "ui_render" then
+    return { root = { id = "root", kind = "stack", children = {
+      { id = "outside_btn", kind = "button", label = "outside" },
+      { id = "overlay", kind = "layer", z = 1, modal = false, children = {
+        { id = "under_btn", kind = "button", label = "under" },
+      } },
+      { id = "sheet", kind = "layer", z = 5, modal = true, children = {
+        { id = "m_input", kind = "input", content = "x" },
+        { id = "m_btn", kind = "button", label = "ok" },
+      } },
+    } } }
+  end
+  error("unknown entry: " .. tostring(d.entry))
+end
+"#;
+    PackageManifest {
+        schema: kanbei_modules::PACKAGE_SCHEMA,
+        module_id: Id128::generate(),
+        origin: ModuleOrigin::UserConfig,
+        trust_class: TrustClass::Builtin,
+        scope: kanbei_services::ScopePath(vec!["root".into()]),
+        deps: Vec::new(),
+        capabilities: Vec::new(),
+        source: source.to_string(),
+        state_schema: None,
+        state_key: None,
+    }
+}
+
+/// Modal containment is kernel-owned and driven by the render: focus enters
+/// the topmost modal layer and Tab cycles only its focusables.
+#[test]
+fn modal_confines_focus_after_render() {
+    require_guest();
+    let (dir, mut session) = open("modal-focus");
+    session.activate_ui(modal_module()).unwrap();
+    session.ui_render_frame().unwrap();
+    assert_eq!(
+        session.ui().unwrap().focus.focused.as_deref(),
+        Some("m_input"),
+        "focus enters the topmost modal"
+    );
+    session.ui_handle_input(b"\t").unwrap();
+    assert_eq!(session.ui().unwrap().focus.focused.as_deref(), Some("m_btn"));
+    session.ui_handle_input(b"\t").unwrap();
+    assert_eq!(
+        session.ui().unwrap().focus.focused.as_deref(),
+        Some("m_input"),
+        "Tab wraps inside the modal, never reaching outside/under"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -25,6 +25,14 @@ pub struct FocusModel {
     pub focused: Option<String>,
     pub caret: usize,
     pub viewport_top: usize,
+    /// The active modal boundary: the topmost modal layer whose focusable
+    /// descendants the ring is confined to. `None` = the whole tree.
+    boundary: Option<String>,
+    /// The boundary the user dismissed with modal escape; containment stays
+    /// suspended for it until the topmost modal changes.
+    escaped: Option<String>,
+    /// Focus to restore when the active boundary is left.
+    restore: Option<String>,
 }
 
 impl Default for FocusModel {
@@ -39,34 +47,148 @@ impl FocusModel {
             focused: None,
             caret: 0,
             viewport_top: 0,
+            boundary: None,
+            escaped: None,
+            restore: None,
         }
     }
 
+    /// The active modal containment scope (the topmost modal layer's id), if
+    /// any. `None` means the ring spans the whole tree.
+    pub fn boundary(&self) -> Option<&str> {
+        self.boundary.as_deref()
+    }
+
     /// Restore the invariants against the current tree: focus names a
-    /// focusable, non-disabled node; caret is clamped to the focused input's
-    /// content length.
+    /// focusable, non-disabled node INSIDE the active modal boundary; caret is
+    /// clamped to the focused input's content length.
     pub fn revalidate(&mut self, tree: &SemanticTree) {
+        self.sync_boundary(tree);
         match &self.focused {
-            Some(id) if tree.is_focusable(id) => {}
+            Some(id) if self.in_scope(tree, id) => {}
             _ => {
-                self.focused = tree.focusable().first().map(|n| n.id.clone());
+                self.focused = self.ring(tree).first().map(|n| n.id.clone());
                 self.caret = 0;
             }
         }
         if let Some(node) = self.focused_node(tree) {
-            if node.kind() == crate::NodeKind::Input {
-                self.caret = self.caret.min(node.content().chars().count());
-            } else {
-                self.caret = 0;
-            }
+            self.clamp_caret(node);
         }
+    }
+
+    /// Reconcile the modal containment scope with a freshly rendered tree
+    /// WITHOUT inventing a focus when none exists yet: entering a boundary
+    /// pulls focus inside, and a vanished or out-of-scope focused id clamps.
+    /// Keeps the module-driven Enter semantics while nothing is focused.
+    pub fn sync_modal_boundary(&mut self, tree: &SemanticTree) {
+        self.sync_boundary(tree);
+        let needs_clamp = match &self.focused {
+            Some(id) => !self.in_scope(tree, id),
+            None => self.boundary.is_some(),
+        };
+        if needs_clamp {
+            self.focused = self.ring(tree).first().map(|n| n.id.clone());
+            self.caret = 0;
+        }
+        if let Some(node) = self.focused_node(tree) {
+            self.clamp_caret(node);
+        }
+    }
+
+    fn clamp_caret(&mut self, node: &Node) {
+        if node.kind() == crate::NodeKind::Input {
+            self.caret = self.caret.min(node.content().chars().count());
+        } else {
+            self.caret = 0;
+        }
+    }
+
+    /// Reconcile the containment scope with the tree: enter the new topmost
+    /// modal boundary, leave one that disappeared (restoring the remembered
+    /// focus), or switch between them.
+    fn sync_boundary(&mut self, tree: &SemanticTree) {
+        let top = tree.modal_boundary().map(|n| n.id.clone());
+        // A dismissal is scoped to the exact modal it was issued for.
+        if self.escaped != top {
+            self.escaped = None;
+        }
+        let active = match &top {
+            Some(id) if self.escaped.as_deref() != Some(id.as_str()) => Some(id.clone()),
+            _ => None,
+        };
+        if active == self.boundary {
+            return;
+        }
+        match (active, self.boundary.take()) {
+            // Entering: remember the outside focus to restore later.
+            (Some(id), None) => {
+                self.restore = self.focused.clone();
+                self.boundary = Some(id);
+            }
+            // Leaving: restore the remembered focus (revalidated by caller).
+            (None, Some(_)) => {
+                if let Some(restore) = self.restore.take()
+                    && tree.is_focusable(&restore)
+                {
+                    self.focused = Some(restore);
+                    self.caret = 0;
+                }
+            }
+            // Switching boundaries: restore only a focus from outside the new
+            // boundary.
+            (Some(id), Some(_)) => {
+                if !self.in_boundary(tree, &id, self.focused.as_deref()) {
+                    self.restore = self.focused.clone();
+                }
+                self.boundary = Some(id);
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// The focus ring for the current containment scope: the whole tree, or
+    /// the focusable descendants of the active modal boundary.
+    pub fn ring<'a>(&self, tree: &'a SemanticTree) -> Vec<&'a Node> {
+        match self.boundary.as_deref() {
+            Some(boundary) => tree
+                .subtree(boundary)
+                .into_iter()
+                .filter(|n| n.is_focusable())
+                .collect(),
+            None => tree.focusable(),
+        }
+    }
+
+    /// Dismiss the active modal boundary (kernel-reserved Escape): the ring
+    /// spans the whole tree again and focus returns to where it was before
+    /// containment.
+    pub fn escape_modal(&mut self, tree: &SemanticTree) {
+        if let Some(top) = tree.modal_boundary() {
+            self.escaped = Some(top.id.clone());
+        }
+    }
+
+    fn in_scope(&self, tree: &SemanticTree, id: &str) -> bool {
+        match self.boundary.as_deref() {
+            Some(boundary) => self.in_boundary(tree, boundary, Some(id)),
+            None => tree.is_focusable(id),
+        }
+    }
+
+    fn in_boundary(&self, tree: &SemanticTree, boundary: &str, id: Option<&str>) -> bool {
+        let Some(id) = id else {
+            return false;
+        };
+        tree.subtree(boundary)
+            .into_iter()
+            .any(|n| n.id == id && n.is_focusable())
     }
 
     /// Move focus through the focusable ring. Left/Right move the caret when
     /// the focused node is an input and are otherwise no-ops.
     pub fn move_focus(&mut self, tree: &SemanticTree, dir: FocusDirection) {
         self.revalidate(tree);
-        let ring = tree.focusable();
+        let ring = self.ring(tree);
         self.move_ring(dir, ring);
     }
 
@@ -77,11 +199,20 @@ impl FocusModel {
     /// must be a composite id (see `SemanticTree::compose`).
     pub fn move_focus_within(&mut self, tree: &SemanticTree, dir: FocusDirection, root_id: &str) {
         self.revalidate(tree);
-        let ring: Vec<&Node> = tree
+        let mut ring: Vec<&Node> = tree
             .subtree(root_id)
             .into_iter()
             .filter(|n| n.is_focusable())
             .collect();
+        // Containment wins over the within-mount restriction: never traverse
+        // out of the active modal boundary.
+        if let Some(boundary) = self.boundary.as_deref() {
+            let scope: Vec<&str> = tree.subtree(boundary).iter().map(|n| n.id.as_str()).collect();
+            ring.retain(|n| scope.contains(&n.id.as_str()));
+            if ring.is_empty() {
+                ring = self.ring(tree);
+            }
+        }
         self.move_ring(dir, ring);
     }
 
@@ -166,6 +297,9 @@ pub enum ReservedAction {
     Repaint,
     /// Enter kernel safe mode (Ctrl-X Ctrl-S).
     SafeModeChord,
+    /// Leave the active modal focus boundary (Escape). Reserved only while a
+    /// modal boundary is active; otherwise Escape forwards to the module.
+    ModalEscape,
 }
 
 /// Result of classifying one decoded input event against the kernel-reserved
@@ -195,7 +329,7 @@ impl KeyClassifier {
         }
     }
 
-    pub fn classify(&mut self, e: &crate::InputEvent) -> InputClass {
+    pub fn classify(&mut self, e: &crate::InputEvent, modal_active: bool) -> InputClass {
         match e {
             crate::InputEvent::CtrlC => {
                 self.safe_mode_pending = false;
@@ -212,6 +346,12 @@ impl KeyClassifier {
             crate::InputEvent::Char('s') if self.safe_mode_pending => {
                 self.safe_mode_pending = false;
                 InputClass::Reserved(ReservedAction::SafeModeChord)
+            }
+            // Escape is kernel-owned only while a modal boundary is active;
+            // otherwise it belongs to the module.
+            crate::InputEvent::Escape if modal_active => {
+                self.safe_mode_pending = false;
+                InputClass::Reserved(ReservedAction::ModalEscape)
             }
             _ => {
                 self.safe_mode_pending = false;
@@ -274,16 +414,16 @@ mod tests {
     #[test]
     fn reserved_keys() {
         let mut c = KeyClassifier::new();
-        assert_eq!(c.classify(&crate::InputEvent::CtrlC), InputClass::Reserved(ReservedAction::CancelRun));
-        assert_eq!(c.classify(&crate::InputEvent::CtrlL), InputClass::Reserved(ReservedAction::Repaint));
-        assert_eq!(c.classify(&crate::InputEvent::CtrlX), InputClass::Consumed);
-        assert_eq!(c.classify(&crate::InputEvent::Char('x')), InputClass::Forward);
-        assert_eq!(c.classify(&crate::InputEvent::CtrlX), InputClass::Consumed);
-        assert_eq!(c.classify(&crate::InputEvent::Char('s')), InputClass::Reserved(ReservedAction::SafeModeChord));
+        assert_eq!(c.classify(&crate::InputEvent::CtrlC, false), InputClass::Reserved(ReservedAction::CancelRun));
+        assert_eq!(c.classify(&crate::InputEvent::CtrlL, false), InputClass::Reserved(ReservedAction::Repaint));
+        assert_eq!(c.classify(&crate::InputEvent::CtrlX, false), InputClass::Consumed);
+        assert_eq!(c.classify(&crate::InputEvent::Char('x'), false), InputClass::Forward);
+        assert_eq!(c.classify(&crate::InputEvent::CtrlX, false), InputClass::Consumed);
+        assert_eq!(c.classify(&crate::InputEvent::Char('s'), false), InputClass::Reserved(ReservedAction::SafeModeChord));
         // any other key clears the pending chord
-        assert_eq!(c.classify(&crate::InputEvent::CtrlX), InputClass::Consumed);
-        assert_eq!(c.classify(&crate::InputEvent::Char('a')), InputClass::Forward);
-        assert_eq!(c.classify(&crate::InputEvent::Char('s')), InputClass::Forward);
+        assert_eq!(c.classify(&crate::InputEvent::CtrlX, false), InputClass::Consumed);
+        assert_eq!(c.classify(&crate::InputEvent::Char('a'), false), InputClass::Forward);
+        assert_eq!(c.classify(&crate::InputEvent::Char('s'), false), InputClass::Forward);
     }
 
     #[test]
@@ -313,5 +453,85 @@ mod tests {
         // Up from mount 1 stays there
         f.move_focus_within(&composite, FocusDirection::Up, "1.root");
         assert_eq!(f.focused.as_deref(), Some("1.input"));
+    }
+
+    /// A tree with an outside button, a non-modal overlay button, and a
+    /// topmost modal layer holding an input + button.
+    fn modal_tree() -> SemanticTree {
+        SemanticTree::new(
+            Node::stack("root")
+                .child(Node::button("outside", "outside"))
+                .child(Node::layer("overlay", 1, false).child(Node::button("under", "under")))
+                .child(
+                    Node::layer("modal", 2, true)
+                        .child(Node::input("m_input", "hi"))
+                        .child(Node::button("m_btn", "ok")),
+                ),
+        )
+    }
+
+    #[test]
+    fn modal_confines_focus_to_topmost_layer() {
+        let t = modal_tree();
+        let mut f = FocusModel::new();
+        f.revalidate(&t);
+        // entering the boundary moves focus to its first focusable
+        assert_eq!(f.focused.as_deref(), Some("m_input"));
+        assert_eq!(f.boundary(), Some("modal"));
+        // traversal cycles only within the boundary
+        f.move_focus(&t, FocusDirection::Next);
+        assert_eq!(f.focused.as_deref(), Some("m_btn"));
+        f.move_focus(&t, FocusDirection::Next);
+        assert_eq!(f.focused.as_deref(), Some("m_input"));
+        f.move_focus(&t, FocusDirection::Prev);
+        assert_eq!(f.focused.as_deref(), Some("m_btn"));
+        // within-mount traversal (Tab/arrows) cannot escape either
+        f.move_focus_within(&t, FocusDirection::Down, "root");
+        assert_eq!(f.focused.as_deref(), Some("m_input"));
+        // the outside/non-modal focusables exist but stay unreachable
+        assert!(t.is_focusable("outside"));
+        assert!(t.is_focusable("under"));
+    }
+
+    #[test]
+    fn focus_clamps_into_boundary_when_its_node_vanishes() {
+        let mut f = FocusModel::new();
+        f.focused = Some("outside".into());
+        f.revalidate(&modal_tree());
+        // focus is inside the boundary; a stale outside id cannot linger
+        assert_eq!(f.focused.as_deref(), Some("m_input"));
+    }
+
+    #[test]
+    fn modal_escape_restores_focus_and_frees_ring() {
+        let t = modal_tree();
+        let mut f = FocusModel::new();
+        f.focused = Some("outside".into());
+        f.revalidate(&t);
+        assert_eq!(f.focused.as_deref(), Some("m_input"));
+        f.escape_modal(&t);
+        f.revalidate(&t);
+        assert_eq!(f.boundary(), None);
+        assert_eq!(
+            f.focused.as_deref(),
+            Some("outside"),
+            "escape restores the pre-modal focus"
+        );
+        // the whole tree is reachable again
+        f.move_focus(&t, FocusDirection::Next);
+        assert_eq!(f.focused.as_deref(), Some("under"));
+    }
+
+    #[test]
+    fn escape_is_reserved_only_under_an_active_modal() {
+        let mut c = KeyClassifier::new();
+        assert_eq!(
+            c.classify(&crate::InputEvent::Escape, false),
+            InputClass::Forward
+        );
+        assert_eq!(
+            c.classify(&crate::InputEvent::Escape, true),
+            InputClass::Reserved(ReservedAction::ModalEscape)
+        );
     }
 }

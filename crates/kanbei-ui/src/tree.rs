@@ -337,6 +337,13 @@ impl Node {
     pub fn is_focusable(&self) -> bool {
         self.is_interactive() && !self.disabled
     }
+
+    /// Whether this node or any descendant is focusable (the kernel's ring
+    /// membership, ignoring disabled ancestors: such trees are rejected by
+    /// the accessibility pass).
+    pub fn has_focusable_descendant(&self) -> bool {
+        self.is_focusable() || self.children.iter().any(|c| c.has_focusable_descendant())
+    }
 }
 
 /// An immutable module-authored UI snapshot. `root.kind` must be `Stack`.
@@ -492,6 +499,26 @@ impl SemanticTree {
     /// ring).
     pub fn focusable(&self) -> Vec<&Node> {
         self.nodes().into_iter().filter(|n| n.is_focusable()).collect()
+    }
+
+    /// The topmost modal `layer` (kernel focus containment scope): highest
+    /// `z`, ties broken by document order so the last one wins. `None` when
+    /// the tree has no modal layer.
+    pub fn modal_boundary(&self) -> Option<&Node> {
+        let mut best: Option<(&Node, i32)> = None;
+        for node in self.nodes() {
+            if node.modal() {
+                let replace = match best {
+                    None => true,
+                    // `>=` makes an equal-z later node win document order.
+                    Some((_, z)) => node.z() >= z,
+                };
+                if replace {
+                    best = Some((node, node.z()));
+                }
+            }
+        }
+        best.map(|(node, _)| node)
     }
 
     pub fn node(&self, id: &str) -> Option<&Node> {
@@ -886,6 +913,42 @@ mod tests {
         let parsed = SemanticTree::from_json(&layered.to_json()).unwrap();
         assert_eq!(parsed.node("high").unwrap().z(), 3);
         assert_eq!(parsed.node("low").unwrap().z(), -1);
+    }
+
+    #[test]
+    fn modal_boundary_is_topmost_by_z_then_document_order() {
+        // no modal layer -> no boundary
+        let none = SemanticTree::new(Node::stack("root").child(Node::layer("l", 5, false)));
+        assert!(none.modal_boundary().is_none());
+        // highest z wins regardless of document order
+        let by_z = SemanticTree::new(
+            Node::stack("root")
+                .child(Node::layer("first", 3, true))
+                .child(Node::layer("second", 1, true)),
+        );
+        assert_eq!(by_z.modal_boundary().unwrap().id, "first");
+        // equal z: document order, last wins
+        let tie = SemanticTree::new(
+            Node::stack("root")
+                .child(Node::layer("first", 2, true))
+                .child(Node::layer("second", 2, true)),
+        );
+        assert_eq!(tie.modal_boundary().unwrap().id, "second");
+        // a non-modal layer never wins on z alone
+        let non_modal = SemanticTree::new(
+            Node::stack("root")
+                .child(Node::layer("modal", -1, true))
+                .child(Node::layer("overlay", 9, false)),
+        );
+        assert_eq!(non_modal.modal_boundary().unwrap().id, "modal");
+        // a nested modal can be the topmost boundary
+        let nested = SemanticTree::new(
+            Node::stack("root").child(
+                Node::layer("outer", 1, true)
+                    .child(Node::layer("inner", 2, true).child(Node::input("i", ""))),
+            ),
+        );
+        assert_eq!(nested.modal_boundary().unwrap().id, "inner");
     }
 
     #[test]

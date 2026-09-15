@@ -56,6 +56,14 @@ fn walk(node: &crate::Node, disabled_ancestor: bool, issues: &mut Vec<Issue>) {
     if node.is_interactive() && disabled {
         issues.push(Issue::error(&node.id, "focusable node is inside a disabled subtree"));
     }
+    // A modal layer with no focusable descendant is unusable: the kernel
+    // cannot place focus inside it (inescapable modal).
+    if node.modal() && !node.has_focusable_descendant() {
+        issues.push(Issue::error(
+            &node.id,
+            "modal layer has no focusable descendant",
+        ));
+    }
     if node.label().chars().any(|c| c.is_control()) {
         issues.push(Issue::warning(&node.id, "content contains control characters"));
     }
@@ -145,5 +153,29 @@ mod tests {
             Node::stack("root").child(Node::text("", "x")),
         );
         assert!(validate(&t).iter().any(|i| i.node_id.is_empty()));
+    }
+
+    #[test]
+    fn modal_without_focusable_descendant_is_error() {
+        let t = SemanticTree::new(
+            Node::stack("root")
+                .child(Node::layer("modal", 1, true).child(Node::text("t", "just text"))),
+        );
+        assert!(!is_valid(&t));
+        let issues = issues_for(&t, "modal");
+        assert!(issues.iter().any(|i| i.severity == Severity::Error));
+        // a modal with a focusable descendant is usable
+        let ok = SemanticTree::new(
+            Node::stack("root")
+                .child(Node::layer("modal", 1, true).child(Node::input("i", ""))),
+        );
+        assert!(is_valid(&ok));
+        // focusables OUTSIDE the boundary are unreachable, not an error
+        let reachable = SemanticTree::new(
+            Node::stack("root")
+                .child(Node::button("outside", "outside"))
+                .child(Node::layer("modal", 1, true).child(Node::input("i", ""))),
+        );
+        assert!(is_valid(&reachable));
     }
 }
