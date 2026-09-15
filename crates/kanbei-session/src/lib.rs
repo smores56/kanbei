@@ -80,6 +80,7 @@ mod telemetry;
 mod branch;
 mod builtin_config;
 mod commit;
+mod discovery;
 mod elements;
 mod recovery;
 mod switch;
@@ -87,6 +88,7 @@ use recovery::{decode_record, recover_or_fresh, shutdown_queue};
 pub use builtin_config::{
     BUILTIN_CONFIG_SOURCE, builtin_config_manifest, builtin_config_module_id, root_scope,
 };
+pub use discovery::{DiscoveryError, discover_config_layers};
 pub use ui::{UiHost, UiIntent, UiOutcome, UI_INTENT_RESOURCE};
 
 /// The bounded recent-event ring size: the trajectory render covers the

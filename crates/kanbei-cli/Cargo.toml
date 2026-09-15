@@ -12,6 +12,7 @@ path = "src/main.rs"
 kanbei-capabilities.workspace = true
 kanbei-core.workspace = true
 kanbei-driver.workspace = true
+kanbei-modules.workspace = true
 kanbei-provider.workspace = true
 kanbei-session.workspace = true
 kanbei-tools.workspace = true

@@ -38,12 +38,13 @@ pub fn root_scope() -> ScopePath {
     ScopePath(vec![])
 }
 
-/// The built-in layer's deterministic module id: the first 16 bytes of the
-/// source digest, shaped as a UUIDv7 (nonzero high byte with the top bit
+/// A deterministic module id for immutable config content: the first 16 bytes
+/// of the seed digest, shaped as a UUIDv7 (nonzero high byte with the top bit
 /// clear, version/variant nibbles) so the text form keeps the frozen 21-char
-/// base58 width.
-pub fn builtin_config_module_id() -> Id128 {
-    let digest = Digest::new(BUILTIN_CONFIG_SOURCE.as_bytes());
+/// base58 width. Shared by the built-in layer and file-discovered layers
+/// ([`crate::discovery`]) so rebuilds/reopens address the same identity.
+pub(crate) fn config_module_id(seed: &[u8]) -> Id128 {
+    let digest = Digest::new(seed);
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest.as_bytes()[..16]);
     // Freeze the text form at the 21-char base58 width: 16 bytes need a high
@@ -53,6 +54,11 @@ pub fn builtin_config_module_id() -> Id128 {
     bytes[6] = (bytes[6] & 0x0f) | 0x70;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Id128::from_bytes(bytes)
+}
+
+/// The built-in layer's deterministic module id, derived from its source.
+pub fn builtin_config_module_id() -> Id128 {
+    config_module_id(BUILTIN_CONFIG_SOURCE.as_bytes())
 }
 
 /// The built-in config generation manifest: `Builtin` origin/trust, root

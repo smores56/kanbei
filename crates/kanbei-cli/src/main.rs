@@ -2,7 +2,10 @@
 //!
 //! Usage: `kanbei [DIR] [--model M] [--fake] [--auto-approve] [--yolo]`
 //!
-//! DIR defaults to `$KANBEI_DIR`, then `.` (the session dir). Provider:
+//! DIR defaults to `$KANBEI_DIR`, then `.` (the session dir). The session dir
+//! is also the project-config root: `discover_config_layers` activates the
+//! built-in defaults, then `$XDG_CONFIG_HOME/kanbei/init.lua` (or
+//! `$HOME/.config/kanbei/init.lua`), then `<DIR>/.kanbei/init.lua`. Provider:
 //! `--fake` (a scripted one-shot engine for smoke runs) or
 //! `KANBEI_PROVIDER_URL` / `KANBEI_PROVIDER_KEY` / `KANBEI_PROVIDER_MODEL`
 //! (an OpenAI-compatible chat-completions endpoint; `--model` overrides the
@@ -30,6 +33,7 @@ use kanbei_core::digest::Digest;
 use kanbei_core::envelope::Envelope;
 use kanbei_core::id::Id128;
 use kanbei_driver::{Driver, Turn};
+use kanbei_modules::PackageManifest;
 use kanbei_provider::{
     CompletionRequest, CompletionResponse, FinishReason, HttpEngine, KeySource, ProviderConfig,
     ProviderEngine, ProviderError, Usage,
@@ -365,6 +369,21 @@ fn yolo_broker(session_id: Id128) -> Broker {
     broker
 }
 
+/// Discovers the desired-state config layers for the session dir. A discovery
+/// failure (a user/project config file that exists but cannot be read) must
+/// not abort startup: surface an actionable line and degrade to built-in-only
+/// layers. Safe mode remains the activation-failure path (a syntactically
+/// broken file is read, then fails to activate).
+fn discover_config_layers_or_default(dir: &Path) -> Vec<PackageManifest> {
+    match kanbei_session::discover_config_layers(dir) {
+        Ok(layers) => layers,
+        Err(e) => {
+            eprintln!("kanbei: {e}; falling back to built-in config defaults");
+            vec![kanbei_session::builtin_config_manifest()]
+        }
+    }
+}
+
 /// Piped-stdin path: the plain line REPL.
 fn run_repl(opts: Options, engine: Box<dyn ProviderEngine>) {
     let yolo_id = opts.yolo.then(Id128::generate);
@@ -374,6 +393,7 @@ fn run_repl(opts: Options, engine: Box<dyn ProviderEngine>) {
         engine: Some(cli_engine()),
         provider_engine: Some(engine),
         fs_root: opts.dir.clone(),
+        config_layers: discover_config_layers_or_default(&opts.dir),
         broker: yolo_id
             .as_ref()
             .map(|id| yolo_broker(*id))
@@ -507,6 +527,7 @@ fn run_tui(opts: Options, engine: Box<dyn ProviderEngine>) -> i32 {
         engine: Some(cli_engine()),
         provider_engine: Some(engine),
         fs_root: opts.dir.clone(),
+        config_layers: discover_config_layers_or_default(&opts.dir),
         broker: yolo_id
             .as_ref()
             .map(|id| yolo_broker(*id))

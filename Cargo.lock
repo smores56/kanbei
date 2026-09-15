@@ -1728,6 +1728,7 @@ dependencies = [
  "kanbei-capabilities",
  "kanbei-core",
  "kanbei-driver",
+ "kanbei-modules",
  "kanbei-provider",
  "kanbei-session",
  "kanbei-tools",
