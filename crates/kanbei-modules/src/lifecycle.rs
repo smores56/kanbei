@@ -769,6 +769,12 @@ impl ModuleManager {
         self.host.ui_generation(component)
     }
 
+    /// The stable module id of a live generation, if any (UI keybinding
+    /// ownership attribution).
+    pub fn generation_module_id(&self, generation: u64) -> Option<Id128> {
+        self.host.generation_module_id(generation)
+    }
+
     /// The live generation that declared hook `(scope, kind, name)`, if any
     /// (T9/E: the full scope path is part of the key).
     pub fn hook_generation(&self, scope: &ScopePath, hook: HookKind, name: &str) -> Option<u64> {

@@ -8,7 +8,7 @@ mod common;
 use kanbei_capabilities::TrustClass;
 use kanbei_core::id::Id128;
 use kanbei_modules::package::{ModuleOrigin, PackageManifest};
-use kanbei_session::Session;
+use kanbei_session::{Session, SessionConfig};
 
 use common::{open, require_guest};
 
@@ -252,4 +252,137 @@ fn cancel_run_binding_is_kernel_handled() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// N1: a degraded module disables only its OWN bindings, not every binding in
+/// its scope; another root-scope module's binding still dispatches.
+#[test]
+fn degraded_module_does_not_disable_another_modules_binding() {
+    let (dir, mut session) = open("keymap-owner-attribution");
+    require_guest();
+    // Both root-scope; only `a` publishes a `g -> cmd_g` binding.
+    session
+        .activate_ui(dispatch_module("a", "a_comp", "main", true, false))
+        .unwrap();
+    session
+        .activate_ui(dispatch_module("b", "b_comp", "status", false, true))
+        .unwrap();
+    session.ui_render_frame().unwrap();
+
+    // Trip `b` (flaky on "x"), degrading its mount.
+    session.ui_mut().unwrap().focus.focused = Some("1.b_input".to_string());
+    session.ui_handle_input(b"x").unwrap();
+    assert!(session.ui().unwrap().mounts[1].degraded, "b degraded");
+
+    // `a`'s binding is unattributed to the dead mount: still dispatch.
+    session.ui_handle_input(b"g").unwrap();
+    assert!(
+        saw_command(&session, 0, "cmd_g"),
+        "a's binding survives b's fault"
+    );
+    assert!(
+        !saw_char(&session, 0, 'g'),
+        "the bound key is not raw-forwarded to a"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// N3: a command with no resolvable owner mount falls back to the focused
+/// mount (never dropped).
+#[test]
+fn command_delivers_when_no_mount_is_focused() {
+    let (dir, mut session) = open("keymap-no-focus");
+    require_guest();
+    session
+        .activate_ui(dispatch_module("a", "a_comp", "main", true, false))
+        .unwrap();
+    session
+        .activate_ui(dispatch_module("b", "b_comp", "status", false, false))
+        .unwrap();
+    session.ui_render_frame().unwrap();
+
+    session.ui_mut().unwrap().focus.focused = None;
+    session.ui_handle_input(b"g").unwrap();
+    assert!(
+        saw_command(&session, 0, "cmd_g"),
+        "the owner mount still receives the command"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// N2: routing is by the binding's OWNER, not the focused mount: a binding
+/// owned by `a` reaches `a` even while `b` holds focus.
+#[test]
+fn owner_binding_reaches_owner_not_focused_mount() {
+    let (dir, mut session) = open("keymap-owner-route");
+    require_guest();
+    session
+        .activate_ui(dispatch_module("a", "a_comp", "main", true, false))
+        .unwrap();
+    session
+        .activate_ui(dispatch_module("b", "b_comp", "status", false, false))
+        .unwrap();
+    session.ui_render_frame().unwrap();
+
+    // Focus `b`, which owns no binding; `a`'s binding must still reach `a`.
+    session.ui_mut().unwrap().focus.focused = Some("1.b_input".to_string());
+    session.ui_handle_input(b"g").unwrap();
+    assert!(saw_command(&session, 0, "cmd_g"), "a (the owner) receives it");
+    assert!(
+        !saw_command(&session, 1, "cmd_g"),
+        "the focused victim mount does not"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// N11: the BUILT-IN config layer's `ctrl-c -> cancel_run` binding survives the
+/// activation path into the registry and dispatches as a kernel-handled cancel
+/// (not merely a source-string assertion).
+#[test]
+fn builtin_layer_ctrl_c_dispatches_as_kernel_cancel() {
+    let dir = common::tempdir("keymap-builtin-cancel");
+    require_guest();
+    let mut session = Session::open(SessionConfig {
+        dir: dir.clone(),
+        stream: "m8-keymap-builtin-cancel".to_string(),
+        engine: Some(common::engine()),
+        config_layers: vec![kanbei_session::builtin_config_manifest()],
+        ..Default::default()
+    })
+    .unwrap();
+    session.activate_builtin_ui().unwrap();
+    session.ui_render_frame().unwrap();
+
+    let outcome = session.ui_handle_input(b"\x03").unwrap();
+    assert!(
+        outcome.repaint,
+        "the built-in ctrl-c -> cancel_run binding is kernel-handled"
+    );
+    let text = body(&session);
+    assert!(
+        !text.contains("command:cancel_run"),
+        "cancel_run is not fan-out to a reducer: {text}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Whether the mount at `index` recorded the routed command `action`.
+fn saw_command(session: &Session, index: usize, action: &str) -> bool {
+    state_contains(session, index, &format!("command:{action}"))
+}
+
+/// Whether the mount at `index` recorded raw-forwarded char `c`.
+fn saw_char(session: &Session, index: usize, c: char) -> bool {
+    state_contains(session, index, &format!("char:{c}"))
+}
+
+fn state_contains(session: &Session, index: usize, needle: &str) -> bool {
+    session.ui().unwrap().mounts[index]
+        .reducer_state
+        .to_string()
+        .contains(needle)
 }

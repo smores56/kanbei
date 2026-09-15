@@ -242,6 +242,7 @@ mod tests {
                     context: ContextPredicate::Always,
                     action: "a".into(),
                     origin: KeymapOrigin::Builtin,
+                    owner: None,
                 }),
             },
             Contribution {
@@ -314,6 +315,7 @@ mod tests {
                     context: ContextPredicate::Always,
                     action: "a".into(),
                     origin: KeymapOrigin::Builtin,
+                    owner: None,
                 }),
             },
             Contribution {

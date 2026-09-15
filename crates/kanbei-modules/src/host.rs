@@ -790,6 +790,7 @@ impl ModuleHost {
                             context,
                             action: action.to_string(),
                             origin,
+                            owner: Some(info.module_id),
                         }),
                     });
                 }
@@ -799,7 +800,31 @@ impl ModuleHost {
         };
         let mut contributions = self.contributions.lock().expect("contributions lock poisoned");
         self.ensure_current(info.generation)?;
-        contributions.entry(info.generation).or_default().extend(staged);
+        // N6: the per-publish cap is not cumulative — a module could call
+        // `contribution_publish` repeatedly and accumulate unbounded keymap
+        // layers. Enforce a per-generation TOTAL instead (reject once it would
+        // exceed `MAX_KEYBINDINGS`); reject rather than deduplicate, so a
+        // module cannot silently lose bindings to a collision-based drop.
+        if kind == "keymap" {
+            let staged_count = contributions
+                .get(&info.generation)
+                .map(|c| {
+                    c.iter()
+                        .filter(|c| matches!(c.kind, ContributionKind::Keymap(_)))
+                        .count()
+                })
+                .unwrap_or(0);
+            let total = staged_count + staged.len();
+            if total > MAX_KEYBINDINGS {
+                return Err(format!(
+                    "contribution_publish: keymap generation exceeds the cumulative maximum of {MAX_KEYBINDINGS} bindings"
+                ));
+            }
+        }
+        contributions
+            .entry(info.generation)
+            .or_default()
+            .extend(staged);
         Ok("ok".into())
     }
 
@@ -822,6 +847,16 @@ impl ModuleHost {
             .expect("ui components lock poisoned")
             .get(component)
             .copied()
+    }
+
+    /// The stable module id of a live generation, if any (the session UI host
+    /// attributes a keybinding to the module that owns the mount).
+    pub(crate) fn generation_module_id(&self, generation: u64) -> Option<Id128> {
+        self.tokens
+            .read()
+            .expect("tokens lock poisoned")
+            .get(&generation)
+            .map(|t| t.module_id)
     }
 
     /// The generation that declared hook `(scope, kind, name)` (session hook
@@ -1226,6 +1261,11 @@ mod tests {
                     KeymapOrigin::UserConfig,
                     "origin is kernel-stamped from the generation"
                 );
+                assert_eq!(
+                    k.owner,
+                    Some(i.module_id),
+                    "the publishing module id is kernel-stamped for attribution"
+                );
             }
             other => panic!("expected a keymap contribution, got {other:?}"),
         }
@@ -1292,6 +1332,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(host.published_contributions(1).len(), 1);
+        drop(host);
+        teardown(dir, queue);
+    }
+
+    /// N6: the keymap cap is per-generation (cumulative), not per-publish — a
+    /// module cannot accumulate unbounded layers by publishing repeatedly.
+    #[test]
+    fn keymap_cap_is_cumulative_per_generation() {
+        let (dir, queue, host) = host_with_generation("keymap-cumulative");
+        let i = info();
+        let bindings: Vec<String> = (0..MAX_KEYBINDINGS)
+            .map(|n| format!(r#"{{"key":"k{n}","action":"a"}}"#))
+            .collect();
+        let payload = format!(
+            r#"{{"kind":"keymap","bindings":[{}]}}"#,
+            bindings.join(",")
+        );
+        host.op_contribution_publish(&i, &payload).unwrap();
+        assert_eq!(host.published_contributions(1).len(), MAX_KEYBINDINGS);
+
+        let err = host
+            .op_contribution_publish(
+                &i,
+                r#"{"kind":"keymap","bindings":[{"key":"extra","action":"a"}]}"#,
+            )
+            .unwrap_err();
+        assert!(err.contains("cumulative"), "{err}");
+        assert_eq!(
+            host.published_contributions(1).len(),
+            MAX_KEYBINDINGS,
+            "the over-cap publish stages nothing"
+        );
         drop(host);
         teardown(dir, queue);
     }

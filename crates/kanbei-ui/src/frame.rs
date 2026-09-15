@@ -256,19 +256,38 @@ pub(crate) fn collect_lines<'a>(node: &'a Node, out: &mut Vec<BodyLine<'a>>) {
                     lines
                 })
                 .collect();
+            // Each column occupies its widest line's width in EVERY band, so a
+            // column with no line in a band (unequal column heights) pads to
+            // the same offset and later columns do not shift left.
+            let widths: Vec<usize> = columns
+                .iter()
+                .map(|lines| lines.iter().map(|l| spans_width(&l.spans)).max().unwrap_or(0))
+                .collect();
             let bands = columns.iter().map(Vec::len).max().unwrap_or(0);
             for band in 0..bands {
                 let mut spans: Vec<(String, String)> = Vec::new();
                 let mut anchor: Option<&'a Node> = None;
-                for lines in &columns {
-                    if let Some(line) = lines.get(band) {
-                        if anchor.is_none() {
-                            anchor = Some(line.node);
+                for (col, lines) in columns.iter().enumerate() {
+                    let width = widths[col];
+                    if !spans.is_empty() {
+                        spans.push((String::from(" "), DEFAULT_STYLE.to_string()));
+                    }
+                    match lines.get(band) {
+                        Some(line) => {
+                            if anchor.is_none() {
+                                anchor = Some(line.node);
+                            }
+                            spans.extend(line.spans.iter().cloned());
+                            let pad = width.saturating_sub(spans_width(&line.spans));
+                            if pad > 0 {
+                                spans.push((" ".repeat(pad), DEFAULT_STYLE.to_string()));
+                            }
                         }
-                        if !spans.is_empty() {
-                            spans.push((String::from(" "), DEFAULT_STYLE.to_string()));
+                        // Absent band: keep the column's position with padding.
+                        None if width > 0 => {
+                            spans.push((" ".repeat(width), DEFAULT_STYLE.to_string()));
                         }
-                        spans.extend(line.spans.iter().cloned());
+                        None => {}
                     }
                 }
                 if let Some(anchor) = anchor {
@@ -309,6 +328,11 @@ fn sorted_children(node: &Node) -> Vec<&Node> {
     let mut children: Vec<&Node> = node.children.iter().collect();
     children.sort_by_key(|c| c.z());
     children
+}
+
+/// The display width (chars) of a run of styled spans.
+fn spans_width(spans: &[(String, String)]) -> usize {
+    spans.iter().map(|(text, _)| text.chars().count()).sum()
 }
 
 /// A text/code node's spans with the kind's default style where a span names
@@ -527,6 +551,28 @@ mod tests {
         let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
         assert_eq!(out.frame.row_text(0), "left");
         assert_eq!(out.frame.row_text(1), "right");
+    }
+
+    #[test]
+    fn row_columns_stay_aligned_across_unequal_height_bands() {
+        // A one-line left column and a two-line right column: the right column
+        // must keep its offset in the band where the left column has no line,
+        // instead of shifting left.
+        let t = SemanticTree::new(
+            Node::stack("root").child(
+                Node::row("r")
+                    .child(Node::text("a", "A"))
+                    .child(
+                        Node::col("c")
+                            .child(Node::text("b1", "B1"))
+                            .child(Node::text("b2", "B2")),
+                    ),
+            ),
+        );
+        let f = FocusModel::new();
+        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
+        assert_eq!(out.frame.row_text(0), "A B1");
+        assert_eq!(out.frame.row_text(1), "  B2", "the column offset is kept");
     }
 
     #[test]

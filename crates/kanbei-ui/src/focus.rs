@@ -29,9 +29,16 @@ pub struct FocusModel {
     /// descendants the ring is confined to. `None` = the whole tree.
     boundary: Option<String>,
     /// Whether the user dismissed modal containment with the reserved Escape.
-    /// Suppression is sticky while ANY modal is present (decision 29): a
+    /// Suppression is sticky while the SAME modal persists (decision 29): a
     /// module rotating its modal id each render cannot re-trap focus.
     escaped: bool,
+    /// The modal id the escape dismissed; used to distinguish a genuinely NEW
+    /// modal from the escaped one.
+    escaped_id: Option<String>,
+    /// The topmost modal id seen on the previous render; a new modal re-arms
+    /// only once its id is STABLE across two consecutive renders (an id that
+    /// rotates every render is never stable, so it can never re-arm).
+    last_top: Option<String>,
     /// Focus to restore when the active boundary is left.
     restore: Option<String>,
 }
@@ -50,6 +57,8 @@ impl FocusModel {
             viewport_top: 0,
             boundary: None,
             escaped: false,
+            escaped_id: None,
+            last_top: None,
             restore: None,
         }
     }
@@ -109,16 +118,26 @@ impl FocusModel {
     /// focus), or switch between them.
     fn sync_boundary(&mut self, tree: &SemanticTree) {
         let top = tree.modal_boundary().map(|n| n.id.clone());
-        // Suppression clears only when NO modal is present: branding the
-        // escape to one modal id (and clearing on a changed id) would let a
-        // module rotating its modal id re-trap focus right after Escape.
+        // Re-arm containment for a genuinely NEW modal: its id must have been
+        // STABLE across two consecutive renders AND differ from the escaped
+        // one. An id that rotates every render is never stable, so it can
+        // never re-arm; a real new dialog persists and does re-arm.
+        if let (Some(top_id), Some(escaped_id)) = (top.as_ref(), self.escaped_id.as_ref())
+            && self.last_top.as_ref() == Some(top_id)
+            && top_id != escaped_id
+        {
+            self.escaped = false;
+            self.escaped_id = None;
+        }
         if top.is_none() {
             self.escaped = false;
+            self.escaped_id = None;
         }
         let active = match &top {
             Some(id) if !self.escaped => Some(id.clone()),
             _ => None,
         };
+        self.last_top = top;
         if active == self.boundary {
             return;
         }
@@ -166,8 +185,9 @@ impl FocusModel {
     /// spans the whole tree again and focus returns to where it was before
     /// containment.
     pub fn escape_modal(&mut self, tree: &SemanticTree) {
-        if tree.modal_boundary().is_some() {
+        if let Some(id) = tree.modal_boundary().map(|n| n.id.clone()) {
             self.escaped = true;
+            self.escaped_id = Some(id);
         }
     }
 
@@ -554,6 +574,50 @@ mod tests {
         f.revalidate(&none);
         f.revalidate(&rotated);
         assert_eq!(f.boundary(), Some("modal2"), "fresh modal contains again");
+    }
+
+    #[test]
+    fn escape_suppression_survives_persistent_id_rotation() {
+        let t = modal_tree();
+        let mut f = FocusModel::new();
+        f.revalidate(&t);
+        f.escape_modal(&t);
+        f.revalidate(&t);
+        assert_eq!(f.boundary(), None);
+        // A module rotating the topmost modal id on EVERY render: no id is
+        // ever stable across two renders, so containment never re-arms.
+        for i in 0..4 {
+            let id = format!("m{i}");
+            let rotated = SemanticTree::new(
+                Node::stack("root")
+                    .child(Node::button("outside", "outside"))
+                    .child(Node::layer(id.clone(), 2, true).child(Node::input(format!("{id}i"), "hi"))),
+            );
+            f.revalidate(&rotated);
+            assert_eq!(f.boundary(), None, "a rotating id never re-arms");
+        }
+    }
+
+    #[test]
+    fn escape_suppression_rearms_for_a_stable_new_modal() {
+        let t = modal_tree();
+        let mut f = FocusModel::new();
+        f.revalidate(&t);
+        f.escape_modal(&t);
+        f.revalidate(&t);
+        assert_eq!(f.boundary(), None);
+        let new = SemanticTree::new(
+            Node::stack("root")
+                .child(Node::button("outside", "outside"))
+                .child(Node::layer("modal2", 2, true).child(Node::input("m2", "hi"))),
+        );
+        // One render of a new id is not yet stable: still suppressed.
+        f.revalidate(&new);
+        assert_eq!(f.boundary(), None, "a single render is not stable");
+        // The id persisted: a genuinely new modal re-arms containment.
+        f.revalidate(&new);
+        assert_eq!(f.boundary(), Some("modal2"), "a stable new modal re-arms");
+        assert_eq!(f.focused.as_deref(), Some("m2"));
     }
 
     #[test]

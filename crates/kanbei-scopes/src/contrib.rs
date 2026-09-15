@@ -2,6 +2,7 @@
 //! entries, never resolution logic; the kernel owns the fixed per-type
 //! conflict rules.
 
+use kanbei_core::id::Id128;
 use kanbei_services::{ScopePath, ServiceDependency, ServiceKey, ServiceProvider};
 use serde::{Deserialize, Serialize};
 
@@ -178,6 +179,14 @@ pub struct Keybinding {
     /// `Builtin` default, a silent precedence downgrade).
     #[serde(default)]
     pub origin: KeymapOrigin,
+    /// Kernel-stamped identity of the publishing module (never
+    /// module-supplied), so a binding can be attributed to its OWNER: a
+    /// degraded mount disables only bindings published by its own module, not
+    /// every binding sharing the scope. `None` when attribution is unknown
+    /// (e.g. a replayed snapshot): an unattributable binding is never treated
+    /// as degraded (fail-safe forward, never silently swallowed).
+    #[serde(default)]
+    pub owner: Option<Id128>,
 }
 
 /// A theme overlay: validated overlay — later overlays merge over earlier

@@ -1442,6 +1442,7 @@ mod tests {
                     context: ContextPredicate::Always,
                     action: "a".into(),
                     origin: KeymapOrigin::Builtin,
+                    owner: None,
                 }),
             },
             Contribution {
@@ -1704,6 +1705,7 @@ mod tests {
                 context: ContextPredicate::Always,
                 action: "a1".into(),
                 origin: KeymapOrigin::Builtin,
+                owner: None,
             }),
         };
         let k2 = Contribution {
@@ -1713,6 +1715,7 @@ mod tests {
                 context: ContextPredicate::Always,
                 action: "a2".into(),
                 origin: KeymapOrigin::Builtin,
+                owner: None,
             }),
         };
         // no conflict: both layers are stored
@@ -1747,6 +1750,7 @@ mod tests {
             context: ContextPredicate::Modal,
             action: "a".into(),
             origin: KeymapOrigin::UserConfig,
+            owner: None,
         };
         let json = serde_json::to_string(&kb).unwrap();
         let back: Keybinding = serde_json::from_str(&json).unwrap();
@@ -1767,6 +1771,7 @@ mod tests {
                 context: ContextPredicate::Always,
                 action: action.into(),
                 origin,
+                owner: None,
             }),
         };
         registry
@@ -1812,6 +1817,7 @@ mod tests {
                 context,
                 action: action.into(),
                 origin,
+                owner: None,
             }),
         };
         let plain = KeyContext::default();
@@ -1883,6 +1889,7 @@ mod tests {
                 context: ContextPredicate::Always,
                 action: action.into(),
                 origin,
+                owner: None,
             }),
         };
         registry
@@ -2913,6 +2920,7 @@ mod tests {
                 context: ContextPredicate::Always,
                 action: "lower".into(),
                 origin: KeymapOrigin::Builtin,
+                owner: None,
             }),
         };
         let lower_theme = Contribution {
@@ -2948,6 +2956,7 @@ mod tests {
                 context: ContextPredicate::Always,
                 action: "higher".into(),
                 origin: KeymapOrigin::Builtin,
+                owner: None,
             }),
         };
         let higher_theme = Contribution {

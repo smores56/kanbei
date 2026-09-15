@@ -34,7 +34,7 @@ use kanbei_capabilities::{Capability, Principal};
 use kanbei_core::id::Id128;
 use kanbei_modules::package::{ModuleOrigin, PackageManifest};
 use kanbei_modules::ModuleManager;
-use kanbei_scopes::contrib::{Keybinding, KeyContext, KeymapOrigin};
+use kanbei_scopes::contrib::{Keybinding, KeyContext};
 use kanbei_ui::accessibility;
 use kanbei_ui::fallback;
 use kanbei_ui::focus::{FocusDirection, InputClass, KeyClassifier, ReservedAction};
@@ -99,6 +99,10 @@ pub struct BoundMount {
     /// The UI component entry (the generation's `kb_hot` ui entry).
     pub component: String,
     pub generation: u64,
+    /// The stable module id that owns this mount (the generation's manifest
+    /// module id). Keybinding ownership attribution: a degraded mount disables
+    /// only bindings published by its own module.
+    pub module_id: Option<Id128>,
     /// The mount's last validated tree with ORIGINAL ids (the composite view
     /// prefixes them). `None` until the first render.
     pub tree: Option<SemanticTree>,
@@ -125,6 +129,7 @@ impl BoundMount {
         name: String,
         component: String,
         generation: u64,
+        module_id: Option<Id128>,
     ) -> Self {
         BoundMount {
             scope,
@@ -132,6 +137,7 @@ impl BoundMount {
             name,
             component,
             generation,
+            module_id,
             tree: None,
             focus: None,
             reducer_state: Value::Null,
@@ -378,7 +384,15 @@ impl Session {
             if let Some(overlay) = self.registry.theme_overlay(&root, &name) {
                 let _ = theme.apply_overlay(&overlay.overlay);
             }
-            bound.push(BoundMount::new(scope, slot, name, component, generation));
+            let module_id = manager.generation_module_id(generation);
+            bound.push(BoundMount::new(
+                scope,
+                slot,
+                name,
+                component,
+                generation,
+                module_id,
+            ));
         }
         self.ui_host = if bound.is_empty() {
             None
@@ -489,8 +503,8 @@ impl Session {
                     // winning context-matched binding (if any) routes its action
                     // id as a typed command intent through the normal reduce
                     // path; only unbound keys fall through to raw forwarding.
-                    if let Some(action) = self.ui_binding_action(&event) {
-                        match action.as_str() {
+                    if let Some(binding) = self.ui_binding_action(&event) {
+                        match binding.action.as_str() {
                             // The built-in layer's default bindings restore the
                             // pre-T10 kernel behaviors: `cancel_run` cancels the
                             // active run, `repaint` forces a full repaint. Both
@@ -503,10 +517,10 @@ impl Session {
                             }
                             "repaint" => outcome.repaint = true,
                             _ => {
-                                // Deliver only to the focused (target) mount: a
-                                // command id is that module's namespace, so a
-                                // victim reducer must not act on it.
-                                self.ui_reduce_command(&action)?;
+                                // Route by OWNERSHIP first: the action id is
+                                // its owner module's namespace; only fall back
+                                // to the focused mount, then to fan-out.
+                                self.ui_reduce_command(&binding.action, binding.owner)?;
                                 let applied = self.apply_ui_intents()?;
                                 outcome.intents_applied += applied;
                             }
@@ -546,12 +560,12 @@ impl Session {
         Ok(())
     }
 
-    /// The winning binding's action for `event` under the current UI context,
-    /// if any binding matches (decision 29). Reserved keys are classified
-    /// before this and never consult the binding table. Bindings owned by a
-    /// degraded mount are skipped so a bound key falls through to forwarding
-    /// instead of being silently swallowed by a dead reducer.
-    fn ui_binding_action(&self, event: &InputEvent) -> Option<String> {
+    /// The winning binding and its owner for `event` under the current UI
+    /// context, if any binding matches (decision 29). Reserved keys are
+    /// classified before this and never consult the binding table. Bindings
+    /// owned by a degraded mount are skipped so a bound key falls through to
+    /// forwarding instead of being silently swallowed by a dead reducer.
+    fn ui_binding_action(&self, event: &InputEvent) -> Option<WinningBinding> {
         let key = event.key_name()?;
         let host = self.ui_host.as_ref()?;
         let ctx = KeyContext {
@@ -561,11 +575,14 @@ impl Session {
                 .as_ref()
                 .is_some_and(|t| t.overlay_present()),
         };
-        let (scope, binding) = self.registry.keymap_winner(&key, ctx)?;
-        if binding_is_degraded(binding, scope, host) {
+        let (_, binding) = self.registry.keymap_winner(&key, ctx)?;
+        if binding_is_degraded(binding, host) {
             return None;
         }
-        Some(binding.action.clone())
+        Some(WinningBinding {
+            action: binding.action.clone(),
+            owner: binding.owner,
+        })
     }
 
     /// Forward one non-reserved event: navigation stays kernel-side; text
@@ -692,38 +709,65 @@ impl Session {
     /// mount (placeholder subtree); the others keep working.
     fn ui_reduce(&mut self, event: UiEvent) -> Result<(), SessionError> {
         self.fault(FaultPoint::BeforeUiReduce);
-        self.ui_reduce_inner(event, false);
+        self.ui_reduce_inner(event, ReduceTarget::Fanout);
         self.fault(FaultPoint::AfterUiReduce);
         Ok(())
     }
 
-    /// Deliver a binding's command ONLY to the focused mount: the action id is
-    /// the target module's namespace, so a victim reducer must not act on it.
-    fn ui_reduce_command(&mut self, action: &str) -> Result<(), SessionError> {
+    /// Deliver a binding's command to its OWNER mount (the module that
+    /// published the binding), else to the focused mount, else fan out — never
+    /// silently drop. The action id is the owner module's namespace, so a
+    /// victim reducer must not act on it.
+    fn ui_reduce_command(
+        &mut self,
+        action: &str,
+        owner: Option<Id128>,
+    ) -> Result<(), SessionError> {
+        let target = {
+            let host = self.ui_host.as_ref();
+            // Prefer the binding's owner; a config/global binding with no
+            // mount of its own falls back to the focused mount.
+            let focus_index = host.and_then(Self::focused_mount_index);
+            let owner_index = owner.and_then(|mid| {
+                host.and_then(|h| h.mounts.iter().position(|m| m.module_id == Some(mid)))
+            });
+            match owner_index.or(focus_index) {
+                Some(i) => ReduceTarget::Index(i),
+                None => ReduceTarget::Fanout,
+            }
+        };
         self.fault(FaultPoint::BeforeUiReduce);
-        self.ui_reduce_inner(UiEvent::user(UiEventKind::Command(action.to_string())), true);
+        self.ui_reduce_inner(UiEvent::user(UiEventKind::Command(action.to_string())), target);
         self.fault(FaultPoint::AfterUiReduce);
         Ok(())
     }
 
-    fn ui_reduce_inner(&mut self, event: UiEvent, target_only: bool) {
+    /// The focused mount's index, or the sole mount's index when the focused
+    /// id is unresolvable (single-mount ids are unprefixed, M5 byte-identical
+    /// trees).
+    fn focused_mount_index(host: &UiHost) -> Option<usize> {
+        host.focus
+            .focused
+            .as_deref()
+            .and_then(SemanticTree::split_composite_id)
+            .map(|(i, _)| i)
+            .filter(|i| *i < host.mounts.len())
+            .or_else(|| (host.mounts.len() == 1).then_some(0))
+    }
+
+    fn ui_reduce_inner(&mut self, event: UiEvent, target: ReduceTarget) {
         let Some(host) = self.ui_host.as_mut() else {
             return;
         };
         let Some(manager) = self.modules.as_ref() else {
             return;
         };
-        // The target: the focused mount's index/slot (None when nothing is
-        // focused). Single-mount ids are unprefixed (M5 byte-identical trees),
-        // so an unresolvable id means the one bound mount.
-        let target_index = host
-            .focus
-            .focused
-            .as_deref()
-            .and_then(SemanticTree::split_composite_id)
-            .map(|(i, _)| i)
-            .filter(|i| *i < host.mounts.len())
-            .or_else(|| (host.mounts.len() == 1).then_some(0));
+        // Fan-out still carries the focused mount's slot as an advisory
+        // `target` hint; an explicit target restricts delivery to one mount.
+        let (target_index, target_only) = match target {
+            ReduceTarget::Fanout => (Self::focused_mount_index(host), false),
+            ReduceTarget::Index(i) => (Some(i), true),
+        };
         let target = target_index.map(|i| host.mounts[i].slot.clone());
         // Activation ids are composite ids; each mount receives its own
         // original id back.
@@ -1104,16 +1148,35 @@ impl Session {
     }
 }
 
-/// Whether a winning binding is owned by a degraded mount. Built-in defaults
-/// are kernel-owned and never skipped; a module/config binding is skipped when
-/// a degraded mount publishes in the same scope, so a bound key falls through
-/// to forwarding instead of being swallowed by a dead reducer (the keymap
-/// stays in the registry after the placeholder swap).
-fn binding_is_degraded(
-    binding: &Keybinding,
-    scope: &kanbei_services::ScopePath,
-    host: &UiHost,
-) -> bool {
-    binding.origin != KeymapOrigin::Builtin
-        && host.mounts.iter().any(|m| m.degraded && &m.scope == scope)
+/// A winning binding plus the module that owns it (the command routing key).
+struct WinningBinding {
+    action: String,
+    owner: Option<Id128>,
+}
+
+/// Where a reducer event is delivered.
+#[derive(Clone, Copy)]
+enum ReduceTarget {
+    /// Every mount (raw forwarding); the event carries the focused mount's
+    /// slot as an advisory hint.
+    Fanout,
+    /// Only the mount at this index.
+    Index(usize),
+}
+
+/// Whether a winning binding is owned by a degraded mount. Attribution is by
+/// MODULE identity: a binding is skipped only when the mount owned by the
+/// module that published it is degraded, so one degraded module never
+/// disables every binding sharing its scope. An unattributable binding
+/// (`owner == None`) is never skipped — fail-safe: forward rather than
+/// silently swallow input. Built-in/config bindings own no mount, so they are
+/// never skipped (the keymap stays in the registry after a placeholder swap).
+fn binding_is_degraded(binding: &Keybinding, host: &UiHost) -> bool {
+    match binding.owner {
+        Some(owner) => host
+            .mounts
+            .iter()
+            .any(|m| m.degraded && m.module_id == Some(owner)),
+        None => false,
+    }
 }

@@ -17,11 +17,16 @@ use serde_json::{Map, Value};
 pub const MAX_TREE_DEPTH: usize = 32;
 /// Maximum node count of a module-authored tree (kernel bound).
 pub const MAX_TREE_NODES: usize = 4096;
-/// Maximum length (in chars) of any single module-authored string: span/item
-/// text, input content, button label. Structural bounds alone do not cap
-/// allocation (one `text` node with a huge span is under the node bound but
-/// forces a huge render-time allocation).
+/// Maximum length (in chars) of a `spans`/`items` string: a render-time
+/// allocation bound. An over-long span/item text fails the whole mount closed
+/// (fail-closed, R-27).
 pub const MAX_TEXT_LEN: usize = 4096;
+/// Maximum length (in chars) of a free-text field (`input.content`,
+/// `button.label`): user drafts and labels are legitimate long input, so an
+/// over-long value is truncated char-safely instead of failing the mount to a
+/// placeholder. Deliberately larger than [`MAX_TEXT_LEN`], which bounds the
+/// render-time allocation units (`spans`/`items`).
+pub const MAX_TEXT_CONTENT_LEN: usize = 65536;
 
 /// The primitive node kinds understood by the kernel renderer. Unknown kinds
 /// are rejected at parse time (fail-closed, R-27).
@@ -654,16 +659,18 @@ fn parse_i32(v: &Value, key: &str, id: &str) -> Result<i32, TreeError> {
     }
 }
 
-fn parse_string(v: &Value, key: &str, id: &str) -> Result<Option<String>, TreeError> {
+/// Parse a free-text prop (`content`/`label`). Over-long text is truncated
+/// char-safely to [`MAX_TEXT_CONTENT_LEN`] rather than failing the parse: a
+/// long draft or label must not degrade the whole mount to a placeholder.
+/// The reported prop on a type error is the real prop, not a hard-coded
+/// `"content"`, so a bad button label is not misreported.
+fn parse_string(v: &Value, key: &'static str, id: &str) -> Result<Option<String>, TreeError> {
     match v.get(key) {
         None => Ok(None),
-        Some(Value::String(s)) if s.chars().count() > MAX_TEXT_LEN => Err(bad_props(
-            id,
-            "content",
-            format!("{key} exceeds the maximum length {MAX_TEXT_LEN}"),
+        Some(Value::String(s)) => Ok(Some(
+            s.chars().take(MAX_TEXT_CONTENT_LEN).collect::<String>(),
         )),
-        Some(Value::String(s)) => Ok(Some(s.clone())),
-        Some(_) => Err(bad_props(id, "content", "expected a string")),
+        Some(_) => Err(bad_props(id, key, "expected a string")),
     }
 }
 
@@ -995,6 +1002,70 @@ mod tests {
         }))
         .unwrap_err();
         assert!(matches!(err, TreeError::BadProps { prop: "items", .. }));
+    }
+
+    #[test]
+    fn long_free_text_is_truncated_not_rejected() {
+        // Just over the span cap: input content / button label are free text,
+        // so they parse at their own (larger) bound instead of failing.
+        let over_span = "x".repeat(MAX_TEXT_LEN + 1);
+        let tree = SemanticTree::from_json(&json!({
+            "root": {"id": "r", "kind": "stack", "children": [
+                {"id": "i", "kind": "input", "content": over_span.clone()},
+                {"id": "b", "kind": "button", "label": over_span.clone()},
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(
+            tree.node("i").unwrap().content().chars().count(),
+            MAX_TEXT_LEN + 1
+        );
+        assert_eq!(
+            tree.node("b").unwrap().content().chars().count(),
+            MAX_TEXT_LEN + 1
+        );
+
+        // Over the content cap: truncate char-safely, never fail-parse.
+        let over_cap = "x".repeat(MAX_TEXT_CONTENT_LEN + 5);
+        let tree = SemanticTree::from_json(&json!({
+            "root": {"id": "r", "kind": "stack", "children": [
+                {"id": "i", "kind": "input", "content": over_cap},
+            ]}
+        }))
+        .unwrap();
+        assert_eq!(
+            tree.node("i").unwrap().content().chars().count(),
+            MAX_TEXT_CONTENT_LEN
+        );
+    }
+
+    #[test]
+    fn multibyte_truncation_keeps_char_boundaries() {
+        // Multibyte chars at the truncation boundary must not panic or split.
+        let content = "é".repeat(MAX_TEXT_CONTENT_LEN + 3);
+        let tree = SemanticTree::from_json(&json!({
+            "root": {"id": "r", "kind": "stack", "children": [
+                {"id": "i", "kind": "input", "content": content},
+            ]}
+        }))
+        .unwrap();
+        let text = tree.node("i").unwrap().content();
+        assert_eq!(text.chars().count(), MAX_TEXT_CONTENT_LEN);
+        assert!(text.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn bad_button_label_reports_the_label_prop() {
+        let err = SemanticTree::from_json(&json!({
+            "root": {"id": "r", "kind": "stack", "children": [
+                {"id": "b", "kind": "button", "label": 7},
+            ]}
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(err, TreeError::BadProps { prop: "label", .. }),
+            "the real prop is reported: {err}"
+        );
     }
 
     #[test]
