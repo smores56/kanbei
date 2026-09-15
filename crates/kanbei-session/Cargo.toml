@@ -23,6 +23,7 @@ kanbei-services.workspace = true
 kanbei-snapshot.workspace = true
 kanbei-telemetry = { workspace = true, optional = true }
 kanbei-tools.workspace = true
+kanbei-transcript.workspace = true
 kanbei-ui.workspace = true
 kanbei-vm.workspace = true
 kanbei-workspace.workspace = true

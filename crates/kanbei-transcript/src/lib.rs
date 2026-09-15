@@ -1,26 +1,30 @@
-//! The conversation transcript: a pure projection of committed envelopes
-//! into the `SemanticTree` contract (R-19: message identity is its
-//! committing event; launch is always resume). The machine is a total
-//! function of the envelope stream it is fed: applying the same envelopes
-//! (a fresh session replays the full log on open) yields the same
-//! transcript. The turn's END is a driver-level fact (the driver stopped
-//! driving) — the worker's `finalize_turn` records it, mirroring the
-//! terminal `run_outcome` the session committed.
+//! kanbei-transcript — the transcript projection service (decision 30).
+//!
+//! A tier-2, replaceable projection of committed envelopes into a typed
+//! conversation view: turn segmentation, thought-vs-response classification,
+//! tool intent/outcome pairing, collapse defaults and streaming state. The
+//! machine is a total function of the envelope stream it is fed — applying the
+//! same envelopes (a fresh session replays the full log on open) yields the
+//! same view — so a rebuilt projection after resume is byte-identical.
+//!
+//! The session owns and drives the projection: it applies committed envelopes
+//! on the commit path, feeds provider-stream deltas (a home for partials, which
+//! stay non-canonical and are never committed), finalizes turns, and exposes
+//! the resulting [`TranscriptView`]. The projection contains no UI types;
+//! `kanbei-ui` renders the typed view to `SemanticTree` primitives.
 //!
 //! Typing (structural, doc-faithful): the response is the turn-terminal
 //! `model_outcome` (content without pending tool calls); thoughts are
 //! intermediate `model_outcome` content plus tool steps; the turn end-state
 //! comes from `run_outcome`. Opaque artifacts never enter the projection
-//! (M6/S9) and are not rendered.
+//! (M6/S9) and are not rendered (R-19: message identity is its committing
+//! event; launch is always resume).
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use kanbei_core::envelope::Envelope;
-
-use crate::tree::{Node, SemanticTree};
 
 /// The turn's terminal classification (UI vocabulary for the scheduler's
 /// `TerminalOutcome`, kept dependency-free).
@@ -103,7 +107,7 @@ impl StepStatus {
 }
 
 /// One row of a turn's working segment (thought bubble).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BubbleRow {
     /// Intermediate model content (a thought).
     Text(String),
@@ -113,7 +117,7 @@ pub enum BubbleRow {
     Notice(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolStep {
     pub call_id: String,
     pub tool: String,
@@ -162,8 +166,10 @@ impl TurnState {
 }
 
 /// One user turn: the message, its working segment, the final answer, and
-/// the recorded terminal state.
-#[derive(Debug, Clone)]
+/// the recorded terminal state. Wall-clock metadata is deliberately absent:
+/// the view is a pure function of the envelope stream, so resume rebuilds are
+/// identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnView {
     pub user: String,
     /// The turn's working segment, in commit order (thoughts and tool
@@ -182,10 +188,13 @@ pub struct TurnView {
     /// replayed turn whose driver result is unknown resolves its state from
     /// this).
     pub last_outcome: Option<(OutcomeClass, Option<String>)>,
-    /// Rendering metadata (wall clock), set by the UI for live turns;
-    /// `None` for replayed history. Not canonical.
-    pub started_at: Option<Instant>,
-    pub ended_at: Option<Instant>,
+    /// Derived, per-view only: whether the turn's thought bubble is open
+    /// (running, or the user re-opened it). Never stored in the projection
+    /// state; the renderer may OR the live overrides on top.
+    pub open: bool,
+    /// Non-canonical in-flight stream text (provider deltas); cleared on
+    /// [`TranscriptProjection::end_stream`]. Never committed.
+    pub streaming: Option<String>,
 }
 
 impl TurnView {
@@ -201,15 +210,8 @@ impl TurnView {
             input_tokens: 0,
             output_tokens: 0,
             last_outcome: None,
-            started_at: None,
-            ended_at: None,
-        }
-    }
-
-    pub fn elapsed(&self) -> Option<Duration> {
-        match (self.started_at, self.ended_at) {
-            (Some(s), Some(e)) => e.checked_duration_since(s),
-            _ => None,
+            open: false,
+            streaming: None,
         }
     }
 
@@ -224,9 +226,6 @@ impl TurnView {
             self.input_tokens,
             self.output_tokens
         );
-        if let Some(elapsed) = self.elapsed() {
-            out.push_str(&format!(" in {:.1}s", elapsed.as_secs_f64()));
-        }
         if !matches!(self.state, TurnState::Completed)
             && let Some(reason) = &self.reason
         {
@@ -236,26 +235,93 @@ impl TurnView {
     }
 }
 
-/// One flat transcript row for the TUI (document order): text, theme style
-/// name, and the turn index it renders (the toggle identity for click/
-/// keyboard selection). Mirrors [`ConversationState::tree`] so the kernel
-/// renderer and the TUI stay in lockstep.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TranscriptRow {
-    pub text: String,
-    pub style: String,
-    pub turn: usize,
-}
-
-/// The whole transcript: turns in commit order. A pure function of the
-/// envelope stream applied so far (plus finalize events, which mirror
-/// committed terminal records).
-#[derive(Debug, Clone, Default)]
-pub struct ConversationState {
+/// The whole transcript as a typed view: turns in commit order. A pure
+/// function of the envelope stream applied so far (plus finalize events, which
+/// mirror committed terminal records).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TranscriptView {
     pub turns: Vec<TurnView>,
 }
 
-impl ConversationState {
+impl TranscriptView {
+    /// Total model egress across all turns (input, output) — status bar.
+    pub fn tokens(&self) -> (u64, u64) {
+        let mut tin = 0u64;
+        let mut tout = 0u64;
+        for t in &self.turns {
+            tin += t.input_tokens;
+            tout += t.output_tokens;
+        }
+        (tin, tout)
+    }
+}
+
+/// Session-local manual collapse overrides: the turns the user re-opened
+/// (Q6/Q5: bubbles collapse on completion, expand on demand). Passed per-view;
+/// never stored in the projection, so the projection's defaults stay a pure
+/// function of the committed envelopes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CollapseOverrides {
+    expanded: HashSet<String>,
+}
+
+impl CollapseOverrides {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn contains(&self, turn: usize) -> bool {
+        self.expanded.contains(&format!("t{turn}"))
+    }
+
+    /// Flip a turn's manual override (running turns are always open; the
+    /// override takes effect once the turn settles).
+    pub fn toggle(&mut self, turn: usize) {
+        let key = format!("t{turn}");
+        if !self.expanded.remove(&key) {
+            self.expanded.insert(key);
+        }
+    }
+}
+
+/// The replaceable typed contract (decision 30): a transcript projection is
+/// driven by the session and yields a deterministic typed view. Inject a
+/// replacement through `SessionConfig::transcript`; the session and the UI
+/// need no changes. Mirrors the `ProviderEngine` seam shape.
+pub trait TranscriptProjection: Send + Sync {
+    /// Implementation identity (diagnostics / egress pins).
+    fn name(&self) -> &str;
+    /// Contract version of the view this projection produces.
+    fn version(&self) -> u32;
+    /// Apply one committed envelope (the only canonical mutation entry point
+    /// besides [`Self::finalize_turn`]/[`Self::finish_replay`]). Unknown kinds
+    /// are kernel records the transcript does not surface.
+    fn apply(&mut self, env: &Envelope);
+    /// Close the active turn with the driver's observed result (the worker
+    /// stopped driving; the terminal `run_outcome` is already in the log).
+    /// `None` = resolve from the recorded terminal outcome.
+    fn finalize_turn(&mut self, last: Option<OutcomeClass>);
+    /// End of a replay (session open / resume): a turn still active has no
+    /// driver result — resolve it from its recorded terminal outcome, else
+    /// mark it interrupted (B-05: the log is the authority).
+    fn finish_replay(&mut self);
+    /// Append a non-canonical provider-stream fragment to the in-flight
+    /// partial (never committed).
+    fn apply_delta(&mut self, fragment: &str);
+    /// The provider stream ended: clear the in-flight partial.
+    fn end_stream(&mut self);
+    /// The typed view, with the given session-local overrides applied.
+    fn view(&self, overrides: &CollapseOverrides) -> TranscriptView;
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// The built-in projection: the extracted conversation state machine.
+#[derive(Debug, Clone, Default)]
+pub struct ConversationProjection {
+    turns: Vec<TurnView>,
+}
+
+impl ConversationProjection {
     pub fn new() -> Self {
         Self::default()
     }
@@ -266,11 +332,139 @@ impl ConversationState {
             .rposition(|t| t.state == TurnState::Running)
     }
 
-    /// Apply one committed envelope (the only mutation entry point besides
-    /// [`Self::finalize_turn`]/[`Self::finish_replay`]). Unknown kinds are
-    /// kernel records the transcript does not surface (M6/S9: opaque
-    /// artifacts never enter the projection).
-    pub fn apply(&mut self, env: &Envelope) {
+    /// One `model_outcome` payload (see [`Self::apply`]).
+    fn apply_model_outcome(turn: &mut TurnView, payload: &Value) {
+        // The response content and pending tool calls live in the
+        // CompletionResponse (`result`) the session committed; the egress
+        // record carries the token usage.
+        let result = payload.get("result");
+        let content = result
+            .and_then(|r| r.get("content"))
+            .and_then(Value::as_str);
+        let has_calls = result
+            .and_then(|r| r.get("tool_calls"))
+            .and_then(Value::as_array)
+            .is_some_and(|v| !v.is_empty());
+        if let Some(egress) = payload.get("egress") {
+            turn.input_tokens += egress
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            turn.output_tokens += egress
+                .get("output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+        }
+        // A committed outcome supersedes any in-flight partial.
+        turn.streaming = None;
+        match (content, has_calls) {
+            (Some(text), false) => {
+                // Turn-terminal: the model stopped without outstanding tool
+                // calls — its content is the answer (Q3 structural rule).
+                turn.response = Some(text.to_string());
+            }
+            (Some(text), true) => {
+                // Intermediate: the model is still acting — thought text.
+                turn.thoughts.push(BubbleRow::Text(text.to_string()));
+            }
+            (None, _) => {
+                // Tool-only call (null content): no phantom text (Q4).
+            }
+        }
+    }
+
+    /// One `tool_intent` payload (see [`Self::apply`]).
+    fn apply_tool_intent(turn: &mut TurnView, payload: &Value) {
+        turn.tools += 1;
+        turn.thoughts.push(BubbleRow::Step(ToolStep {
+            call_id: payload
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            tool: payload
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            args: payload.get("args").map(Value::to_string).unwrap_or_default(),
+            status: StepStatus::InFlight,
+            detail: String::new(),
+        }));
+    }
+
+    /// One `tool_outcome` payload (see [`Self::apply`]).
+    fn apply_tool_outcome(turn: &mut TurnView, payload: &Value) {
+        let call_id = payload
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(step) = turn
+            .thoughts
+            .iter_mut()
+            .filter_map(|row| match row {
+                BubbleRow::Step(s) if s.call_id == call_id => Some(s),
+                _ => None,
+            })
+            .last()
+        else {
+            return;
+        };
+        // OutcomeClassification serializes unit variants as plain strings
+        // and newtypes as single-key objects.
+        let (status, detail) = match payload.get("classification") {
+            Some(Value::String(_)) => (StepStatus::Ok, String::new()),
+            Some(Value::Object(o)) => {
+                let reason = match o
+                    .get("Interrupted")
+                    .or_else(|| o.get("Denied"))
+                    .or_else(|| o.get("Ambiguous"))
+                {
+                    Some(Value::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                (
+                    if o.contains_key("Interrupted") || o.contains_key("Denied") {
+                        StepStatus::Interrupted
+                    } else {
+                        StepStatus::Ambiguous
+                    },
+                    reason,
+                )
+            }
+            _ => (StepStatus::Ok, String::new()),
+        };
+        let error = payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let result_text = truncate(
+            &payload
+                .get("result")
+                .filter(|v| !v.is_null())
+                .map(Value::to_string)
+                .unwrap_or_default(),
+            200,
+        );
+        let detail_parts: Vec<&str> = [&detail, error, &result_text]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        step.status = status;
+        step.detail = detail_parts.join(" · ");
+    }
+}
+
+impl TranscriptProjection for ConversationProjection {
+    fn name(&self) -> &str {
+        "conversation"
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn apply(&mut self, env: &Envelope) {
         match env.kind.as_str() {
             "user_message" => {
                 let text = env
@@ -360,295 +554,61 @@ impl ConversationState {
         }
     }
 
-    /// One `model_outcome` payload (see [`Self::apply`]).
-    fn apply_model_outcome(turn: &mut TurnView, payload: &Value) {
-        // The response content and pending tool calls live in the
-        // CompletionResponse (`result`) the session committed; the egress
-        // record carries the token usage.
-        let result = payload.get("result");
-        let content = result
-            .and_then(|r| r.get("content"))
-            .and_then(Value::as_str);
-        let has_calls = result
-            .and_then(|r| r.get("tool_calls"))
-            .and_then(Value::as_array)
-            .is_some_and(|v| !v.is_empty());
-        if let Some(egress) = payload.get("egress") {
-            turn.input_tokens += egress
-                .get("input_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            turn.output_tokens += egress
-                .get("output_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-        }
-        match (content, has_calls) {
-            (Some(text), false) => {
-                // Turn-terminal: the model stopped without outstanding tool
-                // calls — its content is the answer (Q3 structural rule).
-                turn.response = Some(text.to_string());
-            }
-            (Some(text), true) => {
-                // Intermediate: the model is still acting — thought text.
-                turn.thoughts.push(BubbleRow::Text(text.to_string()));
-            }
-            (None, _) => {
-                // Tool-only call (null content): no phantom text (Q4).
-            }
-        }
-    }
-
-    /// One `tool_intent` payload (see [`Self::apply`]).
-    fn apply_tool_intent(turn: &mut TurnView, payload: &Value) {
-        turn.tools += 1;
-        turn.thoughts.push(BubbleRow::Step(ToolStep {
-            call_id: payload
-                .get("call_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            tool: payload
-                .get("tool")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            args: payload.get("args").map(Value::to_string).unwrap_or_default(),
-            status: StepStatus::InFlight,
-            detail: String::new(),
-        }));
-    }
-
-    /// One `tool_outcome` payload (see [`Self::apply`]).
-    fn apply_tool_outcome(turn: &mut TurnView, payload: &Value) {
-        let call_id = payload
-            .get("call_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let Some(step) = turn
-            .thoughts
-            .iter_mut()
-            .filter_map(|row| match row {
-                BubbleRow::Step(s) if s.call_id == call_id => Some(s),
-                _ => None,
-            })
-            .last()
-        else {
-            return;
-        };
-        // OutcomeClassification serializes unit variants as plain strings
-        // and newtypes as single-key objects.
-        let (status, detail) = match payload.get("classification") {
-            Some(Value::String(_)) => (StepStatus::Ok, String::new()),
-            Some(Value::Object(o)) => {
-                let reason = match o
-                    .get("Interrupted")
-                    .or_else(|| o.get("Denied"))
-                    .or_else(|| o.get("Ambiguous"))
-                {
-                    Some(Value::String(s)) => s.clone(),
-                    _ => String::new(),
-                };
-                (
-                    if o.contains_key("Interrupted") || o.contains_key("Denied") {
-                        StepStatus::Interrupted
-                    } else {
-                        StepStatus::Ambiguous
-                    },
-                    reason,
-                )
-            }
-            _ => (StepStatus::Ok, String::new()),
-        };
-        let error = payload.get("error").and_then(Value::as_str).unwrap_or_default();
-        let result_text = truncate(
-            &payload
-                .get("result")
-                .filter(|v| !v.is_null())
-                .map(Value::to_string)
-                .unwrap_or_default(),
-            200,
-        );
-        let detail_parts: Vec<&str> = [&detail, error, &result_text]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect();
-        step.status = status;
-        step.detail = detail_parts.join(" · ");
-    }
-
-    /// Close the active turn with the driver's observed result (the worker
-    /// stopped driving; the terminal `run_outcome` is already in the log,
-    /// so this mirrors a committed fact). `None` = no run reached a
-    /// terminal outcome (wake denied, error before any run).
-    pub fn finalize_turn(&mut self, last: Option<(OutcomeClass, Option<String>)>) {
+    fn finalize_turn(&mut self, last: Option<OutcomeClass>) {
         let Some(i) = self.active() else {
             return;
         };
         let turn = &mut self.turns[i];
         // The driver's result wins; a `None` result (no run reached a
         // terminal outcome) falls back to the recorded `run_outcome`.
-        let effective = last.or(turn.last_outcome.clone());
+        let effective = last
+            .map(|class| (class, None))
+            .or_else(|| turn.last_outcome.clone());
         turn.state = TurnState::from_outcome(effective);
-        turn.ended_at = Some(Instant::now());
     }
 
-    /// End of a replay (session open / resume): a turn still active has no
-    /// driver result — resolve it from its recorded terminal outcome, else
-    /// mark it interrupted (B-05: the log is the authority).
-    pub fn finish_replay(&mut self) {
+    fn finish_replay(&mut self) {
         if let Some(i) = self.active() {
             let turn = &mut self.turns[i];
             turn.state = TurnState::from_outcome(turn.last_outcome.clone());
         }
     }
 
-    /// The transcript as a semantic tree (the module-facing contract).
-    /// `expanded` names the collapsed turns the user re-opened (Q6/Q5:
-    /// bubbles collapse on completion, expand on demand); a running turn is
-    /// always expanded (Q5: live steps + spinner).
-    pub fn tree(&self, expanded: &HashSet<String>) -> SemanticTree {
-        // The former semantic rows are primitive compositions: a user message
-        // or answer is a styled `text`, a working step is a `code` line, the
-        // live spinner is a styled `text`, and the turn toggle is a `button`.
-        let mut root = Node::stack("root").child(Node::col("conv"));
-        let rows = &mut root.children[0];
-        for (n, turn) in self.turns.iter().enumerate() {
-            let id = |s: &str| format!("{s}{n}");
-            rows.children.push(Node::styled_text(
-                id("u"),
-                format!("❯ {}", turn.user),
-                "user",
-            ));
-            let open = turn.state == TurnState::Running
-                || expanded.contains(&format!("t{n}"));
-            if open && !turn.thoughts.is_empty() {
-                for (k, row) in turn.thoughts.iter().enumerate() {
-                    match row {
-                        BubbleRow::Text(text) => {
-                            rows.children.push(Node::styled_text(
-                                id(&format!("b{k}")),
-                                indent(text, 2),
-                                "thought",
-                            ));
-                        }
-                        BubbleRow::Step(step) => {
-                            rows.children.push(
-                                Node::code(id(&format!("b{k}")), step_line(step)),
-                            );
-                        }
-                        BubbleRow::Notice(text) => {
-                            rows.children.push(Node::styled_text(
-                                id(&format!("b{k}")),
-                                indent(text, 2),
-                                "status",
-                            ));
-                        }
-                    }
-                }
-                if turn.state == TurnState::Running {
-                    rows.children.push(Node::styled_text(
-                        id("p"),
-                        "  … working",
-                        "progress",
-                    ));
-                }
-            }
-            if turn.state != TurnState::Running {
-                let marker = if open { "▾" } else { "▸" };
-                rows.children.push(Node::button(
-                    id("t"),
-                    format!("{marker} {}", turn.summary()),
-                ));
-            }
-            if let Some(answer) = &turn.response {
-                rows.children.push(Node::styled_text(
-                    id("r"),
-                    indent(answer, 1),
-                    "response",
-                ));
-            }
-            rows.children.push(Node::styled_text(id("d"), "─".repeat(2), "divider"));
+    fn apply_delta(&mut self, fragment: &str) {
+        if let Some(i) = self.active() {
+            self.turns[i]
+                .streaming
+                .get_or_insert_with(String::new)
+                .push_str(fragment);
         }
-        SemanticTree::new(root)
     }
 
-    /// The flat TUI transcript (document order) with per-row turn
-    /// attribution. Thought segments render only while the turn is running or
-    /// its bubble is expanded (R-02/C-03). Mirrors [`Self::tree`].
-    pub fn transcript(&self, expanded: &HashSet<String>) -> Vec<TranscriptRow> {
-        let mut rows = Vec::new();
-        for (n, turn) in self.turns.iter().enumerate() {
-            rows.push(TranscriptRow {
-                text: format!("❯ {}", turn.user),
-                style: "user".into(),
-                turn: n,
-            });
-            let open =
-                turn.state == TurnState::Running || expanded.contains(&format!("t{n}"));
-            if open && !turn.thoughts.is_empty() {
-                for row in turn.thoughts.iter() {
-                    let (text, style) = match row {
-                        BubbleRow::Text(t) => (indent(t, 2), "thought"),
-                        BubbleRow::Step(s) => (step_line(s), "tool"),
-                        BubbleRow::Notice(t) => (indent(t, 2), "status"),
-                    };
-                    rows.push(TranscriptRow {
-                        text,
-                        style: style.into(),
-                        turn: n,
-                    });
-                }
-                if turn.state == TurnState::Running {
-                    rows.push(TranscriptRow {
-                        text: "  … working".into(),
-                        style: "progress".into(),
-                        turn: n,
-                    });
-                }
-            }
-            if turn.state != TurnState::Running {
-                let marker = if open { "▾" } else { "▸" };
-                rows.push(TranscriptRow {
-                    text: format!("{marker} {}", turn.summary()),
-                    style: "thought".into(),
-                    turn: n,
-                });
-            }
-            if let Some(answer) = &turn.response {
-                rows.push(TranscriptRow {
-                    text: indent(answer, 1),
-                    style: "response".into(),
-                    turn: n,
-                });
-            }
-            rows.push(TranscriptRow {
-                text: "──".into(),
-                style: "divider".into(),
-                turn: n,
-            });
+    fn end_stream(&mut self) {
+        if let Some(i) = self.active() {
+            self.turns[i].streaming = None;
         }
-        rows
     }
 
-    /// Total model egress across all turns (input, output) — status bar.
-    pub fn tokens(&self) -> (u64, u64) {
-        let mut tin = 0u64;
-        let mut tout = 0u64;
-        for t in &self.turns {
-            tin += t.input_tokens;
-            tout += t.output_tokens;
-        }
-        (tin, tout)
+    fn view(&self, overrides: &CollapseOverrides) -> TranscriptView {
+        // Collapse defaults are a pure function of the envelope stream: a
+        // running turn is always open (live steps + spinner), a settled turn
+        // collapses. Overrides re-open settled turns per-view only.
+        let turns = self
+            .turns
+            .iter()
+            .enumerate()
+            .map(|(n, turn)| {
+                let mut turn = turn.clone();
+                turn.open = turn.state == TurnState::Running || overrides.contains(n);
+                turn
+            })
+            .collect();
+        TranscriptView { turns }
     }
-}
 
-fn step_line(step: &ToolStep) -> String {
-    let mut out = format!("  {} {}({})", step.status.label(), step.tool, truncate(&step.args, 120));
-    if !step.detail.is_empty() {
-        out.push_str(&format!(" — {}", truncate(&step.detail, 160)));
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
-    out
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -659,11 +619,6 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = chars[..max].iter().collect();
     out.push('…');
     out
-}
-
-fn indent(text: &str, spaces: usize) -> String {
-    let pad = " ".repeat(spaces);
-    text.replace('\n', &format!("\n{pad}"))
 }
 
 #[cfg(test)]
@@ -699,9 +654,13 @@ mod tests {
         })
     }
 
+    fn default_view(p: &ConversationProjection) -> TranscriptView {
+        p.view(&CollapseOverrides::new())
+    }
+
     #[test]
     fn user_message_opens_a_turn() {
-        let mut s = ConversationState::new();
+        let mut s = ConversationProjection::new();
         s.apply(&env(1, "user_message", json!({ "text": "hello" })));
         assert_eq!(s.turns.len(), 1);
         assert_eq!(s.turns[0].user, "hello");
@@ -710,7 +669,7 @@ mod tests {
 
     #[test]
     fn terminal_outcome_without_calls_is_the_response() {
-        let mut s = ConversationState::new();
+        let mut s = ConversationProjection::new();
         s.apply(&env(1, "user_message", json!({ "text": "hi" })));
         s.apply(&env(2, "model_outcome", model_outcome(Some("the answer"), &[], 10, 5)));
         assert_eq!(s.turns[0].response.as_deref(), Some("the answer"));
@@ -721,7 +680,7 @@ mod tests {
 
     #[test]
     fn intermediate_outcome_with_calls_is_thought() {
-        let mut s = ConversationState::new();
+        let mut s = ConversationProjection::new();
         s.apply(&env(1, "user_message", json!({ "text": "hi" })));
         s.apply(&env(2, "model_outcome", model_outcome(Some("let me check"), &["fs.read"], 1, 2)));
         assert_eq!(s.turns[0].response, None);
@@ -730,7 +689,7 @@ mod tests {
 
     #[test]
     fn tool_only_outcome_has_no_phantom_text() {
-        let mut s = ConversationState::new();
+        let mut s = ConversationProjection::new();
         s.apply(&env(1, "user_message", json!({ "text": "hi" })));
         s.apply(&env(2, "model_outcome", model_outcome(None, &["fs.read"], 1, 2)));
         assert!(s.turns[0].thoughts.is_empty());
@@ -739,7 +698,7 @@ mod tests {
 
     #[test]
     fn tool_intent_and_outcome_pair_by_call_id() {
-        let mut s = ConversationState::new();
+        let mut s = ConversationProjection::new();
         s.apply(&env(1, "user_message", json!({ "text": "hi" })));
         s.apply(&env(
             2,
@@ -779,21 +738,21 @@ mod tests {
 
     #[test]
     fn run_outcome_records_terminal_and_finalize_closes_the_turn() {
-        let mut s = ConversationState::new();
+        let mut s = ConversationProjection::new();
         s.apply(&env(1, "user_message", json!({ "text": "hi" })));
         s.apply(&env(2, "run_start", json!({})));
         assert_eq!(s.turns[0].runs, 1);
         s.apply(&env(3, "run_outcome", json!({
             "run_id": "r", "outcome": "Progress", "reason": null
         })));
-        s.finalize_turn(Some((OutcomeClass::Progress, None)));
+        s.finalize_turn(Some(OutcomeClass::Progress));
         assert_eq!(s.turns[0].state, TurnState::Completed);
         assert!(s.active().is_none());
     }
 
     #[test]
     fn failed_run_carries_the_reason() {
-        let mut s = ConversationState::new();
+        let mut s = ConversationProjection::new();
         s.apply(&env(1, "user_message", json!({ "text": "hi" })));
         s.apply(&env(2, "run_outcome", json!({
             "run_id": "r",
@@ -808,7 +767,7 @@ mod tests {
 
     #[test]
     fn replay_finish_resolves_a_leftover_active_turn() {
-        let mut s = ConversationState::new();
+        let mut s = ConversationProjection::new();
         s.apply(&env(1, "user_message", json!({ "text": "hi" })));
         s.apply(&env(2, "run_outcome", json!({
             "run_id": "r", "outcome": "Blocked", "reason": null
@@ -819,7 +778,7 @@ mod tests {
 
     #[test]
     fn wake_denial_and_breaker_become_notices() {
-        let mut s = ConversationState::new();
+        let mut s = ConversationProjection::new();
         s.apply(&env(1, "user_message", json!({ "text": "hi" })));
         s.apply(&env(
             2,
@@ -852,106 +811,117 @@ mod tests {
     }
 
     #[test]
-    fn tree_renders_user_bubble_summary_and_response() {
-        let mut s = ConversationState::new();
-        s.apply(&env(1, "user_message", json!({ "text": "hello" })));
-        s.apply(&env(2, "run_start", json!({})));
-        s.apply(&env(
-            3,
-            "tool_intent",
-            json!({ "call_id": "c1", "tool": "fs.read", "args": { "path": "a" } }),
-        ));
-        s.apply(&env(
-            4,
-            "tool_outcome",
-            json!({ "call_id": "c1", "tool": "fs.read", "result": "x", "error": null,
-                    "classification": "Normal" }),
-        ));
-        // running: the bubble is open with the step row + spinner
-        let t = s.tree(&HashSet::new());
-        let kinds: Vec<crate::NodeKind> = t.nodes().iter().map(|n| n.kind()).collect();
-        assert!(kinds.contains(&crate::NodeKind::Code), "a tool step is code");
-        let text: Vec<String> = t.nodes().iter().map(|n| n.content()).collect();
-        assert!(text.iter().any(|c| c.contains("… working")), "spinner is a text row");
-        assert!(t.focusable().is_empty(), "no turn toggle while running");
-        s.apply(&env(5, "model_outcome", model_outcome(Some("done"), &[], 3, 4)));
-        s.finalize_turn(Some((OutcomeClass::Progress, None)));
-        // collapsed: no step row, summary + response present
-        let t = s.tree(&HashSet::new());
-        let text: Vec<String> = t.nodes().iter().map(|n| n.content()).collect();
-        assert!(!text.iter().any(|c| c.contains("fs.read")));
-        assert!(text.iter().any(|c| c.starts_with("▸")));
-        assert!(text.iter().any(|c| c.contains("done")));
-        // the collapsed summary is a focusable button
-        assert_eq!(t.focusable().len(), 1);
-        assert_eq!(t.focusable()[0].kind(), crate::NodeKind::Button);
-        // expanded: the step row comes back
-        let t = s.tree(&HashSet::from([format!("t{}", 0)]));
-        let text: Vec<String> = t.nodes().iter().map(|n| n.content()).collect();
-        assert!(text.iter().any(|c| c.contains("fs.read")));
-        assert!(text.iter().any(|c| c.starts_with("▾")));
-    }
-
-    #[test]
-    fn transcript_projects_document_order_and_toggle_state() {
-        let mut s = ConversationState::new();
-        s.apply(&env(1, "user_message", json!({ "text": "hi" })));
-        s.apply(&env(2, "run_start", json!({})));
-        s.apply(&env(
-            3,
-            "tool_intent",
-            json!({ "call_id": "c1", "tool": "fs.read", "args": { "path": "a" } }),
-        ));
-        // running: bubble open (step + spinner), no summary marker yet
-        let rows = s.transcript(&HashSet::new());
-        assert_eq!(rows[0].text, "❯ hi");
-        assert_eq!(rows[0].style, "user");
-        assert!(rows.iter().any(|r| r.text.contains("fs.read") && r.style == "tool"));
-        assert!(rows
-            .iter()
-            .any(|r| r.text == "  … working" && r.style == "progress"));
-        assert!(!rows.iter().any(|r| r.text.starts_with("▸")));
-
-        s.apply(&env(
-            4,
-            "tool_outcome",
-            json!({ "call_id": "c1", "tool": "fs.read", "result": "x", "error": null,
-                    "classification": "Normal" }),
-        ));
-        s.apply(&env(5, "model_outcome", model_outcome(Some("done"), &[], 3, 4)));
-        s.finalize_turn(Some((OutcomeClass::Progress, None)));
-
-        // collapsed: summary marker, no step rows, indented response, divider
-        let rows = s.transcript(&HashSet::new());
-        assert!(rows.iter().any(|r| r.text.starts_with("▸ [✓]")));
-        assert!(!rows.iter().any(|r| r.text.contains("fs.read")));
-        // `indent` prefixes only continuation lines; a single-line answer
-        // renders bare.
-        assert!(rows
-            .iter()
-            .any(|r| r.text == "done" && r.style == "response"));
-        assert_eq!(rows.last().unwrap().text, "──");
-        assert_eq!(
-            rows.iter().map(|r| r.turn).collect::<Vec<_>>(),
-            vec![0; rows.len()]
-        );
-
-        // expanded: steps come back, marker flips, spinner only while running
-        let rows = s.transcript(&HashSet::from([String::from("t0")]));
-        assert!(rows.iter().any(|r| r.text.starts_with("▾ [✓]")));
-        assert!(rows.iter().any(|r| r.text.contains("fs.read") && r.style == "tool"));
-        assert!(!rows.iter().any(|r| r.text.contains("… working")));
-    }
-
-    #[test]
     fn tokens_sums_egress_across_turns() {
-        let mut s = ConversationState::new();
+        let mut s = ConversationProjection::new();
         s.apply(&env(1, "user_message", json!({ "text": "a" })));
         s.apply(&env(2, "model_outcome", model_outcome(Some("x"), &[], 10, 5)));
-        s.finalize_turn(Some((OutcomeClass::Progress, None)));
+        s.finalize_turn(Some(OutcomeClass::Progress));
         s.apply(&env(3, "user_message", json!({ "text": "b" })));
         s.apply(&env(4, "model_outcome", model_outcome(Some("y"), &[], 7, 2)));
-        s.finalize_turn(Some((OutcomeClass::Progress, None)));
-        assert_eq!(s.tokens(), (17, 7));
+        s.finalize_turn(Some(OutcomeClass::Progress));
+        assert_eq!(default_view(&s).tokens(), (17, 7));
+    }
+
+    // ---- decision 30 acceptance ----
+
+    #[test]
+    fn two_projections_of_the_same_stream_produce_equal_views() {
+        let stream = [
+            env(1, "user_message", json!({ "text": "hi" })),
+            env(2, "run_start", json!({})),
+            env(
+                3,
+                "tool_intent",
+                json!({ "call_id": "c1", "tool": "fs.read", "args": { "path": "a" } }),
+            ),
+            env(
+                4,
+                "tool_outcome",
+                json!({ "call_id": "c1", "tool": "fs.read", "result": "x", "error": null,
+                        "classification": "Normal" }),
+            ),
+            env(5, "model_outcome", model_outcome(Some("done"), &[], 3, 4)),
+        ];
+        let mut a = ConversationProjection::new();
+        let mut b = ConversationProjection::new();
+        for env in &stream {
+            a.apply(env);
+            b.apply(env);
+        }
+        a.finalize_turn(None);
+        b.finalize_turn(None);
+        assert_eq!(default_view(&a), default_view(&b));
+    }
+
+    #[test]
+    fn replay_is_identical_to_live_application() {
+        let stream = [
+            env(1, "user_message", json!({ "text": "hi" })),
+            env(2, "run_start", json!({})),
+            env(3, "model_outcome", model_outcome(Some("thinking"), &["fs.read"], 1, 2)),
+            env(
+                4,
+                "tool_intent",
+                json!({ "call_id": "c1", "tool": "fs.read", "args": { "path": "a" } }),
+            ),
+            env(
+                5,
+                "tool_outcome",
+                json!({ "call_id": "c1", "tool": "fs.read", "result": "x", "error": null,
+                        "classification": "Normal" }),
+            ),
+            env(6, "run_outcome", json!({ "run_id": "r", "outcome": "Blocked", "reason": null })),
+        ];
+        let mut live = ConversationProjection::new();
+        for env in &stream {
+            live.apply(env);
+        }
+        live.finalize_turn(None);
+
+        let mut replay = ConversationProjection::new();
+        for env in &stream {
+            replay.apply(env);
+        }
+        replay.finish_replay();
+
+        assert_eq!(default_view(&live), default_view(&replay));
+    }
+
+    #[test]
+    fn collapse_defaults_are_pure_and_overrides_stay_session_local() {
+        let mut s = ConversationProjection::new();
+        s.apply(&env(1, "user_message", json!({ "text": "a" })));
+        s.apply(&env(2, "run_start", json!({})));
+        s.apply(&env(3, "run_outcome", json!({ "run_id": "r", "outcome": "Progress", "reason": null })));
+        s.finalize_turn(None);
+        s.apply(&env(4, "user_message", json!({ "text": "b" })));
+
+        let baseline = default_view(&s);
+        assert!(!baseline.turns[0].open, "a settled turn collapses by default");
+        assert!(baseline.turns[1].open, "a running turn is always open");
+
+        let mut overrides = CollapseOverrides::new();
+        overrides.toggle(0);
+        let expanded = s.view(&overrides);
+        assert!(expanded.turns[0].open, "the override re-opens the settled turn");
+        assert!(expanded.turns[1].open);
+
+        // The override never mutated the projection: the default view is
+        // byte-identical afterwards.
+        assert_eq!(s.view(&CollapseOverrides::new()), baseline);
+    }
+
+    #[test]
+    fn streaming_deltas_are_an_in_flight_partial_and_end_stream_clears_it() {
+        let mut s = ConversationProjection::new();
+        s.apply(&env(1, "user_message", json!({ "text": "hi" })));
+        assert_eq!(default_view(&s).turns[0].streaming, None);
+        s.apply_delta("he");
+        s.apply_delta("llo");
+        let view = default_view(&s);
+        assert_eq!(view.turns[0].streaming.as_deref(), Some("hello"));
+        assert!(view.turns[0].open, "the in-flight partial renders in an open bubble");
+        s.end_stream();
+        assert_eq!(default_view(&s).turns[0].streaming, None);
     }
 }

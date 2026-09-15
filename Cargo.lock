@@ -1733,6 +1733,7 @@ dependencies = [
  "kanbei-scopes",
  "kanbei-session",
  "kanbei-tools",
+ "kanbei-transcript",
  "kanbei-ui",
  "kanbei-vm",
  "ratatui",
@@ -1968,6 +1969,7 @@ dependencies = [
  "kanbei-snapshot",
  "kanbei-telemetry",
  "kanbei-tools",
+ "kanbei-transcript",
  "kanbei-ui",
  "kanbei-vm",
  "kanbei-workspace",
@@ -2035,11 +2037,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kanbei-transcript"
+version = "0.1.0"
+dependencies = [
+ "kanbei-core",
+ "serde_json",
+]
+
+[[package]]
 name = "kanbei-ui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
  "kanbei-core",
+ "kanbei-transcript",
  "ratatui",
  "rustix",
  "serde",

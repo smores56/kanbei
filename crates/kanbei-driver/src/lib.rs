@@ -159,6 +159,16 @@ impl Driver {
     /// constraint as `wake_denied`), or a terminal outcome that is not a
     /// continuation (`Blocked`, `Failed`, `Waiting`, `NoProgress`).
     pub fn drive_to_quiescence(&mut self) -> Result<Turn, SessionError> {
+        let result = self.drive_wakes();
+        // The driver stopped driving: mirror the terminal fact into the
+        // session-owned transcript projection (decision 30). No-op when no turn
+        // is active; on error the session already committed a truthful terminal
+        // outcome for the failed run.
+        self.session.finalize_transcript_turn();
+        result
+    }
+
+    fn drive_wakes(&mut self) -> Result<Turn, SessionError> {
         let mut turn = Turn::default();
         loop {
             let Some(run) = self.session.accept_wake()? else {

@@ -17,6 +17,7 @@ kanbei-provider.workspace = true
 kanbei-scopes.workspace = true
 kanbei-session.workspace = true
 kanbei-tools.workspace = true
+kanbei-transcript.workspace = true
 kanbei-ui.workspace = true
 kanbei-vm.workspace = true
 serde_json.workspace = true

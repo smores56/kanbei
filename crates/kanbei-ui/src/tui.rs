@@ -73,8 +73,8 @@ pub struct StyledRow {
 }
 
 /// One transcript row the viewport consumes (text + theme style name). Owned
-/// and free of tree borrows so the CLI builds them directly from the
-/// conversation projection.
+/// and free of tree borrows so the CLI builds them directly from the typed
+/// transcript view ([`crate::transcript_rows`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub text: String,

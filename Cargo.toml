@@ -26,6 +26,7 @@ members = [
     "crates/kanbei-provider",
     "crates/kanbei-scheduler",
     "crates/kanbei-tools",
+    "crates/kanbei-transcript",
     "crates/kanbei-ui",
     "crates/kanbei-workspace",
     "xtask",
@@ -59,6 +60,7 @@ default-members = [
     "crates/kanbei-provider",
     "crates/kanbei-scheduler",
     "crates/kanbei-tools",
+    "crates/kanbei-transcript",
     "crates/kanbei-ui",
     "crates/kanbei-workspace",
 ]
@@ -91,6 +93,7 @@ kanbei-scopes = { path = "crates/kanbei-scopes" }
 kanbei-provider = { path = "crates/kanbei-provider" }
 kanbei-scheduler = { path = "crates/kanbei-scheduler" }
 kanbei-tools = { path = "crates/kanbei-tools" }
+kanbei-transcript = { path = "crates/kanbei-transcript" }
 kanbei-ui = { path = "crates/kanbei-ui" }
 kanbei-workspace = { path = "crates/kanbei-workspace" }
 

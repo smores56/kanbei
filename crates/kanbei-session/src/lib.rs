@@ -67,6 +67,7 @@ use kanbei_scopes::scope_tree::ScopeTree;
 use kanbei_scopes::contrib::SettingsContribution;
 use kanbei_services::ServiceRegistry;
 use kanbei_snapshot::ExecutionManifest;
+use kanbei_transcript::{TranscriptProjection, TranscriptView};
 use kanbei_vm::{GuestError, Vm};
 use serde_json::json;
 use thiserror::Error;
@@ -85,6 +86,7 @@ mod elements;
 mod settings_gate;
 mod recovery;
 mod switch;
+mod transcript;
 use recovery::{decode_record, recover_or_fresh, shutdown_queue};
 pub use builtin_config::{
     BUILTIN_CONFIG_SOURCE, builtin_config_manifest, builtin_config_module_id, root_scope,
@@ -111,6 +113,14 @@ pub type CommitListener = Arc<dyn Fn(&Envelope) + Send + Sync>;
 /// observer must not block. None = deltas are consumed (cancellation still
 /// works) but not observed.
 pub type DeltaListener = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Transcript-view observer (UI seam): called with the session's current
+/// projection view whenever the transcript changes (a commit applied, a turn
+/// finalized or replayed, a provider stream ended). Runs on the calling
+/// thread; the observer must not block. Gives a cross-thread UI live access to
+/// the session-owned projection without holding the session. None = not
+/// observed (read on demand with [`Session::transcript_view`]).
+pub type TranscriptListener = Arc<dyn Fn(&TranscriptView) + Send + Sync>;
 
 /// Desired-state settings seam (decision 28): resolves the running session's
 /// wiring from the merged config-layer [`SettingsContribution`].
@@ -231,6 +241,15 @@ pub struct SessionConfig {
     /// Streaming delta observer (UI seam): called per content fragment as the
     /// provider streams a model response. None = deltas are not observed.
     pub delta_listener: Option<DeltaListener>,
+    /// The transcript projection service (decision 30). None = the built-in
+    /// [`kanbei_transcript::ConversationProjection`]. The session owns and
+    /// drives it: committed envelopes, provider-stream deltas, turn finalize,
+    /// and replay all flow through this seam, so a replacement projection
+    /// needs no changes to the session or the UI.
+    pub transcript: Option<Box<dyn TranscriptProjection>>,
+    /// Transcript-view observer (UI seam); called when the projection changes.
+    /// None = read on demand with [`Session::transcript_view`].
+    pub transcript_listener: Option<TranscriptListener>,
     // --- M4 memory substrate + context projection ---
     /// Memory substrate root (canonical XDG state). None = cfg.dir.join("memory").
     pub memory_root: Option<PathBuf>,
@@ -285,6 +304,8 @@ impl Default for SessionConfig {
             commit_listener: None,
             cancel_flag: None,
             delta_listener: None,
+            transcript: None,
+            transcript_listener: None,
             memory_root: None,
             project: None,
             memory_fault: None,
@@ -612,6 +633,12 @@ pub struct Session {
     cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Streaming delta observer (UI seam); called per streamed content fragment.
     delta_listener: Option<DeltaListener>,
+    /// The session-owned transcript projection service (decision 30): applied
+    /// on the commit path, driven by provider-stream deltas, and read through
+    /// [`Session::transcript_view`].
+    transcript: Box<dyn TranscriptProjection>,
+    /// Transcript-view observer (UI seam); called when the projection changes.
+    transcript_listener: Option<TranscriptListener>,
     fs_root: PathBuf,
     session_id: Id128,
     // --- M4 memory substrate + context projection ---
@@ -799,6 +826,11 @@ impl Session {
         let commit_listener = cfg.commit_listener.clone();
         let cancel_flag = cfg.cancel_flag.clone();
         let delta_listener = cfg.delta_listener.clone();
+        let transcript = cfg
+            .transcript
+            .take()
+            .unwrap_or_else(|| Box::new(kanbei_transcript::ConversationProjection::new()));
+        let transcript_listener = cfg.transcript_listener.clone();
         let budgets = cfg.budgets;
         let breaker_floors = cfg.breaker_floors;
         let provider_config = cfg.provider.clone();
@@ -1091,6 +1123,8 @@ impl Session {
             commit_listener,
             cancel_flag,
             delta_listener,
+            transcript,
+            transcript_listener,
             fs_root,
             session_id,
             memory_lifetime,
@@ -1118,6 +1152,13 @@ impl Session {
             open_run_span: None,
             gc_pins: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
+
+        // Decision 30: the transcript projection rebuilds from the canonical
+        // log on open (launch = resume, R-19). Replay applies every committed
+        // envelope, then resolves a leftover active turn from its recorded
+        // terminal outcome. Subsequent commits (config activation, recovery
+        // facts) flow through the commit path.
+        session.replay_transcript()?;
 
         // D-F-Kb: re-arm the pause the log still carries, so the reopened
         // session denies cognition until the user resumes it.

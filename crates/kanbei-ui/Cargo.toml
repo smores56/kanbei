@@ -12,3 +12,4 @@ rustix.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 kanbei-core.workspace = true
+kanbei-transcript.workspace = true

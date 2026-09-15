@@ -82,16 +82,28 @@ impl Session {
         while self.recent_events.len() > RECENT_RING {
             self.recent_events.pop_front();
         }
-        // Envelope observer (UI seam): the transcript is a pure projection of
-        // committed envelopes (R-19), and promoted payloads must reach it
-        // resolved — a `$object` marker is dereferenced to the full record.
-        if let Some(listener) = &self.commit_listener {
-            for env in &outcome.envelopes {
+        // Envelope observer + transcript projection (UI seam, decision 30):
+        // the transcript is a pure projection of committed envelopes (R-19),
+        // and promoted payloads must reach it resolved — a `$object` marker is
+        // dereferenced to the full record.
+        let resolved: Vec<Envelope> = outcome
+            .envelopes
+            .iter()
+            .map(|env| {
                 let mut resolved = env.clone();
-                resolved.payload = self.resolved_payload(env);
-                listener(&resolved);
+                resolved.payload = resolve_payload(&self.store, env);
+                resolved
+            })
+            .collect();
+        for env in &resolved {
+            self.transcript.apply(env);
+        }
+        if let Some(listener) = &self.commit_listener {
+            for env in &resolved {
+                listener(env);
             }
         }
+        self.notify_transcript();
         // A committed compaction selection joins the FSM's covered set (the
         // check above rejects its covered fragments from then on).
         for ev in &events {
@@ -278,17 +290,27 @@ impl Session {
     /// records are invisible: a promoted `tool_intent` would be dropped
     /// from B-05 classification entirely.
     pub(crate) fn resolved_payload(&self, env: &Envelope) -> serde_json::Value {
-        let Some(marker) = env.payload.get("$object").and_then(|o| o.as_str()) else {
-            return env.payload.clone();
-        };
-        match marker.parse::<Digest>() {
-            Ok(digest) => self
-                .store
-                .get(&digest)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .unwrap_or_else(|| env.payload.clone()),
-            Err(_) => env.payload.clone(),
-        }
+        resolve_payload(&self.store, env)
+    }
+}
+
+/// Resolve a possibly object-promoted payload against `store` (see
+/// [`Session::resolved_payload`]). Free so callers can hold disjoint borrows of
+/// the session (the transcript replay mutates the projection while reading the
+/// store).
+pub(crate) fn resolve_payload(
+    store: &kanbei_objects::ObjectStore,
+    env: &Envelope,
+) -> serde_json::Value {
+    let Some(marker) = env.payload.get("$object").and_then(|o| o.as_str()) else {
+        return env.payload.clone();
+    };
+    match marker.parse::<Digest>() {
+        Ok(digest) => store
+            .get(&digest)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_else(|| env.payload.clone()),
+        Err(_) => env.payload.clone(),
     }
 }

@@ -26,7 +26,6 @@
 //! `/status`, `/history [N]`, `/export DIR`, `/resume` (after a breaker
 //! pause), `/exit`.
 
-use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -39,7 +38,6 @@ use kanbei_capabilities::{
     Broker, Capability, Grant, GrantScope, PolicyTemplate, Principal, TrustClass,
 };
 use kanbei_core::digest::Digest;
-use kanbei_core::envelope::Envelope;
 use kanbei_core::id::Id128;
 use kanbei_driver::{Driver, Turn};
 use kanbei_modules::PackageManifest;
@@ -52,9 +50,10 @@ use kanbei_session::{
     ApprovalResolver, Session, SessionConfig, SessionError, SessionSettings, SettingsSource,
 };
 use kanbei_tools::{ApprovalParked, ToolRegistry};
+use kanbei_transcript::{CollapseOverrides, TranscriptView};
 use kanbei_ui::{
-    build_viewport, key_to_input, resolve_style, total_rows, transcript_paragraph,
-    ConversationState, InputEvent, Row, StyledRow, Theme,
+    build_viewport, key_to_input, resolve_style, total_rows, transcript_paragraph, transcript_rows,
+    InputEvent, Row, StyledRow, Theme,
 };
 use kanbei_vm::VmConfig;
 
@@ -518,10 +517,8 @@ fn run_repl(opts: Options) {
 
 /// Worker→main events.
 enum Evt {
-    /// A committed envelope (replay or live) to fold into the transcript.
-    Envelope(Envelope),
-    /// The canonical replay is complete; resolve any leftover active turn.
-    ReplayDone,
+    /// The session's transcript projection changed; render the new view.
+    View(TranscriptView),
     /// An approval-gated intent parked during a turn; the UI decides it
     /// (y/n) and replies on `reply`.
     Approval(ApprovalReq),
@@ -560,8 +557,11 @@ impl Focus {
 
 /// The mutable UI state (main thread).
 struct Ui {
-    conv: ConversationState,
-    expanded: HashSet<String>,
+    /// The session's current transcript view (pushed over `Evt::View`).
+    view: TranscriptView,
+    /// Session-local manual collapse overrides (never stored in the session's
+    /// projection).
+    expanded: CollapseOverrides,
     input: String,
     cursor: usize,
     focus: Focus,
@@ -578,8 +578,8 @@ struct Ui {
 impl Ui {
     fn new(model: String) -> Self {
         Self {
-            conv: ConversationState::new(),
-            expanded: HashSet::new(),
+            view: TranscriptView::default(),
+            expanded: CollapseOverrides::new(),
             input: String::new(),
             cursor: 0,
             focus: Focus::Input,
@@ -603,11 +603,12 @@ fn run_tui(opts: Options) -> i32 {
     let (evt_tx, evt_rx) = mpsc::channel::<Evt>();
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
-    // Observer + approval seams: commit_listener fires on the committing
-    // (worker) thread per resolved envelope; the resolver does a cross-thread
-    // rendezvous (the worker blocks until the UI answers y/n). The config
-    // settings decide auto-approval; the rendezvous is the interactive fallback.
-    let commit_tx = evt_tx.clone();
+    // Observer + approval seams: transcript_listener fires on the committing
+    // (worker) thread per projection change; the session owns and drives the
+    // projection (decision 30). The resolver does a cross-thread rendezvous
+    // (the worker blocks until the UI answers y/n). The config settings decide
+    // auto-approval; the rendezvous is the interactive fallback.
+    let view_tx = evt_tx.clone();
     let approval_tx = evt_tx.clone();
     let interactive: ApprovalResolver = Arc::new(move |p: &ApprovalParked| {
         let (reply_tx, reply_rx) = mpsc::channel::<bool>();
@@ -631,8 +632,8 @@ fn run_tui(opts: Options) -> i32 {
             interactive: Some(interactive),
             yolo: Default::default(),
         })),
-        commit_listener: Some(Arc::new(move |env: &Envelope| {
-            let _ = commit_tx.send(Evt::Envelope(env.clone()));
+        transcript_listener: Some(Arc::new(move |view: &TranscriptView| {
+            let _ = view_tx.send(Evt::View(view.clone()));
         })),
         cancel_flag: Some(cancel_cfg),
         ..Default::default()
@@ -659,16 +660,14 @@ fn run_tui(opts: Options) -> i32 {
         .as_ref()
         .is_some_and(|a| a.auto_approve == Some(true) || a.yolo == Some(true));
 
-    // Worker thread: replay the canonical log (launch = resume, R-19), then
-    // drive turns. On Quit it closes the session (it owns it).
+    // Worker thread: the session already replayed the transcript projection at
+    // open (decision 30, launch = resume, R-19), so push its current view once,
+    // then drive turns. On Quit it closes the session (it owns it).
     let worker = std::thread::spawn(move || {
         let mut driver = Driver::new(session);
-        let _ = driver
-            .session()
-            .replay_envelopes(0, |env| {
-                let _ = evt_tx.send(Evt::Envelope(env.clone()));
-            });
-        let _ = evt_tx.send(Evt::ReplayDone);
+        let _ = evt_tx.send(Evt::View(
+            driver.session().transcript_view(&CollapseOverrides::new()),
+        ));
         loop {
             match cmd_rx.recv() {
                 Ok(Cmd::Submit(text)) => {
@@ -787,7 +786,7 @@ fn run_tui_loop(
         let input_area = chunks[1];
         let status_area = chunks[2];
         let width = area.width as usize;
-        let trows = ui.conv.transcript(&ui.expanded);
+        let trows = transcript_rows(&ui.view, &ui.expanded);
         let rows: Vec<Row> = trows
             .iter()
             .map(|t| Row {
@@ -830,17 +829,15 @@ fn run_tui_loop(
 /// Route one worker event into the UI state.
 fn handle_evt(ui: &mut Ui, evt: Evt) {
     match evt {
-        Evt::Envelope(env) => ui.conv.apply(&env),
-        Evt::ReplayDone => ui.conv.finish_replay(),
+        Evt::View(view) => ui.view = view,
         Evt::Approval(req) => {
             ui.pending = Some(req);
             ui.status = "awaiting approval".into();
         }
         Evt::TurnDone(result) => {
             ui.active = false;
-            // The terminal run_outcome is already committed (apply recorded
-            // it); finalize flips the turn's state from that recorded outcome.
-            ui.conv.finalize_turn(None);
+            // The session already finalized the turn's projection (the driver
+            // mirrors its terminal result on the commit path).
             ui.pinned = true;
             ui.focus = Focus::Input;
             match result {
@@ -960,7 +957,7 @@ fn handle_input(
                 None
             }
             InputEvent::Escape => {
-                let sel = ui.conv.turns.len().saturating_sub(1);
+                let sel = ui.view.turns.len().saturating_sub(1);
                 ui.focus = Focus::Transcript { sel };
                 None
             }
@@ -990,7 +987,7 @@ fn handle_input(
                 None
             }
             InputEvent::ArrowDown | InputEvent::Char('j') => {
-                let max = ui.conv.turns.len().saturating_sub(1);
+                let max = ui.view.turns.len().saturating_sub(1);
                 ui.focus = Focus::Transcript {
                     sel: (sel + 1).min(max),
                 };
@@ -1054,15 +1051,10 @@ fn handle_mouse(
 /// Toggle a turn's thought-bubble expansion (Q5/Q6: collapse on completion,
 /// expand on demand).
 fn toggle_turn(ui: &mut Ui, sel: usize) {
-    if sel >= ui.conv.turns.len() {
+    if sel >= ui.view.turns.len() {
         return;
     }
-    let key = format!("t{sel}");
-    if ui.expanded.contains(&key) {
-        ui.expanded.remove(&key);
-    } else {
-        ui.expanded.insert(key);
-    }
+    ui.expanded.toggle(sel);
 }
 
 /// Scroll the transcript by `n` rows (unpinning from the bottom); the render
@@ -1106,7 +1098,7 @@ fn draw(
     f.render_widget(Paragraph::new(Text::from(vec![line])), input_area);
 
     // 3. status bar: state · model · tokens · hints.
-    let (tin, tout) = ui.conv.tokens();
+    let (tin, tout) = ui.view.tokens();
     let state = if ui.active {
         "running"
     } else {

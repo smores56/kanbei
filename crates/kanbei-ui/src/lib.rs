@@ -17,7 +17,6 @@
 
 pub mod accessibility;
 pub mod builtin;
-pub mod conversation;
 pub mod diff;
 pub mod fallback;
 pub mod focus;
@@ -25,20 +24,18 @@ pub mod frame;
 pub mod input;
 pub mod terminal;
 pub mod theme;
+pub mod transcript;
 pub mod tree;
 pub mod tui;
 
 pub use builtin::{BUILTIN_UI_COMPONENT, BUILTIN_UI_NAME, BUILTIN_UI_SOURCE};
-pub use conversation::{
-    BubbleRow, ConversationState, OutcomeClass, StepStatus, ToolStep, TranscriptRow, TurnState,
-    TurnView,
-};
 pub use diff::{CellEdit, FrameDiff};
 pub use focus::{FocusDirection, FocusModel, KeyClassifier, ReservedAction};
 pub use frame::{RenderContext, RenderError, RenderOutput, TerminalFrame};
 pub use input::{InputDecoder, InputEvent, UiEvent, UiEventKind, UiProvenance};
 pub use terminal::{Terminal, TerminalGuard, TermiosTerminal};
 pub use theme::{Color, Style, Theme};
+pub use transcript::{TranscriptRow, render_transcript, transcript_rows};
 pub use tui::{
     build_viewport, key_to_input, resolve_style, total_rows, transcript_paragraph, Row, StyledRow,
 };

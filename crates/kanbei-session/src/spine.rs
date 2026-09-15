@@ -420,17 +420,22 @@ impl Session {
         let no_cancel = std::sync::atomic::AtomicBool::new(false);
         let cancel_ref = cancel.as_deref().unwrap_or(&no_cancel);
         let listener = self.delta_listener.clone();
+        // Decision 30: partials have a home in the transcript projection; they
+        // are non-canonical and never committed.
+        let transcript = &mut self.transcript;
         let mut on_delta = |fragment: &str| {
+            transcript.apply_delta(fragment);
             if let Some(listener) = &listener {
                 listener(fragment);
             }
         };
-        let response = engine
-            .complete_stream(&request, cancel_ref, &mut on_delta)
-            .map_err(|e| match e {
-                kanbei_provider::ProviderError::Cancelled { .. } => SessionError::Cancelled,
-                e => SessionError::Provider(e.to_string()),
-            })?;
+        let streamed = engine.complete_stream(&request, cancel_ref, &mut on_delta);
+        // The stream ended (success or cancel/error): clear the partial.
+        self.transcript.end_stream();
+        let response = streamed.map_err(|e| match e {
+            kanbei_provider::ProviderError::Cancelled { .. } => SessionError::Cancelled,
+            e => SessionError::Provider(e.to_string()),
+        })?;
         self.fault(crate::FaultPoint::AfterModelCall);
 
         let result = json!({
