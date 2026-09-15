@@ -266,6 +266,10 @@ pub struct SessionConfig {
     // --- M4 memory substrate + context projection ---
     /// Memory substrate root (canonical XDG state). None = cfg.dir.join("memory").
     pub memory_root: Option<PathBuf>,
+    /// XDG state layout (decision 33/T14); None = the legacy cwd-relative
+    /// layout under `dir`. Step 1 only exposes the resolver: nothing in `open`
+    /// consults this yet, so existing paths are unchanged.
+    pub layout: Option<kanbei_core::StateLayout>,
     /// ProjectId (pro_ brand) binding; None = no project memory scope.
     pub project: Option<Id128>,
     /// Kernel fault injector for the memory actors (transition/head points).
@@ -321,6 +325,7 @@ impl Default for SessionConfig {
             transcript_listener: None,
             present_hook: None,
             memory_root: None,
+            layout: None,
             project: None,
             memory_fault: None,
             child_provider: None,

@@ -73,24 +73,10 @@ fn discover_config_layers_with(
 }
 
 /// `$XDG_CONFIG_HOME/kanbei/init.lua`, falling back to
-/// `$HOME/.config/kanbei/init.lua`. None when neither is set (empty values
-/// count as unset, matching the XDG base-directory spec).
+/// `$HOME/.config/kanbei/init.lua`. None when neither is set (empty or
+/// relative values count as unset, per [`kanbei_core::paths::config_root`]).
 fn user_config_path(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
-    if let Some(xdg) = xdg_config_home.filter(|v| !v.is_empty()) {
-        let xdg = PathBuf::from(xdg);
-        // The XDG base-directory spec requires an absolute path; a relative
-        // one is treated as unset (fall through to $HOME).
-        if xdg.is_absolute() {
-            return Some(xdg.join("kanbei").join("init.lua"));
-        }
-    }
-    let home = home.filter(|v| !v.is_empty())?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("kanbei")
-            .join("init.lua"),
-    )
+    kanbei_core::paths::config_root(xdg_config_home, home).map(|root| root.join("init.lua"))
 }
 
 /// Reads one optional config layer. Absent → `Ok(None)`; any other read
