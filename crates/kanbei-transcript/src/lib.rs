@@ -22,13 +22,14 @@
 
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use kanbei_core::envelope::Envelope;
 
 /// The turn's terminal classification (UI vocabulary for the scheduler's
 /// `TerminalOutcome`, kept dependency-free).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OutcomeClass {
     Progress,
     CompletedGoal,
@@ -71,7 +72,7 @@ pub fn parse_outcome(payload: &Value) -> Option<(OutcomeClass, Option<String>)> 
 }
 
 /// Tool step status, from the `tool_outcome` classification (R-02/C-03).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepStatus {
     /// The `tool_intent` committed; no outcome yet.
     InFlight,
@@ -83,7 +84,7 @@ pub enum StepStatus {
 }
 
 /// One row of a turn's working segment (thought bubble).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BubbleRow {
     /// Intermediate model content (a thought).
     Text(String),
@@ -93,7 +94,7 @@ pub enum BubbleRow {
     Notice(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolStep {
     pub call_id: String,
     pub tool: String,
@@ -111,7 +112,7 @@ pub struct ToolStep {
 }
 
 /// The turn's rendered end-state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnState {
     Running,
     /// Terminal `Progress`/`CompletedGoal` (a clean continuation stop).
@@ -146,7 +147,7 @@ impl TurnState {
 /// the recorded terminal state. Wall-clock metadata is deliberately absent:
 /// the view is a pure function of the envelope stream, so resume rebuilds are
 /// identical.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnView {
     pub user: String,
     /// The turn's working segment, in commit order (thoughts and tool
@@ -197,7 +198,7 @@ impl TurnView {
 /// The whole transcript as a typed view: turns in commit order. A pure
 /// function of the envelope stream applied so far (plus finalize events, which
 /// mirror committed terminal records).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptView {
     pub turns: Vec<TurnView>,
 }

@@ -1,10 +1,10 @@
 //! TUI integration test (C4): spawns the real `kanbei` binary on a
 //! pseudo-terminal and drives one scripted turn end-to-end with a
 //! config-driven `provider.fake` engine (no argv flags, no network). The
-//! rendered byte stream is the only observable
-//! surface of a full-screen TUI, so assertions target single-span rows
-//! (each transcript row renders as one styled span, hence contiguous)
-//! and a clean Ctrl-Q exit.
+//! rendered byte stream is the only observable surface of a full-screen TUI,
+//! so assertions target the built-in shell's visible contributions: the
+//! header/status line, the transcript turn rows (user, settled summary, fake
+//! answer), and a clean Ctrl-Q exit through the kernel keymap.
 
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
@@ -115,25 +115,28 @@ end
         .spawn()
         .expect("spawn kanbei");
 
-    // 1. The TUI comes up: the first frame carries the idle status bar.
+    // 1. The shell comes up: the module header carries the kernel status and
+    //    the kernel status bar shows the same state.
     assert!(
-        wait_for(&buf, "idle", BOOT_TIMEOUT),
-        "TUI did not render an initial frame\n---\n{}",
+        wait_for(&buf, "kanbei · idle", BOOT_TIMEOUT),
+        "TUI did not render the shell header\n---\n{}",
         rendered(&buf)
     );
 
     // 2. Submit a prompt (Enter is \r on a raw pty).
     send(&mut master_in, b"hello world\r");
 
-    // 3. The turn renders: the committed user line (one span), then the
-    //    fake provider's answer (first line starts at column 0). The answer
-    //    is in the terminal default text style, so its space cells are
-    //    indistinguishable from blank terminal cells: the diff writes only
-    //    the non-space runs, each as its own write with cursor moves between
-    //    them. Match the longest contiguous run of the answer.
+    // 3. The turn renders through the shell: the transcript user row, the
+    //    settled summary header (the turn consumed one run), then the fake
+    //    provider's answer from the transcript context.
     assert!(
         wait_for(&buf, "❯ hello world", TURN_TIMEOUT),
-        "the user prompt did not render\n---\n{}",
+        "the user turn row did not render\n---\n{}",
+        rendered(&buf)
+    );
+    assert!(
+        wait_for(&buf, "run(s)", TURN_TIMEOUT),
+        "the settled turn summary did not render\n---\n{}",
         rendered(&buf)
     );
     assert!(

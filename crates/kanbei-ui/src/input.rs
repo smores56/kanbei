@@ -128,6 +128,10 @@ impl InputDecoder {
                 self.pending.remove(0);
                 Some(InputEvent::CtrlX)
             }
+            0x11 => {
+                self.pending.remove(0);
+                Some(InputEvent::CtrlQ)
+            }
             0x1a => {
                 self.pending.remove(0);
                 Some(InputEvent::CtrlZ)
@@ -393,6 +397,7 @@ mod tests {
             ]
         );
         assert_eq!(decode(b"\x1a"), vec![InputEvent::CtrlZ]);
+        assert_eq!(decode(b"\x11"), vec![InputEvent::CtrlQ]);
     }
 
     #[test]

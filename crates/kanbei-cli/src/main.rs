@@ -26,7 +26,8 @@
 //! `/status`, `/history [N]`, `/export DIR`, `/resume` (after a breaker
 //! pause), `/exit`.
 
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,25 +48,14 @@ use kanbei_provider::{
 };
 use kanbei_scopes::contrib::{KeyReference, ProviderSettings, SettingsContribution};
 use kanbei_session::{
-    ApprovalResolver, Session, SessionConfig, SessionError, SessionSettings, SettingsSource,
+    ApprovalResolver, Session, SessionConfig, SessionSettings, SettingsSource,
 };
 use kanbei_tools::{ApprovalParked, ToolRegistry};
-use kanbei_transcript::{CollapseOverrides, TranscriptView};
-use kanbei_ui::{
-    build_viewport, key_to_input, resolve_style, total_rows, transcript_paragraph, transcript_rows,
-    InputEvent, Row, StyledRow, Theme,
-};
+use kanbei_ui::terminal::{TerminalGuard, TermiosTerminal};
 use kanbei_vm::VmConfig;
 
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEvent};
 use crossterm::execute;
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Modifier;
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::Paragraph;
-use ratatui::Terminal;
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 
 const USAGE: &str = "usage: kanbei [DIR]";
 
@@ -515,21 +505,20 @@ fn run_repl(opts: Options) {
 
 // ---------- full-screen TUI (TTY path) ----------
 
-/// Worker→main events.
+/// Worker→main events: only the interactive approval rendezvous crosses back —
+/// the worker owns the session and does all rendering (decision 13).
 enum Evt {
-    /// The session's transcript projection changed; render the new view.
-    View(TranscriptView),
-    /// An approval-gated intent parked during a turn; the UI decides it
-    /// (y/n) and replies on `reply`.
+    /// An approval-gated intent parked during a turn; the UI decides it (y/n)
+    /// and replies on `reply`.
     Approval(ApprovalReq),
-    /// A turn finished (or failed) — carries the driver's result.
-    TurnDone(Result<Turn, SessionError>),
+    /// The kernel's `quit` binding won: the process should shut down.
+    Quit,
 }
 
 /// main→worker commands.
 enum Cmd {
-    /// Run a user turn (commit the message + drive to quiescence).
-    Submit(String),
+    /// Feed raw terminal bytes through the kernel UI boundary.
+    Input(Vec<u8>),
     /// Shut down (the worker closes the session and returns).
     Quit,
 }
@@ -537,86 +526,25 @@ enum Cmd {
 /// One approval request the UI must decide. `reply` carries the decision back
 /// to the worker's resolver (which blocks until answered).
 struct ApprovalReq {
-    action: String,
-    args: String,
     reply: mpsc::Sender<bool>,
 }
 
-/// TUI focus: the input line (default) or a transcript turn (j/k/Enter).
-#[derive(Debug, Clone, Copy)]
-enum Focus {
-    Input,
-    Transcript { sel: usize },
-}
-
-impl Focus {
-    fn is_browse(&self) -> bool {
-        matches!(self, Focus::Transcript { .. })
-    }
-}
-
-/// The mutable UI state (main thread).
-struct Ui {
-    /// The session's current transcript view (pushed over `Evt::View`).
-    view: TranscriptView,
-    /// Session-local manual collapse overrides (never stored in the session's
-    /// projection).
-    expanded: CollapseOverrides,
-    input: String,
-    cursor: usize,
-    focus: Focus,
-    scroll_top: usize,
-    pinned: bool,
-    model: String,
-    pending: Option<ApprovalReq>,
-    active: bool,
-    status: String,
-    quit: bool,
-    repaint: bool,
-}
-
-impl Ui {
-    fn new(model: String) -> Self {
-        Self {
-            view: TranscriptView::default(),
-            expanded: CollapseOverrides::new(),
-            input: String::new(),
-            cursor: 0,
-            focus: Focus::Input,
-            scroll_top: 0,
-            pinned: true,
-            model,
-            pending: None,
-            active: false,
-            status: "idle".into(),
-            quit: false,
-            repaint: false,
-        }
-    }
-}
-
 fn run_tui(opts: Options) -> i32 {
-    // main ⇄ worker channels. The worker owns the driver + session and drives
-    // turns to quiescence; the main thread renders and routes input, so the
-    // UI stays responsive while a turn runs (R-27 UI boundary).
+    // main ⇄ worker channels. The worker owns the driver + session (decision
+    // 13: single-owner-at-a-time) and drives turns to quiescence; the main
+    // thread reads terminal bytes and forwards them, so the approval
+    // rendezvous still works while the worker blocks in a turn.
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     let (evt_tx, evt_rx) = mpsc::channel::<Evt>();
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
-    // Observer + approval seams: transcript_listener fires on the committing
-    // (worker) thread per projection change; the session owns and drives the
-    // projection (decision 30). The resolver does a cross-thread rendezvous
-    // (the worker blocks until the UI answers y/n). The config settings decide
+    // Approval seam: the resolver does a cross-thread rendezvous (the worker
+    // blocks until the UI answers y/n). The config settings decide
     // auto-approval; the rendezvous is the interactive fallback.
-    let view_tx = evt_tx.clone();
     let approval_tx = evt_tx.clone();
-    let interactive: ApprovalResolver = Arc::new(move |p: &ApprovalParked| {
+    let interactive: ApprovalResolver = Arc::new(move |_p: &ApprovalParked| {
         let (reply_tx, reply_rx) = mpsc::channel::<bool>();
-        let _ = approval_tx.send(Evt::Approval(ApprovalReq {
-            action: p.approval.action.clone(),
-            args: p.approval.args.to_string(),
-            reply: reply_tx,
-        }));
+        let _ = approval_tx.send(Evt::Approval(ApprovalReq { reply: reply_tx }));
         reply_rx.recv().unwrap_or(false)
     });
     let cancel_cfg = cancel_flag.clone();
@@ -632,552 +560,176 @@ fn run_tui(opts: Options) -> i32 {
             interactive: Some(interactive),
             yolo: Default::default(),
         })),
-        transcript_listener: Some(Arc::new(move |view: &TranscriptView| {
-            let _ = view_tx.send(Evt::View(view.clone()));
-        })),
         cancel_flag: Some(cancel_cfg),
         ..Default::default()
     };
 
-    let session = match Session::open(cfg) {
+    let mut session = match Session::open(cfg) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("kanbei: session open failed: {e}");
             return 2;
         }
     };
+    // The shipped binary drives the UI host (decision 31): the built-in shell
+    // module owns layout, the kernel presents its frames. A missing guest
+    // leaves the host unbound and the CLI renders nothing (fail-loud), so the
+    // module engine is a hard prerequisite of the TUI path.
+    if session.modules().is_none() {
+        eprintln!("kanbei: module engine unavailable: build the guest wasm");
+        return 2;
+    }
+    if let Err(e) = session.activate_builtin_ui() {
+        eprintln!("kanbei: built-in UI activation failed: {e}");
+        return 2;
+    }
 
-    // The settings-resolved wiring drives the UI's labeled model and the
-    // auto-approval status line (decision 28).
-    let settings = session.host_settings();
-    let model = settings
-        .provider
-        .as_ref()
-        .and_then(|p| p.model.clone())
-        .unwrap_or_else(|| "default".into());
-    let auto = settings
-        .approval
-        .as_ref()
-        .is_some_and(|a| a.auto_approve == Some(true) || a.yolo == Some(true));
+    // Terminal lifecycle: raw mode through the kernel boundary (restored by
+    // the guard on every exit path), alternate screen through crossterm.
+    let Some((mut raw_term, present_term)) = open_terminal() else {
+        eprintln!("kanbei: could not open the terminal");
+        return 2;
+    };
+    let guard = match TerminalGuard::new(&mut raw_term) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("kanbei: raw mode failed: {e}");
+            return 2;
+        }
+    };
+    if execute!(std::io::stdout(), EnterAlternateScreen).is_err() {
+        eprintln!("kanbei: alternate screen failed");
+        return 2;
+    }
 
-    // Worker thread: the session already replayed the transcript projection at
-    // open (decision 30, launch = resume, R-19), and the transcript listener
-    // pushed that replayed view as `Evt::View` — no manual push here.
+    // Worker: renders/presents after every command and drives a submitted
+    // turn. Rendering is event-driven (decision 22): only a command or a
+    // completed turn repaints; a scroll/focus repaint never re-enters Wasm.
+    let quit_tx = evt_tx.clone();
     let worker = std::thread::spawn(move || {
         let mut driver = Driver::new(session);
-        loop {
-            match cmd_rx.recv() {
-                Ok(Cmd::Submit(text)) => {
-                    let res = driver.user_turn(&text);
-                    let _ = evt_tx.send(Evt::TurnDone(res));
+        let mut term = present_term;
+        present(&mut driver, &mut term);
+        // A `Cmd::Quit` (or a dropped sender) ends the loop; the session closes
+        // below.
+        while let Ok(Cmd::Input(bytes)) = cmd_rx.recv() {
+            match driver.session_mut().ui_handle_input(&bytes) {
+                Ok(outcome) => {
+                    if outcome.quit {
+                        let _ = quit_tx.send(Evt::Quit);
+                        break;
+                    }
+                    if outcome.submitted
+                        && let Err(e) = driver.drive_to_quiescence()
+                    {
+                        eprintln!("kanbei: turn failed: {e}");
+                    }
                 }
-                Ok(Cmd::Quit) => break,
-                Err(_) => break, // main dropped cmd_tx (shut down)
+                Err(e) => eprintln!("kanbei: ui input failed: {e}"),
             }
+            present(&mut driver, &mut term);
         }
         let _ = driver.into_session().close();
     });
 
-    let (code, mut ui) = run_tui_loop(&evt_rx, &cmd_tx, &cancel_flag, model, auto);
-
-    // If an approval is pending, deny it to unblock the worker's resolver
-    // before joining (a blocked resolver would hang the join).
-    if let Some(p) = ui.pending.take() {
-        p.reply.send(false).ok();
-    }
-    // Shut down: tell the worker to quit, join it (it closes the session).
-    let _ = cmd_tx.send(Cmd::Quit);
-    let _ = worker.join();
-    code
-}
-
-/// The main render + input loop (crossterm events and worker events
-/// interleaved on a short poll; ~60 fps).
-fn run_tui_loop(
-    evt_rx: &mpsc::Receiver<Evt>,
-    cmd_tx: &mpsc::Sender<Cmd>,
-    cancel_flag: &Arc<AtomicBool>,
-    model: String,
-    auto: bool,
-) -> (i32, Ui) {
-    let theme = Theme::default_theme();
-    let mut ui = Ui::new(model);
-    if auto {
-        ui.status = "idle (auto-approve)".into();
-    }
-
-    // Terminal lifecycle (R-27): raw mode + alternate screen + mouse capture
-    // for the session; restored on every exit path below.
-    if terminal::enable_raw_mode().is_err() {
-        eprintln!("kanbei: could not enable raw mode");
-        return (2, ui);
-    }
-    if execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture).is_err() {
-        let _ = terminal::disable_raw_mode();
-        return (2, ui);
-    }
-    // No term.clear() here: the fresh alternate screen is blank on entry, the
-    // first draw covers the full area, and Terminal::clear issues a blocking
-    // cursor-position query (\x1b[6n) that a pty never answers.
-    let backend = CrosstermBackend::new(std::io::stdout());
-    let mut term = Terminal::new(backend).expect("terminal backend");
-
-    // Mouse hit-testing uses the previous frame's layout (rendered rows).
-    let mut last_hit: Vec<usize> = Vec::new();
-    let mut last_turn_of_line: Vec<usize> = Vec::new();
-    let mut last_transcript: Rect = Rect::new(0, 0, 0, 0);
-
-    let code = loop {
-        // 1. Drain worker events (envelopes, approvals, turn results, replay).
-        while let Ok(evt) = evt_rx.try_recv() {
-            handle_evt(&mut ui, evt);
-        }
-
-        // 2. Poll the terminal (short timeout so events interleave with
-        //    input). Read in a batch: event::read() blocks on an empty queue,
-        //    so it runs only while a poll confirms an event is pending.
-        if event::poll(Duration::from_millis(16)).unwrap_or(false) {
-            while let Ok(ev) = event::read() {
-                match ev {
-                    Event::Key(k) => {
-                        if let Some(input) = key_to_input(&k)
-                            && let Some(cmd) = handle_input(&mut ui, input, cancel_flag)
-                        {
-                            let _ = cmd_tx.send(cmd);
-                        }
+    // Reader thread: raw bytes in, so the kernel's decoder owns escape/paste
+    // handling (decision 31). Blocking reads are fine — the process exits
+    // without joining it.
+    let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut stdin = std::io::stdin().lock();
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if input_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
                     }
-                    Event::Mouse(m) => {
-                        handle_mouse(&mut ui, &m, &last_hit, &last_turn_of_line, last_transcript);
-                    }
-                    _ => {}
                 }
-                if !event::poll(Duration::ZERO).unwrap_or(false) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut pending: Option<mpsc::Sender<bool>> = None;
+    let mut quit = false;
+    loop {
+        while let Ok(evt) = evt_rx.try_recv() {
+            match evt {
+                Evt::Approval(req) => pending = Some(req.reply),
+                Evt::Quit => quit = true,
+            }
+        }
+        if quit {
+            break;
+        }
+        match input_rx.recv_timeout(Duration::from_millis(16)) {
+            Ok(bytes) => {
+                // Ctrl-C interrupts an in-flight model call at the stream
+                // boundary (decision 13). Every other key, including Ctrl-Q,
+                // dispatches through the kernel keymap (decision 29).
+                if bytes.contains(&0x03) {
+                    cancel_flag.store(true, Ordering::SeqCst);
+                }
+                if let Some(reply) = pending.take() {
+                    match approval_decision(&bytes) {
+                        Some(decision) => {
+                            reply.send(decision).ok();
+                        }
+                        None => pending = Some(reply),
+                    }
+                    continue;
+                }
+                if cmd_tx.send(Cmd::Input(bytes)).is_err() {
                     break;
                 }
             }
-        }
-
-        // 3. Compute the transcript viewport and render.
-        let Ok(size) = term.size() else {
-            break 0;
-        };
-        let area = Rect::new(0, 0, size.width, size.height);
-        // Ctrl-L: force a full repaint. resize() clears the screen and resets
-        // the diff baseline so the next draw re-emits everything; unlike
-        // clear(), it issues no blocking cursor-position query.
-        if ui.repaint {
-            ui.repaint = false;
-            if term.resize(area).is_err() {
-                break 0;
-            }
-        }
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        let transcript = chunks[0];
-        let input_area = chunks[1];
-        let status_area = chunks[2];
-        let width = area.width as usize;
-        let trows = transcript_rows(&ui.view, &ui.expanded);
-        let rows: Vec<Row> = trows
-            .iter()
-            .map(|t| Row {
-                text: t.text.clone(),
-                style: t.style.clone(),
-            })
-            .collect();
-        let turn_of_line: Vec<usize> = trows.iter().map(|t| t.turn).collect();
-        let total = total_rows(&rows, width);
-        let view_h = transcript.height as usize;
-        let max_top = total.saturating_sub(view_h);
-        let top = if ui.pinned { max_top } else { ui.scroll_top.min(max_top) };
-        if !ui.pinned && top == max_top {
-            ui.pinned = true;
-        }
-        let (styled, hit) = build_viewport(&rows, top, view_h, width);
-
-        if term
-            .draw(|f| draw(f, &ui, &styled, transcript, input_area, status_area, &theme))
-            .is_err()
-        {
-            break 0; // terminal gone
-        }
-
-        last_hit = hit;
-        last_turn_of_line = turn_of_line;
-        last_transcript = transcript;
-
-        if ui.quit {
-            break 0;
-        }
-    };
-
-    // Restore the terminal on every path.
-    let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
-    let _ = terminal::disable_raw_mode();
-    (code, ui)
-}
-
-/// Route one worker event into the UI state.
-fn handle_evt(ui: &mut Ui, evt: Evt) {
-    match evt {
-        Evt::View(view) => ui.view = view,
-        Evt::Approval(req) => {
-            ui.pending = Some(req);
-            ui.status = "awaiting approval".into();
-        }
-        Evt::TurnDone(result) => {
-            ui.active = false;
-            // The session already finalized the turn's projection (the driver
-            // mirrors its terminal result on the commit path).
-            ui.pinned = true;
-            ui.focus = Focus::Input;
-            match result {
-                Ok(turn) => ui.status = if turn.answer.is_some() {
-                    "idle".into()
-                } else {
-                    format!("no answer · {} run(s)", turn.runs)
-                },
-                Err(e) => ui.status = format!("turn failed: {e}"),
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+
+    // If an approval is pending, deny it to unblock the worker's resolver
+    // before joining (a blocked resolver would hang the join).
+    if let Some(reply) = pending {
+        reply.send(false).ok();
+    }
+    let _ = cmd_tx.send(Cmd::Quit);
+    let _ = worker.join();
+    let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    drop(guard);
+    0
 }
 
-/// Route one sanitized input event. Returns the command to send to the worker
-/// (submit / resume) if the input triggered a turn.
-fn handle_input(
-    ui: &mut Ui,
-    input: InputEvent,
-    cancel_flag: &Arc<AtomicBool>,
-) -> Option<Cmd> {
-    // Approvals take priority: y/n (Ctrl-C denies).
-    if let Some(p) = &ui.pending {
-        return match input {
-            InputEvent::Char('y' | 'Y') => {
-                p.reply.send(true).ok();
-                ui.pending = None;
-                ui.status = "approved".into();
-                None
-            }
-            InputEvent::Char('n' | 'N') | InputEvent::CtrlC => {
-                p.reply.send(false).ok();
-                ui.pending = None;
-                ui.status = "denied".into();
-                None
-            }
-            _ => None,
-        };
-    }
-    match ui.focus {
-        Focus::Input => match input {
-            InputEvent::Char(c) => {
-                let b = char_offset(&ui.input, ui.cursor);
-                ui.input.insert(b, c);
-                ui.cursor += 1;
-                None
-            }
-            InputEvent::Backspace => {
-                if ui.cursor == 0 {
-                    return None;
-                }
-                let prev = char_offset(&ui.input, ui.cursor - 1);
-                let cur = char_offset(&ui.input, ui.cursor);
-                ui.input.replace_range(prev..cur, "");
-                ui.cursor -= 1;
-                None
-            }
-            InputEvent::Delete => {
-                let cur = char_offset(&ui.input, ui.cursor);
-                if cur >= ui.input.len() {
-                    return None;
-                }
-                let next = char_offset(&ui.input, ui.cursor + 1);
-                ui.input.replace_range(cur..next, "");
-                None
-            }
-            InputEvent::ArrowLeft => {
-                ui.cursor = ui.cursor.saturating_sub(1);
-                None
-            }
-            InputEvent::ArrowRight => {
-                if ui.cursor < ui.input.chars().count() {
-                    ui.cursor += 1;
-                }
-                None
-            }
-            InputEvent::Home => {
-                ui.cursor = 0;
-                None
-            }
-            InputEvent::End => {
-                ui.cursor = ui.input.chars().count();
-                None
-            }
-            InputEvent::Enter => {
-                let text = ui.input.trim().to_string();
-                if text.is_empty() {
-                    return None;
-                }
-                ui.active = true;
-                ui.input.clear();
-                ui.cursor = 0;
-                ui.pinned = true;
-                ui.status = "running…".into();
-                Some(Cmd::Submit(text))
-            }
-            InputEvent::CtrlC => {
-                if ui.active {
-                    cancel_flag.store(true, Ordering::SeqCst);
-                    ui.status = "cancelling…".into();
-                } else {
-                    ui.input.clear();
-                    ui.cursor = 0;
-                }
-                None
-            }
-            InputEvent::CtrlQ => {
-                // Quit cancels the active run first (the worker owns the close).
-                if ui.active {
-                    cancel_flag.store(true, Ordering::SeqCst);
-                }
-                ui.quit = true;
-                None
-            }
-            InputEvent::CtrlL => {
-                ui.repaint = true;
-                None
-            }
-            InputEvent::Escape => {
-                let sel = ui.view.turns.len().saturating_sub(1);
-                ui.focus = Focus::Transcript { sel };
-                None
-            }
-            InputEvent::ArrowUp => {
-                scroll(ui, 1, false);
-                None
-            }
-            InputEvent::ArrowDown => {
-                scroll(ui, 1, true);
-                None
-            }
-            InputEvent::PageUp => {
-                scroll(ui, 10, false);
-                None
-            }
-            InputEvent::PageDown => {
-                scroll(ui, 10, true);
-                None
-            }
-            _ => None,
-        },
-        Focus::Transcript { sel } => match input {
-            InputEvent::ArrowUp | InputEvent::Char('k') => {
-                ui.focus = Focus::Transcript {
-                    sel: sel.saturating_sub(1),
-                };
-                None
-            }
-            InputEvent::ArrowDown | InputEvent::Char('j') => {
-                let max = ui.view.turns.len().saturating_sub(1);
-                ui.focus = Focus::Transcript {
-                    sel: (sel + 1).min(max),
-                };
-                None
-            }
-            InputEvent::Enter => {
-                toggle_turn(ui, sel);
-                None
-            }
-            InputEvent::Escape => {
-                ui.focus = Focus::Input;
-                None
-            }
-            InputEvent::CtrlQ => {
-                ui.quit = true;
-                None
-            }
-            InputEvent::CtrlL => {
-                ui.repaint = true;
-                None
-            }
-            InputEvent::CtrlC => {
-                if ui.active {
-                    cancel_flag.store(true, Ordering::SeqCst);
-                    ui.status = "cancelling…".into();
-                }
-                None
-            }
-            _ => None,
-        },
+/// Present the session's canonical frame through the kernel terminal boundary.
+fn present(driver: &mut Driver, term: &mut TermiosTerminal) {
+    if let Err(e) = driver.session_mut().ui_present(term) {
+        eprintln!("kanbei: present failed: {e}");
     }
 }
 
-/// Handle a mouse click: a left click in the transcript toggles the turn under
-/// the cursor (the hit map maps the row to its transcript line → turn).
-fn handle_mouse(
-    ui: &mut Ui,
-    m: &MouseEvent,
-    last_hit: &[usize],
-    turn_of_line: &[usize],
-    transcript: Rect,
-) {
-    use crossterm::event::{MouseButton, MouseEventKind};
-    if m.kind != MouseEventKind::Down(MouseButton::Left) {
-        return;
+/// The y/n decision in one input burst, if any (approval keys only).
+fn approval_decision(bytes: &[u8]) -> Option<bool> {
+    if bytes.iter().any(|b| matches!(b, b'y' | b'Y')) {
+        return Some(true);
     }
-    if m.row < transcript.y || m.row >= transcript.y + transcript.height {
-        return;
+    if bytes.iter().any(|b| matches!(b, b'n' | b'N' | 0x03)) {
+        return Some(false);
     }
-    let rel = (m.row - transcript.y) as usize;
-    let Some(&line) = last_hit.get(rel) else {
-        return;
-    };
-    let Some(&turn) = turn_of_line.get(line) else {
-        return;
-    };
-    toggle_turn(ui, turn);
-    ui.focus = Focus::Transcript { sel: turn };
+    None
 }
 
-/// Toggle a turn's thought-bubble expansion (Q5/Q6: collapse on completion,
-/// expand on demand).
-fn toggle_turn(ui: &mut Ui, sel: usize) {
-    if sel >= ui.view.turns.len() {
-        return;
-    }
-    ui.expanded.toggle(sel);
-}
-
-/// Scroll the transcript by `n` rows (unpinning from the bottom); the render
-/// clamps to the available range and re-pins at the bottom.
-fn scroll(ui: &mut Ui, n: usize, down: bool) {
-    ui.pinned = false;
-    if down {
-        ui.scroll_top += n;
-    } else {
-        ui.scroll_top = ui.scroll_top.saturating_sub(n);
-    }
-}
-
-/// Render one frame: transcript viewport, input/approval line, status bar.
-fn draw(
-    f: &mut ratatui::Frame,
-    ui: &Ui,
-    styled: &[StyledRow],
-    transcript: Rect,
-    input_area: Rect,
-    status_area: Rect,
-    theme: &Theme,
-) {
-    // 1. transcript (bottom-pinned viewport over the whole log, R-19).
-    f.render_widget(transcript_paragraph(styled, theme), transcript);
-
-    // 2. input line / approval line.
-    let line = if let Some(p) = &ui.pending {
-        Line::from(vec![
-            Span::styled(
-                "⚠ approval ",
-                resolve_style(theme, Some("error")).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("{} ", p.action), resolve_style(theme, None)),
-            Span::styled(format_args(&p.args), resolve_style(theme, Some("status"))),
-            Span::styled("  [y]es / [n]o", resolve_style(theme, Some("status"))),
-        ])
-    } else {
-        build_input_line(ui, theme)
-    };
-    f.render_widget(Paragraph::new(Text::from(vec![line])), input_area);
-
-    // 3. status bar: state · model · tokens · hints.
-    let (tin, tout) = ui.view.tokens();
-    let state = if ui.active {
-        "running"
-    } else {
-        &ui.status
-    };
-    let hints = if ui.pending.is_some() {
-        "y approve · n deny"
-    } else if ui.focus.is_browse() {
-        "↑/k · ↓/j · Enter toggle · Esc back"
-    } else {
-        "Enter send · Esc browse · ↑↓ scroll · Ctrl-C cancel · Ctrl-Q quit"
-    };
-    let status = Line::from(vec![
-        Span::styled(
-            state.to_string(),
-            resolve_style(theme, Some("progress")).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  ·  {}  ·  {}↓ {}↑ tok", ui.model, tout, tin),
-            resolve_style(theme, Some("status")),
-        ),
-        Span::styled(format!("  ·  {hints}"), resolve_style(theme, Some("status"))),
-    ]);
-    f.render_widget(
-        Paragraph::new(Text::from(vec![status])).style(resolve_style(theme, Some("status"))),
-        status_area,
-    );
-}
-
-/// The editable input line with a block cursor at `ui.cursor`.
-fn build_input_line(ui: &Ui, theme: &Theme) -> Line<'static> {
-    let (before, cur, after) = split_chars(&ui.input, ui.cursor);
-    let default = resolve_style(theme, None);
-    let mut spans = vec![
-        Span::styled(
-            "❯ ",
-            resolve_style(theme, Some("user")).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(before, default),
-    ];
-    if let Some(c) = cur {
-        spans.push(Span::styled(c.to_string(), default.reversed()));
-    } else {
-        spans.push(Span::styled(" ", default.reversed()));
-    }
-    if !after.is_empty() {
-        spans.push(Span::styled(after, default));
-    }
-    Line::from(spans)
-}
-
-/// Split a string at a character index into (before, cursor char, after).
-fn split_chars(s: &str, idx: usize) -> (String, Option<char>, String) {
-    let chars: Vec<char> = s.chars().collect();
-    if idx >= chars.len() {
-        return (s.to_string(), None, String::new());
-    }
-    let before: String = chars[..idx].iter().collect();
-    let cur = chars[idx];
-    let after: String = chars[idx + 1..].iter().collect();
-    (before, Some(cur), after)
-}
-
-/// Byte offset of the character at `idx` (or the end).
-fn char_offset(s: &str, idx: usize) -> usize {
-    s.char_indices().nth(idx).map(|(b, _)| b).unwrap_or(s.len())
-}
-
-/// Render a parked approval's arguments to a compact, single-line string.
-fn format_args(args: &str) -> String {
-    let s = args.trim();
-    if s.is_empty() {
-        return "(no args)".into();
-    }
-    let s = s.replace('\n', " ");
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= 60 {
-        return s;
-    }
-    let mut out: String = chars[..60].iter().collect();
-    out.push('…');
-    out
+/// Two terminal handles over the process's tty: stdin (raw mode, bytes) and
+/// stdout (frames). Each is an owned duplicated fd, so the kernel boundary
+/// stays fd-scoped.
+fn open_terminal() -> Option<(TermiosTerminal, TermiosTerminal)> {
+    let stdin = std::io::stdin();
+    let raw = TermiosTerminal::open(stdin.as_fd().try_clone_to_owned().ok()?).ok()?;
+    let stdout = std::io::stdout();
+    let present = TermiosTerminal::open(stdout.as_fd().try_clone_to_owned().ok()?).ok()?;
+    Some((raw, present))
 }
 
 fn main() {

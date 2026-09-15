@@ -27,11 +27,12 @@ function kb_on_activate(ctx)
     '"provider":{"protocol":"openai"},' ..
     '"approval":{"auto_approve":false,"yolo":false}}')
   -- Decision 29: the built-in layer ships the kernel's default bindings so
-  -- making Ctrl-C/Ctrl-L remappable does not drop run cancellation out of the
-  -- box. Origin is kernel-stamped as `builtin` (lowest dispatch tier).
+  -- making Ctrl-C/Ctrl-Q/Ctrl-L remappable does not drop run cancellation,
+  -- quit, or repaint out of the box. Origin is kernel-stamped as `builtin`
   ctx.contribution_publish(
     '{"kind":"keymap","bindings":[' ..
     '{"key":"ctrl-c","context":"always","action":"cancel_run"},' ..
+    '{"key":"ctrl-q","context":"always","action":"quit"},' ..
     '{"key":"ctrl-l","context":"always","action":"repaint"}]}')
 end
 

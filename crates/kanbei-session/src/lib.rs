@@ -639,6 +639,11 @@ pub struct Session {
     transcript: Box<dyn TranscriptProjection>,
     /// Transcript-view observer (UI seam); called when the projection changes.
     transcript_listener: Option<TranscriptListener>,
+    /// Session-local manual collapse overrides (decision 9): ephemeral
+    /// presentation, never part of the projection, applied when the transcript
+    /// view is built for the render context. A resumed session recreates the
+    /// view identically because the overrides are never persisted.
+    transcript_overrides: CollapseOverrides,
     fs_root: PathBuf,
     session_id: Id128,
     // --- M4 memory substrate + context projection ---
@@ -1125,6 +1130,7 @@ impl Session {
             delta_listener,
             transcript,
             transcript_listener,
+            transcript_overrides: CollapseOverrides::new(),
             fs_root,
             session_id,
             memory_lifetime,

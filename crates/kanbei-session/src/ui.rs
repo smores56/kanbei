@@ -35,6 +35,7 @@ use kanbei_core::id::Id128;
 use kanbei_modules::package::{ModuleOrigin, PackageManifest};
 use kanbei_modules::ModuleManager;
 use kanbei_scopes::contrib::{Keybinding, KeyContext};
+use kanbei_transcript::{CollapseOverrides, TranscriptView};
 use kanbei_ui::accessibility;
 use kanbei_ui::fallback;
 use kanbei_ui::focus::{FocusDirection, InputClass, KeyClassifier, ReservedAction};
@@ -58,6 +59,11 @@ pub const UI_INTENT_RESOURCE: &str = "session";
 pub enum UiIntent {
     SubmitText { text: String },
     CancelRun,
+    /// Re-open or re-collapse a settled turn's working segment. Presentation
+    /// only (decisions 9/32): the kernel applies it to the session-local
+    /// collapse overrides, so the projection stays a pure function of the
+    /// committed envelopes.
+    ToggleCollapse { turn: usize },
 }
 
 impl UiIntent {
@@ -71,6 +77,12 @@ impl UiIntent {
                     .to_string(),
             }),
             Some("cancel_run") => Some(UiIntent::CancelRun),
+            Some("toggle_collapse") => v
+                .get("turn")
+                .and_then(Value::as_u64)
+                .map(|turn| UiIntent::ToggleCollapse {
+                    turn: turn as usize,
+                }),
             _ => None,
         }
     }
@@ -198,6 +210,16 @@ pub struct UiHost {
     last_frame: Option<RenderOutput>,
     size: (u16, u16),
     pub viewport_top: usize,
+    /// The kernel-owned selection pointer (decision 22): the last non-input
+    /// node focus landed on, exposed to the module through the render context
+    /// so the shell can highlight the selected row. Native: moving it never
+    /// re-enters Wasm.
+    pub selection: Option<String>,
+    /// The transcript view handed to the guest on the most recent composition.
+    /// A change (commit, override toggle, streaming delta) marks every mount
+    /// dirty so the shell recomposes exactly when its context changed
+    /// (decision 22).
+    last_transcript: Option<TranscriptView>,
     pub last_status: String,
 }
 
@@ -213,6 +235,11 @@ pub struct UiOutcome {
     /// The kernel reserved Ctrl-Z (Suspend) was pressed: the driver should
     /// suspend the UI to the shell (decision 29).
     pub suspend: bool,
+    /// A `submit_text` intent was applied: the driver should now drive the
+    /// triggered run to quiescence.
+    pub submitted: bool,
+    /// The kernel's `quit` binding won: the driver should shut down.
+    pub quit: bool,
 }
 
 impl UiHost {
@@ -234,6 +261,8 @@ impl UiHost {
             last_frame: None,
             size: (24, 80),
             viewport_top: 0,
+            selection: None,
+            last_transcript: None,
             last_status: "idle".to_string(),
         };
         host.sync_summary();
@@ -515,22 +544,23 @@ impl Session {
                         match binding.action.as_str() {
                             // The built-in layer's default bindings restore the
                             // pre-T10 kernel behaviors: `cancel_run` cancels the
-                            // active run, `repaint` forces a full repaint. Both
-                            // stay remappable (a binding can target other ids).
+                            // active run, `quit` shuts the driver down, `repaint`
+                            // forces a full repaint. All stay remappable (a
+                            // binding can target other ids).
                             "cancel_run" => {
                                 if self.scheduler.active_run().is_some() {
                                     let _ = self.cancel_active_run()?;
                                 }
                                 outcome.repaint = true;
                             }
+                            "quit" => outcome.quit = true,
                             "repaint" => outcome.repaint = true,
                             _ => {
                                 // Route by OWNERSHIP first: the action id is
                                 // its owner module's namespace; only fall back
                                 // to the focused mount, then to fan-out.
                                 self.ui_reduce_command(&binding.action, binding.owner)?;
-                                let applied = self.apply_ui_intents()?;
-                                outcome.intents_applied += applied;
+                                self.apply_ui_intents(&mut outcome)?;
                             }
                         }
                     } else {
@@ -642,8 +672,7 @@ impl Session {
                     _ => kind,
                 };
                 self.ui_reduce(UiEvent::user(kind))?;
-                let applied = self.apply_ui_intents()?;
-                outcome.intents_applied += applied;
+                self.apply_ui_intents(outcome)?;
             }
         }
         Ok(())
@@ -707,6 +736,18 @@ impl Session {
                     }
                 }
             }
+        }
+        // Native selection (decision 22): the selection pointer follows focus
+        // onto a non-input node; the shell reads it from the render context.
+        // Focus on an input leaves the last selection intact.
+        let selectable = host
+            .focus
+            .focused
+            .as_deref()
+            .and_then(|id| tree.node(id))
+            .is_some_and(|n| n.kind() != NodeKind::Input);
+        if selectable {
+            host.selection = host.focus.focused.clone();
         }
     }
 
@@ -851,8 +892,9 @@ impl Session {
     /// capability isolation: a mount without a grant has its intent denied
     /// while another mount's identical intent applies). Accepted intents
     /// apply in slot order. Denied intents are dropped and counted per
-    /// mount, never canonical.
-    fn apply_ui_intents(&mut self) -> Result<usize, SessionError> {
+    /// mount, never canonical. The presentation-only `toggle_collapse` is
+    /// kernel-local (decision 32) and skips the capability intersection.
+    fn apply_ui_intents(&mut self, outcome: &mut UiOutcome) -> Result<(), SessionError> {
         let intents: Vec<(usize, u64, Vec<UiIntent>)> = self
             .ui_host
             .as_mut()
@@ -864,9 +906,16 @@ impl Session {
                     .collect()
             })
             .unwrap_or_default();
-        let mut applied = 0;
         for (mount_index, generation, intents) in intents {
             for intent in intents {
+                // A collapse toggle only changes session-local presentation:
+                // the kernel applies it under the view build, so it carries no
+                // capability (decisions 9/32).
+                if let UiIntent::ToggleCollapse { turn } = intent {
+                    self.toggle_transcript_collapse(turn);
+                    outcome.intents_applied += 1;
+                    continue;
+                }
                 let principal = Principal {
                     session: self.session_id(),
                     generation,
@@ -879,6 +928,7 @@ impl Session {
                     UiIntent::CancelRun => {
                         Capability::new("session".into(), vec!["cancel".into()])
                     }
+                    UiIntent::ToggleCollapse { .. } => unreachable!("handled above"),
                 };
                 let allowed = self
                     .broker
@@ -895,19 +945,46 @@ impl Session {
                 match intent {
                     UiIntent::SubmitText { text } => {
                         self.append_user_message(&text)?;
-                        applied += 1;
+                        outcome.submitted = true;
+                        outcome.intents_applied += 1;
                         let _ = self.ui_refresh("user message committed");
                     }
                     UiIntent::CancelRun => {
                         if self.scheduler.active_run().is_some() {
                             let _ = self.cancel_active_run()?;
                         }
-                        applied += 1;
+                        outcome.intents_applied += 1;
                     }
+                    UiIntent::ToggleCollapse { .. } => unreachable!("handled above"),
                 }
             }
         }
-        Ok(applied)
+        Ok(())
+    }
+
+    /// Mark every non-degraded mount for recomposition (a context-level change
+    /// the per-mount reducer state cannot see: transcript, overrides, size).
+    pub(crate) fn mark_ui_dirty(&mut self) {
+        if let Some(host) = self.ui_host.as_mut() {
+            for mount in host.mounts.iter_mut() {
+                mount.dirty = true;
+            }
+        }
+    }
+
+    /// Replace the session-local collapse overrides (decision 9): ephemeral
+    /// presentation applied when the render context's transcript view is
+    /// built. Never canonical, never persisted, so resume is identical.
+    pub fn set_transcript_overrides(&mut self, overrides: CollapseOverrides) {
+        self.transcript_overrides = overrides;
+        self.mark_ui_dirty();
+    }
+
+    /// Re-open or re-collapse one turn's working segment (the module's
+    /// `toggle_collapse` intent routes here too).
+    pub fn toggle_transcript_collapse(&mut self, turn: usize) {
+        self.transcript_overrides.toggle(turn);
+        self.mark_ui_dirty();
     }
 
     /// Re-render the composite of the mount trees into the canonical render
@@ -971,8 +1048,33 @@ impl Session {
     }
 
     fn ui_render_module_tree_inner(&mut self) -> Option<SemanticTree> {
+        // The render context is kernel-owned (decision 32): the transcript
+        // view (with the session-local collapse overrides already applied), the
+        // kernel status, the surface size, and the native focus/selection/
+        // viewport state. Build it from `self` BEFORE borrowing the host.
+        let overrides = self.transcript_overrides.clone();
+        let transcript = self.transcript_view(&overrides);
+        let status = self.ui_status_text();
         let host = self.ui_host.as_mut()?;
         let manager = self.modules.as_ref()?;
+        // The transcript is part of the guest's context, so a change to it
+        // (commit, override toggle, streaming delta) is a composition state
+        // change exactly like a reducer change (decision 22).
+        if host.last_transcript.as_ref() != Some(&transcript) {
+            for mount in host.mounts.iter_mut() {
+                mount.dirty = true;
+            }
+            host.last_transcript = Some(transcript.clone());
+        }
+        let (rows, cols) = host.size;
+        let context = json!({
+            "transcript": serde_json::to_value(&transcript).unwrap_or(Value::Null),
+            "status": status,
+            "size": { "cols": cols, "rows": rows },
+            "focus": host.focus.focused.clone(),
+            "selection": host.selection.clone(),
+            "viewport_top": host.viewport_top as u32,
+        });
         // Event-driven composition (decision 22): only mounts whose state
         // changed since the last composition re-enter the guest. A repaint
         // (scroll/focus/selection) finds every flag clear and returns the
@@ -990,7 +1092,7 @@ impl Session {
                 // reduce clears the flag.
                 continue;
             }
-            Self::render_mount(manager, mount);
+            Self::render_mount(manager, mount, &context);
         }
         if !changed && let Some(tree) = host.last_tree.as_ref() {
             return Some(tree.clone());
@@ -1015,14 +1117,19 @@ impl Session {
 
     /// Render one mount's tree through its generation and kernel-validate it
     /// (accessibility pass is kernel-owned, R-27), storing the validated tree
-    /// on the mount. A fault degrades the mount but PRESERVES its last-valid
+    /// on the mount. `context` is the kernel-owned read-only render context
+    /// (decision 32). A fault degrades the mount but PRESERVES its last-valid
     /// tree: the composite keeps rendering the previous good tree until the
     /// mount's state changes again (decision 22 fault → last-valid). The
     /// caller supplies a placeholder only when the mount never had a valid
     /// tree.
-    fn render_mount(manager: &ModuleManager, mount: &mut BoundMount) {
+    fn render_mount(manager: &ModuleManager, mount: &mut BoundMount, context: &Value) {
         mount.render_calls += 1;
-        let payload = json!({ "entry": "ui_render", "state": mount.reducer_state });
+        let payload = json!({
+            "entry": "ui_render",
+            "state": mount.reducer_state,
+            "context": context,
+        });
         let out = match manager.call_generation(mount.generation, &payload.to_string()) {
             Ok(out) => out,
             Err(e) => {

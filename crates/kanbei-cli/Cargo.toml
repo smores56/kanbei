@@ -21,7 +21,6 @@ kanbei-transcript.workspace = true
 kanbei-ui.workspace = true
 kanbei-vm.workspace = true
 serde_json.workspace = true
-ratatui.workspace = true
 crossterm.workspace = true
 
 [dev-dependencies]

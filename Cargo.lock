@@ -1736,7 +1736,6 @@ dependencies = [
  "kanbei-transcript",
  "kanbei-ui",
  "kanbei-vm",
- "ratatui",
  "rustix",
  "serde_json",
 ]
@@ -2041,6 +2040,7 @@ name = "kanbei-transcript"
 version = "0.1.0"
 dependencies = [
  "kanbei-core",
+ "serde",
  "serde_json",
 ]
 
