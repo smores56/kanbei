@@ -16,14 +16,74 @@ use thiserror::Error;
 // ---------- config ----------
 /// Where the API key lives. Credentials are kernel-held and injected into
 /// requests at call time only; they never enter canonical records, snapshots,
-/// or objects (R-28/D-06). OS-keychain custody is deferred — the env source
-/// is the MVP default and the seam is this enum.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// or objects (R-28/D-06). `Debug` is manually implemented to redact the
+/// secret (see [`KeySource::fingerprint`]).
+#[derive(Clone, PartialEq, Eq)]
 pub enum KeySource {
     /// Read the key from this environment variable at call time.
     Env(String),
     /// Inline key from config — never serialized into records.
     Inline(String),
+    /// Read the key from the OS keychain at call time (Secret Service on
+    /// Linux, Keychain on macOS, Credential Manager on Windows). `service`
+    /// and `account` are non-secret lookup identifiers.
+    Keychain { service: String, account: String },
+}
+
+impl KeySource {
+    /// Stable, non-secret identifier for this key source. The single source
+    /// of truth for canonical fingerprints and diagnostics, so redaction
+    /// sites cannot drift.
+    pub fn fingerprint(&self) -> String {
+        match self {
+            KeySource::Env(name) => format!("env:{name}"),
+            KeySource::Inline(_) => "inline:redacted".to_string(),
+            KeySource::Keychain { service, account } => {
+                format!("keychain:{service}/{account}")
+            }
+        }
+    }
+
+    /// Materialize the key and discard it, for open-time availability checks.
+    /// Succeeds iff the source resolves right now; the returned error carries
+    /// only the non-secret fingerprint.
+    pub fn probe(&self) -> Result<(), ProviderError> {
+        self.read()
+            .map(|_| ())
+            .map_err(|_| ProviderError::KeySourceUnavailable {
+                fingerprint: self.fingerprint(),
+            })
+    }
+
+    /// The only credential read path (R-28/D-06). Callers must never persist
+    /// the returned string. Errors discriminate the failure without carrying
+    /// secret material.
+    fn read(&self) -> Result<String, KeyReadError> {
+        match self {
+            KeySource::Env(name) => std::env::var(name)
+                .map_err(|_| KeyReadError::MissingEnv { name: name.clone() }),
+            KeySource::Inline(key) => Ok(key.clone()),
+            KeySource::Keychain { service, account } => keyring::Entry::new(service, account)
+                .and_then(|entry| entry.get_password())
+                .map_err(|_| KeyReadError::Keychain {
+                    service: service.clone(),
+                    account: account.clone(),
+                }),
+        }
+    }
+}
+
+/// Internal discriminator for credential materialization failures. Carries
+/// lookup identifiers only, never secret material.
+enum KeyReadError {
+    MissingEnv { name: String },
+    Keychain { service: String, account: String },
+}
+
+impl fmt::Debug for KeySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.fingerprint())
+    }
 }
 
 impl ProviderConfig {
@@ -33,15 +93,11 @@ impl ProviderConfig {
     /// egress redaction rules, R-15/R-28). The bytes are installed as an
     /// object before the manifest is pinned (closure-valid).
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
-        let key_source = match &self.key {
-            KeySource::Env(name) => format!("env:{name}"),
-            KeySource::Inline(_) => "inline:redacted".to_string(),
-        };
         serde_json::to_vec(&json!({
             "provider": self.provider,
             "model": self.model,
             "base_url": self.base_url,
-            "key_source": key_source,
+            "key_source": self.key.fingerprint(),
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "timeout_secs": self.timeout.as_secs(),
@@ -211,6 +267,16 @@ pub enum ProviderError {
     Malformed { provider: String, message: String },
     #[error("provider {provider}: missing API key (source {name})")]
     MissingKey { provider: String, name: String },
+    #[error(
+        "provider {provider}: keychain secret unavailable (service {service}, account {account})"
+    )]
+    KeychainUnavailable {
+        provider: String,
+        service: String,
+        account: String,
+    },
+    #[error("key source {fingerprint} unavailable")]
+    KeySourceUnavailable { fingerprint: String },
     #[error("provider {provider}: request rejected {message}")]
     Rejected { provider: String, message: String },
     #[error("provider {provider}: timed out after {secs}s")]
@@ -222,13 +288,17 @@ pub enum ProviderError {
 /// Resolve the configured key at call time — the only place credentials are
 /// materialized (R-28/D-06).
 pub fn resolve_key(cfg: &ProviderConfig) -> Result<String, ProviderError> {
-    match &cfg.key {
-        KeySource::Env(name) => std::env::var(name).map_err(|_| ProviderError::MissingKey {
+    cfg.key.read().map_err(|err| match err {
+        KeyReadError::MissingEnv { name } => ProviderError::MissingKey {
             provider: cfg.provider.clone(),
-            name: name.clone(),
-        }),
-        KeySource::Inline(key) => Ok(key.clone()),
-    }
+            name,
+        },
+        KeyReadError::Keychain { service, account } => ProviderError::KeychainUnavailable {
+            provider: cfg.provider.clone(),
+            service,
+            account,
+        },
+    })
 }
 
 // ---------- provider HTTP plumbing ----------
@@ -1330,13 +1400,7 @@ impl fmt::Debug for ProviderConfig {
             .field("provider", &self.provider)
             .field("model", &self.model)
             .field("base_url", &self.base_url)
-            .field(
-                "key",
-                &match &self.key {
-                    KeySource::Env(name) => format!("env:{name}"),
-                    KeySource::Inline(_) => "inline:redacted".to_string(),
-                },
-            )
+            .field("key", &self.key.fingerprint())
             .field("temperature", &self.temperature)
             .field("max_tokens", &self.max_tokens)
             .field("timeout", &self.timeout)
@@ -1378,6 +1442,128 @@ mod tests {
         }
         let c = cfg();
         assert_eq!(resolve_key(&c).unwrap(), "k");
+    }
+
+    #[test]
+    fn key_source_fingerprint_all_variants() {
+        assert_eq!(
+            KeySource::Env("ANTHROPIC_API_KEY".into()).fingerprint(),
+            "env:ANTHROPIC_API_KEY"
+        );
+        assert_eq!(
+            KeySource::Inline("super-secret".into()).fingerprint(),
+            "inline:redacted"
+        );
+        assert_eq!(
+            KeySource::Keychain {
+                service: "kanbei".into(),
+                account: "openai".into(),
+            }
+            .fingerprint(),
+            "keychain:kanbei/openai"
+        );
+    }
+
+    #[test]
+    fn canonical_bytes_redaction_is_stable_and_secretless() {
+        let env_cfg = ProviderConfig {
+            key: KeySource::Env("ANTHROPIC_API_KEY".into()),
+            ..cfg()
+        };
+        let bytes = env_cfg.to_canonical_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["key_source"], "env:ANTHROPIC_API_KEY");
+
+        let inline_cfg = ProviderConfig {
+            key: KeySource::Inline("super-secret".into()),
+            ..cfg()
+        };
+        let bytes = inline_cfg.to_canonical_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["key_source"],
+            "inline:redacted"
+        );
+        assert!(!String::from_utf8_lossy(&bytes).contains("super-secret"));
+
+        let kc_cfg = ProviderConfig {
+            key: KeySource::Keychain {
+                service: "kanbei".into(),
+                account: "openai".into(),
+            },
+            ..cfg()
+        };
+        let bytes = kc_cfg.to_canonical_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap()["key_source"],
+            "keychain:kanbei/openai"
+        );
+        assert!(!String::from_utf8_lossy(&bytes).contains("super-secret"));
+    }
+
+    #[test]
+    fn key_source_debug_never_leaks_secret() {
+        let inline = KeySource::Inline("super-secret".into());
+        let dbg = format!("{inline:?}");
+        assert!(!dbg.contains("super-secret"));
+        assert_eq!(dbg, "inline:redacted");
+
+        let kc = KeySource::Keychain {
+            service: "kanbei".into(),
+            account: "openai".into(),
+        };
+        let dbg = format!("{kc:?}");
+        assert!(!dbg.contains("super-secret"));
+        assert_eq!(dbg, "keychain:kanbei/openai");
+
+        let c = ProviderConfig {
+            key: KeySource::Inline("super-secret".into()),
+            ..cfg()
+        };
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("super-secret"));
+        assert!(dbg.contains("inline:redacted"));
+    }
+
+    #[test]
+    fn probe_env_and_inline_succeed_iff_resolution_does() {
+        unsafe {
+            std::env::set_var("KANBEI_PROBE_PRESENT_KEY", "p");
+        }
+        assert!(KeySource::Env("KANBEI_PROBE_PRESENT_KEY".into()).probe().is_ok());
+        assert!(KeySource::Env("KANBEI_PROBE_ABSENT_KEY".into()).probe().is_err());
+        assert!(KeySource::Inline("super-secret".into()).probe().is_ok());
+    }
+
+    #[test]
+    fn keychain_probe_unavailable_is_typed_and_secretless() {
+        let key = KeySource::Keychain {
+            service: "kanbei-test-absent-service".into(),
+            account: "no-such-account".into(),
+        };
+        let err = key.probe().unwrap_err();
+        assert!(matches!(err, ProviderError::KeySourceUnavailable { .. }));
+        // Only the non-secret fingerprint is exposed; no raw backend text.
+        assert_eq!(
+            err.to_string(),
+            "key source keychain:kanbei-test-absent-service/no-such-account unavailable"
+        );
+    }
+
+    #[test]
+    fn resolve_key_keychain_unavailable_is_typed_and_secretless() {
+        let c = ProviderConfig {
+            key: KeySource::Keychain {
+                service: "kanbei-test-absent-service".into(),
+                account: "no-such-account".into(),
+            },
+            ..cfg()
+        };
+        let err = resolve_key(&c).unwrap_err();
+        assert!(matches!(err, ProviderError::KeychainUnavailable { .. }));
+        assert_eq!(
+            err.to_string(),
+            "provider fake: keychain secret unavailable (service kanbei-test-absent-service, account no-such-account)"
+        );
     }
 
     #[test]

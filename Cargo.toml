@@ -96,6 +96,10 @@ kanbei-workspace = { path = "crates/kanbei-workspace" }
 
 blake3 = "1"
 bs58 = "0.5"
+# OS-keychain custody (R-28/D-06): `v1` selects the platform-native
+# credential store — Secret Service (zbus) on Linux, Keychain on macOS,
+# Credential Manager on Windows.
+keyring = { version = "4", default-features = false, features = ["v1"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
