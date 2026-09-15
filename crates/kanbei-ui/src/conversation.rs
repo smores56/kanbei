@@ -441,12 +441,16 @@ impl ConversationState {
         let (status, detail) = match payload.get("classification") {
             Some(Value::String(_)) => (StepStatus::Ok, String::new()),
             Some(Value::Object(o)) => {
-                let reason = match o.get("Interrupted").or_else(|| o.get("Ambiguous")) {
+                let reason = match o
+                    .get("Interrupted")
+                    .or_else(|| o.get("Denied"))
+                    .or_else(|| o.get("Ambiguous"))
+                {
                     Some(Value::String(s)) => s.clone(),
                     _ => String::new(),
                 };
                 (
-                    if o.contains_key("Interrupted") {
+                    if o.contains_key("Interrupted") || o.contains_key("Denied") {
                         StepStatus::Interrupted
                     } else {
                         StepStatus::Ambiguous

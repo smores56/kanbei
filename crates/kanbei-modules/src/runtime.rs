@@ -17,7 +17,7 @@
 //! unknown", not "did not happen".
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -154,7 +154,7 @@ impl std::fmt::Display for ActorError {
 /// clean exit does not decrement it, so it is not a live-leak gauge).
 pub struct GenerationRuntime {
     generation: GenerationId,
-    tx: Sender<Cmd>,
+    tx: SyncSender<Cmd>,
     reply_timeout: Duration,
     join: Mutex<Option<JoinHandle<()>>>,
     /// Work commands the actor is currently executing (0 while idle). A status
@@ -183,7 +183,7 @@ impl GenerationRuntime {
         reply_timeout: Duration,
         abandoned: Arc<AtomicU64>,
     ) -> std::io::Result<Arc<Self>> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
         let in_flight = Arc::new(AtomicUsize::new(0));
         let scope: Arc<Mutex<Option<Scope>>> = Arc::new(Mutex::new(None));
         // Fail closed on thread exhaustion: activation reports the io error
@@ -282,10 +282,12 @@ impl GenerationRuntime {
     }
 
     /// Best-effort, non-blocking stop request (for the vm's `retire` path, which
-    /// runs on a worker and must not block on a drain).
+    /// runs on a worker and must not block on a drain). The command channel is
+    /// capacity-1: a busy actor means the request is dropped, and the caller's
+    /// later drain (or the actor's own idle loop) handles the stop.
     pub(crate) fn request_shutdown(&self) {
         let (done, _never) = mpsc::sync_channel(1);
-        let _ = self.tx.send(Cmd::Shutdown { done });
+        let _ = self.tx.try_send(Cmd::Shutdown { done });
     }
 
     /// Quiesce → deadline → force. Returns `true` when the actor exited within
@@ -297,11 +299,27 @@ impl GenerationRuntime {
     /// cannot acquire a wedged thread: wasmtime 48 has no cross-thread cancel.
     pub fn shutdown(&self, deadline: Duration) -> bool {
         let (done, wait) = mpsc::sync_channel(1);
-        if self.tx.send(Cmd::Shutdown { done }).is_err() {
-            // The actor already exited; joining is immediate.
-            return self.join();
+        let stop = Instant::now() + deadline;
+        let mut cmd = Cmd::Shutdown { done };
+        // The command channel is capacity-1: poll it until `deadline` rather
+        // than block the caller behind a busy actor (G).
+        loop {
+            match self.tx.try_send(cmd) {
+                Ok(()) => break,
+                // The actor already exited; joining is immediate.
+                Err(mpsc::TrySendError::Disconnected(_)) => return self.join(),
+                Err(mpsc::TrySendError::Full(c)) => {
+                    if Instant::now() >= stop {
+                        self.abandoned.fetch_add(1, Ordering::Relaxed);
+                        return false;
+                    }
+                    cmd = c;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
         }
-        match wait.recv_timeout(deadline) {
+        let remaining = stop.saturating_duration_since(Instant::now());
+        match wait.recv_timeout(remaining) {
             Ok(()) => self.join(),
             // The actor is still executing a command past the deadline.
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -320,8 +338,12 @@ impl GenerationRuntime {
         make: impl FnOnce(SyncSender<T>, Option<Scope>) -> Cmd,
     ) -> Result<T, ActorError> {
         let (tx, rx) = mpsc::sync_channel(1);
-        self.tx.send(make(tx, scope)).map_err(|_| ActorError::Gone)?;
-        match rx.recv_timeout(wait) {
+        let cmd = make(tx, scope);
+        // The kernel→guest send is bounded by `wait`: a busy actor must not
+        // block the kernel past the wait (G).
+        let deadline = Instant::now() + wait;
+        send_bounded(&self.tx, cmd, deadline)?;
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(value) => Ok(value),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ActorError::Wedged),
             // The actor dropped the reply (went away mid-request).
@@ -345,6 +367,26 @@ impl std::fmt::Debug for GenerationRuntime {
             .field("generation", &self.generation)
             .field("in_flight", &self.in_flight())
             .finish_non_exhaustive()
+    }
+}
+
+/// Send `cmd` on the capacity-1 command channel, polling until `deadline`.
+/// Returns `Wedged` when the actor stayed busy past the deadline, `Gone` when
+/// the actor already exited (G).
+fn send_bounded(tx: &SyncSender<Cmd>, cmd: Cmd, deadline: Instant) -> Result<(), ActorError> {
+    let mut cmd = cmd;
+    loop {
+        match tx.try_send(cmd) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => return Err(ActorError::Gone),
+            Err(mpsc::TrySendError::Full(c)) => {
+                if Instant::now() >= deadline {
+                    return Err(ActorError::Wedged);
+                }
+                cmd = c;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
 

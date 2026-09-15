@@ -168,7 +168,7 @@ impl ContributionRegistry {
         let mut seen_stages: HashMap<(ScopePath, String, u32), String> = HashMap::new();
         let mut seen_ui: HashMap<(ScopePath, String), String> = HashMap::new();
         let mut seen_guards: HashMap<(ScopePath, String), (String, bool)> = HashMap::new();
-        let mut seen_hooks: HashMap<(ScopePath, HookKind, String), String> = HashMap::new();
+        let mut seen_hooks: HashSet<(ScopePath, HookKind, String)> = HashSet::new();
         let published: HashMap<ServiceKey, ServiceProvider> = self
             .services
             .lock()
@@ -305,20 +305,20 @@ impl ContributionRegistry {
                     validate_settings(contribution, s)?;
                 }
                 ContributionKind::Hook(h) => {
-                    if h.name.is_empty() || h.entry.is_empty() {
+                    if h.name.is_empty() {
                         return Err(ScopeError::InvalidContribution {
                             scope: contribution.scope.clone(),
-                            reason: "hook name and entry must be non-empty".into(),
+                            reason: "hook name must be non-empty".into(),
                         });
                     }
+                    // Merge-only kind: uniqueness is only within the full
+                    // `(scope, hook, name)` key; same-named hooks in different
+                    // scopes coexist (E).
                     let key = (contribution.scope.clone(), h.hook, h.name.clone());
-                    let holder = seen_hooks
-                        .get(&key)
-                        .or_else(|| self.hooks.get(&key).map(|e| &e.entry));
-                    if let Some(holder) = holder {
-                        return Err(conflict("hook", contribution, &h.name, holder, &h.entry));
+                    if seen_hooks.contains(&key) || self.hooks.contains_key(&key) {
+                        return Err(conflict("hook", contribution, &h.name, &h.name, &h.name));
                     }
-                    seen_hooks.insert(key, h.entry.clone());
+                    seen_hooks.insert(key);
                 }
             }
         }
@@ -2804,13 +2804,12 @@ mod tests {
             "user provider field is gone"
         );
     }
-    fn hook(scope: &ScopePath, name: &str, kind: HookKind, entry: &str) -> Contribution {
+    fn hook(scope: &ScopePath, name: &str, kind: HookKind) -> Contribution {
         Contribution {
             scope: scope.clone(),
             kind: ContributionKind::Hook(HookContribution {
                 name: name.into(),
                 hook: kind,
-                entry: entry.into(),
             }),
         }
     }
@@ -2826,19 +2825,19 @@ mod tests {
             &mut registry,
             &b,
             &[
-                hook(&b, "zeta", HookKind::OnTurnStart, "kb_on_turn_start"),
-                hook(&b, "alpha", HookKind::OnTurnStart, "kb_on_turn_start"),
+                hook(&b, "zeta", HookKind::OnTurnStart),
+                hook(&b, "alpha", HookKind::OnTurnStart),
             ],
         );
         validate_and_apply(
             &mut registry,
             &a,
-            &[hook(&a, "one", HookKind::OnTurnStart, "kb_on_turn_start")],
+            &[hook(&a, "one", HookKind::OnTurnStart)],
         );
         validate_and_apply(
             &mut registry,
             &a,
-            &[hook(&a, "other", HookKind::OnToolIntent, "kb_on_tool_intent")],
+            &[hook(&a, "other", HookKind::OnToolIntent)],
         );
 
         let ordered = registry.hooks_for(HookKind::OnTurnStart);
@@ -2860,7 +2859,7 @@ mod tests {
         assert_eq!(intents[0].1.name, "other");
 
         // Hooks never occupy a precedence-replacement identity.
-        assert!(contribution_override_key(&hook(&a, "one", HookKind::OnTurnStart, "x")).is_none());
+        assert!(contribution_override_key(&hook(&a, "one", HookKind::OnTurnStart)).is_none());
     }
 
     /// T9: an exact `(scope, hook, name)` duplicate conflicts; distinct names
@@ -2869,8 +2868,8 @@ mod tests {
     fn duplicate_hook_in_scope_conflicts() {
         let s = scope("app");
         let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
-        let h1 = hook(&s, "guard", HookKind::OnTurnStart, "e1");
-        let h2 = hook(&s, "guard", HookKind::OnTurnStart, "e2");
+        let h1 = hook(&s, "guard", HookKind::OnTurnStart);
+        let h2 = hook(&s, "guard", HookKind::OnTurnStart);
 
         let err = registry.validate(&[h1.clone(), h2.clone()]).unwrap_err();
         assert_eq!(
@@ -2879,8 +2878,8 @@ mod tests {
                 kind: "hook",
                 scope: s.clone(),
                 name: "guard".into(),
-                holder: "e1".into(),
-                challenger: "e2".into(),
+                holder: "guard".into(),
+                challenger: "guard".into(),
             }
         );
 
@@ -2890,25 +2889,21 @@ mod tests {
 
         // A distinct name for the same hook kind merges.
         registry
-            .validate(&[hook(&s, "other", HookKind::OnTurnStart, "e3")])
+            .validate(&[hook(&s, "other", HookKind::OnTurnStart)])
             .unwrap();
         // The same name under the other hook kind is a distinct key.
         registry
-            .validate(&[hook(&s, "guard", HookKind::OnToolIntent, "e3")])
+            .validate(&[hook(&s, "guard", HookKind::OnToolIntent)])
             .unwrap();
     }
 
-    /// T9: empty name/entry is an invalid contribution (no partial state).
+    /// T9: an empty hook name is an invalid contribution (no partial state).
     #[test]
-    fn hook_name_and_entry_must_be_non_empty() {
+    fn hook_name_must_be_non_empty() {
         let s = scope("app");
         let registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
         let err = registry
-            .validate(&[hook(&s, "", HookKind::OnTurnStart, "e")])
-            .unwrap_err();
-        assert!(matches!(err, ScopeError::InvalidContribution { .. }));
-        let err = registry
-            .validate(&[hook(&s, "n", HookKind::OnTurnStart, "")])
+            .validate(&[hook(&s, "", HookKind::OnTurnStart)])
             .unwrap_err();
         assert!(matches!(err, ScopeError::InvalidContribution { .. }));
     }
@@ -2922,17 +2917,17 @@ mod tests {
         validate_and_apply(
             &mut registry,
             &a,
-            &[hook(&a, "one", HookKind::OnTurnStart, "e1")],
+            &[hook(&a, "one", HookKind::OnTurnStart)],
         );
         validate_and_apply(
             &mut registry,
             &b,
-            &[hook(&b, "two", HookKind::OnTurnStart, "e2")],
+            &[hook(&b, "two", HookKind::OnTurnStart)],
         );
         assert_eq!(registry.hooks_for(HookKind::OnTurnStart).len(), 2);
 
         registry
-            .remove_contributions(&[hook(&a, "one", HookKind::OnTurnStart, "e1")])
+            .remove_contributions(&[hook(&a, "one", HookKind::OnTurnStart)])
             .unwrap();
         let remaining = registry.hooks_for(HookKind::OnTurnStart);
         assert_eq!(remaining.len(), 1);

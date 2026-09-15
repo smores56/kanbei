@@ -580,11 +580,10 @@ mod tests {
         let hook = ContributionKind::Hook(crate::contrib::HookContribution {
             name: "h".into(),
             hook: crate::contrib::HookKind::OnTurnStart,
-            entry: "kb_on_turn_start".into(),
         });
         assert_eq!(
             serde_json::to_string(&hook).unwrap(),
-            r#"{"Hook":{"name":"h","hook":"on_turn_start","entry":"kb_on_turn_start"}}"#
+            r#"{"Hook":{"name":"h","hook":"on_turn_start"}}"#
         );
     }
 
@@ -612,7 +611,6 @@ mod tests {
             kind: ContributionKind::Hook(crate::contrib::HookContribution {
                 name: "h".into(),
                 hook: crate::contrib::HookKind::OnTurnStart,
-                entry: "kb_on_turn_start".into(),
             }),
         });
         let mut registry3 = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));

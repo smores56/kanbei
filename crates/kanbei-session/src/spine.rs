@@ -41,6 +41,20 @@ use serde_json::{Value, json};
 use crate::{NewEvent, ProjectionState, Session, SessionError};
 use crate::hooks::Decision;
 
+/// Truncate a string to at most `max` BYTES without splitting a UTF-8 code
+/// point (C: `String::truncate` panics on a non-char boundary, and a guest
+/// hook name/value can be multibyte).
+fn truncate_utf8(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
 /// Tools whose execution is a consequential side effect: the committed
 /// intent is flushed to durable storage before these run (fast/balanced
 /// profiles otherwise acknowledge kernel-buffered writes).
@@ -620,23 +634,27 @@ impl Session {
         intent.intent_event = Some(receipt.last_seq);
 
         // T9: a hook deny is terminal for the intent — commit the canonical
-        // denied outcome (kernel-authored reason, digest of the decision) and
-        // never touch the approval/dispatch path.
+        // denied outcome (constant kernel reason; the denying hook's
+        // kernel-derived ids/digests) and never touch the approval/dispatch
+        // path.
         if let Decision::Deny { .. } = hooks.decision {
-            let reason = match &hooks.denier {
-                Some(denier) => format!("denied by hook {}", denier.name),
-                None => "denied by hook policy".to_string(),
-            };
             let outcome = ToolOutcome {
                 call_id: intent.call_id,
                 tool: intent.tool,
                 result: Value::Null,
                 error: None,
-                classification: OutcomeClassification::Denied(reason),
+                classification: OutcomeClassification::Denied(
+                    crate::hooks::DENIED_REASON.to_string(),
+                ),
                 origin_snapshot: intent.origin_snapshot,
                 commit_snapshot: self.current_snapshot,
                 retained: None,
-                hook_denied: Some(hooks.decision.digest()),
+                hook_denied: hooks.denier.as_ref().map(|denier| kanbei_tools::HookDenier {
+                    module_id: denier.module_id.to_string(),
+                    package_digest: denier.package_digest.to_string(),
+                    hook: denier.hook.as_str().to_string(),
+                    decision_digest: hooks.decision.digest().to_string(),
+                }),
             };
             self.commit_tool_outcome(&outcome)?;
             return Ok(outcome);
@@ -1096,9 +1114,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
             .filter(|(seq, _, _)| self.on_path(*seq))
             .map(|(seq, kind, payload)| {
                 let mut text = serde_json::to_string(payload).unwrap_or_default();
-                if text.len() > 512 {
-                    text.truncate(512);
-                }
+                truncate_utf8(&mut text, 512);
                 RenderedEvent {
                     seq: *seq,
                     kind: kind.clone(),
@@ -2064,10 +2080,6 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
         });
         let hooks = self.evaluate_hooks(HookKind::OnTurnStart, &hook_context.to_string());
         if let Decision::Deny { .. } = hooks.decision {
-            let reason = match &hooks.denier {
-                Some(denier) => format!("turn denied by hook {}", denier.name),
-                None => "turn denied by hook policy".to_string(),
-            };
             self.commit(
                 vec![NewEvent {
                     kind: "turn_denied".into(),
@@ -2075,6 +2087,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                     payload: json!({
                         "run": run_id.to_string(),
                         "hook": HookKind::OnTurnStart.as_str(),
+                        "module_id": hooks.denier.as_ref().map(|d| d.module_id.to_string()),
                         "package_digest": hooks
                             .denier
                             .as_ref()
@@ -2092,7 +2105,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                 TerminalOutcome::Blocked,
                 usage,
                 &[],
-                Some(reason),
+                Some(crate::hooks::DENIED_REASON.to_string()),
             )?;
             return Ok(TerminalOutcome::Blocked);
         }

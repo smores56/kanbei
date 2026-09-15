@@ -120,9 +120,11 @@ pub struct ModuleHost {
     /// UI component name → generation that mounted it (stale generations are
     /// removed on disposal, so a displaced mount cannot be resolved).
     ui_components: Mutex<HashMap<String, u64>>,
-    /// Hook `(kind, name)` → generation that declared it (mirrors
-    /// `ui_components`; stale generations are pruned on disposal).
-    hooks: Mutex<HashMap<(HookKind, String), u64>>,
+    /// Hook `(scope, kind, name)` → generation that declared it (mirrors
+    /// `ui_components`; stale generations are pruned on disposal). Keyed by
+    /// the full scope path so same-named hooks in different scopes never
+    /// collide/misbind (T9/E).
+    hooks: Mutex<HashMap<(ScopePath, HookKind, String), u64>>,
     /// The kernel's canonical generation-currency predicate (shared with the
     /// `StateStore`). Mutating ops re-read it at their commit point so a
     /// generation retired mid-op cannot commit (R-02/C-03); the check is
@@ -617,11 +619,11 @@ impl ModuleHost {
                 }
             }
             "hook" => {
-                // T9: a named lifecycle hook. The shim multiplexes every hook
-                // over `kb_hot`, so `entry` names the guest function the
-                // wrapper dispatches to. A blank name is filled with the
-                // module id (a stable, module-sourced identity) so two
-                // modules hooking the same kind never collide.
+                // T9: a named lifecycle hook. Dispatch is by hook kind over
+                // the guest's `kb_hot` multiplexer, so no entry name is
+                // carried (H). A blank name is filled with the module id (a
+                // stable, module-sourced identity) so two modules hooking the
+                // same kind never collide.
                 let hook = match v.get("hook").and_then(Value::as_str) {
                     Some("on_turn_start") => HookKind::OnTurnStart,
                     Some("on_tool_intent") => HookKind::OnToolIntent,
@@ -634,13 +636,6 @@ impl ModuleHost {
                         );
                     }
                 };
-                let entry = v
-                    .get("entry")
-                    .and_then(Value::as_str)
-                    .map(String::from)
-                    .ok_or_else(|| {
-                        "contribution_publish: hook must carry an \"entry\"".to_string()
-                    })?;
                 let name = v
                     .get("name")
                     .and_then(Value::as_str)
@@ -648,13 +643,33 @@ impl ModuleHost {
                     .map(String::from)
                     .unwrap_or_else(|| info.module_id.to_string());
                 self.ensure_current(info.generation)?;
-                self.hooks
-                    .lock()
-                    .expect("hooks lock poisoned")
-                    .insert((hook, name.clone()), info.generation);
+                {
+                    let mut hooks = self.hooks.lock().expect("hooks lock poisoned");
+                    match hooks.entry((info.scope.clone(), hook, name.clone())) {
+                        // A collision from a DIFFERENT live generation is a
+                        // conflict: never clobber an unrelated holder.
+                        std::collections::hash_map::Entry::Occupied(e)
+                            if *e.get() != info.generation =>
+                        {
+                            return Err(format!(
+                                "contribution_publish: hook {name:?} ({:?}) in {} is already held by generation {}",
+                                hook,
+                                info.scope,
+                                e.get()
+                            ));
+                        }
+                        // Same generation re-publishing is idempotent.
+                        std::collections::hash_map::Entry::Occupied(e) => {
+                            let _ = e.into_mut();
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(info.generation);
+                        }
+                    }
+                }
                 Contribution {
                     scope: info.scope.clone(),
-                    kind: ContributionKind::Hook(HookContribution { name, hook, entry }),
+                    kind: ContributionKind::Hook(HookContribution { name, hook }),
                 }
             }
             "settings" => {
@@ -711,13 +726,18 @@ impl ModuleHost {
             .copied()
     }
 
-    /// The generation that declared hook `(kind, name)` (session hook
+    /// The generation that declared hook `(scope, kind, name)` (session hook
     /// resolution), if it is still live.
-    pub(crate) fn hook_generation(&self, hook: HookKind, name: &str) -> Option<u64> {
+    pub(crate) fn hook_generation(
+        &self,
+        scope: &ScopePath,
+        hook: HookKind,
+        name: &str,
+    ) -> Option<u64> {
         self.hooks
             .lock()
             .expect("hooks lock poisoned")
-            .get(&(hook, name.to_string()))
+            .get(&(scope.clone(), hook, name.to_string()))
             .copied()
     }
 
@@ -1010,7 +1030,7 @@ mod tests {
         let i = info();
         host.op_contribution_publish(
             &i,
-            r#"{"kind":"hook","name":"guard_mod","hook":"on_turn_start","entry":"kb_on_turn_start"}"#,
+            r#"{"kind":"hook","name":"guard_mod","hook":"on_turn_start"}"#,
         )
         .unwrap();
         let published = host.published_contributions(1);
@@ -1019,32 +1039,33 @@ mod tests {
             ContributionKind::Hook(h) => {
                 assert_eq!(h.name, "guard_mod");
                 assert_eq!(h.hook, HookKind::OnTurnStart);
-                assert_eq!(h.entry, "kb_on_turn_start");
             }
             other => panic!("expected a hook contribution, got {other:?}"),
         }
         assert_eq!(
-            host.hook_generation(HookKind::OnTurnStart, "guard_mod"),
+            host.hook_generation(&i.scope, HookKind::OnTurnStart, "guard_mod"),
             Some(1)
         );
-        assert_eq!(host.hook_generation(HookKind::OnToolIntent, "guard_mod"), None);
+        assert_eq!(
+            host.hook_generation(&i.scope, HookKind::OnToolIntent, "guard_mod"),
+            None
+        );
 
         // A blank name is filled with the module's stable id.
         host.op_contribution_publish(
             &i,
-            r#"{"kind":"hook","name":"","hook":"on_tool_intent","entry":"kb_on_tool_intent"}"#,
+            r#"{"kind":"hook","name":"","hook":"on_tool_intent"}"#,
         )
         .unwrap();
         assert_eq!(
-            host.hook_generation(HookKind::OnToolIntent, &i.module_id.to_string()),
+            host.hook_generation(&i.scope, HookKind::OnToolIntent, &i.module_id.to_string()),
             Some(1)
         );
 
         // Malformed payloads stage nothing and record no mapping.
         for bad in [
-            r#"{"kind":"hook","name":"x","entry":"e"}"#,
-            r#"{"kind":"hook","name":"x","hook":"bogus","entry":"e"}"#,
-            r#"{"kind":"hook","name":"x","hook":"on_turn_start"}"#,
+            r#"{"kind":"hook","name":"x"}"#,
+            r#"{"kind":"hook","name":"x","hook":"bogus"}"#,
         ] {
             let err = host.op_contribution_publish(&i, bad).unwrap_err();
             assert!(
@@ -1064,17 +1085,115 @@ mod tests {
         let i = info();
         host.op_contribution_publish(
             &i,
-            r#"{"kind":"hook","name":"guard_mod","hook":"on_turn_start","entry":"kb_on_turn_start"}"#,
+            r#"{"kind":"hook","name":"guard_mod","hook":"on_turn_start"}"#,
         )
         .unwrap();
         assert_eq!(
-            host.hook_generation(HookKind::OnTurnStart, "guard_mod"),
+            host.hook_generation(&i.scope, HookKind::OnTurnStart, "guard_mod"),
             Some(1)
         );
         host.drop_generation_contributions(1);
-        assert_eq!(host.hook_generation(HookKind::OnTurnStart, "guard_mod"), None);
+        assert_eq!(
+            host.hook_generation(&i.scope, HookKind::OnTurnStart, "guard_mod"),
+            None
+        );
         assert!(host.published_contributions(1).is_empty());
         drop(host);
         teardown(dir, queue);
+    }
+
+    /// T9/E: hooks are keyed by the full `(scope, kind, name)`, so same-named
+    /// hooks in different scopes coexist; a same-scope collision from a
+    /// different live generation is refused; retiring one generation drops
+    /// only its own entry.
+    #[test]
+    fn hooks_are_scope_keyed_and_teardown_isolated() {
+        let a = ScopePath(vec!["a".into()]);
+        let b = ScopePath(vec!["b".into()]);
+        let (dir, queue, host) = host_with_generations(
+            "hook-scope",
+            vec![(1, a.clone(), Id128::generate()), (2, b.clone(), Id128::generate())],
+        );
+        let info_for = |generation: u64, scope: &ScopePath| TokenInfo {
+            generation,
+            module_id: Id128::generate(),
+            scope: scope.clone(),
+            deps: Vec::new(),
+            state_key: None,
+            state_schema: None,
+            supersede: HashSet::new(),
+        };
+        host.op_contribution_publish(
+            &info_for(1, &a),
+            r#"{"kind":"hook","name":"same","hook":"on_turn_start"}"#,
+        )
+        .unwrap();
+        host.op_contribution_publish(
+            &info_for(2, &b),
+            r#"{"kind":"hook","name":"same","hook":"on_turn_start"}"#,
+        )
+        .unwrap();
+        assert_eq!(host.hook_generation(&a, HookKind::OnTurnStart, "same"), Some(1));
+        assert_eq!(host.hook_generation(&b, HookKind::OnTurnStart, "same"), Some(2));
+
+        // A collision in the same scope from a different live generation is
+        // refused instead of clobbering the holder.
+        let err = host
+            .op_contribution_publish(
+                &info_for(2, &a),
+                r#"{"kind":"hook","name":"same","hook":"on_turn_start"}"#,
+            )
+            .unwrap_err();
+        assert!(err.contains("already held"), "got: {err}");
+
+        // Retiring generation 1 drops only its own entry.
+        host.drop_generation_contributions(1);
+        assert_eq!(host.hook_generation(&a, HookKind::OnTurnStart, "same"), None);
+        assert_eq!(host.hook_generation(&b, HookKind::OnTurnStart, "same"), Some(2));
+        drop(host);
+        teardown(dir, queue);
+    }
+
+    /// A host with the given `(generation, scope, module_id)` tokens registered.
+    fn host_with_generations(
+        tag: &str,
+        generations: Vec<(u64, ScopePath, Id128)>,
+    ) -> (PathBuf, Arc<DurabilityQueue>, ModuleHost) {
+        let dir = std::env::temp_dir().join(format!("kb-host-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let queue = Arc::new(DurabilityQueue::start(&format!("kb-host-{tag}")));
+        let tokens: Arc<RwLock<HashMap<u64, TokenInfo>>> = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let mut tokens = tokens.write().expect("tokens lock poisoned");
+            for (generation, scope, module_id) in generations {
+                tokens.insert(
+                    generation,
+                    TokenInfo {
+                        generation,
+                        module_id,
+                        scope,
+                        deps: Vec::new(),
+                        state_key: None,
+                        state_schema: None,
+                        supersede: HashSet::new(),
+                    },
+                );
+            }
+        }
+        let currency: Arc<dyn Fn(u64) -> bool + Send + Sync> = {
+            let tokens = Arc::clone(&tokens);
+            Arc::new(move |g| tokens.read().expect("tokens lock poisoned").contains_key(&g))
+        };
+        let state = StateStore::open(&dir, Arc::clone(&queue), Arc::clone(&currency));
+        let host = ModuleHost::new(
+            Id128::generate(),
+            tokens,
+            Weak::new(),
+            Arc::new(Mutex::new(ServiceRegistry::new())),
+            Arc::new(Mutex::new(state)),
+            Arc::new(AtomicU64::new(0)),
+            currency,
+        );
+        (dir, queue, host)
     }
 }

@@ -1,6 +1,6 @@
 //! Module subsystem: config activation, generation replacement, effect dispatch, state-head CAS, retention, and UI staleness.
 
-use crate::settings_gate::{gate_settings_contributions, settings_supersede_allowed};
+use crate::settings_gate::{gate_published_contributions, settings_supersede_allowed};
 use crate::{ConfigActivation, ConfigLayer, Session, FaultPoint, NewEvent, SessionError};
 use kanbei_core::digest::Digest;
 use kanbei_core::id::Id128;
@@ -305,7 +305,7 @@ impl Session {
         // field on the recompose path.
         for layer in &self.config_layers {
             let mut published = manager.published_contributions(layer.generation);
-            gate_settings_contributions(layer.manifest.origin, &mut published);
+            gate_published_contributions(layer.manifest.origin, &mut published);
             for c in published {
                 if matches!(
                     &c.kind,
@@ -451,7 +451,7 @@ impl Session {
         // stripped before they can enter the merged overlay or the canonical
         // commit.
         let mut published = manager.published_contributions(generation.generation);
-        gate_settings_contributions(manifest.origin, &mut published);
+        gate_published_contributions(manifest.origin, &mut published);
         staged.contributions.extend(published);
 
         // Decision 28 precedence plan. The delta IS the module's own
@@ -625,7 +625,9 @@ impl Session {
             package,
             manifest,
         });
-        // T9: bind this layer's hook contributions (if any).
+        // T9: bind this layer's hook contributions (if any). A composition
+        // change is the boundary that clears hook fault backoff (G).
+        self.reset_hook_recovery();
         self.rebind_hooks();
         Ok(ConfigActivation {
             module_id,
@@ -750,7 +752,7 @@ impl Session {
         // activation — a replacement must not re-introduce an untrusted
         // layer's stripped sensitive fields.
         let mut new_published = manager.published_contributions(new_generation);
-        gate_settings_contributions(new_manifest.origin, &mut new_published);
+        gate_published_contributions(new_manifest.origin, &mut new_published);
         staged.contributions.extend(new_published);
         if let Err(e) = self
             .composition
@@ -834,7 +836,9 @@ impl Session {
         }
         // M8: rebind the UI host — the replaced generation's mounts unbind
         // (their components no longer resolve) and the remaining mounts
-        // rebind in slot order.
+        // rebind in slot order. A composition change clears hook fault backoff
+        // (G).
+        self.reset_hook_recovery();
         self.rebind_ui(new_generation)?;
         // Keep the retained config manifest (and its digest) in step with the
         // swap so `reset_module_state` reads the live binding (R-07/C-F1).

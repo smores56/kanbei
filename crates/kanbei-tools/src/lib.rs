@@ -249,9 +249,20 @@ pub enum OutcomeClassification {
     Interrupted(String),
     Ambiguous(String),
     /// A lifecycle hook denied the intent before the approval gate/dispatch
-    /// (T9). The string is kernel-authored (never guest text); the decision's
-    /// content digest rides on [`ToolOutcome::hook_denied`].
+    /// (T9). The string is a KERNEL-authored constant (never guest text); the
+    /// denying hook's kernel-derived ids/digests ride on
+    /// [`ToolOutcome::hook_denied`].
     Denied(String),
+}
+
+/// Kernel-derived identity of a denying hook (T9/C): ids, digests, and the
+/// hook kind only — never the guest's name/reason text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookDenier {
+    pub module_id: String,
+    pub package_digest: String,
+    pub hook: String,
+    pub decision_digest: String,
 }
 
 /// Committed tool outcome: references both the origin snapshot (the intent's
@@ -269,11 +280,11 @@ pub struct ToolOutcome {
     /// Output retention candidate decisions are applied by the session's
     /// retention gate; the outcome records the admission.
     pub retained: Option<bool>,
-    /// Digest of the denying hook's decision (T9); set only when the
-    /// classification is [`OutcomeClassification::Denied`]. Additive and
-    /// defaulted so pre-T9 records deserialize unchanged.
+    /// Kernel-derived identity + decision digest of the denying hook (T9); set
+    /// only when the classification is [`OutcomeClassification::Denied`].
+    /// Additive and defaulted so pre-T9 records deserialize unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hook_denied: Option<Digest>,
+    pub hook_denied: Option<HookDenier>,
 }
 
 /// Classification reason prefix marking an intent parked behind the

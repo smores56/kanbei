@@ -1244,19 +1244,19 @@ fn hook_module_dispatches_named_entry_and_stages_contribution() {
     let hooks: Vec<_> = published
         .iter()
         .filter_map(|c| match &c.kind {
-            ContributionKind::Hook(h) => Some((h.hook, h.name.clone(), h.entry.clone())),
+            ContributionKind::Hook(h) => Some((h.hook, h.name.clone())),
             _ => None,
         })
         .collect();
     assert_eq!(hooks.len(), 2, "both hooks declared: {hooks:?}");
     assert!(hooks
         .iter()
-        .any(|(k, n, e)| *k == HookKind::OnTurnStart && n == "hook_mod" && e == "kb_on_turn_start"));
+        .any(|(k, n)| *k == HookKind::OnTurnStart && n == "hook_mod"));
     assert!(hooks
         .iter()
-        .any(|(k, n, e)| *k == HookKind::OnToolIntent && n == "hook_mod" && e == "kb_on_tool_intent"));
+        .any(|(k, n)| *k == HookKind::OnToolIntent && n == "hook_mod"));
     assert_eq!(
-        manager.hook_generation(HookKind::OnTurnStart, "hook_mod"),
+        manager.hook_generation(&root(), HookKind::OnTurnStart, "hook_mod"),
         Some(g.generation)
     );
 
@@ -1377,12 +1377,13 @@ fn invalid_hook_inputs_and_results_are_structured() {
         .activate(&manifest(id, BAD_RESULT_HOOK, vec![]))
         .unwrap();
 
-    // Invalid context JSON is rejected before any call.
+    // Invalid context JSON is a KERNEL-side bug: a distinct error that the
+    // session must not treat as a guest fault (H).
     assert_eq!(
         manager
             .call_hook(g.generation, HookKind::OnTurnStart, "not json", HOOK_WAIT)
             .unwrap_err(),
-        HookError::Invalid
+        HookError::InvalidContext
     );
     // A non-serializable guest result is a guest return error → Invalid.
     assert_eq!(
@@ -1437,7 +1438,7 @@ fn respawn_rotates_generation_and_preserves_composition() {
     assert_eq!(manager.published_contributions(new_generation), before);
     assert_eq!(manager.snapshot()[0].2, before_snapshot[0].2);
     assert_eq!(
-        manager.hook_generation(HookKind::OnTurnStart, "hook_mod"),
+        manager.hook_generation(&root(), HookKind::OnTurnStart, "hook_mod"),
         Some(new_generation)
     );
 
@@ -1455,6 +1456,47 @@ fn respawn_rotates_generation_and_preserves_composition() {
         manager.call_generation(new_generation, r#"{"kind":"plain"}"#).unwrap(),
         "\"plain\""
     );
+
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// T9/D: a peer module's spoofed `__kb_hook` envelope (no nonce, or a wrong
+/// one) falls through to the real `kb_hot` instead of hijacking the hook; the
+/// kernel's own hook call presents the per-generation secret and dispatches.
+#[test]
+fn hook_call_is_nonce_authenticated() {
+    let vm = hook_vm();
+    let (dir, mut manager, queue) = manager_setup("hook-nonce", vm);
+    let id = Id128::generate();
+    let g = manager
+        .activate(&manifest(id, HOOK_MODULE, vec![]))
+        .unwrap();
+
+    // The kernel's own hook call dispatches to the hook entry.
+    let out = manager
+        .call_hook(
+            g.generation,
+            HookKind::OnToolIntent,
+            r#"{"tool":"rm"}"#,
+            HOOK_WAIT,
+        )
+        .unwrap();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap()["decision"], "deny");
+
+    // A `service_call`-style payload cannot know the nonce, so it reaches the
+    // module's original `kb_hot` (which returns "orig").
+    for spoof in [
+        r#"{"__kb_hook":"on_tool_intent","context":{"tool":"rm"}}"#,
+        r#"{"__kb_hook":"on_tool_intent","__kb_nonce":"guess","context":{"tool":"rm"}}"#,
+    ] {
+        assert_eq!(
+            manager.call_generation(g.generation, spoof).unwrap(),
+            "\"orig\"",
+            "spoof must fall through: {spoof}"
+        );
+    }
 
     drop(g);
     drop(manager);

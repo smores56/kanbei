@@ -70,10 +70,14 @@ fn require_guest() {
 }
 
 fn manifest(id: Id128, source: &str) -> PackageManifest {
+    manifest_origin(id, source, ModuleOrigin::UserConfig)
+}
+
+fn manifest_origin(id: Id128, source: &str, origin: ModuleOrigin) -> PackageManifest {
     PackageManifest {
         schema: kanbei_modules::PACKAGE_SCHEMA,
         module_id: id,
-        origin: ModuleOrigin::UserConfig,
+        origin,
         trust_class: TrustClass::User,
         scope: kanbei_services::ScopePath(vec!["root".into()]),
         deps: Vec::new(),
@@ -232,12 +236,11 @@ function kb_on_tool_intent(context)
 end
 "#;
 
-const FAIL_OPEN_KEYS: [&str; 7] = [
+const FAIL_OPEN_KEYS: [&str; 6] = [
     "module_id",
     "package_digest",
     "generation",
     "hook",
-    "entry",
     "fault_class",
     "count",
 ];
@@ -318,7 +321,18 @@ fn tool_intent_trap_fails_closed() {
         }
         other => panic!("unexpected classification shape {other:?}"),
     }
-    assert!(outcomes[0].payload["hook_denied"].as_str().is_some());
+    assert!(outcomes[0].payload["hook_denied"]["module_id"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    assert!(outcomes[0].payload["hook_denied"]["package_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("blake3:"));
+    assert_eq!(outcomes[0].payload["hook_denied"]["hook"], "on_tool_intent");
+    assert!(outcomes[0].payload["hook_denied"]["decision_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("blake3:"));
     assert_eq!(facts(&envs, "module_fault").len(), 1);
 }
 
@@ -517,6 +531,232 @@ fn faulted_hook_is_retried_on_a_fresh_generation() {
     );
     assert_eq!(facts(&envs, "tool_intent").len(), 2);
 }
+
+// --- review-fix pack: A/B/C/F/G regression tests ----------------------------
+
+fn principal(session: &Session) -> kanbei_capabilities::Principal {
+    kanbei_capabilities::Principal {
+        session: session.session_id(),
+        generation: 0,
+        run: Some(0),
+    }
+}
+
+fn open_origin(source: &str, origin: ModuleOrigin) -> (TempDir, Session) {
+    require_guest();
+    let dir = TempDir::new("origin");
+    let m = manifest_origin(Id128::generate(), source, origin);
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(trap_engine()),
+        config_layers: vec![m],
+        ..Default::default()
+    })
+    .unwrap();
+    (dir, session)
+}
+
+/// A (HIGH): a deny-relevant `on_tool_intent` hook whose generation cannot be
+/// respawned (its wait budget is exhausted on the fault) stays DEGRADED and
+/// fail-closed — every subsequent intent is DENIED, never allowed, and no
+/// per-decision fault storm is emitted.
+#[test]
+fn unrespawnable_intent_hook_stays_fail_closed_across_decisions() {
+    let (dir, mut session) = open_with(WEDGE_TOOL);
+    let (run_id, _trigger) = start_run(&mut session);
+    let state = session.modules().unwrap().state();
+    let holder = std::thread::spawn(move || {
+        let _guard = state.lock().unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+    });
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut outcomes = Vec::new();
+    for i in 0..4 {
+        let outcome = session
+            .tool_call(
+                run_id,
+                principal(&session),
+                "fs.read",
+                json!({ "path": format!("p{i}") }),
+            )
+            .unwrap();
+        outcomes.push(outcome);
+    }
+    holder.join().unwrap();
+    session.close().unwrap();
+
+    for (i, o) in outcomes.iter().enumerate() {
+        assert!(
+            matches!(o.classification, OutcomeClassification::Denied(_)),
+            "intent {i} must stay denied, got {:?}",
+            o.classification
+        );
+    }
+    let envs = envelopes(&dir.path().join("log.zst"));
+    let faults = facts(&envs, "module_fault");
+    assert_eq!(faults.len(), 1, "no per-decision fault storm");
+    assert_eq!(faults[0].payload["fault_class"], "timeout");
+    // The retried decisions carry the constant kernel reason, no guest text.
+    for o in facts(&envs, "tool_outcome") {
+        assert_eq!(o.payload["classification"]["Denied"], "denied by a module hook");
+    }
+}
+
+/// B (HIGH): an untrusted (`WorkspaceConfig`) layer's hook is gated out and
+/// has no effect, while a trusted (`UserConfig`) layer's hook binds.
+#[test]
+fn untrusted_origin_hook_is_not_bound_but_trusted_is() {
+    let (untrusted_dir, mut untrusted) = open_origin(DENY_TOOL, ModuleOrigin::WorkspaceConfig);
+    let (run_id, _trigger) = start_run(&mut untrusted);
+    let allowed = untrusted
+        .tool_call(run_id, principal(&untrusted), "fs.read", json!({ "path": "x" }))
+        .unwrap();
+    untrusted.close().unwrap();
+    assert!(
+        !matches!(allowed.classification, OutcomeClassification::Denied(_)),
+        "a cloned workspace hook must not deny, got {:?}",
+        allowed.classification
+    );
+    let untrusted_envs = envelopes(&untrusted_dir.path().join("log.zst"));
+    assert!(facts(&untrusted_envs, "module_fault").is_empty());
+    assert!(facts(&untrusted_envs, "tool_outcome")
+        .iter()
+        .all(|o| o.payload["classification"].get("Denied").is_none()));
+
+    let (trusted_dir, mut trusted) = open_origin(DENY_TOOL, ModuleOrigin::UserConfig);
+    let (run_id, _trigger) = start_run(&mut trusted);
+    let denied = trusted
+        .tool_call(run_id, principal(&trusted), "fs.read", json!({ "path": "x" }))
+        .unwrap();
+    trusted.close().unwrap();
+    assert!(matches!(denied.classification, OutcomeClassification::Denied(_)));
+    let _ = trusted_dir;
+}
+
+/// C (HIGH): a guest hook name/reason carrying multibyte, long text never
+/// panics and never appears verbatim in a committed payload.
+#[test]
+fn multibyte_guest_hook_text_never_panics_or_reaches_payloads() {
+    let name = format!("Ω{}", "é".repeat(200));
+    let reason = "é".repeat(300);
+    let source = format!(
+        r#"
+kb_name = "{name}"
+function kb_on_activate(ctx) end
+function kb_hot(x) return "hot" end
+function kb_on_tool_intent(context)
+  return {{ decision = "deny", reason = "{reason}", annotations = {{{{ key = "k", value = "{value}" }}}} }}
+end
+"#,
+        value = "é".repeat(400)
+    );
+    let (dir, mut session) = open_with(&source);
+    let (run_id, trigger) = start_run(&mut session);
+    let mut provider = Scripted::new(vec![
+        StepCommand::ToolIntent {
+            tool: "fs.read".into(),
+            arguments: json!({ "path": "x" }),
+        },
+        StepCommand::Finish(kanbei_scheduler::TerminalOutcome::Progress),
+    ]);
+    // The projection render truncates recent-event payloads at a byte bound;
+    // a multibyte payload must not panic there.
+    session
+        .cognition_loop(run_id, trigger.clone(), &mut provider, |s| {
+            s.project_context(run_id, &trigger)
+        })
+        .unwrap();
+    session.close().unwrap();
+
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert!(facts(&envs, "tool_outcome")
+        .iter()
+        .all(|o| o.payload["classification"]["Denied"] == "denied by a module hook"));
+    for env in &envs {
+        let text = env.payload.to_string();
+        assert!(!text.contains(&reason), "guest reason leaked into {}", env.kind);
+        assert!(!text.contains(&name), "guest hook name leaked into {}", env.kind);
+    }
+}
+
+/// F (MEDIUM): after a hook fault respawns the module, the UI mount resolves
+/// to the fresh generation (not the dead one) and the hook is retried.
+#[test]
+fn respawn_rebinds_ui_mount_and_retries_hook() {
+    require_guest();
+    let dir = TempDir::new("respawn-ui");
+    let m = manifest(Id128::generate(), UI_AND_TRAP_ONCE);
+    let module_id = m.module_id;
+    let mut session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(trap_engine()),
+        ..Default::default()
+    })
+    .unwrap();
+    session.activate_ui(m).unwrap();
+    let mount_generation = session.ui().unwrap().mounts[0].generation;
+    assert!(mount_generation >= 1);
+
+    let (run_id, _trigger) = start_run(&mut session);
+    let first = session
+        .tool_call(
+            run_id,
+            principal(&session),
+            "fs.read",
+            json!({ "path": "a" }),
+        )
+        .unwrap();
+    assert!(matches!(first.classification, OutcomeClassification::Denied(_)));
+    let fresh = session
+        .modules()
+        .unwrap()
+        .snapshot()
+        .into_iter()
+        .find(|(id, _, _)| *id == module_id)
+        .unwrap()
+        .1;
+    assert!(fresh > mount_generation, "respawn mints a fresh generation");
+    assert_eq!(
+        session.ui().unwrap().mounts[0].generation,
+        fresh,
+        "the UI mount must rebind to the fresh generation, not stay dead"
+    );
+
+    let second = session
+        .tool_call(
+            run_id,
+            principal(&session),
+            "fs.read",
+            json!({ "path": "b" }),
+        )
+        .unwrap();
+    session.close().unwrap();
+    assert!(
+        !matches!(second.classification, OutcomeClassification::Denied(_)),
+        "the retried hook produces its real decision, got {:?}",
+        second.classification
+    );
+}
+
+/// A module with BOTH a root-scope UI mount and a hook that traps only once
+/// (the marker survives respawn).
+const UI_AND_TRAP_ONCE: &str = r#"
+kb_name = "ui_retry"
+function kb_on_activate(ctx)
+  ctx.contribution_publish('{"kind":"ui","name":"panel","component":"panel_c"}')
+end
+function kb_hot(x) return "hot" end
+function kb_on_tool_intent(context)
+  local r = kb_host_call(1, '{"key":"ui_retry.seen"}')
+  if string.find(r, '"value":null') then
+    kb_host_call(2, '{"key":"ui_retry.seen","schema":1,"value":true}')
+    local n = 0
+    while true do n = n + 1 end
+  end
+  return { decision = "continue" }
+end
+"#;
 
 fn gated_broker(session_id: Id128) -> kanbei_capabilities::Broker {
     use kanbei_capabilities::{Broker, Capability, Grant, GrantScope, PolicyTemplate};

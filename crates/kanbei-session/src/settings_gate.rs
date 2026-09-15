@@ -14,7 +14,23 @@ use kanbei_scopes::contrib::{Contribution, ContributionKind};
 /// engine, or exfiltrate a secret (`provider.base_url`/`provider.key`) through
 /// the CLI's settings source.
 pub(crate) fn origin_is_trusted_for_settings(origin: ModuleOrigin) -> bool {
-    matches!(origin, ModuleOrigin::Builtin | ModuleOrigin::UserConfig)
+    origin.is_trusted()
+}
+
+/// The FULL published-contribution gate applied where a generation's staged
+/// contributions are collected (F2/B): settings fields are trust-gated (see
+/// [`gate_settings_contributions`]) AND a lifecycle hook from an untrusted
+/// origin is dropped entirely — a cloned workspace must not be able to deny
+/// every tool/turn (DoS) or annotate guest data into the model context. Hook
+/// dispatch is advisory, so an untrusted origin's hook simply has no effect.
+pub(crate) fn gate_published_contributions(
+    origin: ModuleOrigin,
+    contributions: &mut Vec<Contribution>,
+) {
+    gate_settings_contributions(origin, contributions);
+    if !origin_is_trusted_for_settings(origin) {
+        contributions.retain(|c| !matches!(c.kind, ContributionKind::Hook(_)));
+    }
 }
 
 /// Filters the settings contributions a generation publishes before they are

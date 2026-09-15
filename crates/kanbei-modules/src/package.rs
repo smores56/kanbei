@@ -50,6 +50,15 @@ impl ModuleOrigin {
         }
     }
 
+    /// Whether this origin is TRUSTED to publish sensitive contributions
+    /// (settings fields, lifecycle hooks). `Builtin` and `UserConfig` are
+    /// user-authorized; `WorkspaceConfig`/`Agent`/`UserInstalled` are repo-,
+    /// agent-, or install-supplied, so the kernel gates their contributions
+    /// (F2/B). One predicate shared by the settings gate and the hook gate.
+    pub fn is_trusted(self) -> bool {
+        matches!(self, ModuleOrigin::Builtin | ModuleOrigin::UserConfig)
+    }
+
     /// Precedence rank for precedence-driven implicit replacement
     /// (decision 28): a contribution whose origin ranks HIGHER replaces the
     /// contribution that occupies the same identity key at a LOWER rank.

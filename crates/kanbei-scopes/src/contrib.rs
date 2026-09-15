@@ -191,7 +191,7 @@ pub struct ApprovalSettings {
 
 /// The kernel-initiated lifecycle seams a module may hook (T9). Hooks are
 /// multiplexed over the guest's single cached entry point (`kb_hot`); see
-/// `kanbei-modules`'s activation shim and `HOT_MULTIPLEXER`.
+/// `kanbei-modules`'s activation shim and hook multiplexer.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum HookKind {
@@ -211,11 +211,11 @@ impl HookKind {
 
 /// A hook: a merge-only contribution (like `keymap`/`guard`) — multiple
 /// modules may hook the same [`HookKind`], so precedence never replaces a
-/// hook. `name` identifies the contribution within `(scope, hook)`;
-/// `entry` names the guest function the multiplexer must dispatch to.
+/// hook. `name` is a non-canonical identifier within `(scope, hook)`; dispatch
+/// is by hook kind over the guest's `kb_hot` multiplexer, so no entry name is
+/// carried (T9/H).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct HookContribution {
     pub name: String,
     pub hook: HookKind,
-    pub entry: String,
 }

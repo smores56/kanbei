@@ -13,11 +13,15 @@
 //! wired by [`crate::Session`]; this module owns the pure decision/binding
 //! logic so it is unit-testable without a live guest.
 
+use std::collections::HashSet;
+use std::time::Instant;
+
 use kanbei_core::digest::Digest;
 use kanbei_core::id::Id128;
 use kanbei_modules::{HOOK_WAIT, HookError, ModuleManager};
 use kanbei_scopes::contrib::HookKind;
 use kanbei_scopes::registry::ContributionRegistry;
+use kanbei_services::ScopePath;
 use serde_json::Value;
 
 /// Canonical session-side name for a hook annotation (the kernel-visible
@@ -32,6 +36,19 @@ const DENY_REASON_MAX: usize = 240;
 const ANNOTATION_KEY_MAX: usize = 64;
 /// Maximum annotation string-value length.
 const ANNOTATION_VALUE_MAX: usize = 512;
+/// Maximum number of annotations a single hook return may attach (C).
+const ANNOTATION_COUNT_MAX: usize = 32;
+/// Maximum total serialized size (bytes) of a hook's annotation list (C). A
+/// bound on nested structures, not just top-level strings.
+const ANNOTATION_TOTAL_MAX: usize = 4096;
+
+/// The kernel-authored constant reason a denied tool/turn carries. Never guest
+/// text (C): the hook's identity rides canonical facts as ids/digests instead.
+pub(crate) const DENIED_REASON: &str = "denied by a module hook";
+
+/// Minimum respawn budget: below this the fault path degrades without a
+/// synchronous drain (G).
+const MIN_RESPAWN_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// A hook's decision. Deny short-circuits evaluation; the reason is
 /// guest-authored memory-only text (canonical facts carry the decision
@@ -85,10 +102,24 @@ impl HookDecision {
         };
         let annotations = match obj.get("annotations") {
             None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(items)) => items
-                .iter()
-                .map(parse_annotation)
-                .collect::<Result<Vec<_>, _>>()?,
+            Some(Value::Array(items)) => {
+                let mut parsed = items
+                    .iter()
+                    .map(parse_annotation)
+                    .collect::<Result<Vec<_>, _>>()?;
+                // C: bound BOTH the count and the total serialized size, so a
+                // guest cannot smuggle unbounded nested data into a payload.
+                parsed.truncate(ANNOTATION_COUNT_MAX);
+                while !parsed.is_empty()
+                    && serde_json::to_string(&parsed)
+                        .map(|s| s.len())
+                        .unwrap_or(usize::MAX)
+                        > ANNOTATION_TOTAL_MAX
+                {
+                    parsed.pop();
+                }
+                parsed
+            }
             Some(_) => return Err(HookError::Invalid),
         };
         Ok(Self {
@@ -134,28 +165,17 @@ pub struct HookBinding {
     pub module_id: Id128,
     pub package_digest: Digest,
     pub generation: u64,
+    /// The scope the contribution was registered in (E: part of the identity,
+    /// so same-named hooks in different scopes never collide).
+    pub scope: ScopePath,
     pub name: String,
     pub hook: HookKind,
-    pub entry: String,
     /// Whether a fault has degraded this binding (its decisions fall back to
-    /// the built-in default until a respawn rebinds a fresh generation).
+    /// the built-in default until a composition rebind clears the backoff).
     pub degraded: bool,
-    /// Number of faults suppressed while degraded (cumulative per binding).
+    /// Cumulative fault count for this binding (across respawn generations and
+    /// suppressed degraded decisions).
     pub faults: u64,
-    /// Commit seq of the `module_fault` fact recording the transition.
-    pub last_fault_seq: Option<u64>,
-}
-
-impl HookBinding {
-    fn identity(&self) -> (Id128, u64, HookKind, &str, &str) {
-        (
-            self.module_id,
-            self.generation,
-            self.hook,
-            self.name.as_str(),
-            self.entry.as_str(),
-        )
-    }
 }
 
 /// One recorded fault during an evaluation: the binding identity at the time
@@ -166,9 +186,6 @@ pub struct HookFault {
     pub index: usize,
     pub binding: HookBinding,
     pub error: HookError,
-    /// True when this fault transitioned the binding into `degraded` (the
-    /// condition for committing a `module_fault` fact).
-    pub transitioned: bool,
 }
 
 /// The result of evaluating one hook kind: the effective decision, the
@@ -190,7 +207,7 @@ impl HookEvaluation {
         match kind {
             // Fail-closed: an unavailable intent gate must never permit.
             HookKind::OnToolIntent => Decision::Deny {
-                reason: "denied: on_tool_intent hook unavailable".to_string(),
+                reason: DENIED_REASON.to_string(),
             },
             HookKind::OnTurnStart => Decision::Continue,
         }
@@ -209,13 +226,19 @@ impl HookEvaluation {
 }
 
 /// The ordered bindings per hook kind. Rebuilt on composition change (mirrors
-/// how the UI host rebinds its mounts): degradation state is carried across
-/// for a binding whose `(module_id, generation, hook, name, entry)` identity
-/// is unchanged, so a failed respawn leaves the binding degraded.
+/// how the UI host rebinds its mounts): fault/degradation state is carried
+/// across for a binding whose module identity is unchanged. A contribution
+/// that is registered but whose generation no longer resolves is retained as
+/// a DEGRADED binding (never dropped — the fail-closed default keeps
+/// applying, A). `backoff` suppresses re-running (and re-respawning) a
+/// deterministically-faulting binding until the next composition rebind (G).
 #[derive(Debug, Clone, Default)]
 pub struct HookSet {
     on_turn_start: Vec<HookBinding>,
     on_tool_intent: Vec<HookBinding>,
+    /// `(scope, kind, name)` of bindings whose faults must be suppressed until
+    /// the next composition rebind (G backoff).
+    backoff: HashSet<(ScopePath, HookKind, String)>,
 }
 
 impl HookSet {
@@ -228,6 +251,7 @@ impl HookSet {
         Self {
             on_turn_start,
             on_tool_intent,
+            backoff: HashSet::new(),
         }
     }
 
@@ -250,53 +274,90 @@ impl HookSet {
         self.on_turn_start.is_empty() && self.on_tool_intent.is_empty()
     }
 
-    /// Record the commit seq of the fault fact on the binding at `index`.
-    pub(crate) fn mark_fault_seq(&mut self, kind: HookKind, index: usize, seq: u64) {
-        if let Some(b) = self.bindings_mut(kind).get_mut(index) {
-            b.last_fault_seq = Some(seq);
-        }
+    /// Put a binding into backoff (G) so repeated decisions apply the default
+    /// without a fault fact or a respawn until the next composition rebind.
+    pub(crate) fn set_backoff(&mut self, scope: &ScopePath, kind: HookKind, name: &str) {
+        self.backoff
+            .insert((scope.clone(), kind, name.to_string()));
     }
 
-    /// Rebuild the ordered bindings from the composition registry. Only
-    /// contributions whose generation still resolves are bound (mirroring
-    /// `rebind_ui`). The registry's `hooks_for` already orders by
-    /// `(scope path, name)`.
+    /// Whether a binding is currently backed off.
+    pub(crate) fn is_backed_off(&self, scope: &ScopePath, kind: HookKind, name: &str) -> bool {
+        self.backoff.contains(&(scope.clone(), kind, name.to_string()))
+    }
+
+    /// Clear all backoff (a composition rebind gives every binding a fresh
+    /// chance).
+    pub(crate) fn clear_backoff(&mut self) {
+        self.backoff.clear();
+    }
+
+    /// Rebuild the ordered bindings from the composition registry. A
+    /// contribution whose generation still resolves is bound (mirroring
+    /// `rebind_ui`); one that is registered but unresolvable is retained as a
+    /// DEGRADED binding when it was previously bound (A). The registry's
+    /// `hooks_for` already orders by `(scope path, name)` and only ever
+    /// contains trust-gated hooks (B).
     pub fn rebuild(&mut self, registry: &ContributionRegistry, manager: &ModuleManager) {
         let generations: std::collections::HashMap<u64, (Id128, Digest)> = manager
             .snapshot()
             .into_iter()
             .map(|(id, generation, package)| (generation, (id, package)))
             .collect();
-        let old = std::mem::take(self);
+        let old_turn = std::mem::take(&mut self.on_turn_start);
+        let old_tool = std::mem::take(&mut self.on_tool_intent);
         for kind in [HookKind::OnTurnStart, HookKind::OnToolIntent] {
+            let old = match kind {
+                HookKind::OnTurnStart => &old_turn,
+                HookKind::OnToolIntent => &old_tool,
+            };
             let mut bindings = Vec::new();
-            for (_, contrib) in registry.hooks_for(kind) {
-                let Some(generation) = manager.hook_generation(kind, &contrib.name) else {
-                    continue;
-                };
-                let Some((module_id, package_digest)) = generations.get(&generation) else {
-                    continue;
-                };
-                let mut binding = HookBinding {
-                    module_id: *module_id,
-                    package_digest: *package_digest,
-                    generation,
-                    name: contrib.name,
-                    hook: kind,
-                    entry: contrib.entry,
-                    degraded: false,
-                    faults: 0,
-                    last_fault_seq: None,
-                };
-                // Carry degradation state when the exact binding survives.
-                if let Some(previous) = old
-                    .bindings(kind)
+            for (scope, contrib) in registry.hooks_for(kind) {
+                let resolved = manager
+                    .hook_generation(&scope, kind, &contrib.name)
+                    .and_then(|generation| {
+                        generations
+                            .get(&generation)
+                            .map(|(id, package)| (generation, *id, *package))
+                    });
+                let previous = old
                     .iter()
-                    .find(|p| p.identity() == binding.identity())
+                    .find(|p| p.scope == scope && p.hook == kind && p.name == contrib.name);
+                let mut binding = match resolved {
+                    Some((generation, module_id, package_digest)) => HookBinding {
+                        module_id,
+                        package_digest,
+                        generation,
+                        scope: scope.clone(),
+                        name: contrib.name.clone(),
+                        hook: kind,
+                        degraded: false,
+                        faults: 0,
+                    },
+                    None => match previous {
+                        // Registered but unresolvable: retain DEGRADED so the
+                        // fail-closed default keeps applying (A).
+                        Some(prev) => {
+                            let mut prev = prev.clone();
+                            prev.degraded = true;
+                            prev
+                        }
+                        // Never bound (or trust-gated): nothing to fail closed
+                        // on — an untrusted registration must not manufacture a
+                        // deny (B).
+                        None => continue,
+                    },
+                };
+                // Carry the cumulative fault count across respawn generations
+                // of the same binding (G: `count` accumulates).
+                if let Some(prev) = previous {
+                    binding.faults = binding.faults.max(prev.faults);
+                }
+                if self
+                    .backoff
+                    .contains(&(binding.scope.clone(), kind, binding.name.clone()))
                 {
-                    binding.degraded = previous.degraded;
-                    binding.faults = previous.faults;
-                    binding.last_fault_seq = previous.last_fault_seq;
+                    binding.degraded = true;
                 }
                 bindings.push(binding);
             }
@@ -305,9 +366,9 @@ impl HookSet {
     }
 
     /// Evaluate the kind's bindings in order. Degraded bindings are skipped
-    /// and their built-in default applies; a deny ends evaluation
-    /// immediately (annotations from preceding hooks — and the denier's own —
-    /// are kept).
+    /// and their built-in default applies (their suppressed-fault counter
+    /// advances); a deny ends evaluation immediately (annotations from
+    /// preceding hooks — and the denier's own — are kept).
     pub fn evaluate(
         &mut self,
         manager: &ModuleManager,
@@ -320,7 +381,9 @@ impl HookSet {
         for index in 0..count {
             let binding = self.bindings(kind)[index].clone();
             if binding.degraded {
-                // A degraded binding applies the built-in default.
+                // A degraded binding applies the built-in default; counting the
+                // suppressed fault lets `count` accumulate across decisions (G).
+                self.bindings_mut(kind)[index].faults += 1;
                 if let Decision::Deny { reason } = HookEvaluation::default_for(kind) {
                     return HookEvaluation {
                         decision: Decision::Deny { reason },
@@ -332,12 +395,18 @@ impl HookSet {
                 continue;
             }
             match manager.call_hook(binding.generation, kind, context_json, HOOK_WAIT) {
+                // A kernel-side context bug must not degrade a healthy guest (H).
+                Err(HookError::InvalidContext) => continue,
                 Err(error) => {
+                    let is_deny = matches!(
+                        HookEvaluation::default_for(kind),
+                        Decision::Deny { .. }
+                    );
                     let fault = self.record_fault(kind, index, error);
                     faults.push(fault);
-                    if let Decision::Deny { reason } = HookEvaluation::default_for(kind) {
+                    if is_deny {
                         return HookEvaluation {
-                            decision: Decision::Deny { reason },
+                            decision: HookEvaluation::default_for(kind),
                             annotations,
                             denier: Some(self.bindings(kind)[index].clone()),
                             faults,
@@ -346,11 +415,15 @@ impl HookSet {
                 }
                 Ok(raw) => match HookDecision::parse(&raw) {
                     Err(error) => {
+                        let is_deny = matches!(
+                            HookEvaluation::default_for(kind),
+                            Decision::Deny { .. }
+                        );
                         let fault = self.record_fault(kind, index, error);
                         faults.push(fault);
-                        if let Decision::Deny { reason } = HookEvaluation::default_for(kind) {
+                        if is_deny {
                             return HookEvaluation {
-                                decision: Decision::Deny { reason },
+                                decision: HookEvaluation::default_for(kind),
                                 annotations,
                                 denier: Some(self.bindings(kind)[index].clone()),
                                 faults,
@@ -358,10 +431,7 @@ impl HookSet {
                         }
                     }
                     Ok(decision) => {
-                        {
-                            let b = &mut self.bindings_mut(kind)[index];
-                            b.degraded = false;
-                        }
+                        self.bindings_mut(kind)[index].degraded = false;
                         annotations.extend(decision.annotations);
                         if let Decision::Deny { .. } = decision.decision {
                             return HookEvaluation {
@@ -385,14 +455,12 @@ impl HookSet {
 
     fn record_fault(&mut self, kind: HookKind, index: usize, error: HookError) -> HookFault {
         let b = &mut self.bindings_mut(kind)[index];
-        let transitioned = !b.degraded;
         b.degraded = true;
         b.faults += 1;
         HookFault {
             index,
             binding: b.clone(),
             error,
-            transitioned,
         }
     }
 }
@@ -403,6 +471,9 @@ fn fault_class(error: HookError) -> &'static str {
         HookError::Trap => "trap",
         HookError::Timeout => "timeout",
         HookError::Invalid => "invalid",
+        // Unreachable in practice (kernel context is always valid JSON); never
+        // emitted as a guest fault anyway.
+        HookError::InvalidContext => "invalid_context",
         HookError::Gone => "gone",
     }
 }
@@ -418,17 +489,26 @@ impl crate::Session {
         self.hooks.rebuild(&self.registry, manager);
     }
 
+    /// Clear per-composition fault recovery state: every binding gets a fresh
+    /// chance on the next composition rebind (G).
+    pub(crate) fn reset_hook_recovery(&mut self) {
+        self.hook_respawned.clear();
+        self.hooks.clear_backoff();
+    }
+
     /// Evaluate a hook kind end-to-end: run the ordered bindings, then apply
     /// the fault policy for any fault — commit one canonical `module_fault`
-    /// per transition into degraded (ids/digests/counts only), respawn the
-    /// faulty module, and rebuild the binding set so a fresh generation's
-    /// hooks are used. A failed respawn leaves the binding degraded (its
-    /// built-in default keeps applying) rather than blocking.
+    /// per fault (ids/digests/counts only), then attempt a BOUNDED respawn and
+    /// re-resolve the composition state. A failed/skipped respawn (or a failed
+    /// fact commit) puts the binding into backoff: the built-in default keeps
+    /// applying with no further fault fact or respawn until the next
+    /// composition rebind (G).
     pub(crate) fn evaluate_hooks(
         &mut self,
         kind: HookKind,
         context_json: &str,
     ) -> HookEvaluation {
+        let started = Instant::now();
         let evaluation = match self.modules.as_ref() {
             Some(manager) => self.hooks.evaluate(manager, kind, context_json),
             None => HookEvaluation::default_only(kind),
@@ -436,18 +516,22 @@ impl crate::Session {
         if evaluation.faults.is_empty() {
             return evaluation;
         }
-        for fault in &evaluation.faults {
-            if fault.transitioned {
-                let payload = serde_json::json!({
-                    "module_id": fault.binding.module_id.to_string(),
-                    "package_digest": fault.binding.package_digest.to_string(),
-                    "generation": fault.binding.generation,
-                    "hook": fault.binding.hook.as_str(),
-                    "entry": fault.binding.entry,
-                    "fault_class": fault_class(fault.error),
-                    "count": fault.binding.faults,
-                });
-                if let Ok(receipt) = self.commit(
+        let elapsed = started.elapsed();
+        // Commit one fact per fault. A failed commit is NOT swallowed (H): the
+        // binding is backed off and never respawned off a fact that never
+        // landed.
+        let mut fact_ok = vec![true; evaluation.faults.len()];
+        for (i, fault) in evaluation.faults.iter().enumerate() {
+            let payload = serde_json::json!({
+                "module_id": fault.binding.module_id.to_string(),
+                "package_digest": fault.binding.package_digest.to_string(),
+                "generation": fault.binding.generation,
+                "hook": fault.binding.hook.as_str(),
+                "fault_class": fault_class(fault.error),
+                "count": fault.binding.faults,
+            });
+            if self
+                .commit(
                     vec![crate::NewEvent {
                         kind: "module_fault".into(),
                         payload_schema: 1,
@@ -456,19 +540,76 @@ impl crate::Session {
                         refs: Vec::new(),
                     }],
                     None,
-                ) {
-                    self.hooks.mark_fault_seq(kind, fault.index, receipt.last_seq);
-                }
-            }
-            if let Some(manager) = self.modules.as_mut() {
-                let _ = manager.respawn(fault.binding.module_id);
+                )
+                .is_err()
+            {
+                fact_ok[i] = false;
+                self.hooks.set_backoff(
+                    &fault.binding.scope,
+                    kind,
+                    &fault.binding.name,
+                );
             }
         }
-        self.rebind_hooks();
+        let remaining = HOOK_WAIT.saturating_sub(elapsed);
+        let mut respawned_any = false;
+        let mut respawned_ids: Vec<Id128> = Vec::new();
+        for (i, fault) in evaluation.faults.iter().enumerate() {
+            if !fact_ok[i] {
+                continue;
+            }
+            let (scope, name) = (fault.binding.scope.clone(), fault.binding.name.clone());
+            if self.hooks.is_backed_off(&scope, kind, &name) {
+                continue;
+            }
+            // Backoff when the drain cannot complete in the remaining budget,
+            // or when this module already consumed its one respawn since the
+            // last composition rebind (no per-decision storm, G).
+            if remaining < MIN_RESPAWN_BUDGET
+                || self.hook_respawned.contains(&fault.binding.module_id)
+            {
+                self.hooks.set_backoff(&scope, kind, &name);
+                continue;
+            }
+            let Some(manager) = self.modules.as_mut() else {
+                continue;
+            };
+            match manager.respawn_bounded(fault.binding.module_id, remaining) {
+                Ok(_) => {
+                    self.hook_respawned.insert(fault.binding.module_id);
+                    respawned_any = true;
+                    respawned_ids.push(fault.binding.module_id);
+                }
+                Err(_) => self.hooks.set_backoff(&scope, kind, &name),
+            }
+        }
+        if respawned_any {
+            self.rebind_after_respawn(&respawned_ids);
+        }
         evaluation
     }
-}
 
+    /// Re-resolve every generation-bound session state after a respawn (F):
+    /// refresh the affected `ConfigLayer.generation`s, then run the ONE
+    /// composition-change choke point (`rebind_ui`, which also rebinds hooks).
+    fn rebind_after_respawn(&mut self, module_ids: &[Id128]) {
+        if let Some(manager) = self.modules.as_ref() {
+            let current: std::collections::HashMap<Id128, u64> = manager
+                .snapshot()
+                .into_iter()
+                .map(|(id, generation, _)| (id, generation))
+                .collect();
+            for layer in &mut self.config_layers {
+                if module_ids.contains(&layer.module_id)
+                    && let Some(generation) = current.get(&layer.module_id)
+                {
+                    layer.generation = *generation;
+                }
+            }
+        }
+        let _ = self.rebind_ui(0);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -480,12 +621,11 @@ mod tests {
             module_id: Id128::generate(),
             package_digest: Digest::new(name.as_bytes()),
             generation: 1,
+            scope: ScopePath(vec!["root".into()]),
             name: name.to_string(),
             hook,
-            entry: format!("kb_{}", hook.as_str()),
             degraded: false,
             faults: 0,
-            last_fault_seq: None,
         }
     }
 
@@ -541,6 +681,25 @@ mod tests {
     }
 
     #[test]
+    fn annotations_are_bounded_in_count_and_total_size() {
+        let many: Vec<Value> = (0..(ANNOTATION_COUNT_MAX + 10))
+            .map(|i| json!({ "key": format!("k{i}"), "value": "v" }))
+            .collect();
+        let raw = json!({ "decision": "continue", "annotations": many }).to_string();
+        let d = HookDecision::parse(&raw).unwrap();
+        assert!(d.annotations.len() <= ANNOTATION_COUNT_MAX);
+
+        // Nested structure counts toward the total-size cap, not only strings.
+        let nested: Vec<Value> = (0..500)
+            .map(|i| json!({ "key": format!("key-{i}"), "value": { "deep": [1, 2, 3, 4, 5] } }))
+            .collect();
+        let raw = json!({ "decision": "continue", "annotations": nested }).to_string();
+        let d = HookDecision::parse(&raw).unwrap();
+        let size = serde_json::to_string(&d.annotations).unwrap().len();
+        assert!(size <= ANNOTATION_TOTAL_MAX, "total size {size}");
+    }
+
+    #[test]
     fn decision_digests_distinguish_outcomes() {
         let cont = Decision::Continue.digest();
         let deny = Decision::Deny { reason: "x".into() }.digest();
@@ -575,5 +734,10 @@ mod tests {
             HookEvaluation::default_for(HookKind::OnTurnStart),
             Decision::Continue
         );
+        // The deny reason is kernel-authored (C).
+        match HookEvaluation::default_for(HookKind::OnToolIntent) {
+            Decision::Deny { reason } => assert_eq!(reason, DENIED_REASON),
+            other => panic!("expected deny, got {other:?}"),
+        }
     }
 }

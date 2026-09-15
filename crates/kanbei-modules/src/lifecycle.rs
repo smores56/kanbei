@@ -58,7 +58,7 @@ use crate::state::{StateError, StateStore};
 ///
 /// T9: after activation it publishes one `hook` contribution per declared hook
 /// function (`kb_on_turn_start` / `kb_on_tool_intent`). The functions
-/// themselves are dispatched by [`HOT_MULTIPLEXER`].
+/// themselves are dispatched by the `hot_multiplexer` wrapper.
 pub const ACTIVATION_SHIM: &str = r#"
 -- kanbei-modules M2 activation shim (internal/unstable ABI).
 local __kb_json = function(s)
@@ -96,14 +96,14 @@ kb_on_activate(__ctx)
 -- T9: declare each hook the module defined. `kb_name`, when the module sets
 -- it, is the stable contribution name; otherwise the host fills the module id
 -- (so two modules hooking the same kind never collide).
-local function __kb_publish_hook(fn, entry, hook)
+local function __kb_publish_hook(fn, hook)
   if type(fn) == "function" then
     local name = type(kb_name) == "string" and kb_name or ""
-    __ctx.contribution_publish('{"kind":"hook","name":' .. __kb_json(name) .. ',"hook":"' .. hook .. '","entry":"' .. entry .. '"}')
+    __ctx.contribution_publish('{"kind":"hook","name":' .. __kb_json(name) .. ',"hook":"' .. hook .. '"}')
   end
 end
-__kb_publish_hook(kb_on_turn_start, "kb_on_turn_start", "on_turn_start")
-__kb_publish_hook(kb_on_tool_intent, "kb_on_tool_intent", "on_tool_intent")
+__kb_publish_hook(kb_on_turn_start, "on_turn_start")
+__kb_publish_hook(kb_on_tool_intent, "on_tool_intent")
 "#;
 
 /// T9 hook multiplexer: the guest caches exactly one callable entry (`kb_hot`)
@@ -112,18 +112,21 @@ __kb_publish_hook(kb_on_tool_intent, "kb_on_tool_intent", "on_tool_intent")
 /// installed ONLY when the module declares at least one hook function, so a
 /// plain module's `kb_hot` is byte-identical to before. A kernel-initiated
 /// hook call arrives on `kb_hot` as the envelope
-/// `{"__kb_hook":"on_turn_start"|"on_tool_intent","context":<value>}`; anything
-/// else falls through to the module's original `kb_hot`.
+/// `{"__kb_hook":"on_turn_start"|"on_tool_intent","__kb_nonce":<secret>,
+/// "context":<value>}`; anything else — including a peer module's
+/// `service_call` that guesses the shape but does not know the per-generation
+/// secret — falls through to the module's original `kb_hot` (D).
 ///
-/// Appended to the module source at compile time (the source cached by
-/// `kb_init`), and again ahead of [`ACTIVATION_SHIM`] so the discovery VM sees
-/// the same definitions. Internal/unstable ABI.
-pub const HOT_MULTIPLEXER: &str = r#"
+/// The nonce is embedded per activation by [`hot_multiplexer`] into the
+/// compiled source (both the kernel instance and the discovery VM shim), so
+/// only the kernel and that generation's VM share it. Internal/unstable ABI.
+const HOT_MULTIPLEXER_TEMPLATE: &str = r#"
 -- kanbei-modules T9 hook multiplexer (internal/unstable ABI).
 local __kb_orig_hot = kb_hot
+local __kb_hook_nonce = "__KB_NONCE__"
 if type(kb_on_turn_start) == "function" or type(kb_on_tool_intent) == "function" then
   kb_hot = function(x)
-    if type(x) == "table" then
+    if type(x) == "table" and x.__kb_nonce == __kb_hook_nonce then
       if x.__kb_hook == "on_turn_start" and type(kb_on_turn_start) == "function" then
         return kb_on_turn_start(x.context)
       elseif x.__kb_hook == "on_tool_intent" and type(kb_on_tool_intent) == "function" then
@@ -134,6 +137,12 @@ if type(kb_on_turn_start) == "function" or type(kb_on_tool_intent) == "function"
   end
 end
 "#;
+
+/// The hook multiplexer with this generation's secret nonce embedded (D). The
+/// nonce is a fresh `Id128` string per activation, never reused.
+fn hot_multiplexer(nonce: &str) -> String {
+    HOT_MULTIPLEXER_TEMPLATE.replace("__KB_NONCE__", nonce)
+}
 
 /// Reply bound for a kernel-initiated hook call (T9). Deliberately short
 /// (order 100–250ms) and NOT the 10s [`REPLY_TIMEOUT`]: hooks are advisory
@@ -151,6 +160,10 @@ struct LifecycleTables {
     /// fresh, never-reused counters).
     generation_token: HashMap<u64, u64>,
     packages: HashMap<u64, Digest>,
+    /// generation → per-generation hook secret nonce (D). Embedded in the
+    /// compiled multiplexer; the kernel presents it on every hook envelope so a
+    /// peer module's guessed `service_call` cannot hijack a hook.
+    hook_nonces: HashMap<u64, String>,
 }
 
 /// A live module generation. The generation's Wasmtime store is owned by a
@@ -199,12 +212,19 @@ enum Drain {
 }
 
 impl Drain {
-    /// Drain a generation's actor, if the table still holds it.
+    /// Drain a generation's actor, if the table still holds it, within the
+    /// standard [`DRAIN_DEADLINE`].
     fn of(runtime: Option<Arc<GenerationRuntime>>) -> Self {
+        Self::of_with(runtime, DRAIN_DEADLINE)
+    }
+
+    /// As [`Self::of`], with an explicit drain deadline (the bounded decision
+    /// path passes its remaining budget, G).
+    fn of_with(runtime: Option<Arc<GenerationRuntime>>, deadline: Duration) -> Self {
         match runtime {
             None => Drain::AlreadyRetired,
             Some(runtime) => {
-                let joined = runtime.shutdown(DRAIN_DEADLINE);
+                let joined = runtime.shutdown(deadline);
                 if runtime.panicked() {
                     Drain::Panicked
                 } else if joined {
@@ -278,6 +298,7 @@ impl Generation {
             let mut tables = self.tables.lock().expect("lifecycle tables lock poisoned");
             tables.generation_token.remove(&self.generation);
             tables.packages.remove(&self.generation);
+            tables.hook_nonces.remove(&self.generation);
             tables.current.retain(|_, g| *g != self.generation);
         }
         Drain::of(Some(Arc::clone(&self.runtime))).record(self.generation, "dispose")
@@ -472,9 +493,12 @@ impl ModuleManager {
         // atomically and the old head (and object store) stay untouched.
         Self::validate_state_schema(&self.state, manifest)?;
         let (package, _deduped) = install_package(&mut self.store, manifest)?;
+        // D: fresh per-generation hook secret, embedded into the compiled
+        // multiplexer so only this generation's VM and the kernel know it.
+        let hook_nonce = Id128::generate().to_string();
         let compiled = self
             .vm
-            .compile(&format!("{}\n{HOT_MULTIPLEXER}", manifest.source))?;
+            .compile(&format!("{}\n{}", manifest.source, hot_multiplexer(&hook_nonce)))?;
         let generation = self.next_generation;
         self.next_generation += 1;
         let dyn_host: Arc<dyn kanbei_vm::Host> = self.host.clone();
@@ -506,8 +530,9 @@ impl ModuleManager {
             tables.current.insert(manifest.module_id, generation);
             tables.generation_token.insert(generation, generation);
             tables.packages.insert(generation, package);
+            tables.hook_nonces.insert(generation, hook_nonce.clone());
         }
-        if let Err(e) = self.run_activation(&runtime, &manifest.source) {
+        if let Err(e) = self.run_activation(&runtime, &manifest.source, &hook_nonce) {
             // Roll back atomically (C-F2): invalidate the token and unpublish
             // anything the failed activation staged (services, contributions, UI
             // mounts) BEFORE shutting the actor down, so no in-flight op can
@@ -520,6 +545,7 @@ impl ModuleManager {
                 tables.current.remove(&manifest.module_id);
                 tables.generation_token.remove(&generation);
                 tables.packages.remove(&generation);
+                tables.hook_nonces.remove(&generation);
             }
             let _ = runtime.shutdown(DRAIN_DEADLINE);
             return Err(e);
@@ -542,8 +568,12 @@ impl ModuleManager {
         &self,
         runtime: &Arc<GenerationRuntime>,
         source: &str,
+        hook_nonce: &str,
     ) -> Result<(), ModuleError> {
-        let script = format!("{source}\n{HOT_MULTIPLEXER}\n{ACTIVATION_SHIM}");
+        let script = format!(
+            "{source}\n{}\n{ACTIVATION_SHIM}",
+            hot_multiplexer(hook_nonce)
+        );
         runtime
             .run_script(&script)
             .map_err(|e| ModuleError::Activation(format!("activation entry failed: {e}")))?
@@ -716,9 +746,10 @@ impl ModuleManager {
         self.host.ui_generation(component)
     }
 
-    /// The live generation that declared hook `(kind, name)`, if any.
-    pub fn hook_generation(&self, hook: HookKind, name: &str) -> Option<u64> {
-        self.host.hook_generation(hook, name)
+    /// The live generation that declared hook `(scope, kind, name)`, if any
+    /// (T9/E: the full scope path is part of the key).
+    pub fn hook_generation(&self, scope: &ScopePath, hook: HookKind, name: &str) -> Option<u64> {
+        self.host.hook_generation(scope, hook, name)
     }
 
     /// Direct kernel-side call of a generation's `kb_hot` (the kernel side of
@@ -762,10 +793,21 @@ impl ModuleManager {
             .get(&generation)
             .cloned()
             .ok_or(HookError::Gone)?;
+        // D: present the per-generation secret so a peer module's guessed
+        // `service_call` cannot impersonate a kernel-initiated hook.
+        let nonce = self
+            .tables
+            .lock()
+            .expect("lifecycle tables lock poisoned")
+            .hook_nonces
+            .get(&generation)
+            .cloned()
+            .ok_or(HookError::Gone)?;
         let context: serde_json::Value =
-            serde_json::from_str(context_json).map_err(|_| HookError::Invalid)?;
+            serde_json::from_str(context_json).map_err(|_| HookError::InvalidContext)?;
         let envelope = serde_json::json!({
             "__kb_hook": hook.as_str(),
+            "__kb_nonce": nonce,
             "context": context,
         })
         .to_string();
@@ -785,6 +827,18 @@ impl ModuleManager {
     /// byte-identically from the object store, so the package/composition
     /// digest is unchanged.
     pub fn respawn(&mut self, module_id: Id128) -> Result<u64, ModuleError> {
+        self.respawn_bounded(module_id, DRAIN_DEADLINE)
+    }
+
+    /// As [`Self::respawn`], but the old actor's drain is bounded by
+    /// `drain_budget` (G: the hook fault path must never stall a decision).
+    /// The token is invalidated before the drain, so a detached actor cannot
+    /// commit further host ops.
+    pub fn respawn_bounded(
+        &mut self,
+        module_id: Id128,
+        drain_budget: Duration,
+    ) -> Result<u64, ModuleError> {
         let generation = *self
             .tables
             .lock()
@@ -811,7 +865,7 @@ impl ModuleManager {
         // prune, contribution drop, then drain the actor. Services are
         // unpublished unconditionally — the re-activation re-publishes them.
         self.host.teardown_generation(generation, true);
-        self.drop_generation(module_id, generation);
+        self.drop_generation_with(module_id, generation, drain_budget);
         let new = self.activate(&manifest)?;
         Ok(new.generation)
     }
@@ -866,6 +920,17 @@ impl ModuleManager {
     /// already have registered the next generation under the same module id).
     /// Returns how the actor drain ended ([`Drain`]).
     fn drop_generation(&mut self, module_id: Id128, generation: u64) -> Drain {
+        self.drop_generation_with(module_id, generation, DRAIN_DEADLINE)
+    }
+
+    /// As [`Self::drop_generation`], with a caller-supplied drain deadline so
+    /// the fault-decision path can bound its teardown (G).
+    fn drop_generation_with(
+        &mut self,
+        module_id: Id128,
+        generation: u64,
+        deadline: Duration,
+    ) -> Drain {
         // Canonical teardown outside the tables lock (never nest it under the
         // host's own locks).
         self.host.teardown_generation(generation, false);
@@ -873,6 +938,7 @@ impl ModuleManager {
             let mut tables = self.tables.lock().expect("lifecycle tables lock poisoned");
             tables.generation_token.remove(&generation);
             tables.packages.remove(&generation);
+            tables.hook_nonces.remove(&generation);
             if tables.current.get(&module_id) == Some(&generation) {
                 tables.current.remove(&module_id);
             }
@@ -881,7 +947,7 @@ impl ModuleManager {
         // join must not run while holding the tables lock (T20's no-lock-across-
         // mailbox rule).
         let runtime = self.instances.lock().expect("instances lock poisoned").remove(&generation);
-        Drain::of(runtime)
+        Drain::of_with(runtime, deadline)
     }
 }
 
@@ -917,6 +983,8 @@ impl Drop for ModuleManager {
 ///   (wedged; outcome unknown, the queued command still executes);
 /// - [`HookError::Invalid`] — the actor answered with a guest/return error (the
 ///   session classifies malformed decision JSON itself);
+/// - [`HookError::InvalidContext`] — the KERNEL supplied a non-JSON context
+///   (a kernel-side bug): never degrades or respawns a healthy guest (H);
 /// - [`HookError::Gone`] — the actor is gone or the generation was never live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum HookError {
@@ -926,6 +994,8 @@ pub enum HookError {
     Timeout,
     #[error("hook call returned an invalid result")]
     Invalid,
+    #[error("hook call received an invalid kernel context")]
+    InvalidContext,
     #[error("hook call target generation is gone")]
     Gone,
 }

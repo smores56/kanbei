@@ -592,6 +592,9 @@ pub struct Session {
     ui_host: Option<UiHost>,
     /// T9 lifecycle hook bindings (rebuilt on composition change).
     hooks: crate::hooks::HookSet,
+    /// Modules that already consumed a hook-fault respawn since the last
+    /// composition rebind (G backoff: at most one respawn per decision epoch).
+    hook_respawned: std::collections::HashSet<Id128>,
     // --- M3 agent spine ---
     scheduler: kanbei_scheduler::Scheduler,
     provider: Option<Box<dyn kanbei_provider::ProviderEngine>>,
@@ -1072,6 +1075,7 @@ impl Session {
             vm_engine_digest,
             ui_host: None,
             hooks: crate::hooks::HookSet::default(),
+            hook_respawned: std::collections::HashSet::new(),
             scheduler: kanbei_scheduler::Scheduler::new(budgets, breaker_floors),
             provider: provider_engine,
             provider_config,
