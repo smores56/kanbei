@@ -49,6 +49,26 @@ impl ModuleOrigin {
             other => Err(format!("unknown module origin {other:?}")),
         }
     }
+
+    /// Precedence rank for precedence-driven implicit replacement
+    /// (decision 28): a contribution whose origin ranks HIGHER replaces the
+    /// contribution that occupies the same identity key at a LOWER rank.
+    ///
+    /// The declared config layers are `Builtin < UserConfig < WorkspaceConfig`
+    /// — project (workspace) config is more specific than user config, which is
+    /// more specific than the built-in defaults. `Agent` and `UserInstalled`
+    /// rank above all declared config: they are explicit, deliberate additions
+    /// made at runtime (by the agent or by an install), so they should take a
+    /// key over rather than be silently displaced by a discovered config file.
+    pub fn precedence_rank(self) -> u8 {
+        match self {
+            ModuleOrigin::Builtin => 0,
+            ModuleOrigin::UserConfig => 1,
+            ModuleOrigin::WorkspaceConfig => 2,
+            ModuleOrigin::Agent => 3,
+            ModuleOrigin::UserInstalled => 4,
+        }
+    }
 }
 
 /// Wire form of `kanbei_capabilities::TrustClass` (that crate has no serde

@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::contrib::Contribution;
 use crate::errors::ScopeError;
-use crate::registry::ContributionRegistry;
+use crate::registry::{ContributionRegistry, OverridePlan};
 
 /// Domain-separation prefix for the composition digest (R-01; same pattern as
 /// R-16/D-12 digest domains): a composition digest can never collide with a
@@ -87,12 +87,24 @@ impl CompositionStore {
         staged: &[Contribution],
         registry: &mut ContributionRegistry,
     ) -> Result<(), ScopeError> {
-        registry.validate(staged)?;
+        self.stage_publish_planned(staged, registry, &OverridePlan::default())
+    }
+
+    /// As [`Self::stage_publish`], with a transient precedence plan (decision
+    /// 28): the plan's displaced entries are removed from the registry in the
+    /// same atomic apply as the staged additions.
+    pub fn stage_publish_planned(
+        &mut self,
+        staged: &[Contribution],
+        registry: &mut ContributionRegistry,
+        plan: &OverridePlan,
+    ) -> Result<(), ScopeError> {
+        registry.validate_planned(staged, plan)?;
         let scope = staged
             .first()
             .map(|c| c.scope.clone())
             .unwrap_or_else(|| ScopePath(vec![]));
-        registry.apply(&scope, staged)?;
+        registry.apply_planned(&scope, staged, plan)?;
         self.commit(registry);
         Ok(())
     }
@@ -104,13 +116,25 @@ impl CompositionStore {
         staged: &StagedSet,
         registry: &mut ContributionRegistry,
     ) -> Result<(), ScopeError> {
+        self.publish_planned(staged, registry, &OverridePlan::default())
+    }
+
+    /// As [`Self::publish`], with a transient precedence plan. The epoch check
+    /// runs FIRST, before validation or any registry mutation, so a stale
+    /// attempt leaves every observable registry surface byte-identical.
+    pub fn publish_planned(
+        &mut self,
+        staged: &StagedSet,
+        registry: &mut ContributionRegistry,
+        plan: &OverridePlan,
+    ) -> Result<(), ScopeError> {
         if staged.against_epoch != self.current.epoch {
             return Err(ScopeError::StaleEpoch {
                 staged: staged.against_epoch,
                 current: self.current.epoch,
             });
         }
-        self.stage_publish(&staged.contributions, registry)
+        self.stage_publish_planned(&staged.contributions, registry, plan)
     }
 
     fn commit(&mut self, registry: &ContributionRegistry) {
@@ -433,6 +457,98 @@ mod tests {
             !String::from_utf8_lossy(&committed).contains("epoch"),
             "canonical composition bytes must not embed the epoch: {}",
             String::from_utf8_lossy(&committed)
+        );
+    }
+
+    /// Decision 28 / R-26/C-09: a stale-epoch planned publish is rejected
+    /// before any registry mutation — a displaced lower service holder still
+    /// resolves and every observable surface is byte-identical.
+    #[test]
+    fn stale_epoch_planned_publish_mutates_nothing() {
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let mut store = CompositionStore::new(&registry);
+        let s = scope("app");
+        // Compose the lower layer (includes service `svc` v1 and command `cmd`).
+        store.stage_publish(&full_set(&s), &mut registry).unwrap();
+        assert_eq!(store.current().epoch, 1);
+
+        let before_snapshot = registry.snapshot();
+        let before_serialized = serde_json::to_vec(&before_snapshot).unwrap();
+        let before_epoch = store.current().epoch;
+        let before_digest = store.current().digest;
+
+        // The higher layer's staged set, planned against epoch 1: it takes over
+        // the service key and the command name.
+        let higher_key = ServiceKey {
+            scope: s.clone(),
+            name: "svc".into(),
+        };
+        let higher = vec![
+            Contribution {
+                scope: s.clone(),
+                kind: ContributionKind::Command(CommandContribution {
+                    name: "cmd".into(),
+                    handler: "project_h".into(),
+                }),
+            },
+            Contribution {
+                scope: s.clone(),
+                kind: ContributionKind::Service(ServiceContribution {
+                    key: higher_key.clone(),
+                    provider: provider("svc", 2),
+                    deps: vec![],
+                }),
+            },
+        ];
+        let plan = OverridePlan {
+            removed: vec![
+                Contribution {
+                    scope: s.clone(),
+                    kind: ContributionKind::Command(CommandContribution {
+                        name: "cmd".into(),
+                        handler: "cmd_h".into(),
+                    }),
+                },
+                Contribution {
+                    scope: s.clone(),
+                    kind: ContributionKind::Service(ServiceContribution {
+                        key: higher_key.clone(),
+                        provider: provider("svc", 1),
+                        deps: vec![],
+                    }),
+                },
+            ],
+        };
+        let staged = store.stage(higher);
+
+        // Someone else advances the composition: the staged set is now stale.
+        store.stage_publish(&[], &mut registry).unwrap();
+        assert_eq!(store.current().epoch, 2);
+
+        let err = store
+            .publish_planned(&staged, &mut registry, &plan)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ScopeError::StaleEpoch {
+                staged: 1,
+                current: 2,
+            }
+        );
+        // byte-identical: same epoch/digest, same snapshot, lower holder intact
+        assert_eq!(store.current().epoch, before_epoch + 1);
+        assert_eq!(store.current().digest, before_digest);
+        assert_eq!(
+            serde_json::to_vec(&registry.snapshot()).unwrap(),
+            before_serialized,
+            "a stale planned publish must leave the registry byte-identical"
+        );
+        assert!(
+            registry
+                .snapshot()
+                .iter()
+                .any(|c| matches!(&c.kind, ContributionKind::Service(s) if s.provider.contract.version == 1)),
+            "the lower service holder still resolves"
         );
     }
 }

@@ -117,7 +117,12 @@ pub enum ServiceError {
 /// The service DAG: key → provider publications plus each key's declared
 /// dependency edges. All mutations happen through here; the replacement policy
 /// lives in [`replacement`].
-#[derive(Debug, Default)]
+///
+/// `Clone` supports transactional publishes (R-26/C-09): the contribution
+/// registry stages removals and additions against a cloned DAG and swaps the
+/// result into the shared instance only after the OCC epoch check, so a stale
+/// attempt mutates nothing.
+#[derive(Debug, Default, Clone)]
 pub struct ServiceRegistry {
     holders: HashMap<ServiceKey, ServiceProvider>,
     deps: HashMap<ServiceKey, Vec<ServiceDependency>>,
@@ -359,6 +364,18 @@ impl ServiceRegistry {
             self.holders.remove(&key);
             self.deps.remove(&key);
         }
+    }
+
+    /// Removes `key` regardless of dependents and returns the displaced
+    /// provider. Precedence-driven implicit replacement (decision 28): a
+    /// higher-precedence layer takes the key over in the same atomic publish,
+    /// so dependents keep resolving against the replacement provider and the
+    /// removal must not be blocked by them. Monotonicity/ownership rules do
+    /// not apply — callers (the contribution registry) only invoke this for a
+    /// key they are about to re-publish.
+    pub fn remove_forced(&mut self, key: &ServiceKey) -> Option<ServiceProvider> {
+        self.deps.remove(key);
+        self.holders.remove(key)
     }
 
     /// Full registry state as `(key, provider, declared dependencies)` in

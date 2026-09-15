@@ -14,10 +14,13 @@ use kanbei_policy::Candidate;
 use kanbei_scopes::contrib::Contribution;
 use kanbei_scopes::contrib::ContributionKind;
 use kanbei_scopes::contrib::ServiceContribution;
+use kanbei_scopes::registry::OverridePlan;
+use kanbei_scopes::registry::contribution_override_key;
 use kanbei_services::ServiceKey;
 use kanbei_services::ServiceProvider;
 use kanbei_vm::Host;
 use serde_json::json;
+use std::collections::HashSet;
 
 impl Session {
     /// Activates the open-time desired-state config layers in LOW→HIGH
@@ -39,15 +42,20 @@ impl Session {
         &mut self,
         layers: Vec<PackageManifest>,
     ) -> Result<(), SessionError> {
-        let mut activated: Vec<PackageManifest> = Vec::new();
+        let mut activated: Vec<(PackageManifest, Vec<Contribution>)> = Vec::new();
         let mut builtin_active = false;
         let mut safe_reason: Option<String> = None;
         for manifest in layers {
             let is_builtin = manifest.origin == ModuleOrigin::Builtin;
             match self.activate_config(manifest.clone()) {
-                Ok(_) => {
+                Ok(ca) => {
                     builtin_active |= is_builtin;
-                    activated.push(manifest);
+                    let contributions = self
+                        .modules
+                        .as_ref()
+                        .map(|m| m.published_contributions(ca.generation))
+                        .unwrap_or_default();
+                    activated.push((manifest, contributions));
                 }
                 // A non-builtin failure is safe-mode-able; the failed layer is
                 // already deactivated by `activate_config`.
@@ -68,22 +76,70 @@ impl Session {
             // Drop every activated non-builtin layer (best-effort: a layer with
             // dependents stays, but safe mode is still recorded).
             if let Some(manager) = self.modules.as_mut() {
-                for m in activated
+                for (m, _) in activated
                     .iter()
                     .rev()
-                    .filter(|m| m.origin != ModuleOrigin::Builtin)
+                    .filter(|(m, _)| m.origin != ModuleOrigin::Builtin)
                 {
                     let _ = manager.deactivate(m.module_id);
                 }
             }
+            // The dropped layers' generations are no longer active: forget their
+            // precedence records so a later publish cannot try to override them.
+            self.active_config_layers.retain(|(rank, _, _)| *rank == 0);
             if !builtin_active {
                 let fallback = crate::builtin_config::builtin_config_manifest();
-                if self.activate_config(fallback).is_err() {
+                match self.activate_config(fallback.clone()) {
+                    Ok(ca) => {
+                        let contributions = self
+                            .modules
+                            .as_ref()
+                            .map(|m| m.published_contributions(ca.generation))
+                            .unwrap_or_default();
+                        activated.push((fallback, contributions));
+                    }
                     // The built-in itself could not activate: storage-only.
-                    self.modules = None;
-                    self.vm_engine_digest = None;
+                    Err(_) => {
+                        self.modules = None;
+                        self.vm_engine_digest = None;
+                    }
                 }
             }
+            // Safe-mode residue (A2a): overlay kinds merge and cannot be
+            // un-merged by name, so a dropped layer's settings/theme residue
+            // would otherwise survive in the registry. Remove the dropped
+            // layers' non-overlay contributions and replay the surviving
+            // built-in layer's overlays from scratch.
+            let dropped: Vec<Contribution> = activated
+                .iter()
+                .filter(|(m, _)| m.origin != ModuleOrigin::Builtin)
+                .flat_map(|(_, c)| c.iter().cloned())
+                .collect();
+            let surviving_overlays: Vec<Contribution> = activated
+                .iter()
+                .filter(|(m, _)| m.origin == ModuleOrigin::Builtin)
+                .flat_map(|(_, c)| c.iter().cloned())
+                .filter(|c| {
+                    matches!(
+                        c.kind,
+                        ContributionKind::Settings(_) | ContributionKind::Theme(_)
+                    )
+                })
+                .collect();
+            let to_remove: Vec<Contribution> = dropped
+                .into_iter()
+                .filter(|c| {
+                    !matches!(
+                        c.kind,
+                        ContributionKind::Settings(_)
+                            | ContributionKind::Theme(_)
+                            | ContributionKind::Service(_)
+                    )
+                })
+                .collect();
+            let _ = self.registry.remove_contributions(&to_remove);
+            self.registry
+                .recompose_overlays(&crate::builtin_config::root_scope(), &surviving_overlays);
             self.commit_safe_mode(&reason)?;
         }
         self.host_settings = self
@@ -190,20 +246,6 @@ impl Session {
             .filter(|(_, p, _)| p.generation == generation.generation)
             .map(|(k, p, _)| (k, p))
             .collect();
-        // Stage: pull the delta back out of the shared registry so validate
-        // and apply run against the pre-activation state (the delta IS the
-        // staged set; without this, the module's own publications would
-        // self-conflict on the re-publish).
-        {
-            let mut reg = self.services.lock().expect("services lock poisoned");
-            for (key, provider) in &delta {
-                if let Err(e) = reg.remove(key, provider.module_id) {
-                    drop(reg);
-                    let _ = manager.deactivate(manifest.module_id);
-                    return Err(e.into());
-                }
-            }
-        }
         let mut staged = staged;
         staged.contributions = delta
             .iter()
@@ -221,15 +263,72 @@ impl Session {
         staged
             .contributions
             .extend(manager.published_contributions(generation.generation));
-        // 6 — validate against the current composition; on conflict roll back.
-        if let Err(e) = self.registry.validate(&staged.contributions) {
-            let reason = e.to_string();
-            let _ = manager.deactivate(manifest.module_id);
-            self.ui_mark_stale(&reason);
-            return Err(e.into());
+
+        // Decision 28 precedence plan. The delta IS the module's own
+        // pre-publication into the shared registry: displace it in the atomic
+        // apply instead of removing it beforehand, so a stale-epoch publish
+        // mutates nothing.
+        let mut plan = OverridePlan {
+            removed: delta
+                .iter()
+                .map(|(key, provider)| Contribution {
+                    scope: manifest.scope.clone(),
+                    kind: ContributionKind::Service(ServiceContribution {
+                        key: key.clone(),
+                        provider: provider.clone(),
+                        deps: manifest.deps.clone(),
+                    }),
+                })
+                .collect(),
+        };
+        // Precedence-driven implicit replacement: a higher-origin layer takes
+        // over the identity keys held by lower-precedence active layers.
+        let my_rank = manifest.origin.precedence_rank();
+        let staged_keys: HashSet<(kanbei_services::ScopePath, String)> = staged
+            .contributions
+            .iter()
+            .filter_map(contribution_override_key)
+            .collect();
+        let lower_generations: Vec<u64> = self
+            .active_config_layers
+            .iter()
+            .filter(|(rank, _, _)| *rank < my_rank)
+            .map(|(_, _, generation)| *generation)
+            .collect();
+        for lower_generation in lower_generations {
+            for c in manager.published_contributions(lower_generation) {
+                if contribution_override_key(&c).is_some_and(|k| staged_keys.contains(&k)) {
+                    plan.removed.push(c);
+                }
+            }
+            let lower_services: Vec<Contribution> = self
+                .services
+                .lock()
+                .expect("services lock poisoned")
+                .snapshot()
+                .into_iter()
+                .filter(|(_, p, _)| p.generation == lower_generation)
+                .map(|(key, provider, deps)| Contribution {
+                    scope: key.scope.clone(),
+                    kind: ContributionKind::Service(ServiceContribution {
+                        key,
+                        provider,
+                        deps,
+                    }),
+                })
+                .collect();
+            for c in lower_services {
+                if contribution_override_key(&c).is_some_and(|k| staged_keys.contains(&k)) {
+                    plan.removed.push(c);
+                }
+            }
         }
-        // 7 — OCC publish; stale → roll back.
-        if let Err(e) = self.composition.publish(&staged, &mut self.registry) {
+        // 6+7 — validate, epoch-check, and apply atomically (removals + the
+        // staged additions); stale → roll back.
+        if let Err(e) = self
+            .composition
+            .publish_planned(&staged, &mut self.registry, &plan)
+        {
             let reason = e.to_string();
             let _ = manager.deactivate(manifest.module_id);
             self.ui_mark_stale(&reason);
@@ -286,6 +385,11 @@ impl Session {
         }
         self.config_digest = Some(package);
         self.config_manifest = Some(manifest.clone());
+        // Track this layer for later precedence-driven implicit replacement
+        // (decision 28): its rank and generation resolve which of its
+        // contributions a higher-origin publish may take over.
+        self.active_config_layers
+            .push((my_rank, manifest.module_id, generation.generation));
         Ok(ConfigActivation {
             module_id: manifest.module_id,
             generation: generation.generation,
@@ -367,21 +471,6 @@ impl Session {
             .into_iter()
             .filter(|(_, p, _)| p.generation == new_generation)
             .collect();
-        // Stage: pull the new generation's publications out so validate/apply
-        // run against the pre-replace state.
-        {
-            let mut reg = self.services.lock().expect("services lock poisoned");
-            for (key, provider, _) in &new_entries {
-                if let Err(e) = reg.remove(key, provider.module_id) {
-                    drop(reg);
-                    let _ = manager.deactivate(module_id);
-                    // The old generation is already gone: rebind so its UI
-                    // mounts unbind (their components no longer resolve).
-                    let _ = self.rebind_ui(new_generation);
-                    return Err(e.into());
-                }
-            }
-        }
         let mut staged = staged;
         staged.contributions = new_entries
             .iter()
@@ -395,23 +484,33 @@ impl Session {
             })
             .collect();
         // M8: the replaced generation's UI mounts/theme overlays leave the
-        // composition (clone-and-swap removal, idempotent), and the new
-        // generation's own contributions join the staged set — a replaced UI
-        // module re-mounts under its new generation.
-        if let Err(e) = self.registry.remove_contributions(&old_published) {
-            let _ = manager.deactivate(module_id);
-            let _ = self.rebind_ui(new_generation);
-            return Err(e.into());
-        }
+        // composition and the new generation's own contributions join the
+        // staged set — a replaced UI module re-mounts under its new
+        // generation. Both the new generation's pre-publication and the old
+        // generation's displaced entries are removed in the same atomic apply
+        // as the additions (decision 28), so no registry mutation happens
+        // before the OCC epoch check.
+        let mut plan = OverridePlan {
+            removed: new_entries
+                .iter()
+                .map(|(key, provider, deps)| Contribution {
+                    scope: new_manifest.scope.clone(),
+                    kind: ContributionKind::Service(ServiceContribution {
+                        key: key.clone(),
+                        provider: provider.clone(),
+                        deps: deps.clone(),
+                    }),
+                })
+                .collect(),
+        };
+        plan.removed.extend(old_published);
         staged
             .contributions
             .extend(manager.published_contributions(new_generation));
-        if let Err(e) = self.registry.validate(&staged.contributions) {
-            let _ = manager.deactivate(module_id);
-            let _ = self.rebind_ui(new_generation);
-            return Err(e.into());
-        }
-        if let Err(e) = self.composition.publish(&staged, &mut self.registry) {
+        if let Err(e) = self
+            .composition
+            .publish_planned(&staged, &mut self.registry, &plan)
+        {
             let _ = manager.deactivate(module_id);
             let _ = self.rebind_ui(new_generation);
             return Err(e.into());

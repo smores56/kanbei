@@ -617,6 +617,10 @@ pub struct Session {
     /// layers (decision 28). Stored, not resolved live, so it survives
     /// generation teardown (safe mode reflects the built-in layer).
     host_settings: SettingsContribution,
+    /// Active config-layer precedence records `(rank, module_id, generation)`
+    /// in activation order (decision 28). A higher-rank publish consults these
+    /// to compute the lower-precedence contributions it implicitly replaces.
+    active_config_layers: Vec<(u8, Id128, u64)>,
     /// The memory roots pinned by the checkpoint this branch continues from
     /// (wave 2 consumes them).
     pinned_roots: Option<PinnedRoots>,
@@ -1058,6 +1062,7 @@ impl Session {
             config_digest: None,
             config_manifest: None,
             host_settings: SettingsContribution::default(),
+            active_config_layers: Vec::new(),
             pinned_roots: None,
             child_provider,
             #[cfg(feature = "otel")]

@@ -41,6 +41,31 @@ impl ContributionKind {
             ContributionKind::Settings(_) => "settings",
         }
     }
+
+    /// The unique identity this contribution occupies within its kind, or
+    /// `None` for the layered/overlay kinds (`keymap`, `theme`, `settings`)
+    /// and for `guard` (monotonicity forbids implicit replacement).
+    ///
+    /// Decision 28 precedence-driven implicit replacement: a higher-precedence
+    /// layer replaces the holder of the same `(scope, identity)` key; layers
+    /// whose kinds return `None` always merge instead. The key is transient
+    /// (never serialized), so the composition digest domain is unchanged.
+    pub fn override_identity(&self) -> Option<String> {
+        let identity = match self {
+            ContributionKind::Command(c) => format!("command\u{1f}{}", c.name),
+            ContributionKind::Tool(t) => format!("tool\u{1f}{}", t.name),
+            ContributionKind::Service(s) => format!("service\u{1f}{}", s.key.name),
+            ContributionKind::ProjectionStage(p) => {
+                format!("stage\u{1f}{}\u{1f}{}", p.slot, p.ordering)
+            }
+            ContributionKind::UiMount(u) => format!("ui\u{1f}{}", u.name),
+            ContributionKind::Keymap(_)
+            | ContributionKind::Theme(_)
+            | ContributionKind::Guard(_)
+            | ContributionKind::Settings(_) => return None,
+        };
+        Some(identity)
+    }
 }
 
 /// A command: unique per (scope, name) or explicitly replaced (R-19).

@@ -1004,6 +1004,113 @@ fn builtin_settings_survive_failed_user_layer() {
     session.close().unwrap();
 }
 
+/// Decision 28: a higher-precedence layer implicitly replaces a lower layer's
+/// UI mount of the same `(scope, name)`; exactly one holder (the highest
+/// layer's) remains in the composition.
+#[test]
+fn project_layer_overrides_user_ui_mount() {
+    require_guest();
+    let dir = TempDir::new("ui-override");
+    let user = settings_manifest(
+        Id128::generate(),
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
+        r#"{"kind":"ui","name":"chat","component":"UserChat"}"#,
+    );
+    let project = settings_manifest(
+        Id128::generate(),
+        ModuleOrigin::WorkspaceConfig,
+        TrustClass::Workspace,
+        r#"{"kind":"ui","name":"chat","component":"ProjectChat"}"#,
+    );
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest(), user, project],
+        ..Default::default()
+    })
+    .unwrap();
+    let mounts: Vec<String> = session
+        .composition()
+        .contributions
+        .iter()
+        .filter_map(|c| match &c.kind {
+            kanbei_scopes::contrib::ContributionKind::UiMount(u) => Some(u.component.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        mounts,
+        vec!["ProjectChat".to_string()],
+        "the workspace layer's mount replaced the user layer's"
+    );
+    session.close().unwrap();
+}
+
+/// Decision 28 safe-mode residue (A2a): an already-activated user layer that
+/// published settings must not leave its merged overlay behind when a later
+/// project layer fails. `host_settings` shows only the built-in defaults.
+#[test]
+fn safe_mode_drops_activated_user_layer_settings_residue() {
+    require_guest();
+    let dir = TempDir::new("settings-safe-residue");
+    let user = settings_manifest(
+        Id128::generate(),
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
+        r#"{"kind":"settings","provider":{"model":"user-model"},"approval":{"auto_approve":true}}"#,
+    );
+    let bad_project = PackageManifest {
+        schema: kanbei_modules::PACKAGE_SCHEMA,
+        module_id: Id128::generate(),
+        origin: ModuleOrigin::WorkspaceConfig,
+        trust_class: TrustClass::Workspace,
+        scope: root(),
+        deps: vec![],
+        capabilities: vec![],
+        source: "local x = = 1".to_string(),
+        state_schema: None,
+        state_key: None,
+    };
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest(), user, bad_project],
+        ..Default::default()
+    })
+    .unwrap();
+    // only the built-in generation survives
+    assert_eq!(session.modules().unwrap().snapshot().len(), 1);
+    let settings = session.host_settings();
+    let approval = settings
+        .approval
+        .as_ref()
+        .expect("built-in approval survives");
+    assert_eq!(
+        approval.auto_approve,
+        Some(false),
+        "the dropped user layer's auto_approve overlay is gone"
+    );
+    assert_eq!(approval.yolo, Some(false), "built-in default survives");
+    assert_eq!(
+        settings
+            .provider
+            .as_ref()
+            .and_then(|p| p.model.as_deref()),
+        None,
+        "the dropped user layer's model residue is gone"
+    );
+    assert_eq!(
+        settings
+            .provider
+            .as_ref()
+            .and_then(|p| p.protocol.as_deref()),
+        Some("openai"),
+        "built-in provider default survives"
+    );
+    session.close().unwrap();
+}
+
 /// Decision 28: a session with no config layers activates nothing and reports
 /// the empty settings overlay.
 #[test]

@@ -44,6 +44,51 @@ pub struct RemovedSet {
     pub cascaded_scopes: Vec<ScopePath>,
 }
 
+/// A transient precedence plan for one publish (decision 28): the
+/// lower-precedence contributions this publish implicitly replaces. The plan
+/// is a parameter to validate/publish/apply, never serialized, so the
+/// composition digest domain for the existing kinds is unchanged.
+///
+/// `Contribution` carries no origin: the orchestrator (the session, which
+/// knows each active generation's `ModuleOrigin`) resolves precedence and
+/// supplies the displaced contributions here.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct OverridePlan {
+    /// Lower-precedence contributions taken over by the staged set: removed
+    /// from the composed set and the registry in the same atomic apply as the
+    /// staged additions.
+    pub removed: Vec<Contribution>,
+}
+
+impl OverridePlan {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.removed.is_empty()
+    }
+
+    fn removed_service_keys(&self) -> HashSet<ServiceKey> {
+        self.removed
+            .iter()
+            .filter_map(|c| match &c.kind {
+                ContributionKind::Service(s) => Some(s.key.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// The `(scope, kind identity)` key a contribution occupies for precedence
+/// replacement, or `None` for kinds that merge (see
+/// [`ContributionKind::override_identity`]).
+pub fn contribution_override_key(c: &Contribution) -> Option<(ScopePath, String)> {
+    c.kind
+        .override_identity()
+        .map(|identity| (c.scope.clone(), identity))
+}
+
 /// The typed contribution registries.
 ///
 /// `apply` is transactional for the registry's own maps: it builds the merged
@@ -88,10 +133,35 @@ impl ContributionRegistry {
         }
     }
 
+    /// Validates a staged set against the current registrations and earlier
+    /// entries of the same set, with no precedence overrides.
+    pub fn validate(&self, staged: &[Contribution]) -> Result<(), ScopeError> {
+        self.validate_planned(staged, &OverridePlan::default())
+    }
+
     /// Validates a staged set against the current registrations (the current
     /// composition) and against earlier entries of the same set, applying the
     /// fixed per-type rules. Returns the first violation.
-    pub fn validate(&self, staged: &[Contribution]) -> Result<(), ScopeError> {
+    ///
+    /// A contribution in `plan.removed` is treated as already displaced: its
+    /// current holder no longer conflicts with a staged contribution that
+    /// occupies the same identity key (decision 28 precedence-driven implicit
+    /// replacement). Validation performs no mutation — the displaced entries
+    /// are removed on a private scratch clone.
+    pub fn validate_planned(
+        &self,
+        staged: &[Contribution],
+        plan: &OverridePlan,
+    ) -> Result<(), ScopeError> {
+        if plan.is_empty() {
+            return self.validate_inner(staged);
+        }
+        let mut scratch = self.scratch();
+        scratch.remove_override_targets(plan);
+        scratch.validate_inner(staged)
+    }
+
+    fn validate_inner(&self, staged: &[Contribution]) -> Result<(), ScopeError> {
         let mut seen_commands: HashMap<(ScopePath, String), String> = HashMap::new();
         let mut seen_tools: HashMap<(ScopePath, String), String> = HashMap::new();
         let mut seen_services: HashMap<ServiceKey, String> = HashMap::new();
@@ -238,14 +308,34 @@ impl ContributionRegistry {
         Ok(())
     }
 
-    /// Atomically applies a validated staged set to `scope`: every
-    /// contribution must carry that scope. All mutations happen on a clone of
-    /// the registry; on success the clone is swapped in, so any failure (e.g.
-    /// a service-dependency cycle detected by the service registry at publish
-    /// time) rejects the whole set with no partial state. Callers must run
-    /// [`Self::validate`] first; this method re-checks only the structural
-    /// invariants it relies on (theme overlays must be objects for merging).
+    /// Atomically applies a validated staged set to `scope` with no
+    /// precedence overrides.
     pub fn apply(&mut self, scope: &ScopePath, staged: &[Contribution]) -> Result<(), ScopeError> {
+        self.apply_planned(scope, staged, &OverridePlan::default())
+    }
+
+    /// Atomically applies a validated staged set to `scope`: every
+    /// contribution must carry that scope. All mutations — the single
+    /// service-registry state AND the typed maps — happen on clones; on
+    /// success both are swapped into `self` and the shared service registry,
+    /// so any failure (e.g. a service-dependency cycle detected at publish
+    /// time) rejects the whole set with no partial state, and a caller that
+    /// never reaches this method (stale epoch) mutates nothing. Callers must
+    /// run [`Self::validate_planned`] first; this method re-checks only the
+    /// structural invariants it relies on (theme overlays must be objects for
+    /// merging).
+    ///
+    /// `plan.removed`'s service keys are force-displaced from the cloned DAG
+    /// before the staged providers publish (precedence-driven implicit
+    /// replacement, decision 28); its non-service kinds are removed from the
+    /// cloned maps. Dependents of a displaced service keep resolving against
+    /// the staged replacement under the same key.
+    pub fn apply_planned(
+        &mut self,
+        scope: &ScopePath,
+        staged: &[Contribution],
+        plan: &OverridePlan,
+    ) -> Result<(), ScopeError> {
         for c in staged {
             if &c.scope != scope {
                 return Err(ScopeError::InvalidContribution {
@@ -258,12 +348,46 @@ impl ContributionRegistry {
             }
         }
         let mut next = self.clone_state();
+        let mut next_services = self
+            .services
+            .lock()
+            .expect("services lock poisoned")
+            .clone();
+        let removed_services = plan.removed_service_keys();
+        for c in &plan.removed {
+            match &c.kind {
+                ContributionKind::Service(_) => {}
+                ContributionKind::Command(cmd) => {
+                    next.commands.remove(&(c.scope.clone(), cmd.name.clone()));
+                }
+                ContributionKind::Tool(t) => {
+                    next.tools.remove(&(c.scope.clone(), t.name.clone()));
+                }
+                ContributionKind::Theme(t) => {
+                    next.themes.remove(&(c.scope.clone(), t.name.clone()));
+                }
+                ContributionKind::ProjectionStage(p) => {
+                    next.stages.remove(&(c.scope.clone(), p.slot.clone(), p.ordering));
+                }
+                ContributionKind::UiMount(u) => {
+                    next.ui.remove(&(c.scope.clone(), u.name.clone()));
+                }
+                ContributionKind::Guard(g) => {
+                    next.guards.remove(&(c.scope.clone(), g.name.clone()));
+                }
+                ContributionKind::Keymap(km) => {
+                    next.keymaps.retain(|(s, e)| !(s == &c.scope && e.key == km.key));
+                }
+                ContributionKind::Settings(_) => {}
+            }
+        }
         for c in staged {
             match &c.kind {
                 ContributionKind::Service(s) => {
-                    next.services
-                        .lock()
-                        .expect("services lock poisoned")
+                    if removed_services.contains(&s.key) {
+                        next_services.remove_forced(&s.key);
+                    }
+                    next_services
                         .publish_with_deps(s.key.clone(), s.provider.clone(), &s.deps)?;
                 }
                 ContributionKind::Command(cmd) => {
@@ -339,7 +463,12 @@ impl ContributionRegistry {
                 }
             }
         }
+        // Atomic swap: the cloned maps replace `self`'s, then the staged DAG
+        // replaces the shared instance's contents in place (the module host
+        // holds the same `Arc`, so its handle stays valid and no caller ever
+        // observes a half-applied service set).
         *self = next;
+        *self.services.lock().expect("services lock poisoned") = next_services;
         Ok(())
     }
 
@@ -847,9 +976,9 @@ impl ContributionRegistry {
         Ok(())
     }
 
-    /// The clone `apply` mutates: maps are cloned; the service registry is
-    /// the shared kernel registry (same `Arc`), so `apply`'s service
-    /// publications are visible to the module host immediately.
+    /// The clone `apply_planned` mutates: maps and service-DAG state are
+    /// cloned; the swap-in at the end keeps the module host's shared `Arc`
+    /// valid.
     fn clone_state(&self) -> ContributionRegistry {
         ContributionRegistry {
             commands: self.commands.clone(),
@@ -862,6 +991,110 @@ impl ContributionRegistry {
             settings: self.settings.clone(),
             services: Arc::clone(&self.services),
         }
+    }
+
+    /// A fully independent clone (own `Arc<Mutex<ServiceRegistry>>` with a
+    /// cloned DAG) used by `validate_planned` to remove override targets
+    /// without touching the live registry.
+    fn scratch(&self) -> ContributionRegistry {
+        let mut scratch = self.clone_state();
+        scratch.services = Arc::new(Mutex::new(
+            self.services
+                .lock()
+                .expect("services lock poisoned")
+                .clone(),
+        ));
+        scratch
+    }
+
+    /// Removes the precedence plan's displaced entries from a scratch clone:
+    /// services are force-displaced (the staged replacement will re-occupy the
+    /// key), non-service kinds are dropped from their maps.
+    fn remove_override_targets(&mut self, plan: &OverridePlan) {
+        for c in &plan.removed {
+            match &c.kind {
+                ContributionKind::Service(s) => {
+                    self.services
+                        .lock()
+                        .expect("services lock poisoned")
+                        .remove_forced(&s.key);
+                }
+                ContributionKind::Command(cmd) => {
+                    self.commands.remove(&(c.scope.clone(), cmd.name.clone()));
+                }
+                ContributionKind::Tool(t) => {
+                    self.tools.remove(&(c.scope.clone(), t.name.clone()));
+                }
+                ContributionKind::Theme(t) => {
+                    self.themes.remove(&(c.scope.clone(), t.name.clone()));
+                }
+                ContributionKind::ProjectionStage(p) => {
+                    self.stages
+                        .remove(&(c.scope.clone(), p.slot.clone(), p.ordering));
+                }
+                ContributionKind::UiMount(u) => {
+                    self.ui.remove(&(c.scope.clone(), u.name.clone()));
+                }
+                ContributionKind::Guard(g) => {
+                    self.guards.remove(&(c.scope.clone(), g.name.clone()));
+                }
+                ContributionKind::Keymap(km) => {
+                    self.keymaps
+                        .retain(|(s, e)| !(s == &c.scope && e.key == km.key));
+                }
+                ContributionKind::Settings(_) => {}
+            }
+        }
+    }
+
+    /// Rebuilds `scope`'s overlay kinds (`settings`, `themes`) from exactly
+    /// `contributions`, in order. Overlay kinds merge rather than occupy a
+    /// slot, so a layer cannot be un-merged by name; the safe-mode rollback
+    /// (R-01/C-02) replays the surviving layers' overlays instead. Non-overlay
+    /// contributions are ignored (their removal is
+    /// [`Self::remove_contributions`]'s job).
+    pub fn recompose_overlays(&mut self, scope: &ScopePath, contributions: &[Contribution]) {
+        let mut next = self.clone_state();
+        next.settings.remove(scope);
+        next.themes.retain(|(s, _), _| s != scope);
+        for c in contributions.iter().filter(|c| &c.scope == scope) {
+            match &c.kind {
+                ContributionKind::Settings(s) => {
+                    merge_settings(
+                        next.settings
+                            .entry(c.scope.clone())
+                            .or_insert(SettingsContribution {
+                                provider: None,
+                                approval: None,
+                            }),
+                        s,
+                    );
+                }
+                ContributionKind::Theme(t) if t.overlay.is_object() => {
+                    match next.themes.entry((c.scope.clone(), t.name.clone())) {
+                        Entry::Occupied(mut e) => {
+                            let merged = e
+                                .get_mut()
+                                .overlay
+                                .as_object_mut()
+                                .expect("stored theme overlays are objects");
+                            merged.extend(
+                                t.overlay
+                                    .as_object()
+                                    .expect("checked above")
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone())),
+                            );
+                        }
+                        Entry::Vacant(v) => {
+                            v.insert(t.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        *self = next;
     }
 }
 
@@ -2174,6 +2407,268 @@ mod tests {
             }))
             .unwrap(),
             json!({"Settings": {"provider": null, "approval": null}})
+        );
+    }
+
+    // --- decision 28: precedence-driven implicit replacement -------------
+
+    fn command(s: &ScopePath, name: &str, handler: &str) -> Contribution {
+        Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::Command(CommandContribution {
+                name: name.into(),
+                handler: handler.into(),
+            }),
+        }
+    }
+
+    fn tool(s: &ScopePath, name: &str, handler: &str) -> Contribution {
+        Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::Tool(ToolContribution {
+                name: name.into(),
+                manifest: json!({"replay_relevant": true}),
+                handler: handler.into(),
+            }),
+        }
+    }
+
+    fn service(s: &ScopePath, name: &str, provider: ServiceProvider) -> Contribution {
+        Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::Service(ServiceContribution {
+                key: ServiceKey {
+                    scope: s.clone(),
+                    name: name.into(),
+                },
+                provider,
+                deps: vec![],
+            }),
+        }
+    }
+
+    fn plan(removed: Vec<Contribution>) -> OverridePlan {
+        OverridePlan { removed }
+    }
+
+    /// A higher-precedence layer replaces a lower command/tool of the same
+    /// (scope, name); validation accepts it only because the plan names the
+    /// displaced holder, and exactly one holder remains afterwards.
+    #[test]
+    fn override_plan_replaces_lower_command_and_tool() {
+        let s = scope("app");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let lower_cmd = command(&s, "run", "builtin_h");
+        let lower_tool = tool(&s, "sh", "builtin_t");
+        validate_and_apply(&mut registry, &s, &[lower_cmd.clone(), lower_tool.clone()]);
+
+        let higher_cmd = command(&s, "run", "project_h");
+        let higher_tool = tool(&s, "sh", "project_t");
+        let pl = plan(vec![lower_cmd, lower_tool]);
+        // without the plan the higher layer conflicts
+        assert!(registry.validate(&[higher_cmd.clone()]).is_err());
+        registry
+            .validate_planned(&[higher_cmd.clone(), higher_tool.clone()], &pl)
+            .unwrap();
+        registry
+            .apply_planned(
+                &s,
+                &[higher_cmd.clone(), higher_tool.clone()],
+                &pl,
+            )
+            .unwrap();
+
+        let snap = registry.snapshot();
+        let commands: Vec<_> = snap
+            .iter()
+            .filter_map(|c| match &c.kind {
+                ContributionKind::Command(cmd) => Some(cmd.handler.as_str()),
+                _ => None,
+            })
+            .collect();
+        let tools: Vec<_> = snap
+            .iter()
+            .filter_map(|c| match &c.kind {
+                ContributionKind::Tool(t) => Some(t.handler.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commands, ["project_h"], "one command holder, the higher one");
+        assert_eq!(tools, ["project_t"], "one tool holder, the higher one");
+    }
+
+    /// A higher-precedence layer replaces a lower service provider at the same
+    /// key; the lower provider no longer resolves and the higher one does.
+    #[test]
+    fn override_plan_replaces_lower_service_provider() {
+        let s = scope("app");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let lower = service(&s, "greeter", provider("greeter", 1));
+        validate_and_apply(&mut registry, &s, &[lower.clone()]);
+
+        let higher_provider = provider("greeter", 3);
+        let higher = service(&s, "greeter", higher_provider.clone());
+        let pl = plan(vec![lower]);
+        assert!(registry.validate(&[higher.clone()]).is_err());
+        registry.validate_planned(&[higher.clone()], &pl).unwrap();
+        registry.apply_planned(&s, &[higher], &pl).unwrap();
+
+        let reg = registry.services.lock().unwrap();
+        let resolved = reg
+            .resolve(
+                &ServiceKey {
+                    scope: s.clone(),
+                    name: "greeter".into(),
+                },
+                3,
+                &s,
+            )
+            .expect("higher provider resolves")
+            .clone();
+        assert_eq!(resolved.contract.version, 3);
+        assert_eq!(resolved.module_id, higher_provider.module_id);
+        assert!(
+            reg.resolve(
+                &ServiceKey {
+                    scope: s.clone(),
+                    name: "greeter".into(),
+                },
+                1,
+                &s,
+            )
+            .is_err(),
+            "the lower v1 provider is gone"
+        );
+    }
+
+    /// Keymaps, themes and settings are layered/merged kinds: a plan never
+    /// names them, and both layers survive with later-wins semantics.
+    #[test]
+    fn keymaps_themes_and_settings_still_layer() {
+        let s = scope("app");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let lower_keymap = Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::Keymap(KeymapContribution {
+                key: "ctrl-k".into(),
+                action: "lower".into(),
+            }),
+        };
+        let lower_theme = Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::Theme(ThemeContribution {
+                name: "default".into(),
+                overlay: json!({"bg": "black", "fg": "white"}),
+            }),
+        };
+        validate_and_apply(
+            &mut registry,
+            &s,
+            &[
+                lower_keymap.clone(),
+                lower_theme.clone(),
+                settings(
+                    &s,
+                    SettingsContribution {
+                        approval: Some(ApprovalSettings {
+                            auto_approve: Some(true),
+                            yolo: None,
+                        }),
+                        provider: None,
+                    },
+                ),
+            ],
+        );
+
+        let higher_keymap = Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::Keymap(KeymapContribution {
+                key: "ctrl-k".into(),
+                action: "higher".into(),
+            }),
+        };
+        let higher_theme = Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::Theme(ThemeContribution {
+                name: "default".into(),
+                overlay: json!({"bg": "blue"}),
+            }),
+        };
+        // A plan removing an unrelated entry must not disturb the layered kinds.
+        let unrelated = command(&s, "unrelated", "h");
+        validate_and_apply(&mut registry, &s, &[unrelated.clone()]);
+        let pl = plan(vec![unrelated]);
+        registry
+            .validate_planned(&[higher_keymap.clone(), higher_theme.clone()], &pl)
+            .unwrap();
+        registry
+            .apply_planned(&s, &[higher_keymap, higher_theme], &pl)
+            .unwrap();
+
+        assert_eq!(
+            registry.keymap_for(&s, "ctrl-k").map(|k| k.action.as_str()),
+            Some("higher"),
+            "keymap layers, last wins"
+        );
+        let theme = registry.theme_overlay(&s, "default").unwrap();
+        assert_eq!(theme.overlay, json!({"bg": "blue", "fg": "white"}));
+        assert_eq!(
+            registry
+                .settings_for(&s)
+                .and_then(|s| s.approval.as_ref())
+                .and_then(|a| a.auto_approve),
+            Some(true),
+            "lower settings layer survives"
+        );
+    }
+
+    /// Safe-mode rollback (R-01/C-02): overlay kinds cannot be un-merged by
+    /// name, so `recompose_overlays` replays only the surviving layers'
+    /// overlays — a dropped layer's settings/theme residue is gone.
+    #[test]
+    fn recompose_overlays_drops_a_layer_residue() {
+        let s = scope("");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let builtin = settings(
+            &s,
+            SettingsContribution {
+                provider: Some(ProviderSettings {
+                    protocol: Some("openai".into()),
+                    ..Default::default()
+                }),
+                approval: Some(ApprovalSettings {
+                    auto_approve: Some(false),
+                    yolo: Some(false),
+                }),
+            },
+        );
+        let user = settings(
+            &s,
+            SettingsContribution {
+                provider: Some(ProviderSettings {
+                    model: Some("user-model".into()),
+                    ..Default::default()
+                }),
+                approval: Some(ApprovalSettings {
+                    auto_approve: Some(true),
+                    yolo: None,
+                }),
+            },
+        );
+        validate_and_apply(&mut registry, &s, &[builtin.clone(), user]);
+        let merged = registry.settings_for(&s).unwrap();
+        assert_eq!(merged.approval.as_ref().unwrap().auto_approve, Some(true));
+
+        // Drop the user layer: replay only the built-in overlay.
+        registry.recompose_overlays(&s, &[builtin]);
+        let rebuilt = registry.settings_for(&s).unwrap();
+        let approval = rebuilt.approval.as_ref().unwrap();
+        assert_eq!(approval.auto_approve, Some(false), "user overlay is gone");
+        assert_eq!(approval.yolo, Some(false), "built-in default survives");
+        assert_eq!(
+            rebuilt.provider.as_ref().and_then(|p| p.model.as_deref()),
+            None,
+            "user provider field is gone"
         );
     }
 }
