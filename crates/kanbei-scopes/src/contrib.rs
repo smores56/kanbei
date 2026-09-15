@@ -18,7 +18,7 @@ pub enum ContributionKind {
     Command(CommandContribution),
     Tool(ToolContribution),
     Service(ServiceContribution),
-    Keymap(KeymapContribution),
+    Keymap(Keybinding),
     Theme(ThemeContribution),
     ProjectionStage(ProjectionStageContribution),
     UiMount(UiMountContribution),
@@ -98,12 +98,85 @@ pub struct ServiceContribution {
     pub deps: Vec<ServiceDependency>,
 }
 
-/// A keymap entry: layered match — duplicates merge as layers, and lookup
-/// returns the last matching layer (R-19).
+/// The UI context a lookup runs under (decision 29): whether a modal focus
+/// boundary is active and whether a non-modal `layer` node is present.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyContext {
+    pub modal: bool,
+    pub overlay: bool,
+}
+
+/// The context a keybinding is live under (decision 29). `Modal` matches only
+/// while a modal focus boundary is active; `Overlay` only while a non-modal
+/// `layer` node is present in the tree; `Always` matches in every context.
+/// Overlay and Modal outrank every origin tier.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextPredicate {
+    #[default]
+    Always,
+    Modal,
+    Overlay,
+}
+
+impl ContextPredicate {
+    /// Whether this predicate matches `ctx`.
+    pub fn matches(self, ctx: KeyContext) -> bool {
+        match self {
+            ContextPredicate::Always => true,
+            ContextPredicate::Modal => ctx.modal,
+            ContextPredicate::Overlay => ctx.overlay,
+        }
+    }
+
+    /// Dispatch tier within the context dimension: `Always` is the lowest,
+    /// `Overlay` above it, `Modal` highest (decision 29).
+    pub fn rank(self) -> u8 {
+        match self {
+            ContextPredicate::Always => 0,
+            ContextPredicate::Overlay => 1,
+            ContextPredicate::Modal => 2,
+        }
+    }
+}
+
+/// Kernel-assigned dispatch origin of a binding (decision 29), derived from
+/// the publishing module's origin: `Builtin < Plugin < UserConfig`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeymapOrigin {
+    #[default]
+    Builtin,
+    Plugin,
+    UserConfig,
+}
+
+impl KeymapOrigin {
+    /// Dispatch tier within the origin dimension (decision 29).
+    pub fn rank(self) -> u8 {
+        match self {
+            KeymapOrigin::Builtin => 0,
+            KeymapOrigin::Plugin => 1,
+            KeymapOrigin::UserConfig => 2,
+        }
+    }
+}
+
+/// A keybinding: a key, the context predicate it is live under, and the
+/// action (command) id the kernel routes to the focused mount. Layered match:
+/// duplicates merge as layers, and lookup returns the highest matching layer
+/// for the current context (R-19, decision 29).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct KeymapContribution {
+pub struct Keybinding {
     pub key: String,
+    #[serde(default)]
+    pub context: ContextPredicate,
     pub action: String,
+    /// Kernel-stamped from the publishing generation's origin; never
+    /// module-supplied. Skipped by serde: origin is kernel provenance, not
+    /// module content, so it stays out of the composition digest.
+    #[serde(skip)]
+    pub origin: KeymapOrigin,
 }
 
 /// A theme overlay: validated overlay — later overlays merge over earlier

@@ -34,6 +34,7 @@ use kanbei_capabilities::{Capability, Principal};
 use kanbei_core::id::Id128;
 use kanbei_modules::package::{ModuleOrigin, PackageManifest};
 use kanbei_modules::ModuleManager;
+use kanbei_scopes::contrib::KeyContext;
 use kanbei_ui::accessibility;
 use kanbei_ui::fallback;
 use kanbei_ui::focus::{FocusDirection, InputClass, KeyClassifier, ReservedAction};
@@ -180,6 +181,9 @@ pub struct UiOutcome {
     pub staleness: Option<String>,
     pub safe_mode: bool,
     pub repaint: bool,
+    /// The kernel reserved Ctrl-Z (Suspend) was pressed: the driver should
+    /// suspend the UI to the shell (decision 29).
+    pub suspend: bool,
 }
 
 impl UiHost {
@@ -448,11 +452,9 @@ impl Session {
                 })
                 .unwrap_or(InputClass::Forward);
             match class {
-                InputClass::Reserved(ReservedAction::CancelRun) => {
-                    let _ = self.cancel_active_run()?;
-                    outcome.repaint = true;
+                InputClass::Reserved(ReservedAction::Suspend) => {
+                    outcome.suspend = true;
                 }
-                InputClass::Reserved(ReservedAction::Repaint) => outcome.repaint = true,
                 InputClass::Reserved(ReservedAction::SafeModeChord) => {
                     self.enter_ui_safe_mode()?;
                     outcome.safe_mode = true;
@@ -470,7 +472,19 @@ impl Session {
                     outcome.repaint = true;
                 }
                 InputClass::Consumed => {}
-                InputClass::Forward => self.ui_forward(&event, &mut outcome)?,
+                InputClass::Forward => {
+                    // Decision 29: reserved classification wins first; then the
+                    // winning context-matched binding (if any) routes its action
+                    // id as a typed command intent through the normal reduce
+                    // path; only unbound keys fall through to raw forwarding.
+                    if let Some(action) = self.ui_binding_action(&event) {
+                        self.ui_reduce(UiEvent::user(UiEventKind::Command(action)))?;
+                        let applied = self.apply_ui_intents()?;
+                        outcome.intents_applied += applied;
+                    } else {
+                        self.ui_forward(&event, &mut outcome)?;
+                    }
+                }
             }
         }
         if let Some(host) = self.ui_host.as_mut() {
@@ -500,6 +514,24 @@ impl Session {
             None,
         )?;
         Ok(())
+    }
+
+    /// The winning binding's action for `event` under the current UI context,
+    /// if any binding matches (decision 29). Reserved keys are classified
+    /// before this and never consult the binding table.
+    fn ui_binding_action(&self, event: &InputEvent) -> Option<String> {
+        let key = event.key_name()?;
+        let host = self.ui_host.as_ref()?;
+        let ctx = KeyContext {
+            modal: host.focus.boundary().is_some(),
+            overlay: host
+                .last_tree
+                .as_ref()
+                .is_some_and(|t| t.overlay_present()),
+        };
+        self.registry
+            .keymap_winner(&key, ctx)
+            .map(|(_, binding)| binding.action.clone())
     }
 
     /// Forward one non-reserved event: navigation stays kernel-side; text
@@ -667,6 +699,7 @@ impl Session {
             UiEventKind::Backspace => json!({ "kind": "backspace" }),
             UiEventKind::Enter => json!({ "kind": "enter" }),
             UiEventKind::Activate(id) => json!({ "kind": "activate", "node": id }),
+            UiEventKind::Command(action) => json!({ "kind": "command", "action": action }),
         };
         let mut event_value = event_value;
         if let Some(target) = target {

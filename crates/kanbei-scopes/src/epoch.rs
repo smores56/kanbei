@@ -182,9 +182,9 @@ fn composition_canonical_bytes(contributions: &[Contribution]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::contrib::{
-        CommandContribution, Contribution, ContributionKind, GuardContribution, KeymapContribution,
-        ProjectionStageContribution, ServiceContribution, ThemeContribution, ToolContribution,
-        UiMountContribution,
+        CommandContribution, ContextPredicate, Contribution, ContributionKind, GuardContribution,
+        Keybinding, KeymapOrigin, ProjectionStageContribution, ServiceContribution,
+        ThemeContribution, ToolContribution, UiMountContribution,
     };
     use crate::registry::ContributionRegistry;
     use kanbei_core::Id128;
@@ -237,9 +237,11 @@ mod tests {
             },
             Contribution {
                 scope: s.clone(),
-                kind: ContributionKind::Keymap(KeymapContribution {
+                kind: ContributionKind::Keymap(Keybinding {
                     key: "k".into(),
+                    context: ContextPredicate::Always,
                     action: "a".into(),
+                    origin: KeymapOrigin::Builtin,
                 }),
             },
             Contribution {
@@ -307,9 +309,11 @@ mod tests {
             },
             Contribution {
                 scope: s.clone(),
-                kind: ContributionKind::Keymap(KeymapContribution {
+                kind: ContributionKind::Keymap(Keybinding {
                     key: "k2".into(),
+                    context: ContextPredicate::Always,
                     action: "a".into(),
+                    origin: KeymapOrigin::Builtin,
                 }),
             },
             Contribution {

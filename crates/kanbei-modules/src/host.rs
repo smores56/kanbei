@@ -19,7 +19,7 @@
 //! | 4 | `check` | `{"resource": <string>, "verbs": [<string>]}` | `{"allowed":true}` |
 //! | 5 | `require_approval` | `{"resource": <string>, "verbs": [<string>]}` | `{"intent": <ApprovalIntent>}` |
 //! | 6 | `service_publish` | `{"key": <ServiceKey>, "version": <u32>, "deps": [<ServiceDependency>]}` | `"ok"` |
-//! | 7 | `contribution_publish` | `{"kind": "ui"\|"theme"\|"settings", ...}` | `"ok"` |
+//! | 7 | `contribution_publish` | `{"kind": "ui"\|"theme"\|"settings"\|"hook"\|"keymap", ...}` | `"ok"` |
 //! | 6 | `service_publish` | `{"key": <ServiceKey>, "version": <u32>, "deps": [<ServiceDependency>]}` | `"ok"` |
 //!
 //! M2 keeps state bytes as the compact JSON encoding of the value the module
@@ -42,8 +42,9 @@ use std::time::{Duration, Instant};
 use kanbei_capabilities::{ApprovalIntent, Broker, Capability, GrantScope, Principal};
 use kanbei_core::id::Id128;
 use kanbei_scopes::contrib::{
-    ApprovalSettings, Contribution, ContributionKind, HookContribution, HookKind,
-    ProviderSettings, SettingsContribution, ThemeContribution, UiMountContribution,
+    ApprovalSettings, ContextPredicate, Contribution, ContributionKind, HookContribution, HookKind,
+    Keybinding, KeymapOrigin, ProviderSettings, SettingsContribution, ThemeContribution,
+    UiMountContribution,
 };
 use kanbei_services::{
     ReplaceIntent, ScopePath, ServiceContract, ServiceDependency, ServiceError, ServiceKey,
@@ -571,6 +572,8 @@ impl ModuleHost {
     /// - `{"kind":"ui","name":<string>,"component":<string>,"slot":<string, optional>}`
     /// - `{"kind":"theme","name":<string>,"overlay":<object>}`
     /// - `{"kind":"settings","provider":<object, optional>,"approval":<object, optional>}`
+    /// - `{"kind":"hook","name":<string>,"hook":"on_turn_start"|"on_tool_intent"}`
+    /// - `{"kind":"keymap","bindings":[{"key":<string>,"context":"always"|"modal"|"overlay","action":<string>}]}`
     fn op_contribution_publish(&self, info: &TokenInfo, payload: &str) -> Result<String, String> {
         let v: Value = serde_json::from_str(payload)
             .map_err(|e| format!("contribution_publish: invalid payload: {e}"))?;
@@ -584,7 +587,7 @@ impl ModuleHost {
                 .map(String::from)
                 .ok_or_else(|| "contribution_publish: payload must carry a \"name\"".to_string())
         };
-        let contribution = match kind {
+        let staged: Vec<Contribution> = match kind {
             "ui" => {
                 let name = name()?;
                 let component = v
@@ -604,24 +607,24 @@ impl ModuleHost {
                     .expect("ui components lock poisoned");
                 self.ensure_current(info.generation)?;
                 ui_components.insert(component.clone(), info.generation);
-                Contribution {
+                vec![Contribution {
                     scope: info.scope.clone(),
                     kind: ContributionKind::UiMount(UiMountContribution {
                         name,
                         component,
                         slot,
                     }),
-                }
+                }]
             }
             "theme" => {
                 let name = name()?;
                 let overlay = v.get("overlay").cloned().ok_or_else(|| {
                     "contribution_publish: theme must carry an \"overlay\"".to_string()
                 })?;
-                Contribution {
+                vec![Contribution {
                     scope: info.scope.clone(),
                     kind: ContributionKind::Theme(ThemeContribution { name, overlay }),
-                }
+                }]
             }
             "hook" => {
                 // T9: a named lifecycle hook. Dispatch is by hook kind over
@@ -683,10 +686,10 @@ impl ModuleHost {
                         }
                     }
                 }
-                Contribution {
+                vec![Contribution {
                     scope: info.scope.clone(),
                     kind: ContributionKind::Hook(HookContribution { name, hook }),
-                }
+                }]
             }
             "settings" => {
                 // Decision 28: a desired-state layer publishes typed settings
@@ -705,19 +708,70 @@ impl ModuleHost {
                     .map(serde_json::from_value::<ApprovalSettings>)
                     .transpose()
                     .map_err(|e| format!("contribution_publish: settings.approval: {e}"))?;
-                Contribution {
+                vec![Contribution {
                     scope: info.scope.clone(),
                     kind: ContributionKind::Settings(SettingsContribution { provider, approval }),
+                }]
+            }
+            "keymap" => {
+                // Decision 29: a module publishes one or more bindings in a
+                // single fail-closed payload. The dispatch origin is stamped
+                // from the publishing generation's origin here — never taken
+                // from the payload, so a module cannot claim a higher tier.
+                let bindings = v
+                    .get("bindings")
+                    .and_then(Value::as_array)
+                    .filter(|b| !b.is_empty())
+                    .ok_or_else(|| {
+                        "contribution_publish: keymap must carry a non-empty \"bindings\" array"
+                            .to_string()
+                    })?;
+                let origin = keymap_origin(info.origin);
+                let mut staged = Vec::with_capacity(bindings.len());
+                for b in bindings {
+                    let key = b
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .filter(|k| !k.is_empty())
+                        .ok_or_else(|| {
+                            "contribution_publish: keymap binding must carry a non-empty \"key\""
+                                .to_string()
+                        })?;
+                    let action = b
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .filter(|a| !a.is_empty())
+                        .ok_or_else(|| {
+                            "contribution_publish: keymap binding must carry a non-empty \"action\""
+                                .to_string()
+                        })?;
+                    let context = match b.get("context").and_then(Value::as_str) {
+                        None | Some("always") => ContextPredicate::Always,
+                        Some("modal") => ContextPredicate::Modal,
+                        Some("overlay") => ContextPredicate::Overlay,
+                        Some(other) => {
+                            return Err(format!(
+                                "contribution_publish: unknown keymap context {other:?}"
+                            ));
+                        }
+                    };
+                    staged.push(Contribution {
+                        scope: info.scope.clone(),
+                        kind: ContributionKind::Keymap(Keybinding {
+                            key: key.to_string(),
+                            context,
+                            action: action.to_string(),
+                            origin,
+                        }),
+                    });
                 }
+                staged
             }
             other => return Err(format!("contribution_publish: unknown kind {other:?}")),
         };
         let mut contributions = self.contributions.lock().expect("contributions lock poisoned");
         self.ensure_current(info.generation)?;
-        contributions
-            .entry(info.generation)
-            .or_default()
-            .push(contribution);
+        contributions.entry(info.generation).or_default().extend(staged);
         Ok("ok".into())
     }
 
@@ -772,6 +826,19 @@ impl ModuleHost {
             .lock()
             .expect("hooks lock poisoned")
             .retain(|_, g| *g != generation);
+    }
+}
+
+/// Map the publishing generation's origin to its keymap dispatch tier
+/// (decision 29): built-in defaults rank lowest; runtime-added modules
+/// (`Agent`, `UserInstalled`) rank as plugins; user/project config ranks
+/// highest. Workspace config is config, not a plugin, so it ranks with user
+/// config.
+fn keymap_origin(origin: ModuleOrigin) -> KeymapOrigin {
+    match origin {
+        ModuleOrigin::Builtin => KeymapOrigin::Builtin,
+        ModuleOrigin::UserConfig | ModuleOrigin::WorkspaceConfig => KeymapOrigin::UserConfig,
+        ModuleOrigin::Agent | ModuleOrigin::UserInstalled => KeymapOrigin::Plugin,
     }
 }
 
@@ -1092,6 +1159,64 @@ mod tests {
             );
         }
         assert_eq!(host.published_contributions(1).len(), 2);
+        drop(host);
+        teardown(dir, queue);
+    }
+
+    /// Decision 29: op 7 accepts a `"kind":"keymap"` payload, stages one
+    /// binding per entry, and kernel-stamps the origin tier from the
+    /// publishing generation (never the payload); malformed payloads are
+    /// typed errors that stage nothing.
+    #[test]
+    fn contribution_publish_keymap_parses_stamps_origin_and_rejects_malformed() {
+        let (dir, queue, host) = host_with_generation("keymap");
+        let i = info();
+        host.op_contribution_publish(
+            &i,
+            r#"{"kind":"keymap","bindings":[{"key":"ctrl-k","context":"modal","action":"close"},{"key":"j","action":"next"}]}"#,
+        )
+        .unwrap();
+        let published = host.published_contributions(1);
+        assert_eq!(published.len(), 2);
+        match &published[0].kind {
+            ContributionKind::Keymap(k) => {
+                assert_eq!(k.key, "ctrl-k");
+                assert_eq!(k.context, ContextPredicate::Modal);
+                assert_eq!(k.action, "close");
+                assert_eq!(
+                    k.origin,
+                    KeymapOrigin::UserConfig,
+                    "origin is kernel-stamped from the generation"
+                );
+            }
+            other => panic!("expected a keymap contribution, got {other:?}"),
+        }
+        match &published[1].kind {
+            ContributionKind::Keymap(k) => {
+                assert_eq!(k.key, "j");
+                assert_eq!(k.context, ContextPredicate::Always, "context defaults to always");
+            }
+            other => panic!("expected a keymap contribution, got {other:?}"),
+        }
+
+        for bad in [
+            r#"{"kind":"keymap"}"#,
+            r#"{"kind":"keymap","bindings":[]}"#,
+            r#"{"kind":"keymap","bindings":[{"key":"","action":"a"}]}"#,
+            r#"{"kind":"keymap","bindings":[{"key":"k"}]}"#,
+            r#"{"kind":"keymap","bindings":[{"key":"k","context":"bogus","action":"a"}]}"#,
+        ] {
+            let err = host.op_contribution_publish(&i, bad).unwrap_err();
+            assert!(
+                err.starts_with("contribution_publish:"),
+                "typed error for {bad}: {err}"
+            );
+        }
+        assert_eq!(
+            host.published_contributions(1).len(),
+            2,
+            "malformed payloads stage nothing"
+        );
         drop(host);
         teardown(dir, queue);
     }

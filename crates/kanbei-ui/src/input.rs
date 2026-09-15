@@ -23,6 +23,8 @@ pub enum InputEvent {
     CtrlC,
     CtrlL,
     CtrlX,
+    /// Terminal suspend (SIGTSTP-like). Kernel-reserved: never remappable.
+    CtrlZ,
     /// Lone escape (TUI: back to input focus). The byte decoder cannot
     /// produce it (a lone ESC is ambiguous with an Alt prefix); the
     /// terminal-event decoder does.
@@ -125,6 +127,10 @@ impl InputDecoder {
             0x18 => {
                 self.pending.remove(0);
                 Some(InputEvent::CtrlX)
+            }
+            0x1a => {
+                self.pending.remove(0);
+                Some(InputEvent::CtrlZ)
             }
             c if c < 0x20 => {
                 self.pending.remove(0);
@@ -267,6 +273,34 @@ impl InputEvent {
             _ => None,
         }
     }
+
+    /// The canonical binding key name for this event (decision 29): the key a
+    /// `Keybinding` matches. `None` for `Drop` (unrecognized input).
+    pub fn key_name(&self) -> Option<String> {
+        Some(match self {
+            InputEvent::Char(c) => c.to_string(),
+            InputEvent::Backspace => "backspace".into(),
+            InputEvent::Enter => "enter".into(),
+            InputEvent::Tab => "tab".into(),
+            InputEvent::ShiftTab => "shift-tab".into(),
+            InputEvent::ArrowUp => "up".into(),
+            InputEvent::ArrowDown => "down".into(),
+            InputEvent::ArrowLeft => "left".into(),
+            InputEvent::ArrowRight => "right".into(),
+            InputEvent::Home => "home".into(),
+            InputEvent::End => "end".into(),
+            InputEvent::PageUp => "page-up".into(),
+            InputEvent::PageDown => "page-down".into(),
+            InputEvent::Delete => "delete".into(),
+            InputEvent::CtrlC => "ctrl-c".into(),
+            InputEvent::CtrlL => "ctrl-l".into(),
+            InputEvent::CtrlX => "ctrl-x".into(),
+            InputEvent::CtrlZ => "ctrl-z".into(),
+            InputEvent::CtrlQ => "ctrl-q".into(),
+            InputEvent::Escape => "escape".into(),
+            InputEvent::Drop => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +316,9 @@ pub enum UiEventKind {
     Enter,
     /// The user activated the focused node (button).
     Activate(String),
+    /// The user pressed a key bound to `action`; the kernel routes the action
+    /// id to the mounted modules (decision 29).
+    Command(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +392,7 @@ mod tests {
                 InputEvent::Drop,
             ]
         );
+        assert_eq!(decode(b"\x1a"), vec![InputEvent::CtrlZ]);
     }
 
     #[test]

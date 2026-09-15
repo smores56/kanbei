@@ -525,6 +525,14 @@ impl SemanticTree {
         self.nodes().into_iter().find(|n| n.id == id)
     }
 
+    /// Whether a non-modal `layer` node is present anywhere in the tree
+    /// (decision 29: `Overlay` bindings are live only then).
+    pub fn overlay_present(&self) -> bool {
+        self.nodes()
+            .into_iter()
+            .any(|n| n.kind() == NodeKind::Layer && !n.modal())
+    }
+
     pub fn is_focusable(&self, id: &str) -> bool {
         self.focusable().iter().any(|n| n.id == id)
     }
@@ -949,6 +957,16 @@ mod tests {
             ),
         );
         assert_eq!(nested.modal_boundary().unwrap().id, "inner");
+    }
+
+    #[test]
+    fn overlay_present_detects_non_modal_layers() {
+        let none = SemanticTree::new(Node::stack("root").child(Node::button("b", "b")));
+        assert!(!none.overlay_present());
+        let modal = SemanticTree::new(Node::stack("root").child(Node::layer("m", 1, true)));
+        assert!(!modal.overlay_present(), "a modal layer is not an overlay");
+        let overlay = SemanticTree::new(Node::stack("root").child(Node::layer("o", 1, false)));
+        assert!(overlay.overlay_present());
     }
 
     #[test]

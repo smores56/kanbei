@@ -288,13 +288,13 @@ impl FocusModel {
 }
 
 /// Kernel-reserved interaction results. These are consumed by the kernel and
-/// never reach a module (R-27).
+/// never reach a module (R-27). `CancelRun`/`Repaint` are NOT reserved: they
+/// are remappable via bindings (decision 29).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReservedAction {
-    /// Modal escape / cancel the active run (Ctrl-C).
-    CancelRun,
-    /// Repaint the whole frame (Ctrl-L).
-    Repaint,
+    /// Suspend the UI to the shell (Ctrl-Z). Reserved so modules cannot
+    /// rebind the process-level suspend escape.
+    Suspend,
     /// Enter kernel safe mode (Ctrl-X Ctrl-S).
     SafeModeChord,
     /// Leave the active modal focus boundary (Escape). Reserved only while a
@@ -331,13 +331,9 @@ impl KeyClassifier {
 
     pub fn classify(&mut self, e: &crate::InputEvent, modal_active: bool) -> InputClass {
         match e {
-            crate::InputEvent::CtrlC => {
+            crate::InputEvent::CtrlZ => {
                 self.safe_mode_pending = false;
-                InputClass::Reserved(ReservedAction::CancelRun)
-            }
-            crate::InputEvent::CtrlL => {
-                self.safe_mode_pending = false;
-                InputClass::Reserved(ReservedAction::Repaint)
+                InputClass::Reserved(ReservedAction::Suspend)
             }
             crate::InputEvent::CtrlX => {
                 self.safe_mode_pending = true;
@@ -414,8 +410,11 @@ mod tests {
     #[test]
     fn reserved_keys() {
         let mut c = KeyClassifier::new();
-        assert_eq!(c.classify(&crate::InputEvent::CtrlC, false), InputClass::Reserved(ReservedAction::CancelRun));
-        assert_eq!(c.classify(&crate::InputEvent::CtrlL, false), InputClass::Reserved(ReservedAction::Repaint));
+        // CancelRun/Repaint are remappable now: Ctrl-C/Ctrl-L forward.
+        assert_eq!(c.classify(&crate::InputEvent::CtrlC, false), InputClass::Forward);
+        assert_eq!(c.classify(&crate::InputEvent::CtrlL, false), InputClass::Forward);
+        // Suspend is reserved and wins.
+        assert_eq!(c.classify(&crate::InputEvent::CtrlZ, false), InputClass::Reserved(ReservedAction::Suspend));
         assert_eq!(c.classify(&crate::InputEvent::CtrlX, false), InputClass::Consumed);
         assert_eq!(c.classify(&crate::InputEvent::Char('x'), false), InputClass::Forward);
         assert_eq!(c.classify(&crate::InputEvent::CtrlX, false), InputClass::Consumed);

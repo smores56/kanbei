@@ -9,7 +9,8 @@
 //!   the `replace_*` methods (generation replacement);
 //! - services: one provider per scoped key (delegated to the
 //!   `kanbei_services` registry);
-//! - keymaps: layered match — duplicates are layers, lookup takes the last;
+//! - keymaps: layered match — duplicates are layers, ranked by (context,
+//!   origin, layer); a same-key/same-tier duplicate warns;
 //! - themes: validated overlay — the overlay must be a JSON object and later
 //!   overlays merge (shallowly) over earlier ones;
 //! - projection stages: named slots with ordering constraints — a
@@ -29,7 +30,7 @@ use serde_json::Value;
 
 use crate::contrib::{
     ApprovalSettings, CommandContribution, Contribution, ContributionKind, GuardContribution,
-    HookContribution, HookKind, KeyReference, KeymapContribution, ProjectionStageContribution,
+    HookContribution, HookKind, KeyContext, KeyReference, Keybinding, ProjectionStageContribution,
     ProviderSettings, ServiceContribution, SettingsContribution, ThemeContribution,
     ToolContribution, UiMountContribution,
 };
@@ -99,9 +100,10 @@ pub fn contribution_override_key(c: &Contribution) -> Option<(ScopePath, String)
 pub struct ContributionRegistry {
     commands: HashMap<(ScopePath, String), CommandContribution>,
     tools: HashMap<(ScopePath, String), ToolContribution>,
-    /// Layered keymap table: order is the layer; lookup returns the last
-    /// matching layer (R-19 "keymaps: layered match").
-    keymaps: Vec<(ScopePath, KeymapContribution)>,
+    /// Layered keymap table: lookup ranks by (context, origin, layer) and
+    /// returns the highest matching layer (R-19 "keymaps: layered match",
+    /// decision 29).
+    keymaps: Vec<(ScopePath, Keybinding)>,
     /// Validated overlay view: one entry per (scope, name); later overlays
     /// merge (shallowly) over earlier ones (R-19 "themes: validated overlay").
     themes: HashMap<(ScopePath, String), ThemeContribution>,
@@ -169,6 +171,7 @@ impl ContributionRegistry {
         let mut seen_ui: HashMap<(ScopePath, String), String> = HashMap::new();
         let mut seen_guards: HashMap<(ScopePath, String), (String, bool)> = HashMap::new();
         let mut seen_hooks: HashSet<(ScopePath, HookKind, String)> = HashSet::new();
+        let mut seen_keymaps: Vec<Keybinding> = Vec::new();
         let published: HashMap<ServiceKey, ServiceProvider> = self
             .services
             .lock()
@@ -245,8 +248,28 @@ impl ContributionRegistry {
                     }
                     seen_services.insert(key, provider_identity(&s.provider));
                 }
-                ContributionKind::Keymap(_) => {
-                    // Layered match: duplicates are layers, never a conflict.
+                ContributionKind::Keymap(kb) => {
+                    // Layered match: duplicates are layers, never a hard
+                    // conflict. A duplicate in the SAME tier (same key,
+                    // context, and origin) is a satisfiable ambiguity — both
+                    // layers can match one keypress — so warn (decision 29).
+                    // A canonical fact is deferred: the scopes registry has no
+                    // fact channel.
+                    let same_tier = |o: &Keybinding| {
+                        o.key == kb.key && o.context == kb.context && o.origin == kb.origin
+                    };
+                    if self.keymaps.iter().any(|(_, o)| same_tier(o))
+                        || seen_keymaps.iter().any(same_tier)
+                    {
+                        tracing::warn!(
+                            name: "keymap_conflict",
+                            key = %kb.key,
+                            context = ?kb.context,
+                            origin = ?kb.origin,
+                            "keybinding shadows an existing same-tier binding for the same key"
+                        );
+                    }
+                    seen_keymaps.push(kb.clone());
                 }
                 ContributionKind::Theme(t) => {
                     if !t.overlay.is_object() {
@@ -396,7 +419,8 @@ impl ContributionRegistry {
                     next.hooks.remove(&(c.scope.clone(), h.hook, h.name.clone()));
                 }
                 ContributionKind::Keymap(km) => {
-                    next.keymaps.retain(|(s, e)| !(s == &c.scope && e.key == km.key));
+                    next.keymaps
+                        .retain(|(s, e)| !(s == &c.scope && e.key == km.key && e.context == km.context));
                 }
                 ContributionKind::Settings(_) => {
                     // Intended asymmetry (F11): settings are a merge-only
@@ -761,7 +785,8 @@ impl ContributionRegistry {
                     next.hooks.remove(&(c.scope.clone(), h.hook, h.name.clone()));
                 }
                 ContributionKind::Keymap(km) => {
-                    next.keymaps.retain(|(s, e)| !(s == &c.scope && e.key == km.key));
+                    next.keymaps
+                        .retain(|(s, e)| !(s == &c.scope && e.key == km.key && e.context == km.context));
                 }
                 ContributionKind::Settings(_) => {
                     // One merged entry per scope: removing the scope's
@@ -861,13 +886,34 @@ impl ContributionRegistry {
         out
     }
 
-    /// Layered keymap match (R-19): the LAST matching layer for
-    /// `(scope, key)` — later layers win.
-    pub fn keymap_for(&self, scope: &ScopePath, key: &str) -> Option<&KeymapContribution> {
+    /// Layered keymap match (R-19/decision 29): the highest-ranked matching
+    /// layer for `(scope, key)` given the current context. Rank order is
+    /// context first (`Always < Overlay < Modal`), then origin
+    /// (`Builtin < Plugin < UserConfig`), then later layers over earlier.
+    pub fn keymap_for(
+        &self,
+        scope: &ScopePath,
+        key: &str,
+        ctx: KeyContext,
+    ) -> Option<&Keybinding> {
         self.keymaps
             .iter()
-            .rev()
-            .find_map(|(s, km)| (s == scope && km.key == key).then_some(km))
+            .enumerate()
+            .filter(|(_, (s, kb))| s == scope && kb.key == key && kb.context.matches(ctx))
+            .max_by_key(|(i, (_, kb))| (kb.context.rank(), kb.origin.rank(), *i))
+            .map(|(_, (_, kb))| kb)
+    }
+
+    /// The registry-wide winning binding for `key` under `ctx` (decision 29):
+    /// dispatch is global — the winning action is routed to the focused mount,
+    /// not looked up per scope. Returns the owning scope and the binding.
+    pub fn keymap_winner(&self, key: &str, ctx: KeyContext) -> Option<(&ScopePath, &Keybinding)> {
+        self.keymaps
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, kb))| kb.key == key && kb.context.matches(ctx))
+            .max_by_key(|(i, (_, kb))| (kb.context.rank(), kb.origin.rank(), *i))
+            .map(|(_, (s, kb))| (s, kb))
     }
 
     /// Merged overlay view for `(scope, name)`: the single entry holding the
@@ -1112,8 +1158,9 @@ impl ContributionRegistry {
                     self.hooks.remove(&(c.scope.clone(), h.hook, h.name.clone()));
                 }
                 ContributionKind::Keymap(km) => {
-                    self.keymaps
-                        .retain(|(s, e)| !(s == &c.scope && e.key == km.key));
+                    self.keymaps.retain(|(s, e)| {
+                        !(s == &c.scope && e.key == km.key && e.context == km.context)
+                    });
                 }
                 ContributionKind::Settings(_) => {
                     // Same intended asymmetry as `apply_planned`: a plan never
@@ -1326,6 +1373,7 @@ fn snapshot_sort_key(c: &Contribution) -> (String, &'static str, String, String,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contrib::{ContextPredicate, KeymapOrigin};
     use kanbei_core::Id128;
     use kanbei_services::ServiceContract;
     use serde_json::json;
@@ -1375,9 +1423,11 @@ mod tests {
             },
             Contribution {
                 scope: s.clone(),
-                kind: ContributionKind::Keymap(KeymapContribution {
+                kind: ContributionKind::Keymap(Keybinding {
                     key: "k".into(),
+                    context: ContextPredicate::Always,
                     action: "a".into(),
+                    origin: KeymapOrigin::Builtin,
                 }),
             },
             Contribution {
@@ -1635,16 +1685,20 @@ mod tests {
         let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
         let k1 = Contribution {
             scope: s.clone(),
-            kind: ContributionKind::Keymap(KeymapContribution {
+            kind: ContributionKind::Keymap(Keybinding {
                 key: "k".into(),
+                context: ContextPredicate::Always,
                 action: "a1".into(),
+                origin: KeymapOrigin::Builtin,
             }),
         };
         let k2 = Contribution {
             scope: s.clone(),
-            kind: ContributionKind::Keymap(KeymapContribution {
+            kind: ContributionKind::Keymap(Keybinding {
                 key: "k".into(),
+                context: ContextPredicate::Always,
                 action: "a2".into(),
+                origin: KeymapOrigin::Builtin,
             }),
         };
         // no conflict: both layers are stored
@@ -1657,8 +1711,161 @@ mod tests {
             .collect();
         assert_eq!(keymaps.len(), 2);
         // lookup returns the LAST matching layer
-        assert_eq!(registry.keymap_for(&s, "k").unwrap().action, "a2");
-        assert!(registry.keymap_for(&s, "missing").is_none());
+        assert_eq!(
+            registry
+                .keymap_for(&s, "k", KeyContext::default())
+                .unwrap()
+                .action,
+            "a2"
+        );
+        assert!(registry
+            .keymap_for(&s, "missing", KeyContext::default())
+            .is_none());
+    }
+
+    /// Decision 29: dispatch ranks context first (`Always < Overlay < Modal`),
+    /// then origin (`Builtin < Plugin < UserConfig`), then later layers; a
+    /// context predicate that does not match the current context is ignored.
+    #[test]
+    fn keymap_dispatch_precedence_and_context() {
+        let s = scope("app");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let kb = |context: ContextPredicate, origin: KeymapOrigin, action: &str| Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::Keymap(Keybinding {
+                key: "k".into(),
+                context,
+                action: action.into(),
+                origin,
+            }),
+        };
+        let plain = KeyContext::default();
+        let overlay = KeyContext {
+            overlay: true,
+            ..KeyContext::default()
+        };
+        let modal = KeyContext {
+            modal: true,
+            ..KeyContext::default()
+        };
+
+        registry
+            .apply(&s, &[kb(ContextPredicate::Always, KeymapOrigin::Builtin, "builtin")])
+            .unwrap();
+        assert_eq!(winner(&registry, &s, "k", plain).as_deref(), Some("builtin"));
+
+        registry
+            .apply(&s, &[kb(ContextPredicate::Always, KeymapOrigin::Plugin, "plugin")])
+            .unwrap();
+        assert_eq!(winner(&registry, &s, "k", plain).as_deref(), Some("plugin"), "plugin beats builtin");
+
+        registry
+            .apply(
+                &s,
+                &[kb(ContextPredicate::Always, KeymapOrigin::UserConfig, "user")],
+            )
+            .unwrap();
+        assert_eq!(winner(&registry, &s, "k", plain).as_deref(), Some("user"), "user beats plugin");
+
+        // Overlay outranks every origin, but only while a non-modal layer is
+        // present.
+        registry
+            .apply(&s, &[kb(ContextPredicate::Overlay, KeymapOrigin::Builtin, "overlay")])
+            .unwrap();
+        assert_eq!(winner(&registry, &s, "k", plain).as_deref(), Some("user"), "overlay ignored outside a layer");
+        assert_eq!(winner(&registry, &s, "k", overlay).as_deref(), Some("overlay"), "overlay beats user");
+
+        // Modal outranks overlay.
+        registry
+            .apply(&s, &[kb(ContextPredicate::Modal, KeymapOrigin::Builtin, "modal")])
+            .unwrap();
+        assert_eq!(winner(&registry, &s, "k", plain).as_deref(), Some("user"), "modal ignored with no boundary");
+        assert_eq!(winner(&registry, &s, "k", overlay).as_deref(), Some("overlay"), "modal ignored under overlay");
+        assert_eq!(winner(&registry, &s, "k", modal).as_deref(), Some("modal"), "modal beats overlay");
+        assert_eq!(
+            winner(&registry, &s, "k", KeyContext { modal: true, overlay: true }).as_deref(),
+            Some("modal"),
+            "modal beats overlay when both match"
+        );
+
+        // The registry-wide winner resolves across scopes.
+        assert_eq!(
+            registry.keymap_winner("k", plain).map(|(_, k)| k.action.as_str()),
+            Some("user")
+        );
+    }
+
+    /// Decision 29: a same-key/same-tier (same context AND origin) satisfiable
+    /// conflict warns via tracing; a cross-tier duplicate does not.
+    #[test]
+    fn same_tier_keymap_conflict_warns() {
+        let s = scope("app");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let kb = |origin: KeymapOrigin, action: &str| Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::Keymap(Keybinding {
+                key: "k".into(),
+                context: ContextPredicate::Always,
+                action: action.into(),
+                origin,
+            }),
+        };
+        registry
+            .apply(&s, &[kb(KeymapOrigin::Builtin, "first")])
+            .unwrap();
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let guard = tracing::subscriber::set_default(Capture(Arc::clone(&captured)));
+        // Same key, same context, same origin: a satisfiable ambiguity.
+        registry.validate(&[kb(KeymapOrigin::Builtin, "shadow")]).unwrap();
+        // Same key, different origin: layered precedence, no warning.
+        registry.validate(&[kb(KeymapOrigin::UserConfig, "higher")]).unwrap();
+        drop(guard);
+
+        let warnings = captured.lock().unwrap();
+        assert_eq!(
+            warnings.as_slice(),
+            ["keymap_conflict".to_string()],
+            "only the same-tier conflict warns: {warnings:?}"
+        );
+    }
+
+    /// The (scoped) winning binding's action for a key under a context.
+    fn winner(
+        registry: &ContributionRegistry,
+        scope: &ScopePath,
+        key: &str,
+        ctx: KeyContext,
+    ) -> Option<String> {
+        registry
+            .keymap_for(scope, key, ctx)
+            .map(|k| k.action.clone())
+    }
+
+    /// Minimal `tracing::Subscriber` that records WARN event names, so the
+    /// decision-29 conflict warning is assertable without a dev-dependency.
+    #[derive(Debug)]
+    struct Capture(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(event.metadata().name().to_string());
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
     }
 
     #[test]
@@ -2626,9 +2833,11 @@ mod tests {
         let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
         let lower_keymap = Contribution {
             scope: s.clone(),
-            kind: ContributionKind::Keymap(KeymapContribution {
+            kind: ContributionKind::Keymap(Keybinding {
                 key: "ctrl-k".into(),
+                context: ContextPredicate::Always,
                 action: "lower".into(),
+                origin: KeymapOrigin::Builtin,
             }),
         };
         let lower_theme = Contribution {
@@ -2659,9 +2868,11 @@ mod tests {
 
         let higher_keymap = Contribution {
             scope: s.clone(),
-            kind: ContributionKind::Keymap(KeymapContribution {
+            kind: ContributionKind::Keymap(Keybinding {
                 key: "ctrl-k".into(),
+                context: ContextPredicate::Always,
                 action: "higher".into(),
+                origin: KeymapOrigin::Builtin,
             }),
         };
         let higher_theme = Contribution {
@@ -2683,7 +2894,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            registry.keymap_for(&s, "ctrl-k").map(|k| k.action.as_str()),
+            registry
+                .keymap_for(&s, "ctrl-k", KeyContext::default())
+                .map(|k| k.action.as_str()),
             Some("higher"),
             "keymap layers, last wins"
         );
