@@ -45,14 +45,22 @@ impl KeySource {
     }
 
     /// Materialize the key and discard it, for open-time availability checks.
-    /// Succeeds iff the source resolves right now; the returned error carries
-    /// only the non-secret fingerprint.
-    pub fn probe(&self) -> Result<(), ProviderError> {
-        self.read()
-            .map(|_| ())
-            .map_err(|_| ProviderError::KeySourceUnavailable {
-                fingerprint: self.fingerprint(),
-            })
+    /// Succeeds iff the source resolves right now. `provider` is the
+    /// diagnostic provider name only. Errors map to the SAME variants as
+    /// [`resolve_key`] (`MissingKey`/`KeychainUnavailable`), so a probe
+    /// failure and a call-time failure are indistinguishable in the taxonomy.
+    pub fn probe(&self, provider: &str) -> Result<(), ProviderError> {
+        self.read().map(|_| ()).map_err(|err| match err {
+            KeyReadError::MissingEnv { name } => ProviderError::MissingKey {
+                provider: provider.to_string(),
+                name,
+            },
+            KeyReadError::Keychain { service, account } => ProviderError::KeychainUnavailable {
+                provider: provider.to_string(),
+                service,
+                account,
+            },
+        })
     }
 
     /// The only credential read path (R-28/D-06). Callers must never persist
@@ -275,8 +283,6 @@ pub enum ProviderError {
         service: String,
         account: String,
     },
-    #[error("key source {fingerprint} unavailable")]
-    KeySourceUnavailable { fingerprint: String },
     #[error("provider {provider}: request rejected {message}")]
     Rejected { provider: String, message: String },
     #[error("provider {provider}: timed out after {secs}s")]
@@ -1529,24 +1535,31 @@ mod tests {
         unsafe {
             std::env::set_var("KANBEI_PROBE_PRESENT_KEY", "p");
         }
-        assert!(KeySource::Env("KANBEI_PROBE_PRESENT_KEY".into()).probe().is_ok());
-        assert!(KeySource::Env("KANBEI_PROBE_ABSENT_KEY".into()).probe().is_err());
-        assert!(KeySource::Inline("super-secret".into()).probe().is_ok());
+        assert!(KeySource::Env("KANBEI_PROBE_PRESENT_KEY".into()).probe("fake").is_ok());
+        assert!(KeySource::Env("KANBEI_PROBE_ABSENT_KEY".into()).probe("fake").is_err());
+        assert!(KeySource::Inline("super-secret".into()).probe("fake").is_ok());
     }
 
     #[test]
-    fn keychain_probe_unavailable_is_typed_and_secretless() {
+    fn probe_uses_the_same_taxonomy_as_resolve_key() {
         let key = KeySource::Keychain {
             service: "kanbei-test-absent-service".into(),
             account: "no-such-account".into(),
         };
-        let err = key.probe().unwrap_err();
-        assert!(matches!(err, ProviderError::KeySourceUnavailable { .. }));
-        // Only the non-secret fingerprint is exposed; no raw backend text.
-        assert_eq!(
-            err.to_string(),
-            "key source keychain:kanbei-test-absent-service/no-such-account unavailable"
-        );
+        let probe_err = key.probe("fake").unwrap_err();
+        let resolve_err = resolve_key(&ProviderConfig {
+            key: key.clone(),
+            ..cfg()
+        })
+        .unwrap_err();
+        // The probe must not invent a variant resolve_key would not return.
+        assert!(matches!(probe_err, ProviderError::KeychainUnavailable { .. }));
+        assert_eq!(probe_err.to_string(), resolve_err.to_string());
+        // A missing env var maps to MissingKey, matching resolve_key.
+        let env_err = KeySource::Env("KANBEI_PROBE_ABSENT_KEY".into())
+            .probe("fake")
+            .unwrap_err();
+        assert!(matches!(env_err, ProviderError::MissingKey { .. }));
     }
 
     #[test]

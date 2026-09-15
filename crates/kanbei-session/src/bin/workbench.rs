@@ -12,6 +12,12 @@
 //! (one response, "workbench ready"); otherwise an HttpEngine is built from
 //! `KANBEI_PROVIDER_URL` / `KANBEI_PROVIDER_KEY` / `KANBEI_PROVIDER_MODEL`.
 //! `fs_root` is the session dir.
+//!
+//! This is a DEV/smoke binary: unlike the shipped `kanbei` CLI it does NOT
+//! discover or activate config layers, and it still reads
+//! `KANBEI_PROVIDER_MODEL` (retired from the CLI by decision 28 — model is a
+//! config field now). Its env surface is intentionally its own bootstrap, not
+//! the product config surface.
 
 use std::io::{IsTerminal, Read};
 use std::os::fd::AsFd;

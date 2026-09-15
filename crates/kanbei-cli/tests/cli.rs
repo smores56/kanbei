@@ -121,3 +121,43 @@ fn removed_flags_are_rejected() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// F12: a resolvable provider URL with an unavailable key degrades to a
+/// storage-only session (never fails open) and prints an actionable,
+/// secret-free stderr line.
+#[test]
+fn unavailable_provider_key_degrades_to_storage_only() {
+    let dir = temp_dir("nokey");
+    let xdg = temp_dir("nokey-xdg");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kanbei"))
+        .arg(dir.to_string_lossy().to_string())
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("KANBEI_PROVIDER_URL", "https://example.invalid/v1")
+        .env_remove("KANBEI_PROVIDER_KEY")
+        .env_remove("KANBEI_PROVIDER_MODEL")
+        .env_remove("KANBEI_YOLO")
+        .env_remove("KANBEI_DIR")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"hello\n/exit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("provider key unavailable") && stderr.contains("storage-only"),
+        "expected an actionable storage-only notice, stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("(none)"),
+        "the session reports no provider engine: {stderr:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&xdg);
+}

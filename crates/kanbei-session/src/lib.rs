@@ -123,19 +123,25 @@ pub trait SettingsSource: Send + Sync {
     fn resolve(&self, settings: &kanbei_scopes::contrib::SettingsContribution) -> SessionSettings;
 }
 
-/// The runtime wiring a [`SettingsSource`] resolves from config settings. Each
-/// `Some` field overrides the corresponding [`SessionConfig`] value; `None`
-/// falls back to it (so a partial settings overlay never clears wiring the
-/// bootstrap env supplied).
+/// The runtime wiring a [`SettingsSource`] resolves from config settings.
+///
+/// When a source is configured, it FULLY determines the wiring (F10): the
+/// session assigns `provider_engine`/`provider`/`broker`/`approval_resolver`
+/// from this struct on every apply, `Some` or `None`, so a higher layer that
+/// clears a field actually uninstalls the earlier wiring. `session_id` is the
+/// exception — only overwritten when `Some` (the open-time identity pin; see
+/// `Session::apply_settings`).
 #[derive(Default)]
 pub struct SessionSettings {
-    /// Provider engine override; None = keep the `SessionConfig` engine (or
-    /// the one built from `provider`/`protocol`).
+    /// Provider engine; `None` = storage-only (no model calls).
     pub provider_engine: Option<Box<dyn kanbei_provider::ProviderEngine>>,
-    /// Provider config override (also the manifest's `provider_config` pin).
+    /// Provider config (also the manifest's `provider_config` pin).
     pub provider: Option<kanbei_provider::ProviderConfig>,
+    /// Capability broker; `None` = the default (empty, default-deny) broker.
     pub broker: Option<kanbei_capabilities::Broker>,
+    /// Approval resolver; `None` = park every gated intent.
     pub approval_resolver: Option<ApprovalResolver>,
+    /// Session identity override; `None` = keep the current identity.
     pub session_id: Option<Id128>,
 }
 
@@ -158,6 +164,12 @@ pub struct SessionConfig {
     /// config generation. A failed non-builtin layer drops every non-builtin
     /// layer and keeps the built-in generation active (safe mode, R-01/C-02).
     pub config_layers: Vec<PackageManifest>,
+    /// A config-discovery read failure the caller degraded to built-in-only
+    /// layers (F14): `open` records it as a canonical `safe_mode_activated`
+    /// fact. None = discovery succeeded (or was not attempted). The layers the
+    /// caller passes are still the ones activated; this field only carries the
+    /// reason for the canonical trace.
+    pub config_discovery_error: Option<String>,
     /// Desired-state settings factory (decision 28); None = no settings seam
     /// (today's argv/env-derived behavior). Resolved AFTER the config layers
     /// activate and BEFORE the composition commit, so the settings-resolved
@@ -253,6 +265,7 @@ impl Default for SessionConfig {
             object_min: 8192,
             fault: None,
             config_layers: Vec::new(),
+            config_discovery_error: None,
             settings: None,
             max_state_bytes: 1024 * 1024,
             policy: Arc::new(StoreAllPolicy),
@@ -1014,6 +1027,7 @@ impl Session {
         }
 
         let config_layers = cfg.config_layers.clone();
+        let config_discovery_error = cfg.config_discovery_error.clone();
         let mut session = Self {
             log,
             store,
@@ -1089,6 +1103,12 @@ impl Session {
         // non-builtin layer drops the non-builtin layers and keeps the
         // built-in generation active in safe mode (R-01/C-02).
         session.activate_config_layers(config_layers)?;
+        // F14: a discovery read failure is a canonical safe-mode fact, not
+        // just a stderr line — the caller degraded to built-in-only layers and
+        // the log must say so.
+        if let Some(reason) = config_discovery_error {
+            session.commit_safe_mode(&reason)?;
+        }
 
         // M4 recovery facts: commit the pending backlinks (R-11), then the
         // one-time canonical project binding (fresh logs only — the log

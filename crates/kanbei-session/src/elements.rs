@@ -16,6 +16,7 @@ use kanbei_scopes::contrib::ContributionKind;
 use kanbei_scopes::contrib::ServiceContribution;
 use kanbei_scopes::registry::OverridePlan;
 use kanbei_scopes::registry::contribution_override_key;
+use kanbei_services::ScopePath;
 use kanbei_services::ServiceKey;
 use kanbei_services::ServiceProvider;
 use kanbei_vm::Host;
@@ -153,9 +154,21 @@ impl Session {
 
     /// Resolves the merged config-layer settings through
     /// [`SessionConfig::settings`](crate::SessionConfig::settings) and applies
-    /// each `Some` field as an override of the bootstrap (`SessionConfig`)
-    /// value; `None` fields fall back. No-op when no source is configured —
-    /// today's behavior is preserved exactly.
+    /// the result as the session's wiring. When a source is configured it
+    /// FULLY determines the wiring (F10): each of
+    /// `provider_engine`/`provider`/`broker`/`approval_resolver` is assigned
+    /// on every apply, `Some` or `None`, so a higher layer that clears a field
+    /// (e.g. turns yolo off) uninstalls the earlier wiring instead of leaving
+    /// it stuck. No-op when no source is configured — the `SessionConfig`
+    /// values are left exactly as the bootstrap set them.
+    ///
+    /// `session_id` is the one exception: it is only overwritten when the
+    /// resolver supplies one. The session identity is committed as the project
+    /// registry's `created_session` pin BEFORE config activation (open), so a
+    /// config-derived id can diverge from that pin — a known limitation, kept
+    /// because reordering open (activate before the identity pin) would ripple
+    /// through the memory substrate. The yolo broker is keyed to whatever id
+    /// the resolver returns, so the wiring itself stays consistent.
     ///
     /// Called after a layer's composition publishes and before its canonical
     /// commit, so the config event's post-manifest pins the resolved
@@ -165,25 +178,58 @@ impl Session {
             return;
         };
         let resolved = source.resolve(&self.host_settings);
-        if let Some(engine) = resolved.provider_engine {
-            self.provider = Some(engine);
-        }
-        if let Some(provider) = resolved.provider {
-            self.provider_config = Some(provider);
-        }
-        if let Some(broker) = resolved.broker {
-            self.broker = broker;
-        }
-        if let Some(resolver) = resolved.approval_resolver {
-            self.approval_resolver = Some(resolver);
-        }
+        self.provider = resolved.provider_engine;
+        self.provider_config = resolved.provider;
+        self.broker = resolved.broker.unwrap_or_default();
+        self.approval_resolver = resolved.approval_resolver;
         if let Some(id) = resolved.session_id {
             self.session_id = id;
         }
     }
 
+    /// Rebuilds the merged settings overlays after a config module replacement
+    /// (F6). Settings are a merge-only overlay: precedence displacement cannot
+    /// un-merge a replaced generation's contribution, so a stale `yolo`/
+    /// `auto_approve` would survive a swap to a benign generation. Replay the
+    /// surviving layers' overlays from scratch (their settings AND themes, so
+    /// the recompose does not drop a surviving theme), including the new
+    /// generation the caller already recorded in `active_config_layers`, then
+    /// re-resolve the runtime wiring. `old_settings_scopes` names the scopes
+    /// the replaced generation contributed settings to, so a scope that no
+    /// surviving layer touches is cleared too.
+    fn recompose_settings_after_replace(&mut self, old_settings_scopes: Vec<ScopePath>) {
+        let Some(manager) = self.modules.as_ref() else {
+            return;
+        };
+        let mut overlays: Vec<Contribution> = Vec::new();
+        let mut scopes = old_settings_scopes;
+        for (_, _, generation) in &self.active_config_layers {
+            for c in manager.published_contributions(*generation) {
+                match &c.kind {
+                    ContributionKind::Settings(_) => {
+                        scopes.push(c.scope.clone());
+                        overlays.push(c);
+                    }
+                    ContributionKind::Theme(_) => overlays.push(c),
+                    _ => {}
+                }
+            }
+        }
+        scopes.sort_by_key(|s| s.to_string());
+        scopes.dedup();
+        for scope in scopes {
+            self.registry.recompose_overlays(&scope, &overlays);
+        }
+        self.host_settings = self
+            .registry
+            .settings_for(&crate::builtin_config::root_scope())
+            .cloned()
+            .unwrap_or_default();
+        self.apply_settings();
+    }
+
     /// Commits the canonical `safe_mode_activated` fact with the failure reason.
-    fn commit_safe_mode(&mut self, reason: &str) -> Result<(), SessionError> {
+    pub(crate) fn commit_safe_mode(&mut self, reason: &str) -> Result<(), SessionError> {
         self.commit(
             vec![NewEvent {
                 kind: "safe_mode_activated".into(),
@@ -259,15 +305,29 @@ impl Session {
             })
             .collect();
         // M5: non-service contributions staged via `contribution_publish`
-        // (UI mounts, theme overlays) join the same atomic publish.
-        staged
-            .contributions
-            .extend(manager.published_contributions(generation.generation));
+        // (UI mounts, theme overlays) join the same atomic publish. Settings
+        // are trust-gated here (F2): an untrusted layer's sensitive fields are
+        // stripped before they can enter the merged overlay or the canonical
+        // commit.
+        let mut published = manager.published_contributions(generation.generation);
+        gate_settings_contributions(manifest.origin, &mut published);
+        staged.contributions.extend(published);
 
         // Decision 28 precedence plan. The delta IS the module's own
         // pre-publication into the shared registry: displace it in the atomic
-        // apply instead of removing it beforehand, so a stale-epoch publish
-        // mutates nothing.
+        // apply instead of removing it beforehand. The atomic guarantee here
+        // is registry/epoch-level: `publish_planned` mutates the registry (and
+        // the shared service registry the host already published into) only
+        // once the OCC epoch check passes, so a stale-epoch publish mutates no
+        // registry state. The session path is not fully zero-mutation, though:
+        // `kb_on_activate` publishes services into the SHARED service registry
+        // before the epoch check, so a stale publish still relies on the
+        // module deactivate below to roll those registrations back (best
+        // effort — a deferred/dependent provider may survive). There is no
+        // deterministic session-path stale-epoch test: activation is
+        // synchronous and single-writer, so nothing can advance the
+        // composition between `stage` and `publish_planned`; the epoch CAS is
+        // exercised directly at the composition/registry layer instead.
         let mut plan = OverridePlan {
             removed: delta
                 .iter()
@@ -330,6 +390,14 @@ impl Session {
             .publish_planned(&staged, &mut self.registry, &plan)
         {
             let reason = e.to_string();
+            // Rollback for the pre-epoch-check service publications: the
+            // activation's `kb_on_activate` already published into the shared
+            // registry, so a stale-epoch (or otherwise rejected) publish must
+            // deactivate the generation to remove those registrations. The
+            // typed registry maps themselves were never mutated
+            // (`publish_planned` applies on a clone), so this is the only
+            // session-path residue — best effort, since a dependent provider
+            // may keep the registration alive.
             let _ = manager.deactivate(manifest.module_id);
             self.ui_mark_stale(&reason);
             return Err(e.into());
@@ -444,6 +512,11 @@ impl Session {
         // `contribution_publish`) BEFORE the swap — `replace` drops the
         // generation's staging records.
         let old_published = manager.published_contributions(old_generation);
+        let old_settings_scopes: Vec<ScopePath> = old_published
+            .iter()
+            .filter(|c| matches!(c.kind, ContributionKind::Settings(_)))
+            .map(|c| c.scope.clone())
+            .collect();
         let outcome = match manager.replace(module_id, &new_manifest) {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -514,6 +587,20 @@ impl Session {
             let _ = manager.deactivate(module_id);
             let _ = self.rebind_ui(new_generation);
             return Err(e.into());
+        }
+        // F6: a replaced config layer's settings overlay is merge-only, so the
+        // precedence plan cannot un-merge a stale yolo/auto_approve. Record the
+        // new generation as the active layer and rebuild the merged settings
+        // from the surviving layers before the canonical commit (so the
+        // post-manifest pins the refreshed wiring).
+        let is_config_layer = self
+            .active_config_layers
+            .iter_mut()
+            .find(|(_, id, _)| *id == module_id)
+            .map(|entry| entry.2 = new_generation)
+            .is_some();
+        if is_config_layer {
+            self.recompose_settings_after_replace(old_settings_scopes);
         }
         let epoch = self.composition.current().epoch;
         let composition_digest = self.composition.current().digest;
@@ -719,4 +806,65 @@ impl Session {
         }
         Ok(admission)
     }
+}
+
+// ---------- settings trust gate (F2) ----------
+
+/// The origins trusted to publish sensitive settings fields (F2). Everything
+/// else (`WorkspaceConfig`, `Agent`, `UserInstalled`) is repo- or agent-
+/// supplied: a cloned workspace can otherwise auto-approve tools
+/// (`approval.yolo`/`auto_approve`) or exfiltrate a secret
+/// (`provider.base_url`/`provider.key`) through the CLI's settings source.
+fn origin_is_trusted_for_settings(origin: ModuleOrigin) -> bool {
+    matches!(origin, ModuleOrigin::Builtin | ModuleOrigin::UserConfig)
+}
+
+/// Filters the settings contributions a generation publishes before they are
+/// staged/merged (F2).
+///
+/// Every layer's `provider.base_url` is validated here — an invalid value
+/// (not `http`/`https` with a host) is dropped so a malformed URL can never
+/// drive the engine. Untrusted layers additionally have every sensitive field
+/// removed: `approval.auto_approve`, `approval.yolo`, `provider.base_url`,
+/// `provider.key`. Non-sensitive fields (`provider.model`,
+/// `provider.protocol`, `provider.fake`) pass through for every origin.
+fn gate_settings_contributions(origin: ModuleOrigin, contributions: &mut [Contribution]) {
+    let trusted = origin_is_trusted_for_settings(origin);
+    for c in contributions.iter_mut() {
+        let ContributionKind::Settings(settings) = &mut c.kind else {
+            continue;
+        };
+        if let Some(provider) = settings.provider.as_mut() {
+            if provider.base_url.as_deref().is_some_and(|u| !valid_base_url(u)) {
+                provider.base_url = None;
+            }
+            if !trusted {
+                provider.base_url = None;
+                provider.key = None;
+            }
+        }
+        if !trusted
+            && let Some(approval) = settings.approval.as_mut()
+        {
+            approval.auto_approve = None;
+            approval.yolo = None;
+        }
+    }
+}
+
+/// `http`/`https` with a non-empty host. Deliberately structural (no `url`
+/// dependency): scheme `://`, and a host before any path/query/fragment.
+fn valid_base_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if scheme != "http" && scheme != "https" {
+        return false;
+    }
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    !host.is_empty()
 }

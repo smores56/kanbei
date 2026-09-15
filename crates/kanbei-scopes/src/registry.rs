@@ -61,10 +61,6 @@ pub struct OverridePlan {
 }
 
 impl OverridePlan {
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.removed.is_empty()
     }
@@ -378,7 +374,14 @@ impl ContributionRegistry {
                 ContributionKind::Keymap(km) => {
                     next.keymaps.retain(|(s, e)| !(s == &c.scope && e.key == km.key));
                 }
-                ContributionKind::Settings(_) => {}
+                ContributionKind::Settings(_) => {
+                    // Intended asymmetry (F11): settings are a merge-only
+                    // overlay, so a precedence plan never un-merges them — a
+                    // displaced lower layer's fields must survive under the
+                    // higher layer. A layer that must be fully DROPPED is
+                    // handled by `remove_contributions` (or
+                    // `recompose_overlays`), not by `plan.removed`.
+                }
             }
         }
         for c in staged {
@@ -1042,7 +1045,10 @@ impl ContributionRegistry {
                     self.keymaps
                         .retain(|(s, e)| !(s == &c.scope && e.key == km.key));
                 }
-                ContributionKind::Settings(_) => {}
+                ContributionKind::Settings(_) => {
+                    // Same intended asymmetry as `apply_planned`: a plan never
+                    // displaces a merge-only settings overlay.
+                }
             }
         }
     }
@@ -2619,6 +2625,62 @@ mod tests {
                 .and_then(|a| a.auto_approve),
             Some(true),
             "lower settings layer survives"
+        );
+    }
+
+    /// F11: a precedence plan never un-merges settings (the intended
+    /// asymmetry) — a displaced lower layer's fields survive. An explicit
+    /// `remove_contributions` DOES drop the scope's merged settings.
+    #[test]
+    fn override_plan_never_unmerges_settings() {
+        let s = scope("app");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let lower = settings(
+            &s,
+            SettingsContribution {
+                approval: Some(ApprovalSettings {
+                    auto_approve: Some(true),
+                    yolo: None,
+                }),
+                provider: None,
+            },
+        );
+        validate_and_apply(&mut registry, &s, &[lower.clone()]);
+
+        let higher = settings(
+            &s,
+            SettingsContribution {
+                provider: Some(ProviderSettings {
+                    model: Some("m".into()),
+                    ..Default::default()
+                }),
+                approval: None,
+            },
+        );
+        let pl = plan(vec![lower]);
+        registry.validate_planned(&[higher.clone()], &pl).unwrap();
+        registry.apply_planned(&s, &[higher], &pl).unwrap();
+
+        let merged = registry.settings_for(&s).unwrap();
+        assert_eq!(
+            merged
+                .approval
+                .as_ref()
+                .and_then(|a| a.auto_approve),
+            Some(true),
+            "the plan does not un-merge the lower settings layer"
+        );
+        assert_eq!(
+            merged.provider.as_ref().and_then(|p| p.model.as_deref()),
+            Some("m")
+        );
+
+        registry
+            .remove_contributions(&[settings(&s, merged.clone())])
+            .unwrap();
+        assert!(
+            registry.settings_for(&s).is_none(),
+            "an explicit removal drops the scope's merged settings"
         );
     }
 

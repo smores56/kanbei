@@ -956,7 +956,10 @@ fn config_layers_merge_settings_builtin_user_project() {
     assert_eq!(p.model.as_deref(), Some("project-model"), "project wins");
     let a = settings.approval.as_ref().expect("merged approval");
     assert_eq!(a.auto_approve, Some(true), "user field kept");
-    assert_eq!(a.yolo, Some(true), "project wins");
+    // F2: the workspace/project layer's yolo is a sensitive field and is
+    // stripped, so the built-in default survives (the non-sensitive model
+    // field still wins below).
+    assert_eq!(a.yolo, Some(false), "untrusted project yolo is stripped");
     // three layers activated, each on the log
     let envs = envelopes(&dir.path().join("log.zst"));
     assert_eq!(envs.len(), 3);
@@ -1129,5 +1132,28 @@ fn no_config_layers_reports_default_settings() {
     );
     let envs = envelopes(&dir.path().join("log.zst"));
     assert!(envs.is_empty(), "no layer activated, no events");
+    session.close().unwrap();
+}
+
+/// F14: a config-discovery read failure the caller degraded to built-in-only
+/// layers is recorded as a canonical `safe_mode_activated` fact.
+#[test]
+fn discovery_error_records_canonical_safe_mode_fact() {
+    require_guest();
+    let dir = TempDir::new("discovery-error");
+    let reason = "cannot read config layer /nope/init.lua: permission denied";
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest()],
+        config_discovery_error: Some(reason.into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert_eq!(envs.len(), 2, "built-in activation + the discovery fact");
+    assert_eq!(envs[0].kind, "composition_changed");
+    assert_eq!(envs[1].kind, "safe_mode_activated");
+    assert_eq!(envs[1].payload["reason"].as_str(), Some(reason));
     session.close().unwrap();
 }

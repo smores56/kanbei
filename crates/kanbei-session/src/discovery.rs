@@ -77,7 +77,12 @@ fn discover_config_layers_with(
 /// count as unset, matching the XDG base-directory spec).
 fn user_config_path(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
     if let Some(xdg) = xdg_config_home.filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(xdg).join("kanbei").join("init.lua"));
+        let xdg = PathBuf::from(xdg);
+        // The XDG base-directory spec requires an absolute path; a relative
+        // one is treated as unset (fall through to $HOME).
+        if xdg.is_absolute() {
+            return Some(xdg.join("kanbei").join("init.lua"));
+        }
     }
     let home = home.filter(|v| !v.is_empty())?;
     Some(
@@ -292,5 +297,25 @@ mod tests {
         let layers = discover_config_layers_with(dir.path(), None, None).unwrap();
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0], builtin_config_manifest());
+    }
+
+    /// A relative `XDG_CONFIG_HOME` violates the spec and is treated as unset:
+    /// the user layer falls back to `$HOME/.config`.
+    #[test]
+    fn relative_xdg_config_home_is_treated_as_unset() {
+        let home = TempDir::new("rel-xdg-home");
+        let dir = TempDir::new("rel-xdg-proj");
+        write(
+            &home.path().join(".config").join("kanbei").join("init.lua"),
+            "home-layer",
+        );
+        let layers = discover_config_layers_with(
+            dir.path(),
+            Some(OsStr::new("relative/config")),
+            Some(home.path().as_os_str()),
+        )
+        .unwrap();
+        assert_eq!(layers.len(), 2, "the HOME fallback layer is used");
+        assert_eq!(layers[1].source, "home-layer");
     }
 }

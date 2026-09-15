@@ -8,9 +8,17 @@
 //! `$HOME/.config/kanbei/init.lua`), then `<DIR>/.kanbei/init.lua`. The
 //! provider and approval wiring — engine, base URL, model, protocol, key
 //! reference, auto-approval, yolo — comes from the merged config layers
-//! through [`CliSettings`] (decision 28), not argv. Bootstrap exception:
-//! `KANBEI_PROVIDER_URL` / `KANBEI_PROVIDER_KEY` are read as env fallbacks
-//! when config does not supply them; config wins. `fs_root` is the session dir.
+//! through [`CliSettings`] (decision 28), not argv.
+//!
+//! Bootstrap env surface (all other `KANBEI_*` env was retired by decision 28):
+//! - `KANBEI_DIR` — the session/layout root when no positional DIR is given.
+//! - `KANBEI_PROVIDER_URL` / `KANBEI_PROVIDER_KEY` — read only as fallbacks
+//!   when config does not supply a base URL/key; config wins.
+//!
+//! `KANBEI_YOLO` and `KANBEI_PROVIDER_MODEL` are intentionally GONE (decision
+//! 28): approval policy (`approval.yolo`/`auto_approve`) and the model
+//! (`provider.model`) are config fields now, so a repo's config layer cannot
+//! be silently overridden by env. `fs_root` is the session dir.
 //!
 //! The REPL reads one user message per line and drives the resulting wakes
 //! to quiescence: the model's final answer is printed to stdout; intermediate
@@ -189,6 +197,11 @@ fn parse_protocol(protocol: Option<&str>) -> WireProtocol {
 /// stdin prompt or the TUI's cross-thread rendezvous).
 struct CliSettings {
     interactive: Option<ApprovalResolver>,
+    /// The yolo session identity, minted ONCE per source (F10 idempotency) so
+    /// repeated resolves return identical values; the broker is
+    /// deterministically rebuilt from it on each resolve (a `Broker` is not
+    /// `Clone`, but its grants/templates derive only from the id).
+    yolo: std::sync::OnceLock<Id128>,
 }
 
 impl SettingsSource for CliSettings {
@@ -203,11 +216,23 @@ impl SettingsSource for CliSettings {
             // The scripted one-shot engine for smoke runs.
             (Some(Box::new(RepeatedEngine::fake())), None)
         } else if let Some(config) = bootstrap {
-            let protocol = parse_protocol(provider.and_then(|p| p.protocol.as_deref()));
-            (
-                Some(kanbei_provider::engine_for(&config, protocol)),
-                Some(config),
-            )
+            // F12: open-time key availability probe for a real engine. The
+            // scripted fake engine needs no key, so it is exempt. On failure
+            // the CLI degrades to a storage-only session (never fails open)
+            // and prints an actionable, secret-free line.
+            if let Err(e) = config.key.probe(&config.provider) {
+                eprintln!(
+                    "kanbei: provider key unavailable ({e}); \
+                     starting storage-only — the session runs without model calls"
+                );
+                (None, None)
+            } else {
+                let protocol = parse_protocol(provider.and_then(|p| p.protocol.as_deref()));
+                (
+                    Some(kanbei_provider::engine_for(&config, protocol)),
+                    Some(config),
+                )
+            }
         } else {
             (None, None)
         };
@@ -216,7 +241,7 @@ impl SettingsSource for CliSettings {
         let yolo = approval.and_then(|a| a.yolo).unwrap_or(false);
         let auto = yolo || approval.and_then(|a| a.auto_approve).unwrap_or(false);
         let (broker, session_id) = if yolo {
-            let id = Id128::generate();
+            let id = *self.yolo.get_or_init(Id128::generate);
             (Some(yolo_broker(id)), Some(id))
         } else {
             (None, None)
@@ -417,15 +442,17 @@ fn yolo_broker(session_id: Id128) -> Broker {
 
 /// Discovers the desired-state config layers for the session dir. A discovery
 /// failure (a user/project config file that exists but cannot be read) must
-/// not abort startup: surface an actionable line and degrade to built-in-only
-/// layers. Safe mode remains the activation-failure path (a syntactically
-/// broken file is read, then fails to activate).
-fn discover_config_layers_or_default(dir: &Path) -> Vec<PackageManifest> {
+/// not abort startup: surface an actionable line, degrade to built-in-only
+/// layers, and hand the reason to `Session::open` so it lands as a canonical
+/// `safe_mode_activated` fact (F14). Safe mode remains the activation-failure
+/// path (a syntactically broken file is read, then fails to activate).
+fn discover_config_layers_or_default(dir: &Path) -> (Vec<PackageManifest>, Option<String>) {
     match kanbei_session::discover_config_layers(dir) {
-        Ok(layers) => layers,
+        Ok(layers) => (layers, None),
         Err(e) => {
-            eprintln!("kanbei: {e}; falling back to built-in config defaults");
-            vec![kanbei_session::builtin_config_manifest()]
+            let reason = e.to_string();
+            eprintln!("kanbei: {reason}; falling back to built-in config defaults");
+            (vec![kanbei_session::builtin_config_manifest()], Some(reason))
         }
     }
 }
@@ -433,14 +460,17 @@ fn discover_config_layers_or_default(dir: &Path) -> Vec<PackageManifest> {
 /// Piped-stdin path: the plain line REPL.
 fn run_repl(opts: Options) {
     let interactive: ApprovalResolver = Arc::new(interactive_approve);
+    let (config_layers, config_discovery_error) = discover_config_layers_or_default(&opts.dir);
     let session = match Session::open(SessionConfig {
         dir: opts.dir.clone(),
         stream: "cli".into(),
         engine: Some(cli_engine()),
         fs_root: opts.dir.clone(),
-        config_layers: discover_config_layers_or_default(&opts.dir),
+        config_layers,
+        config_discovery_error,
         settings: Some(Arc::new(CliSettings {
             interactive: Some(interactive),
+            yolo: Default::default(),
         })),
         ..Default::default()
     }) {
@@ -563,14 +593,17 @@ fn run_tui(opts: Options) -> i32 {
         reply_rx.recv().unwrap_or(false)
     });
     let cancel_cfg = cancel_flag.clone();
+    let (config_layers, config_discovery_error) = discover_config_layers_or_default(&opts.dir);
     let cfg = SessionConfig {
         dir: opts.dir.clone(),
         stream: "cli".into(),
         engine: Some(cli_engine()),
         fs_root: opts.dir.clone(),
-        config_layers: discover_config_layers_or_default(&opts.dir),
+        config_layers,
+        config_discovery_error,
         settings: Some(Arc::new(CliSettings {
             interactive: Some(interactive),
+            yolo: Default::default(),
         })),
         commit_listener: Some(Arc::new(move |env: &Envelope| {
             let _ = commit_tx.send(Evt::Envelope(env.clone()));
@@ -1209,9 +1242,12 @@ mod tests {
     /// and `yolo` to a broker + session id.
     #[test]
     fn cli_settings_resolves_config_driven_wiring() {
+        // SAFETY: unique env name, only read by this test's settings source.
+        unsafe { std::env::set_var("KANBEI_TEST_SETTINGS_PRESENT_KEY", "k") };
         let interactive: ApprovalResolver = Arc::new(|_| false);
         let source = CliSettings {
             interactive: Some(interactive),
+            yolo: Default::default(),
         };
         let fake: SettingsContribution =
             serde_json::from_str(r#"{"provider":{"fake":true}}"#).unwrap();
@@ -1220,7 +1256,7 @@ mod tests {
         assert!(resolved.provider.is_none());
 
         let http: SettingsContribution = serde_json::from_str(
-            r#"{"provider":{"base_url":"https://x","model":"m","protocol":"anthropic"}}"#,
+            r#"{"provider":{"base_url":"https://x","model":"m","protocol":"anthropic","key":{"Env":{"name":"KANBEI_TEST_SETTINGS_PRESENT_KEY"}}}}"#,
         )
         .unwrap();
         let resolved = source.resolve(&http);
@@ -1243,5 +1279,47 @@ mod tests {
             "the interactive resolver remains the fallback"
         );
         assert!(resolved.broker.is_none(), "no yolo → no broker override");
+    }
+
+    /// F10: yolo's session id (and therefore its broker) is minted once per
+    /// source, so repeated resolves agree.
+    #[test]
+    fn cli_settings_yolo_identity_is_idempotent() {
+        let source = CliSettings {
+            interactive: None,
+            yolo: Default::default(),
+        };
+        let yolo: SettingsContribution = serde_json::from_str(r#"{"approval":{"yolo":true}}"#).unwrap();
+        let first = source.resolve(&yolo);
+        let second = source.resolve(&yolo);
+        assert_eq!(
+            first.session_id, second.session_id,
+            "the yolo session id is cached"
+        );
+        assert_eq!(
+            first.broker.as_ref().map(|b| b.grants.len()),
+            second.broker.as_ref().map(|b| b.grants.len()),
+            "the broker is rebuilt deterministically from the cached id"
+        );
+    }
+
+    /// F12: a present-but-unresolvable key probe degrades to storage-only (no
+    /// engine) instead of failing open.
+    #[test]
+    fn cli_settings_probe_failure_is_storage_only() {
+        let source = CliSettings {
+            interactive: None,
+            yolo: Default::default(),
+        };
+        let http: SettingsContribution = serde_json::from_str(
+            r#"{"provider":{"base_url":"https://x","model":"m","key":{"Env":{"name":"KANBEI_TEST_SETTINGS_ABSENT_KEY"}}}}"#,
+        )
+        .unwrap();
+        let resolved = source.resolve(&http);
+        assert!(
+            resolved.provider_engine.is_none(),
+            "unavailable key → no provider engine"
+        );
+        assert!(resolved.provider.is_none());
     }
 }

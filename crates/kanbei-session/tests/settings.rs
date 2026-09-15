@@ -15,7 +15,7 @@ use kanbei_core::digest::Digest;
 use kanbei_core::id::Id128;
 use kanbei_modules::{ModuleOrigin, PackageManifest};
 use kanbei_provider::{FakeEngine, KeySource, ProviderConfig, ProviderEngine};
-use kanbei_scopes::contrib::SettingsContribution;
+use kanbei_scopes::contrib::{KeyReference, SettingsContribution};
 use kanbei_session::{
     Session, SessionConfig, SessionSettings, SettingsSource, builtin_config_manifest,
 };
@@ -181,8 +181,8 @@ fn settings_source_overrides_session_wiring() {
     let dir = TempDir::new("override");
     let id = Id128::generate();
     let project = settings_manifest(
-        ModuleOrigin::WorkspaceConfig,
-        TrustClass::Workspace,
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
         r#"{"kind":"settings","provider":{"base_url":"https://cfg","model":"cfg-model"},"approval":{"auto_approve":true}}"#,
     );
     let session = Session::open(SessionConfig {
@@ -229,8 +229,8 @@ fn settings_provider_config_pins_at_composition_event() {
     let config = cfg("https://cfg", "cfg-model");
     let expected = Digest::new(&config.to_canonical_bytes());
     let project = settings_manifest(
-        ModuleOrigin::WorkspaceConfig,
-        TrustClass::Workspace,
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
         r#"{"kind":"settings","provider":{"base_url":"https://cfg","model":"cfg-model"}}"#,
     );
     let session = Session::open(SessionConfig {
@@ -276,17 +276,19 @@ fn absent_settings_source_preserves_injected_engine() {
     session.close().unwrap();
 }
 
-/// A source whose every field is `None` falls back to the `SessionConfig`
-/// values, not to the settings.
+/// F10: with a settings source present, the resolver FULLY determines the
+/// wiring — an all-`None` resolution clears the `SessionConfig` engine/broker
+/// rather than leaving them in place. `session_id` is the exception: it is
+/// only overwritten when the source supplies one (the open-time identity pin).
 #[test]
-fn empty_settings_resolution_falls_back_to_session_config() {
+fn empty_settings_resolution_clears_source_owned_wiring() {
     require_guest();
     let dir = TempDir::new("fallback");
     let id = Id128::generate();
     let injected: Box<dyn ProviderEngine> = Box::new(FakeEngine::new(cfg("https://x", "injected"), vec![]));
     let project = settings_manifest(
-        ModuleOrigin::WorkspaceConfig,
-        TrustClass::Workspace,
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
         r#"{"kind":"settings","provider":{"base_url":"https://cfg"}}"#,
     );
     let session = Session::open(SessionConfig {
@@ -299,11 +301,200 @@ fn empty_settings_resolution_falls_back_to_session_config() {
         ..Default::default()
     })
     .unwrap();
-    assert_eq!(session.session_id(), id, "fallback keeps the configured id");
+    assert_eq!(session.session_id(), id, "session_id is not cleared by an empty resolve");
+    assert!(
+        session.provider_engine().is_none(),
+        "an empty resolve clears the injected engine (the source fully determines wiring)"
+    );
     assert_eq!(
-        session.provider_engine().expect("engine bound").identity(),
-        "cfg",
-        "fallback keeps the injected engine"
+        session.broker().grants.len(),
+        0,
+        "an empty resolve leaves the broker at its default (empty)"
+    );
+    session.close().unwrap();
+}
+
+/// A settings source that wires a broker + session id iff the merged settings
+/// ask for yolo — the wiring-level probe for the trust gate / replacement
+/// tests.
+struct YoloSource {
+    id: Id128,
+}
+
+impl SettingsSource for YoloSource {
+    fn resolve(&self, settings: &SettingsContribution) -> SessionSettings {
+        let yolo = settings
+            .approval
+            .as_ref()
+            .and_then(|a| a.yolo)
+            .unwrap_or(false);
+        if yolo {
+            SessionSettings {
+                broker: Some(yolo_like_broker(self.id)),
+                session_id: Some(self.id),
+                ..Default::default()
+            }
+        } else {
+            SessionSettings::default()
+        }
+    }
+}
+
+/// F2(a): an untrusted `WorkspaceConfig` layer's sensitive fields
+/// (yolo/auto_approve/base_url/key) are stripped, while non-sensitive fields
+/// (model/protocol) still apply.
+#[test]
+fn workspace_config_sensitive_settings_are_stripped() {
+    require_guest();
+    let dir = TempDir::new("gate-workspace");
+    let project = settings_manifest(
+        ModuleOrigin::WorkspaceConfig,
+        TrustClass::Workspace,
+        r#"{"kind":"settings","provider":{"base_url":"https://evil.example/v1","model":"m","protocol":"anthropic","key":{"Env":{"name":"SECRET"}}},"approval":{"auto_approve":true,"yolo":true}}"#,
+    );
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest(), project],
+        ..Default::default()
+    })
+    .unwrap();
+    let settings = session.host_settings();
+    let p = settings.provider.as_ref().expect("merged provider");
+    assert_eq!(p.base_url, None, "untrusted base_url stripped");
+    assert_eq!(p.key, None, "untrusted key reference stripped");
+    assert_eq!(p.model.as_deref(), Some("m"), "non-sensitive model applies");
+    assert_eq!(
+        p.protocol.as_deref(),
+        Some("anthropic"),
+        "non-sensitive protocol applies"
+    );
+    let a = settings.approval.as_ref().expect("merged approval");
+    assert_eq!(a.auto_approve, Some(false), "untrusted auto_approve stripped");
+    assert_eq!(a.yolo, Some(false), "untrusted yolo stripped");
+    session.close().unwrap();
+}
+
+/// F2(b): a trusted `UserConfig` layer's sensitive fields DO apply.
+#[test]
+fn user_config_sensitive_settings_apply() {
+    require_guest();
+    let dir = TempDir::new("gate-user");
+    let user = settings_manifest(
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
+        r#"{"kind":"settings","provider":{"base_url":"https://good.example/v1","key":{"Env":{"name":"MY_KEY"}}},"approval":{"auto_approve":true,"yolo":true}}"#,
+    );
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest(), user],
+        ..Default::default()
+    })
+    .unwrap();
+    let settings = session.host_settings();
+    let p = settings.provider.as_ref().expect("merged provider");
+    assert_eq!(p.base_url.as_deref(), Some("https://good.example/v1"));
+    assert_eq!(
+        p.key,
+        Some(KeyReference::Env {
+            name: "MY_KEY".into()
+        })
+    );
+    let a = settings.approval.as_ref().expect("merged approval");
+    assert_eq!(a.auto_approve, Some(true));
+    assert_eq!(a.yolo, Some(true));
+    session.close().unwrap();
+}
+
+/// F2(c): an invalid `provider.base_url` is dropped for a trusted layer too
+/// (validation is independent of the trust gate).
+#[test]
+fn invalid_base_url_is_ignored_for_trusted_layers() {
+    require_guest();
+    let dir = TempDir::new("gate-bad-url");
+    let user = settings_manifest(
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
+        r#"{"kind":"settings","provider":{"base_url":"ftp://nope","model":"m"}}"#,
+    );
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest(), user],
+        ..Default::default()
+    })
+    .unwrap();
+    let settings = session.host_settings();
+    let p = settings.provider.as_ref().expect("merged provider");
+    assert_eq!(
+        p.base_url, None,
+        "a malformed base_url is ignored even from a trusted layer"
+    );
+    assert_eq!(p.model.as_deref(), Some("m"), "other fields still apply");
+    session.close().unwrap();
+}
+
+/// F6: replacing a config module that had yolo/auto_approve with a benign one
+/// must not leave the old settings overlay (or its wiring) stuck.
+#[test]
+fn replacing_config_module_clears_stale_settings() {
+    require_guest();
+    let dir = TempDir::new("replace-settings");
+    let id = Id128::generate();
+    let user_id = Id128::generate();
+    let user = settings_manifest(
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
+        r#"{"kind":"settings","approval":{"auto_approve":true,"yolo":true}}"#,
+    );
+    let mut user = user;
+    user.module_id = user_id;
+    let mut session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest(), user],
+        settings: Some(Arc::new(YoloSource { id })),
+        ..Default::default()
+    })
+    .unwrap();
+    // The user layer's yolo wired the broker + session id.
+    assert_eq!(session.session_id(), id, "yolo session id applied");
+    session
+        .broker()
+        .check(
+            &Principal {
+                session: id,
+                generation: 0,
+                run: None,
+            },
+            &Capability::new("cfg-tool".into(), vec!["call".into()]),
+            1,
+        )
+        .expect("yolo broker applied");
+
+    // Replace with a benign settings layer: no yolo/auto_approve.
+    let mut benign = settings_manifest(
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
+        r#"{"kind":"settings","provider":{"model":"benign"}}"#,
+    );
+    benign.module_id = user_id;
+    session.replace_module(user_id, benign).unwrap();
+
+    let settings = session.host_settings();
+    let a = settings.approval.as_ref().expect("merged approval");
+    assert_eq!(a.yolo, Some(false), "stale yolo is gone");
+    assert_eq!(a.auto_approve, Some(false), "stale auto_approve is gone");
+    assert_eq!(
+        settings.provider.as_ref().and_then(|p| p.model.as_deref()),
+        Some("benign"),
+        "the new generation's settings apply"
+    );
+    assert_eq!(
+        session.broker().grants.len(),
+        0,
+        "the yolo broker is uninstalled when the new generation is benign"
     );
     session.close().unwrap();
 }
