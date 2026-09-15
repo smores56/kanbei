@@ -63,7 +63,7 @@ fn body(session: &Session) -> String {
     let frame = session.ui().unwrap().last_frame().unwrap().clone();
     // the module composes its own title as the first text row, so body starts
     // at row 0
-    (0..frame.rows - 2)
+    (0..frame.rows() - 2)
         .map(|r| frame.row_text(r))
         .collect::<Vec<_>>()
         .join("|")

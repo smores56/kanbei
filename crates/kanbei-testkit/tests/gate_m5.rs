@@ -45,8 +45,8 @@ fn tempdir(tag: &str) -> PathBuf {
     dir
 }
 
-fn input_row(frame: &kanbei_ui::TerminalFrame) -> String {
-    frame.row_text(frame.rows - 1)
+fn input_row(frame: &kanbei_ui::RenderOutput) -> String {
+    frame.row_text(frame.rows() - 1)
 }
 
 fn open(tag: &str) -> (PathBuf, Session) {
@@ -291,7 +291,7 @@ fn runtime_component_fault_degrades() {
     session.ui_render_frame().unwrap();
     assert!(session.ui().unwrap().degraded, "invalid tree degrades the module");
     let frame = session.ui().unwrap().last_frame().unwrap().clone();
-    let body: String = (1..frame.rows - 2)
+    let body: String = (1..frame.rows() - 2)
         .map(|r| frame.row_text(r))
         .collect::<Vec<_>>()
         .join("|");

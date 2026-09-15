@@ -42,8 +42,7 @@ use kanbei_ui::frame::{RenderContext, render};
 use kanbei_ui::input::{InputDecoder, InputEvent, UiEvent, UiEventKind};
 use kanbei_ui::theme::Theme;
 use kanbei_ui::tree::{NodeKind, SemanticTree};
-use kanbei_ui::diff::{FrameDiff, apply, paint_full};
-use kanbei_ui::{Terminal, TerminalFrame};
+use kanbei_ui::{RenderOutput, Terminal};
 use serde_json::{Value, json};
 
 use crate::{FaultPoint, NewEvent, Session, SessionError};
@@ -182,8 +181,7 @@ pub struct UiHost {
     /// The composed synthetic tree (or the kernel fallback tree in safe
     /// mode).
     last_tree: Option<SemanticTree>,
-    last_frame: Option<TerminalFrame>,
-    last_diff: FrameDiff,
+    last_frame: Option<RenderOutput>,
     size: (u16, u16),
     pub viewport_top: usize,
     pub last_status: String,
@@ -220,7 +218,6 @@ impl UiHost {
             theme,
             last_tree: None,
             last_frame: None,
-            last_diff: FrameDiff::default(),
             size: (24, 80),
             viewport_top: 0,
             last_status: "idle".to_string(),
@@ -247,12 +244,9 @@ impl UiHost {
         self.last_tree.as_ref()
     }
 
-    pub fn last_frame(&self) -> Option<&TerminalFrame> {
+    /// The last rendered surface (the kernel's canonical render output).
+    pub fn last_frame(&self) -> Option<&RenderOutput> {
         self.last_frame.as_ref()
-    }
-
-    pub fn last_diff(&self) -> &FrameDiff {
-        &self.last_diff
     }
 }
 
@@ -897,9 +891,8 @@ impl Session {
         Ok(applied)
     }
 
-    /// Re-render the composite of the mount trees into a frame + diff
-    /// against the last frame (kernel-owned rendering; the modules produced
-    /// only tree data).
+    /// Re-render the composite of the mount trees into the canonical render
+    /// surface (kernel-owned rendering; the modules produced only tree data).
     pub fn ui_render_frame(&mut self) -> Result<(), SessionError> {
         let safe_mode = self.ui_host.as_ref().map(|h| h.safe_mode).unwrap_or(true);
         let tree = if safe_mode {
@@ -938,14 +931,9 @@ impl Session {
             degraded: host.degraded,
         };
         let output = render(&ctx).map_err(|e| SessionError::InvalidInput(e.to_string()))?;
-        let diff = match &host.last_frame {
-            Some(prev) => kanbei_ui::diff::diff(prev, &output.frame),
-            None => FrameDiff::default(),
-        };
-        host.last_diff = diff;
-        host.last_frame = Some(output.frame);
         host.viewport_top = output.viewport_top;
         host.focus.viewport_top = output.viewport_top;
+        host.last_frame = Some(output);
         Ok(())
     }
 
@@ -1092,33 +1080,32 @@ impl Session {
         Ok(())
     }
 
-    /// Present the pending frame to a terminal: repaint on size change or
-    /// explicit repaint, else write only the diff (kernel render diffing).
-    /// A write failure is a kernel render fault: the kernel fallback UI is
-    /// rendered instead (R-27 fault class 3).
+    /// Present the last rendered surface to the kernel terminal boundary.
+    /// `ui_present` owns the terminal: it takes the kernel fd boundary and
+    /// paints the session's canonical [`RenderOutput`] through ratatui's
+    /// diffing engine (no hand-rolled cell diff, no terminal-side session
+    /// state). A write failure is a kernel render fault: the kernel fallback
+    /// UI is rendered and presented instead (R-27 fault class 3).
     pub fn ui_present(&mut self, terminal: &mut dyn Terminal) -> io::Result<()> {
-        let Some(host) = self.ui_host.as_mut() else {
-            return Ok(());
-        };
-        let size = terminal.size()?;
-        let resized = size != host.size;
-        if resized {
-            host.size = size;
+        match self.ui_host.as_mut() {
+            Some(host) => {
+                let size = terminal.size()?;
+                if size != host.size {
+                    host.size = size;
+                }
+            }
+            None => return Ok(()),
         }
-        let repaint = resized || host.last_frame.is_none();
         self.ui_render_frame()
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let (frame, diff) = {
-            let host = self.ui_host.as_ref().expect("ui host present");
-            (host.last_frame.clone().expect("frame rendered"), host.last_diff.clone())
-        };
-        let theme = self.ui_host.as_ref().expect("ui host present").theme.clone();
-        let result = if repaint || diff.is_empty() {
-            paint_full(terminal, &frame, &theme)
-        } else {
-            apply(terminal, &diff, &theme)
-        };
-        if let Err(e) = result {
+        let frame = self
+            .ui_host
+            .as_ref()
+            .expect("ui host present")
+            .last_frame
+            .clone()
+            .expect("frame rendered");
+        if let Err(e) = frame.present(terminal) {
             // Kernel render fault: fall back to the kernel fallback UI.
             let host = self.ui_host.as_mut().expect("ui host present");
             host.safe_mode = true;
@@ -1136,13 +1123,11 @@ impl Session {
                 degraded: false,
             };
             let output = render(&ctx).map_err(|e| io::Error::other(e.to_string()))?;
-            host.last_frame = Some(output.frame);
-            host.last_diff = FrameDiff::default();
-            paint_full(
-                terminal,
-                host.last_frame.as_ref().expect("fallback frame"),
-                &host.theme,
-            )?;
+            host.last_frame = Some(output);
+            host.last_frame
+                .as_ref()
+                .expect("fallback frame")
+                .present(terminal)?;
         }
         Ok(())
     }

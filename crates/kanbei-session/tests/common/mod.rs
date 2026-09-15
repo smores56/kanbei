@@ -178,6 +178,6 @@ pub fn has_user_message(dir: &PathBuf, text: &str) -> bool {
 }
 
 /// The visible text of one frame row (test helper).
-pub fn input_row(frame: &kanbei_ui::TerminalFrame) -> String {
-    frame.row_text(frame.rows - 1)
+pub fn input_row(frame: &kanbei_ui::RenderOutput) -> String {
+    frame.row_text(frame.rows() - 1)
 }

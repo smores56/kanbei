@@ -66,7 +66,7 @@ end
 /// The visible body text of the last rendered frame.
 fn body(session: &Session) -> String {
     let frame = session.ui().unwrap().last_frame().unwrap().clone();
-    (0..frame.rows - 2)
+    (0..frame.rows() - 2)
         .map(|r| frame.row_text(r))
         .collect::<Vec<_>>()
         .join("|")

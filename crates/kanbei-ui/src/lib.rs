@@ -4,10 +4,10 @@
 //! `fallback`.
 //!
 //! Structural guarantee (consistency 13, "Hot path"): this crate has **no**
-//! dependency on kanbei-vm or kanbei-modules. Terminal-cell rendering, input
-//! decoding/sanitization, focus/modal invariants, accessibility validation,
-//! and render diffing are pure Rust; Luau/Wasm produces only `SemanticTree`
-//! data and never draws terminal cells (R-27).
+//! dependency on kanbei-vm or kanbei-modules. ratatui-backed rendering, input
+//! decoding/sanitization, focus/modal invariants, and accessibility validation
+//! are pure Rust; Luau/Wasm produces only `SemanticTree` data and never draws
+//! terminal cells (R-27).
 //!
 //! Fault-class split (R-27): composition-validation failure is surfaced as a
 //! staleness banner (a kernel overlay, see [`frame`]); a runtime component
@@ -17,7 +17,6 @@
 
 pub mod accessibility;
 pub mod builtin;
-pub mod diff;
 pub mod fallback;
 pub mod focus;
 pub mod frame;
@@ -29,9 +28,8 @@ pub mod tree;
 pub mod tui;
 
 pub use builtin::{BUILTIN_UI_COMPONENT, BUILTIN_UI_NAME, BUILTIN_UI_SOURCE};
-pub use diff::{CellEdit, FrameDiff};
 pub use focus::{FocusDirection, FocusModel, KeyClassifier, ReservedAction};
-pub use frame::{RenderContext, RenderError, RenderOutput, TerminalFrame};
+pub use frame::{RenderContext, RenderError, RenderOutput};
 pub use input::{InputDecoder, InputEvent, UiEvent, UiEventKind, UiProvenance};
 pub use terminal::{Terminal, TerminalGuard, TermiosTerminal};
 pub use theme::{Color, Style, Theme};

@@ -9,13 +9,19 @@
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
+use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
+use ratatui::buffer::Cell as BufferCell;
+use ratatui::layout::{Position, Size};
+use ratatui::Terminal as RatatuiTerminal;
 use rustix::fs::{Mode, OFlags};
 use rustix::io as rio;
 use rustix::pty::{OpenptFlags, openpt, ptsname, unlockpt};
 use rustix::termios::{OptionalActions, Termios, isatty, tcgetattr, tcgetwinsize, tcsetattr};
 
+use crate::frame::RenderOutput;
+
 /// The kernel's terminal abstraction. Implementations are hot-path pieces:
-/// cell writes are buffered by the caller's diff/paint paths and flushed by
+/// ratatui's diff output is buffered by the presenter and flushed by
 /// [`Terminal::flush`].
 pub trait Terminal {
     fn size(&mut self) -> io::Result<(u16, u16)>;
@@ -146,6 +152,95 @@ impl Drop for TerminalGuard<'_> {
             let _ = self.term.restore();
         }
     }
+}
+
+/// Adapter presenting the kernel [`Terminal`] as an `io::Write` sink for
+/// ratatui's crossterm backend.
+struct Sink<'a>(&'a mut dyn Terminal);
+
+impl io::Write for Sink<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// A ratatui backend over the kernel terminal boundary. ANSI encoding is
+/// delegated to ratatui's crossterm backend; the size is the kernel fd's, not
+/// crossterm's process-global tty query, so the fd-scoped hermetic boundary
+/// (and its tests) keep working.
+struct KernelBackend<'a> {
+    inner: CrosstermBackend<Sink<'a>>,
+    size: Size,
+}
+
+impl Backend for KernelBackend<'_> {
+    type Error = io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a BufferCell)>,
+    {
+        self.inner.draw(content)
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        Ok(self.size)
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        Ok(WindowSize {
+            columns_rows: self.size,
+            pixels: Size::new(0, 0),
+        })
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Paint a kernel frame through ratatui's diffing engine over the kernel
+/// terminal boundary. A fresh [`Terminal`] each call compares the frame
+/// against a blank previous buffer, so it repaints the visible cells (the
+/// kernel keeps no terminal-side diff state across presents).
+pub fn present(terminal: &mut dyn Terminal, frame: &RenderOutput) -> io::Result<()> {
+    let backend = KernelBackend {
+        inner: CrosstermBackend::new(Sink(terminal)),
+        size: Size::new(frame.cols(), frame.rows()),
+    };
+    let mut term = RatatuiTerminal::new(backend)?;
+    term.current_buffer_mut().merge(&frame.buffer);
+    term.apply_buffer()?;
+    Ok(())
 }
 
 /// Open a fresh pseudo-terminal pair `(master, slave)` for hermetic terminal

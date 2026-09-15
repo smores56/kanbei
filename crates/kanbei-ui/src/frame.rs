@@ -1,95 +1,22 @@
-//! Kernel-owned rendering: `SemanticTree + Theme -> TerminalFrame`
+//! Kernel-owned rendering: `SemanticTree + Theme -> ratatui::Buffer`
 //! (architecture.md UI model). The layout is deterministic and module-free:
 //! banner/header rows on top, body in the middle, kernel status bar and the
 //! focused input line at the bottom. Luau/Wasm never draws cells (R-27,
 //! consistency 13).
 
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color as RColor, Style as RStyle};
+use ratatui::text::{Line, Span};
+
 use crate::focus::FocusModel;
 use crate::theme::{DEFAULT_STYLE, Theme};
 use crate::tree::{Node, NodeKind, SemanticTree};
+use crate::tui::resolve_style;
 
 /// Minimum terminal rows for a usable frame: banner/header + body + status +
 /// input.
 pub const MIN_ROWS: usize = 4;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Cell {
-    pub ch: char,
-    pub style: String,
-}
-
-impl Cell {
-    pub fn blank() -> Self {
-        Cell {
-            ch: ' ',
-            style: DEFAULT_STYLE.to_string(),
-        }
-    }
-
-    pub fn is_blank(&self) -> bool {
-        self.ch == ' ' && self.style == DEFAULT_STYLE
-    }
-}
-
-/// A full snapshot of the terminal surface (immutable; hot paths consume
-/// these, consistency 13).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalFrame {
-    pub rows: u16,
-    pub cols: u16,
-    pub cells: Vec<Cell>,
-}
-
-impl TerminalFrame {
-    pub fn blank(rows: u16, cols: u16) -> Self {
-        TerminalFrame {
-            rows,
-            cols,
-            cells: vec![Cell::blank(); rows as usize * cols as usize],
-        }
-    }
-
-    pub fn cell(&self, row: u16, col: u16) -> &Cell {
-        &self.cells[row as usize * self.cols as usize + col as usize]
-    }
-
-    pub fn set(&mut self, row: u16, col: u16, ch: char, style: &str) {
-        let idx = row as usize * self.cols as usize + col as usize;
-        self.cells[idx] = Cell {
-            ch,
-            style: style.to_string(),
-        };
-    }
-
-    /// The visible text of one row (test helper).
-    pub fn row_text(&self, row: u16) -> String {
-        (0..self.cols)
-            .map(|c| self.cell(row, c).ch)
-            .collect::<String>()
-            .trim_end()
-            .to_string()
-    }
-
-    pub fn write_line(&mut self, row: u16, text: &str, style: &str, focused: bool) {
-        let style = if focused { "selected" } else { style };
-        let cols = self.cols as usize;
-        for (i, ch) in text.chars().take(cols).enumerate() {
-            let ch = if ch.is_control() { ' ' } else { ch };
-            self.set(row, i as u16, ch, style);
-        }
-    }
-
-    /// Write one pre-wrapped row of per-character styles; a focused row is
-    /// drawn uniformly in reverse video (the kernel's focus highlight).
-    pub fn write_chars(&mut self, row: u16, chars: &[(char, String)], focused: bool) {
-        let cols = self.cols as usize;
-        for (i, (ch, style)) in chars.iter().take(cols).enumerate() {
-            let ch = if ch.is_control() { ' ' } else { *ch };
-            let style = if focused { "selected" } else { style.as_str() };
-            self.set(row, i as u16, ch, style);
-        }
-    }
-}
 
 /// Everything the renderer needs. Status/staleness/degraded are kernel-owned
 /// overlays; the tree and focus come from the module-facing side.
@@ -105,12 +32,58 @@ pub struct RenderContext<'a> {
     pub degraded: bool,
 }
 
-/// The rendered frame plus the viewport top the renderer actually used
-/// (focus-follow may move it; the caller stores it back into the focus
-/// model).
+/// The kernel's rendered surface: the ratatui [`Buffer`] it composed plus the
+/// viewport top the body scrolled to (the caller stores it back into the focus
+/// model). Cells carry final, theme-resolved styles — no style keys survive
+/// the render — so the present path paints the buffer as-is.
+#[derive(Debug, Clone)]
 pub struct RenderOutput {
-    pub frame: TerminalFrame,
+    pub buffer: Buffer,
     pub viewport_top: usize,
+}
+
+impl RenderOutput {
+    pub fn rows(&self) -> u16 {
+        self.buffer.area.height
+    }
+
+    pub fn cols(&self) -> u16 {
+        self.buffer.area.width
+    }
+
+    /// The visible text of one row (inspection/test helper).
+    pub fn row_text(&self, row: u16) -> String {
+        (0..self.buffer.area.width)
+            .map(|col| {
+                self.buffer[(col, row)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+            })
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// The resolved style of one cell (inspection/test helper). Reset
+    /// channels stay unset, matching [`resolve_style`]'s output.
+    pub fn cell_style(&self, row: u16, col: u16) -> RStyle {
+        let cell = &self.buffer[(col, row)];
+        let mut style = RStyle::default().add_modifier(cell.modifier);
+        if cell.fg != RColor::Reset {
+            style = style.fg(cell.fg);
+        }
+        if cell.bg != RColor::Reset {
+            style = style.bg(cell.bg);
+        }
+        style
+    }
+
+    /// Paint this frame through the kernel terminal boundary (ratatui diffing).
+    pub fn present(&self, terminal: &mut dyn crate::terminal::Terminal) -> std::io::Result<()> {
+        crate::terminal::present(terminal, self)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -126,13 +99,16 @@ pub struct BodyLine<'a> {
     pub spans: Vec<(String, String)>,
 }
 
-/// Render the tree into cells. Layout (top to bottom):
+/// Render the tree into a ratatui [`Buffer`]. Layout (top to bottom):
 /// 1. staleness banner (when present), then the first header node;
 /// 2. body: depth-first lines (list items, text wrapped to the width, status
 ///    and button nodes); scrolled so the focused node stays visible;
 /// 3. kernel status bar;
 /// 4. the input line: `> ` + focused input content with the caret drawn in
 ///    reverse video.
+///
+/// Styles are resolved through the theme here, so every cell carries its final
+/// ratatui style and the present path paints the buffer as-is.
 pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
     let (rows, cols) = ctx.size;
     let rows = rows as usize;
@@ -140,13 +116,15 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
     if rows < MIN_ROWS {
         return Err(RenderError::TooSmall { rows: rows as u16 });
     }
-    let mut frame = TerminalFrame::blank(ctx.size.0, ctx.size.1);
+    let mut buf = Buffer::empty(Rect::new(0, 0, cols as u16, rows as u16));
+    let theme = ctx.theme;
 
     // 1. banner row. There is no header kind: a module composes its title as
     // the first `text` row of the body, so titled workbenches occupy the same
     // top row they did when the kernel special-cased headers.
     if let Some(reason) = ctx.staleness {
-        frame.write_line(0, &crate::fallback::staleness_text(reason), "banner", false);
+        let line = plain_line(theme, &crate::fallback::staleness_text(reason), "banner", cols);
+        paint_line(&mut buf, 0, &line, cols as u16);
     }
     let body_start = if ctx.staleness.is_some() { 1 } else { 0 };
 
@@ -190,7 +168,8 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
             if r >= body_start + body_rows {
                 break;
             }
-            frame.write_chars(r as u16, chars, focused);
+            let line = body_line(theme, chars, focused);
+            paint_line(&mut buf, r as u16, &line, cols as u16);
         }
         row += segs.len();
         if row >= body_start + body_rows {
@@ -200,7 +179,8 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
 
     // Status bar.
     let status_row = rows - 2;
-    frame.write_line(status_row as u16, &status.chars().take(cols).collect::<String>(), "status", false);
+    let line = plain_line(theme, &status, "status", cols);
+    paint_line(&mut buf, status_row as u16, &line, cols as u16);
 
     // Input line with caret.
     let input_row = rows - 1;
@@ -209,7 +189,8 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
         input_text.push_str(&node.content());
     }
     let input_text: String = input_text.chars().take(cols).collect();
-    frame.write_line(input_row as u16, &input_text, "input", false);
+    let line = plain_line(theme, &input_text, "input", cols);
+    paint_line(&mut buf, input_row as u16, &line, cols as u16);
     // Caret: reverse-video at the caret offset into the prompt+content
     // (prompt is the 2-char "> " prefix), clamped to the visible text.
     let caret = match &input_node {
@@ -220,13 +201,79 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
     if let Some(ch) = input_text.chars().nth(caret)
         && ch != ' '
     {
-        frame.set(input_row as u16, caret as u16, ch, "selected");
+        let cell = &mut buf[(caret as u16, input_row as u16)];
+        // The old cell writer placed the raw char (even a control) and merely
+        // restyled the cell, so mirror that rather than the sanitized run.
+        cell.set_char(ch);
+        cell.set_style(resolve_style(theme, Some("selected")));
     }
 
     Ok(RenderOutput {
-        frame,
+        buffer: buf,
         viewport_top: top,
     })
+}
+
+/// The frame contract is one visible cell per char and controls are never
+/// emitted, so sanitize control characters up front.
+fn sanitize(ch: char) -> char {
+    if ch.is_control() { ' ' } else { ch }
+}
+
+/// Paint a line one char per cell, bounded by `cols`. ratatui's own line
+/// painting uses grapheme widths (a wide char would consume two cells and a
+/// zero-width mark one), which would shift text against the frame contract's
+/// one cell per char; the contract wins, so cells are set directly.
+fn paint_line(buf: &mut Buffer, row: u16, line: &Line<'_>, cols: u16) {
+    let mut x = 0u16;
+    'spans: for span in &line.spans {
+        for ch in span.content.chars() {
+            if x >= cols {
+                break 'spans;
+            }
+            let cell = &mut buf[(x, row)];
+            cell.set_char(ch);
+            cell.set_style(span.style);
+            x += 1;
+        }
+    }
+}
+
+/// A single-style line, truncated to `cols`, with the named theme style.
+fn plain_line(theme: &Theme, text: &str, name: &str, cols: usize) -> Line<'static> {
+    let text: String = text.chars().take(cols).map(sanitize).collect();
+    Line::from(Span::styled(text, resolve_style(theme, Some(name))))
+}
+
+/// A pre-wrapped body row: one span per run of equal style; a focused row is
+/// uniformly reverse video (the kernel's focus highlight).
+fn body_line(theme: &Theme, chars: &[(char, String)], focused: bool) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut text = String::new();
+    let mut run: Option<&str> = None;
+    for (ch, name) in chars {
+        let name = if focused { "selected" } else { name.as_str() };
+        if run != Some(name) {
+            push_run(&mut spans, theme, &mut text, run);
+            run = Some(name);
+        }
+        text.push(sanitize(*ch));
+    }
+    push_run(&mut spans, theme, &mut text, run);
+    Line::from(spans)
+}
+
+fn push_run(
+    spans: &mut Vec<Span<'static>>,
+    theme: &Theme,
+    text: &mut String,
+    name: Option<&str>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let style = resolve_style(theme, Some(name.unwrap_or(DEFAULT_STYLE)));
+    spans.push(Span::styled(std::mem::take(text), style));
 }
 
 /// Depth-first body lines. Layout kinds recurse (siblings in ascending z
@@ -427,15 +474,16 @@ mod tests {
         let mut f = FocusModel::new();
         f.revalidate(&t);
         f.caret = 1;
-        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
-        assert_eq!(out.frame.row_text(0), "kanbei");
-        assert_eq!(out.frame.row_text(1), "first");
-        assert_eq!(out.frame.row_text(2), "second");
-        assert_eq!(out.frame.row_text(8), "idle");
-        assert_eq!(out.frame.row_text(9), "> hi");
-        // caret at offset 1 is reverse-video
-        assert_eq!(out.frame.cell(9, 3).style, "selected");
-        assert_eq!(out.frame.cell(9, 2).style, "input");
+        let theme = Theme::default_theme();
+        let out = render(&ctx(&t, &f, "idle", &theme)).unwrap();
+        assert_eq!(out.row_text(0), "kanbei");
+        assert_eq!(out.row_text(1), "first");
+        assert_eq!(out.row_text(2), "second");
+        assert_eq!(out.row_text(8), "idle");
+        assert_eq!(out.row_text(9), "> hi");
+        // caret at offset 1 is reverse-video; the prompt cell is the input style
+        assert_eq!(out.cell_style(9, 3), resolve_style(&theme, Some("selected")));
+        assert_eq!(out.cell_style(9, 2), resolve_style(&theme, Some("input")));
     }
 
     #[test]
@@ -448,11 +496,11 @@ mod tests {
         c.staleness = Some("publish failed");
         c.degraded = true;
         let out = render(&c).unwrap();
-        assert!(out.frame.row_text(0).starts_with("composition stale"));
-        assert_eq!(out.frame.row_text(1), "kanbei");
-        assert!(out.frame.row_text(8).contains("idle"));
-        assert!(out.frame.row_text(8).contains("[degraded]"));
-        assert!(out.frame.row_text(8).contains("[stale]"));
+        assert!(out.row_text(0).starts_with("composition stale"));
+        assert_eq!(out.row_text(1), "kanbei");
+        assert!(out.row_text(8).contains("idle"));
+        assert!(out.row_text(8).contains("[degraded]"));
+        assert!(out.row_text(8).contains("[stale]"));
     }
 
     #[test]
@@ -468,7 +516,7 @@ mod tests {
         f.focused = Some("top".into());
         let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
         assert_eq!(out.viewport_top, 0);
-        assert_eq!(out.frame.row_text(0), "line one, far above");
+        assert_eq!(out.row_text(0), "line one, far above");
     }
 
     #[test]
@@ -477,9 +525,9 @@ mod tests {
         let f = FocusModel::new();
         let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
         // 10 rows: body(8) + status + input; all 3 body lines fit
-        assert_eq!(out.frame.row_text(0), "kanbei");
-        assert_eq!(out.frame.row_text(1), "first");
-        assert_eq!(out.frame.row_text(2), "second");
+        assert_eq!(out.row_text(0), "kanbei");
+        assert_eq!(out.row_text(1), "first");
+        assert_eq!(out.row_text(2), "second");
     }
 
     #[test]
@@ -490,8 +538,8 @@ mod tests {
         )));
         let f = FocusModel::new();
         let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
-        assert_eq!(out.frame.row_text(0), "0123456789 012345678");
-        assert_eq!(out.frame.row_text(1), "9, wrapped tail");
+        assert_eq!(out.row_text(0), "0123456789 012345678");
+        assert_eq!(out.row_text(1), "9, wrapped tail");
     }
 
     #[test]
@@ -503,8 +551,8 @@ mod tests {
         );
         let f = FocusModel::new();
         let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
-        assert_eq!(out.frame.row_text(0), "low");
-        assert_eq!(out.frame.row_text(1), "high");
+        assert_eq!(out.row_text(0), "low");
+        assert_eq!(out.row_text(1), "high");
     }
 
     #[test]
@@ -519,11 +567,15 @@ mod tests {
             )),
         );
         let f = FocusModel::new();
-        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
-        assert_eq!(out.frame.row_text(0), "abcd");
-        assert_eq!(out.frame.cell(0, 0).style, "user");
-        assert_eq!(out.frame.cell(0, 1).style, "user");
-        assert_eq!(out.frame.cell(0, 2).style, DEFAULT_STYLE);
+        let theme = Theme::default_theme();
+        let out = render(&ctx(&t, &f, "idle", &theme)).unwrap();
+        assert_eq!(out.row_text(0), "abcd");
+        assert_eq!(out.cell_style(0, 0), resolve_style(&theme, Some("user")));
+        assert_eq!(out.cell_style(0, 1), resolve_style(&theme, Some("user")));
+        assert_eq!(
+            out.cell_style(0, 2),
+            resolve_style(&theme, Some(DEFAULT_STYLE))
+        );
     }
 
     #[test]
@@ -537,8 +589,8 @@ mod tests {
         );
         let f = FocusModel::new();
         let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
-        assert_eq!(out.frame.row_text(0), "left right");
-        assert_eq!(out.frame.row_text(1), "", "row consumes a single band");
+        assert_eq!(out.row_text(0), "left right");
+        assert_eq!(out.row_text(1), "", "row consumes a single band");
 
         // `col` stays vertical (the old row==col aliasing is gone).
         let t = SemanticTree::new(
@@ -549,8 +601,8 @@ mod tests {
             ),
         );
         let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
-        assert_eq!(out.frame.row_text(0), "left");
-        assert_eq!(out.frame.row_text(1), "right");
+        assert_eq!(out.row_text(0), "left");
+        assert_eq!(out.row_text(1), "right");
     }
 
     #[test]
@@ -571,8 +623,8 @@ mod tests {
         );
         let f = FocusModel::new();
         let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
-        assert_eq!(out.frame.row_text(0), "A B1");
-        assert_eq!(out.frame.row_text(1), "  B2", "the column offset is kept");
+        assert_eq!(out.row_text(0), "A B1");
+        assert_eq!(out.row_text(1), "  B2", "the column offset is kept");
     }
 
     #[test]
@@ -590,7 +642,7 @@ mod tests {
         let t = SemanticTree::new(Node::stack("root").child(Node::text("t", "a\tb")));
         let f = FocusModel::new();
         let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
-        assert_eq!(out.frame.row_text(0), "a b");
+        assert_eq!(out.row_text(0), "a b");
     }
 
     #[test]
@@ -598,14 +650,67 @@ mod tests {
         let p = fallback::placeholder_tree("workbench", "reduce failed");
         let f = FocusModel::new();
         let out = render(&ctx(&p, &f, "idle", &Theme::default_theme())).unwrap();
-        let body: String = (0..8).map(|r| out.frame.row_text(r)).collect::<Vec<_>>().join("|");
+        let body: String = (0..8).map(|r| out.row_text(r)).collect::<Vec<_>>().join("|");
         assert!(body.contains("UI component faulted"), "body: {body}");
         assert!(body.contains("reduce failed"), "body: {body}");
 
         let fb = fallback::FallbackUi::new("kernel render fault");
         let tree = fb.tree();
         let out = render(&ctx(&tree, &f, "safe mode", &Theme::default_theme())).unwrap();
-        assert_eq!(out.frame.row_text(0), "kanbei safe mode");
-        assert_eq!(out.frame.row_text(9), ">");
+        assert_eq!(out.row_text(0), "kanbei safe mode");
+        assert_eq!(out.row_text(9), ">");
+    }
+
+    /// Pin the whole visible frame the ratatui engine emits for a
+    /// representative tree, so the engine swap cannot drift.
+    #[test]
+    fn ratatui_engine_pins_visible_frame() {
+        let t = tree();
+        let mut f = FocusModel::new();
+        f.revalidate(&t);
+        f.caret = 1;
+        let theme = Theme::default_theme();
+        let out = render(&ctx(&t, &f, "idle", &theme)).unwrap();
+        let rows: Vec<String> = (0..10).map(|r| out.row_text(r)).collect();
+        assert_eq!(rows.join("|"), "kanbei|first|second||||||idle|> hi");
+        assert_eq!(out.viewport_top, 0);
+        assert_eq!(out.cell_style(9, 0), resolve_style(&theme, Some("input")));
+        assert_eq!(
+            out.cell_style(9, 3),
+            resolve_style(&theme, Some("selected"))
+        );
+    }
+
+    /// The render resolves theme keys at paint time: cells carry the theme's
+    /// final style (no style-key round-trip), including a re-themed caret.
+    #[test]
+    fn cells_carry_resolved_theme_styles() {
+        let t = tree();
+        let mut f = FocusModel::new();
+        f.revalidate(&t);
+        f.caret = 1;
+        let mut theme = Theme::default_theme();
+        theme.styles.insert(
+            "selected".into(),
+            crate::Style {
+                fg: crate::Color::Magenta,
+                bg: crate::Color::Default,
+                bold: false,
+                underline: false,
+                reverse: true,
+            },
+        );
+        let out = render(&ctx(&t, &f, "idle", &theme)).unwrap();
+        // The caret (offset 1 + two-char prompt) takes the re-themed style...
+        assert_eq!(
+            out.cell_style(9, 3),
+            resolve_style(&theme, Some("selected"))
+        );
+        // ...and the prompt keeps the input style.
+        assert_eq!(out.cell_style(9, 2), resolve_style(&theme, Some("input")));
+        assert_ne!(
+            out.cell_style(9, 3),
+            resolve_style(&Theme::default_theme(), Some("selected"))
+        );
     }
 }
