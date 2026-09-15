@@ -676,7 +676,7 @@ fn continue_from_records_live_config_digest() {
         dir: dir.path().to_path_buf(),
         memory_root: Some(memory_root),
         provider: Some(provider_cfg.clone()),
-        config: Some(config),
+        config_layers: vec![config],
         session_id: Some(session_id),
         engine: Some(no_epoch()),
         ..Default::default()

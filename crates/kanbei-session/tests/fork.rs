@@ -481,7 +481,7 @@ fn fork_with_config_activates_same_digest() {
         dir: dir.path().to_path_buf(),
         memory_root: Some(dir.path().join("memory")),
         session_id: Some(source_id),
-        config: Some(config),
+        config_layers: vec![config],
         engine: Some(no_epoch()),
         ..Default::default()
     })

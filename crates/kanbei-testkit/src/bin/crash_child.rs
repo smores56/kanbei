@@ -235,7 +235,7 @@ fn run_m2(dir: String, point: Option<FaultPoint>, after_acks: u64, events: u64, 
         stream: "crash-m2".into(),
         profile,
         fault: Some(injector),
-        config: Some(manifest),
+        config_layers: vec![manifest],
         // No fuel/epoch limits: the flow must not trap before the crash point.
         engine: Some(VmConfig {
             fuel_per_call: u64::MAX,

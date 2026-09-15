@@ -122,8 +122,11 @@ pub struct GuardContribution {
 
 /// A settings overlay: at most one effective entry per scope; later layers
 /// merge field-wise over earlier ones, so a partial layer never clobbers
-/// fields it does not set (R-19 layered/overlay semantics).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+/// fields it does not set (R-19 layered/overlay semantics). `Default` is the
+/// empty overlay (every field unset) — the settings a session reports when no
+/// layer contributed any.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
 pub struct SettingsContribution {
     pub provider: Option<ProviderSettings>,
     pub approval: Option<ApprovalSettings>,
@@ -131,7 +134,8 @@ pub struct SettingsContribution {
 
 /// Provider-side settings (R-19): every field is optional so a layer can
 /// override just the parts it owns.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
 pub struct ProviderSettings {
     pub base_url: Option<String>,
     pub model: Option<String>,
@@ -149,7 +153,8 @@ pub enum KeyReference {
 }
 
 /// Approval-policy settings (R-19).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
 pub struct ApprovalSettings {
     pub auto_approve: Option<bool>,
     pub yolo: Option<bool>,

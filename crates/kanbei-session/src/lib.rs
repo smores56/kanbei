@@ -64,6 +64,7 @@ use kanbei_policy::{PolicyPlugin, RetentionGate};
 use kanbei_scopes::epoch::{Composition, CompositionStore};
 use kanbei_scopes::registry::ContributionRegistry;
 use kanbei_scopes::scope_tree::ScopeTree;
+use kanbei_scopes::contrib::SettingsContribution;
 use kanbei_services::ServiceRegistry;
 use kanbei_snapshot::ExecutionManifest;
 use kanbei_vm::{GuestError, Vm};
@@ -77,11 +78,15 @@ mod ui;
 #[cfg(feature = "otel")]
 mod telemetry;
 mod branch;
+mod builtin_config;
 mod commit;
 mod elements;
 mod recovery;
 mod switch;
 use recovery::{decode_record, recover_or_fresh, shutdown_queue};
+pub use builtin_config::{
+    BUILTIN_CONFIG_SOURCE, builtin_config_manifest, builtin_config_module_id, root_scope,
+};
 pub use ui::{UiHost, UiIntent, UiOutcome, UI_INTENT_RESOURCE};
 
 /// The bounded recent-event ring size: the trajectory render covers the
@@ -118,15 +123,18 @@ pub struct SessionConfig {
     /// currently unused.
     pub object_min: usize,
     pub fault: Option<Arc<dyn FaultInjector>>,
-    /// Root config module to activate at open (R-01/C-02); None = no modules.
-    pub config: Option<PackageManifest>,
+    /// Root config layers to activate at open (R-01/C-02), ordered LOW→HIGH
+    /// precedence (built-in defaults, then user, then project). Empty = no
+    /// config generation. A failed non-builtin layer drops every non-builtin
+    /// layer and keeps the built-in generation active (safe mode, R-01/C-02).
+    pub config_layers: Vec<PackageManifest>,
     /// Module state-head size ceiling (R-07); default 1 MB.
     pub max_state_bytes: usize,
     /// Retention policy plugin; default [`StoreAllPolicy`].
     pub policy: Arc<dyn PolicyPlugin>,
     /// Wasm engine config; None = [`kanbei_vm::VmConfig::default`]. When the
     /// guest wasm is not built (`Vm::load` → `NotBuilt`), modules are
-    /// disabled (a `config` then opens in safe mode).
+    /// disabled (a config layer then opens in safe mode with no modules).
     pub engine: Option<kanbei_vm::VmConfig>,
     // --- M3 agent spine ---
     /// Provider gateway config; None = no model calls (storage-only session).
@@ -209,7 +217,7 @@ impl Default for SessionConfig {
             inline_max: 1024,
             object_min: 8192,
             fault: None,
-            config: None,
+            config_layers: Vec::new(),
             max_state_bytes: 1024 * 1024,
             policy: Arc::new(StoreAllPolicy),
             engine: None,
@@ -569,6 +577,10 @@ pub struct Session {
     /// The live config manifest, retained for `module reset-state`'s
     /// state-key binding (R-07/C-F1); None when no config activated.
     config_manifest: Option<PackageManifest>,
+    /// The merged settings snapshot captured after open activated the config
+    /// layers (decision 28). Stored, not resolved live, so it survives
+    /// generation teardown (safe mode reflects the built-in layer).
+    host_settings: SettingsContribution,
     /// The memory roots pinned by the checkpoint this branch continues from
     /// (wave 2 consumes them).
     pinned_roots: Option<PinnedRoots>,
@@ -601,10 +613,11 @@ impl Session {
     /// registry, the scope tree, the contribution registry, the composition
     /// store, the retention gate, and (when the guest wasm loads) the module
     /// manager with its own object-store handle over `<dir>/objects` and the
-    /// state store over `<dir>/state`. A `cfg.config` manifest is then
-    /// activated atomically; on any failure the module subsystem is dropped
-    /// and a canonical `safe_mode_activated` event is committed — the session
-    /// remains usable with storage only (R-01/C-02).
+    /// state store over `<dir>/state`. The `cfg.config_layers` generations are
+    /// then activated atomically LOW→HIGH; a failing non-builtin layer drops
+    /// the non-builtin generations, keeps the built-in one active, and commits
+    /// a canonical `safe_mode_activated` event — the session remains usable
+    /// (R-01/C-02, decision 28).
     pub fn open(mut cfg: SessionConfig) -> Result<Self, SessionError> {
         std::fs::create_dir_all(&cfg.dir)?;
         let log_path = cfg.dir.join("log.zst");
@@ -960,7 +973,7 @@ impl Session {
             return Err(err);
         }
 
-        let config_manifest = cfg.config.clone();
+        let config_layers = cfg.config_layers.clone();
         let mut session = Self {
             log,
             store,
@@ -1008,6 +1021,7 @@ impl Session {
             branch_records,
             config_digest: None,
             config_manifest: None,
+            host_settings: SettingsContribution::default(),
             pinned_roots: None,
             child_provider,
             #[cfg(feature = "otel")]
@@ -1030,24 +1044,10 @@ impl Session {
             session.run_auto_gc(&gc_cfg);
         }
 
-        // Root config module: atomic activation; failure → safe mode.
-        if let Some(manifest) = config_manifest
-            && let Err(e) = session.activate_config(manifest)
-        {
-            session.modules = None;
-            session.vm_engine_digest = None;
-            let reason = e.to_string();
-            session.commit(
-                vec![NewEvent {
-                    kind: "safe_mode_activated".into(),
-                    payload_schema: 1,
-                    payload: json!({ "reason": reason }),
-                    objects: Vec::new(),
-                    refs: Vec::new(),
-                }],
-                None,
-            )?;
-        }
+        // Root config layers (decision 28): activated LOW→HIGH. A failing
+        // non-builtin layer drops the non-builtin layers and keeps the
+        // built-in generation active in safe mode (R-01/C-02).
+        session.activate_config_layers(config_layers)?;
 
         // M4 recovery facts: commit the pending backlinks (R-11), then the
         // one-time canonical project binding (fresh logs only — the log
@@ -1436,6 +1436,14 @@ impl Session {
     /// field); None for storage-only sessions and safe-mode opens.
     pub fn config_digest(&self) -> Option<Digest> {
         self.config_digest
+    }
+
+    /// The merged settings the config layers contributed at open (decision 28),
+    /// snapshotted: it reflects the built-in layer in safe mode and is
+    /// `SettingsContribution::default()` when no layer contributed settings
+    /// (e.g. Wasm not built).
+    pub fn host_settings(&self) -> &SettingsContribution {
+        &self.host_settings
     }
 
     /// The session's own identity (caller principal for kernel-originated

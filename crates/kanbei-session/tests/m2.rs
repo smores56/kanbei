@@ -22,7 +22,10 @@ use kanbei_policy::{
 use kanbei_services::{
     ScopePath, ServiceContract, ServiceDependency, ServiceError, ServiceKey, ServiceProvider,
 };
-use kanbei_session::{FaultInjector, FaultPoint, NewEvent, Session, SessionConfig, SessionError};
+use kanbei_session::{
+    FaultInjector, FaultPoint, NewEvent, Session, SessionConfig, SessionError,
+    builtin_config_manifest,
+};
 use kanbei_snapshot::ExecutionManifest;
 use kanbei_vm::{GuestError, Vm, VmConfig};
 use serde_json::{Value, json};
@@ -98,6 +101,30 @@ fn manifest(id: Id128, source: &str, deps: Vec<ServiceDependency>) -> PackageMan
         deps,
         capabilities: vec![],
         source: source.to_string(),
+        state_schema: None,
+        state_key: None,
+    }
+}
+
+/// A settings-only config layer: `kb_on_activate` publishes one typed settings
+/// contribution. Used to exercise LOW→HIGH field-wise overlay merge.
+fn settings_manifest(
+    id: Id128,
+    origin: ModuleOrigin,
+    trust_class: TrustClass,
+    payload: &str,
+) -> PackageManifest {
+    PackageManifest {
+        schema: kanbei_modules::PACKAGE_SCHEMA,
+        module_id: id,
+        origin,
+        trust_class,
+        scope: root(),
+        deps: vec![],
+        capabilities: vec![],
+        source: format!(
+            "function kb_on_activate(ctx) ctx.contribution_publish('{payload}') end\nfunction kb_hot(x) return x end"
+        ),
         state_schema: None,
         state_key: None,
     }
@@ -205,7 +232,7 @@ fn activate_config_publishes_service_and_composition() {
     let session = Session::open(SessionConfig {
         dir: dir.path().to_path_buf(),
         engine: Some(no_epoch()),
-        config: Some(m.clone()),
+        config_layers: vec![m.clone()],
         ..Default::default()
     })
     .unwrap();
@@ -318,7 +345,7 @@ fn replace_module_swaps_generation_and_records_delta() {
     let mut session = Session::open(SessionConfig {
         dir: dir.path().to_path_buf(),
         engine: Some(no_epoch()),
-        config: Some(manifest(id, PUBLISHER, vec![])),
+        config_layers: vec![manifest(id, PUBLISHER, vec![])],
         ..Default::default()
     })
     .unwrap();
@@ -373,7 +400,7 @@ fn effect_dispatch_routes_to_provider_kb_hot() {
     let mut session = Session::open(SessionConfig {
         dir: dir.path().to_path_buf(),
         engine: Some(no_epoch()),
-        config: Some(manifest(id_prov, PUBLISHER, vec![])),
+        config_layers: vec![manifest(id_prov, PUBLISHER, vec![])],
         ..Default::default()
     })
     .unwrap();
@@ -414,7 +441,7 @@ fn module_state_cas_heads_and_fail_closed() {
         dir: dir.path().to_path_buf(),
         engine: Some(no_epoch()),
         max_state_bytes: 64,
-        config: Some(manifest(id, TRIVIAL, vec![])),
+        config_layers: vec![manifest(id, TRIVIAL, vec![])],
         ..Default::default()
     })
     .unwrap();
@@ -590,9 +617,9 @@ fn retain_candidate_drop_boundary_commits_fact() {
     session.close().unwrap();
 }
 
-/// (g) safe mode: a config manifest that fails activation opens the session
-/// with modules dropped and a canonical `safe_mode_activated` event on the
-/// log; the session remains usable with storage only (R-01/C-02).
+/// (g) safe mode: a config layer that fails activation opens the session with
+/// the built-in generation kept active and a canonical `safe_mode_activated`
+/// event on the log; the session remains usable (R-01/C-02, decision 28).
 #[test]
 fn invalid_config_opens_safe_mode() {
     require_guest();
@@ -601,22 +628,36 @@ fn invalid_config_opens_safe_mode() {
     let mut session = Session::open(SessionConfig {
         dir: dir.path().to_path_buf(),
         engine: Some(no_epoch()),
-        config: Some(manifest(id, "local x = = 1", vec![])),
+        config_layers: vec![manifest(id, "local x = = 1", vec![])],
         ..Default::default()
     })
     .unwrap();
-    assert!(session.modules().is_none());
-    assert_eq!(session.vm_engine_digest(), None);
-    // the session remains usable with storage only
+    assert!(session.modules().is_some(), "safe mode keeps modules enabled");
+    assert!(session.vm_engine_digest().is_some());
+    // the built-in config generation is the one left active
+    let snapshot = session.modules().unwrap().snapshot();
+    assert_eq!(snapshot.len(), 1, "only the built-in generation survives");
+    assert_eq!(snapshot[0].0, builtin_config_manifest().module_id);
+    // host settings reflect the built-in layer
+    let settings = session.host_settings();
+    assert_eq!(
+        settings
+            .provider
+            .as_ref()
+            .and_then(|p| p.protocol.as_deref()),
+        Some("openai")
+    );
+    // the session remains usable with modules enabled
     let receipt = session
         .commit(vec![event("post-safe", json!({"n": 1}))], None)
         .unwrap();
-    assert_eq!(receipt.first_seq, 2);
+    assert_eq!(receipt.first_seq, 3);
     let envs = envelopes(&dir.path().join("log.zst"));
-    assert_eq!(envs.len(), 2);
-    assert_eq!(envs[0].kind, "safe_mode_activated");
+    assert_eq!(envs.len(), 3);
+    assert_eq!(envs[0].kind, "composition_changed"); // built-in activation
+    assert_eq!(envs[1].kind, "safe_mode_activated");
     assert!(
-        envs[0].payload["reason"]
+        envs[1].payload["reason"]
             .as_str()
             .unwrap()
             .contains("compile")
@@ -642,7 +683,7 @@ fn wasm_trap_contained_session_survives() {
             epoch_deadline: u64::MAX,
             ..Default::default()
         }),
-        config: Some(manifest(id_trap, TRAP, vec![])),
+        config_layers: vec![manifest(id_trap, TRAP, vec![])],
         ..Default::default()
     })
     .unwrap();
@@ -683,7 +724,7 @@ fn m2_fault_points_recorded() {
         dir: dir.path().to_path_buf(),
         engine: Some(no_epoch()),
         fault: Some(Arc::new(recorder)),
-        config: Some(manifest(id_prov, PUBLISHER, vec![])),
+        config_layers: vec![manifest(id_prov, PUBLISHER, vec![])],
         ..Default::default()
     })
     .unwrap();
@@ -743,7 +784,7 @@ fn committed_manifests_are_schema_2() {
     let mut session = Session::open(SessionConfig {
         dir: dir.path().to_path_buf(),
         engine: Some(no_epoch()),
-        config: Some(manifest(id, PUBLISHER, vec![])),
+        config_layers: vec![manifest(id, PUBLISHER, vec![])],
         ..Default::default()
     })
     .unwrap();
@@ -811,7 +852,7 @@ fn reset_module_state_starts_a_fresh_head_and_records_a_fact() {
     let mut session = Session::open(SessionConfig {
         dir: dir.path().to_path_buf(),
         engine: Some(no_epoch()),
-        config: Some(m),
+        config_layers: vec![m],
         ..Default::default()
     })
     .unwrap();
@@ -871,7 +912,7 @@ fn reset_module_state_rejects_untracked_or_unbound_modules() {
     let mut session = Session::open(SessionConfig {
         dir: dir.path().to_path_buf(),
         engine: Some(no_epoch()),
-        config: Some(m),
+        config_layers: vec![m],
         ..Default::default()
     })
     .unwrap();
@@ -879,5 +920,107 @@ fn reset_module_state_rejects_untracked_or_unbound_modules() {
     assert!(matches!(err, SessionError::InvalidInput(_)), "{err:?}");
     let err = session.reset_module_state(id).unwrap_err();
     assert!(matches!(err, SessionError::InvalidInput(_)), "{err:?}");
+    session.close().unwrap();
+}
+
+/// Decision 28: config layers merge LOW→HIGH field-wise (built-in defaults
+/// overridden by user, then project, field by field) and the merged snapshot
+/// is exposed through `host_settings`.
+#[test]
+fn config_layers_merge_settings_builtin_user_project() {
+    require_guest();
+    let dir = TempDir::new("settings-merge");
+    let user = settings_manifest(
+        Id128::generate(),
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
+        r#"{"kind":"settings","provider":{"model":"user-model","base_url":"https://user"},"approval":{"auto_approve":true}}"#,
+    );
+    let project = settings_manifest(
+        Id128::generate(),
+        ModuleOrigin::WorkspaceConfig,
+        TrustClass::Workspace,
+        r#"{"kind":"settings","provider":{"model":"project-model"},"approval":{"yolo":true}}"#,
+    );
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest(), user, project],
+        ..Default::default()
+    })
+    .unwrap();
+    let settings = session.host_settings();
+    let p = settings.provider.as_ref().expect("merged provider");
+    assert_eq!(p.protocol.as_deref(), Some("openai"), "built-in default kept");
+    assert_eq!(p.base_url.as_deref(), Some("https://user"), "user field kept");
+    assert_eq!(p.model.as_deref(), Some("project-model"), "project wins");
+    let a = settings.approval.as_ref().expect("merged approval");
+    assert_eq!(a.auto_approve, Some(true), "user field kept");
+    assert_eq!(a.yolo, Some(true), "project wins");
+    // three layers activated, each on the log
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert_eq!(envs.len(), 3);
+    assert!(envs.iter().all(|e| e.kind == "composition_changed"));
+    session.close().unwrap();
+}
+
+/// Decision 28: a failing user layer drops the non-builtin layers but keeps the
+/// built-in generation active — built-in settings survive, user settings do
+/// not, and safe mode is canonically recorded.
+#[test]
+fn builtin_settings_survive_failed_user_layer() {
+    require_guest();
+    let dir = TempDir::new("settings-safe");
+    let bad_user = manifest(Id128::generate(), "local x = = 1", vec![]);
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest(), bad_user],
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(session.modules().is_some());
+    let snapshot = session.modules().unwrap().snapshot();
+    assert_eq!(snapshot.len(), 1, "only the built-in survives");
+    assert_eq!(snapshot[0].0, builtin_config_manifest().module_id);
+    let settings = session.host_settings();
+    assert_eq!(
+        settings
+            .provider
+            .as_ref()
+            .and_then(|p| p.protocol.as_deref()),
+        Some("openai"),
+        "built-in settings survive"
+    );
+    assert_eq!(
+        settings.provider.as_ref().and_then(|p| p.model.as_deref()),
+        None,
+        "the failed user layer contributed nothing"
+    );
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert_eq!(envs.len(), 2);
+    assert_eq!(envs[0].kind, "composition_changed"); // built-in activation
+    assert_eq!(envs[1].kind, "safe_mode_activated");
+    session.close().unwrap();
+}
+
+/// Decision 28: a session with no config layers activates nothing and reports
+/// the empty settings overlay.
+#[test]
+fn no_config_layers_reports_default_settings() {
+    require_guest();
+    let dir = TempDir::new("settings-default");
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        session.host_settings(),
+        &kanbei_scopes::contrib::SettingsContribution::default()
+    );
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert!(envs.is_empty(), "no layer activated, no events");
     session.close().unwrap();
 }

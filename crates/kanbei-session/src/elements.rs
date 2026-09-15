@@ -4,6 +4,7 @@ use crate::{ConfigActivation, Session, FaultPoint, NewEvent, SessionError};
 use kanbei_core::id::Id128;
 use kanbei_modules::HeadFile;
 use kanbei_modules::ModuleError;
+use kanbei_modules::ModuleOrigin;
 use kanbei_modules::PackageManifest;
 use kanbei_modules::ReplacementOutcome;
 use kanbei_modules::StateUpdate;
@@ -19,6 +20,95 @@ use kanbei_vm::Host;
 use serde_json::json;
 
 impl Session {
+    /// Activates the open-time desired-state config layers in LOW→HIGH
+    /// precedence order (decision 28). Each layer activates independently
+    /// through [`Self::activate_config`]; the registry's field-wise settings
+    /// overlay supplies built-in-defaults-overridden-by-higher fields, so a
+    /// higher layer that only sets some fields never clobbers the rest.
+    ///
+    /// Safe mode (R-01/C-02): a failing NON-builtin layer drops the failed and
+    /// every already-activated non-builtin layer, keeps (or activates) the
+    /// built-in generation, commits the canonical `safe_mode_activated` fact,
+    /// and leaves `modules` enabled — the session stays usable and
+    /// `host_settings` reflects the built-in layer. A failing built-in layer
+    /// (or no Wasm) drops modules to storage-only.
+    ///
+    /// Whatever the outcome, the merged settings are snapshotted on the
+    /// session (they survive generation teardown).
+    pub(crate) fn activate_config_layers(
+        &mut self,
+        layers: Vec<PackageManifest>,
+    ) -> Result<(), SessionError> {
+        let mut activated: Vec<PackageManifest> = Vec::new();
+        let mut builtin_active = false;
+        let mut safe_reason: Option<String> = None;
+        for manifest in layers {
+            let is_builtin = manifest.origin == ModuleOrigin::Builtin;
+            match self.activate_config(manifest.clone()) {
+                Ok(_) => {
+                    builtin_active |= is_builtin;
+                    activated.push(manifest);
+                }
+                // A non-builtin failure is safe-mode-able; the failed layer is
+                // already deactivated by `activate_config`.
+                Err(e) if !is_builtin => {
+                    safe_reason = Some(e.to_string());
+                    break;
+                }
+                // A built-in failure is not recoverable by keeping built-ins.
+                Err(e) => {
+                    self.modules = None;
+                    self.vm_engine_digest = None;
+                    self.commit_safe_mode(&e.to_string())?;
+                    return Ok(());
+                }
+            }
+        }
+        if let Some(reason) = safe_reason {
+            // Drop every activated non-builtin layer (best-effort: a layer with
+            // dependents stays, but safe mode is still recorded).
+            if let Some(manager) = self.modules.as_mut() {
+                for m in activated
+                    .iter()
+                    .rev()
+                    .filter(|m| m.origin != ModuleOrigin::Builtin)
+                {
+                    let _ = manager.deactivate(m.module_id);
+                }
+            }
+            if !builtin_active {
+                let fallback = crate::builtin_config::builtin_config_manifest();
+                if self.activate_config(fallback).is_err() {
+                    // The built-in itself could not activate: storage-only.
+                    self.modules = None;
+                    self.vm_engine_digest = None;
+                }
+            }
+            self.commit_safe_mode(&reason)?;
+        }
+        self.host_settings = self
+            .registry
+            .settings_for(&crate::builtin_config::root_scope())
+            .cloned()
+            .unwrap_or_default();
+        Ok(())
+    }
+
+    /// Commits the canonical `safe_mode_activated` fact with the failure reason.
+    fn commit_safe_mode(&mut self, reason: &str) -> Result<(), SessionError> {
+        self.commit(
+            vec![NewEvent {
+                kind: "safe_mode_activated".into(),
+                payload_schema: 1,
+                payload: json!({ "reason": reason }),
+                objects: Vec::new(),
+                refs: Vec::new(),
+            }],
+            None,
+        )?;
+        Ok(())
+    }
+
     /// THE atomic config reload (R-01/C-02): activates the manifest's module
     /// (its `kb_on_activate` publishes services via host op 6 into the shared
     /// registry), collects the registry delta (services published by the new

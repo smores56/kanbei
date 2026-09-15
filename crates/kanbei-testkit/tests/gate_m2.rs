@@ -31,7 +31,9 @@ use kanbei_scopes::errors::ScopeError;
 use kanbei_scopes::registry::ContributionRegistry;
 use kanbei_scopes::scope_tree::{OwnerLease, ScopeTree};
 use kanbei_services::{ScopePath, ServiceDependency, ServiceKey, ServiceRegistry};
-use kanbei_session::{FaultPoint, NewEvent, Session, SessionConfig, SessionError};
+use kanbei_session::{
+    FaultPoint, NewEvent, Session, SessionConfig, SessionError, builtin_config_manifest,
+};
 use kanbei_testkit::{child_acked, session_dir_layout, spawn_m2_crash_child, verify_m2_recovery};
 use kanbei_vm::{GuestError, Host, Vm, VmConfig};
 use serde_json::{Value, json};
@@ -209,7 +211,7 @@ fn acceptance_generation_replacement_leaves_no_stale_state() {
     let mut session = Session::open(SessionConfig {
         dir: dir.to_path_buf(),
         engine: Some(no_epoch()),
-        config: Some(manifest(id, GREET_PUBLISHER, vec![])),
+        config_layers: vec![manifest(id, GREET_PUBLISHER, vec![])],
         ..Default::default()
     })
     .unwrap();
@@ -297,7 +299,7 @@ fn acceptance_wasm_traps_do_not_corrupt_session() {
             epoch_deadline: u64::MAX,
             ..Default::default()
         }),
-        config: Some(manifest(id_trap, TRAP, vec![])),
+        config_layers: vec![manifest(id_trap, TRAP, vec![])],
         ..Default::default()
     })
     .unwrap();
@@ -332,7 +334,7 @@ fn acceptance_capabilities_attenuate_and_stale_cannot_act() {
     let mut session = Session::open(SessionConfig {
         dir: dir.to_path_buf(),
         engine: Some(no_epoch()),
-        config: Some(manifest_trust(id, CALLER, vec![], TrustClass::Agent)),
+        config_layers: vec![manifest_trust(id, CALLER, vec![], TrustClass::Agent)],
         ..Default::default()
     })
     .unwrap();
@@ -464,24 +466,28 @@ fn acceptance_config_reload_publishes_atomically() {
     assert_eq!(envs[0].kind, "composition_changed");
     session.close().unwrap();
 
-    // (c) reopening with the same failing config activates built-in safe mode
-    // (R-01/C-02): the config's kb_on_activate fails even on a fresh registry
-    // (it errors after publishing), so modules drop and a canonical
-    // safe_mode_activated event is committed; the session stays usable
+    // (c) reopening with the same failing config keeps the built-in safe mode
+    // (R-01/C-02, decision 28): the config's kb_on_activate fails even on a
+    // fresh registry (it errors after publishing), so it is dropped, the
+    // built-in generation stays active, and a canonical safe_mode_activated
+    // event is committed; the session stays usable
     let mut session2 = Session::open(SessionConfig {
         dir: dir.to_path_buf(),
         engine: Some(no_epoch()),
-        config: Some(manifest(id_b, CONFLICT_AND_FAIL, vec![])),
+        config_layers: vec![manifest(id_b, CONFLICT_AND_FAIL, vec![])],
         ..Default::default()
     })
     .unwrap();
-    assert!(session2.modules().is_none());
-    assert_eq!(session2.vm_engine_digest(), None);
+    let snapshot = session2.modules().unwrap().snapshot();
+    assert_eq!(snapshot.len(), 1, "only the built-in generation survives");
+    assert_eq!(snapshot[0].0, builtin_config_manifest().module_id);
+    assert!(session2.vm_engine_digest().is_some());
     let envs = envelopes(&dir.join("log.zst"));
-    assert_eq!(envs.len(), 2);
-    assert_eq!(envs[1].kind, "safe_mode_activated");
+    assert_eq!(envs.len(), 3);
+    assert_eq!(envs[1].kind, "composition_changed"); // built-in activation
+    assert_eq!(envs[2].kind, "safe_mode_activated");
     let receipt = session2.commit(vec![event("post-safe", json!({"n": 1}))], None).unwrap();
-    assert_eq!(receipt.first_seq, 3);
+    assert_eq!(receipt.first_seq, 4);
     session2.close().unwrap();
 }
 

@@ -19,7 +19,7 @@
 //! | 4 | `check` | `{"resource": <string>, "verbs": [<string>]}` | `{"allowed":true}` |
 //! | 5 | `require_approval` | `{"resource": <string>, "verbs": [<string>]}` | `{"intent": <ApprovalIntent>}` |
 //! | 6 | `service_publish` | `{"key": <ServiceKey>, "version": <u32>, "deps": [<ServiceDependency>]}` | `"ok"` |
-//! | 7 | `contribution_publish` | `{"kind": "ui"|"theme", ...}` | `"ok"` |
+//! | 7 | `contribution_publish` | `{"kind": "ui"\|"theme"\|"settings", ...}` | `"ok"` |
 //! | 6 | `service_publish` | `{"key": <ServiceKey>, "version": <u32>, "deps": [<ServiceDependency>]}` | `"ok"` |
 //!
 //! M2 keeps state bytes as the compact JSON encoding of the value the module
@@ -41,7 +41,10 @@ use std::time::{Duration, Instant};
 
 use kanbei_capabilities::{ApprovalIntent, Broker, Capability, GrantScope, Principal};
 use kanbei_core::id::Id128;
-use kanbei_scopes::contrib::{Contribution, ContributionKind, ThemeContribution, UiMountContribution};
+use kanbei_scopes::contrib::{
+    ApprovalSettings, Contribution, ContributionKind, ProviderSettings, SettingsContribution,
+    ThemeContribution, UiMountContribution,
+};
 use kanbei_services::{
     ReplaceIntent, ScopePath, ServiceContract, ServiceDependency, ServiceError, ServiceKey,
     ServiceProvider, ServiceRegistry,
@@ -537,6 +540,7 @@ impl ModuleHost {
     /// Payloads:
     /// - `{"kind":"ui","name":<string>,"component":<string>,"slot":<string, optional>}`
     /// - `{"kind":"theme","name":<string>,"overlay":<object>}`
+    /// - `{"kind":"settings","provider":<object, optional>,"approval":<object, optional>}`
     fn op_contribution_publish(&self, info: &TokenInfo, payload: &str) -> Result<String, String> {
         let v: Value = serde_json::from_str(payload)
             .map_err(|e| format!("contribution_publish: invalid payload: {e}"))?;
@@ -587,6 +591,28 @@ impl ModuleHost {
                 Contribution {
                     scope: info.scope.clone(),
                     kind: ContributionKind::Theme(ThemeContribution { name, overlay }),
+                }
+            }
+            "settings" => {
+                // Decision 28: a desired-state layer publishes typed settings
+                // (built-in defaults, user, project). A malformed payload is
+                // rejected here, before anything is staged — no partial
+                // publish.
+                let provider = v
+                    .get("provider")
+                    .cloned()
+                    .map(serde_json::from_value::<ProviderSettings>)
+                    .transpose()
+                    .map_err(|e| format!("contribution_publish: settings.provider: {e}"))?;
+                let approval = v
+                    .get("approval")
+                    .cloned()
+                    .map(serde_json::from_value::<ApprovalSettings>)
+                    .transpose()
+                    .map_err(|e| format!("contribution_publish: settings.approval: {e}"))?;
+                Contribution {
+                    scope: info.scope.clone(),
+                    kind: ContributionKind::Settings(SettingsContribution { provider, approval }),
                 }
             }
             other => return Err(format!("contribution_publish: unknown kind {other:?}")),
@@ -835,6 +861,62 @@ mod tests {
         assert_eq!(host.rejected_stale_effects(), 0);
         assert_eq!(host.services.lock().unwrap().snapshot().len(), 1);
         assert_eq!(host.published_contributions(1).len(), 1);
+        drop(host);
+        teardown(dir, queue);
+    }
+
+    /// Decision 28: `contribution_publish` accepts `"kind":"settings"` and
+    /// stages a typed settings contribution; a malformed payload is a typed
+    /// error that stages nothing (no partial publish).
+    #[test]
+    fn contribution_publish_settings_parses_and_rejects_malformed() {
+        let (dir, queue, host) = host_with_generation("settings");
+        let i = info();
+        host.op_contribution_publish(
+            &i,
+            r#"{"kind":"settings","provider":{"protocol":"openai","base_url":"https://x"},"approval":{"auto_approve":false,"yolo":false}}"#,
+        )
+        .unwrap();
+        let published = host.published_contributions(1);
+        assert_eq!(published.len(), 1);
+        match &published[0].kind {
+            ContributionKind::Settings(s) => {
+                let p = s.provider.as_ref().expect("provider parsed");
+                assert_eq!(p.protocol.as_deref(), Some("openai"));
+                assert_eq!(p.base_url.as_deref(), Some("https://x"));
+                assert_eq!(p.model, None, "unset fields default to None");
+                let a = s.approval.as_ref().expect("approval parsed");
+                assert_eq!(a.auto_approve, Some(false));
+                assert_eq!(a.yolo, Some(false));
+            }
+            other => panic!("expected a settings contribution, got {other:?}"),
+        }
+
+        // A well-formed key reference (externally tagged) parses too.
+        host.op_contribution_publish(
+            &i,
+            r#"{"kind":"settings","provider":{"key":{"Env":{"name":"OPENAI_API_KEY"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(host.published_contributions(1).len(), 2);
+
+        // Malformed: unknown key-reference shape and a non-object provider.
+        for bad in [
+            r#"{"kind":"settings","provider":{"key":{"Bogus":{}}}}"#,
+            r#"{"kind":"settings","provider":42}"#,
+            r#"{"kind":"settings","approval":{"auto_approve":"yes"}}"#,
+        ] {
+            let err = host.op_contribution_publish(&i, bad).unwrap_err();
+            assert!(
+                err.starts_with("contribution_publish:"),
+                "typed error for {bad}: {err}"
+            );
+        }
+        assert_eq!(
+            host.published_contributions(1).len(),
+            2,
+            "malformed payloads stage nothing"
+        );
         drop(host);
         teardown(dir, queue);
     }

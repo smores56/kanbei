@@ -509,7 +509,7 @@ fn config_package_and_module_pin_survive_gc() {
     let package_digest = Digest::new(&serde_json::to_vec(&config).unwrap());
     let mut session = Session::open(SessionConfig {
         dir: dir.clone(),
-        config: Some(config),
+        config_layers: vec![config],
         engine: Some(no_epoch()),
         ..Default::default()
     })

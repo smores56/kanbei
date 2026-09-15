@@ -227,8 +227,8 @@ impl Session {
         });
 
         // Open the forked session: the overridden lane fields (dir, identity,
-        // policy, broker, memory root, config, project) beat anything the
-        // caller set in `options.config`. GC is forced off: the seeded
+        // policy, broker, memory root, config layers, project) beat anything
+        // the caller set in `options.config`. GC is forced off: the seeded
         // objects are not yet event-referenced at open, so the automatic
         // quarantine pass would move them all (the caller can run the
         // explicit `Session::run_gc` after the fork, when the `forked` fact
@@ -239,7 +239,7 @@ impl Session {
         target_cfg.policy = options.policy;
         target_cfg.broker = broker;
         target_cfg.memory_root = None;
-        target_cfg.config = config_manifest;
+        target_cfg.config_layers = config_manifest.into_iter().collect();
         target_cfg.gc = None;
         if source_project.is_some() {
             target_cfg.project = source_project;

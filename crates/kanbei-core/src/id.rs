@@ -27,6 +27,14 @@ impl Id128 {
         Self(Uuid::now_v7().into_bytes())
     }
 
+    /// A deterministic id from raw bytes: the same bytes always yield the same
+    /// id (deterministic built-in generations derive theirs from source
+    /// content). Callers that need the frozen 21-char text width must seed a
+    /// nonzero high byte themselves.
+    pub fn from_bytes(bytes: [u8; UUID_BYTES]) -> Self {
+        Self(bytes)
+    }
+
     pub fn as_bytes(&self) -> &[u8; UUID_BYTES] {
         &self.0
     }
