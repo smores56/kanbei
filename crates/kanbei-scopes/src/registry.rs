@@ -28,8 +28,9 @@ use kanbei_services::{ScopePath, ServiceDependency, ServiceKey, ServiceProvider,
 use serde_json::Value;
 
 use crate::contrib::{
-    CommandContribution, Contribution, ContributionKind, GuardContribution, KeymapContribution,
-    ProjectionStageContribution, ServiceContribution, ThemeContribution, ToolContribution,
+    ApprovalSettings, CommandContribution, Contribution, ContributionKind, GuardContribution,
+    KeyReference, KeymapContribution, ProjectionStageContribution, ProviderSettings,
+    ServiceContribution, SettingsContribution, ThemeContribution, ToolContribution,
     UiMountContribution,
 };
 use crate::errors::ScopeError;
@@ -66,6 +67,9 @@ pub struct ContributionRegistry {
     stages: HashMap<(ScopePath, String, u32), ProjectionStageContribution>,
     ui: HashMap<(ScopePath, String), UiMountContribution>,
     guards: HashMap<(ScopePath, String), GuardContribution>,
+    /// Merged settings view: at most one effective entry per scope; later
+    /// layers overlay field-wise over earlier ones (R-19).
+    settings: HashMap<ScopePath, SettingsContribution>,
     services: Arc<Mutex<ServiceRegistry>>,
 }
 
@@ -79,6 +83,7 @@ impl ContributionRegistry {
             stages: HashMap::new(),
             ui: HashMap::new(),
             guards: HashMap::new(),
+            settings: HashMap::new(),
             services,
         }
     }
@@ -223,6 +228,11 @@ impl ContributionRegistry {
                     }
                     seen_guards.insert(key, (g.predicate.clone(), g.monotonic));
                 }
+                ContributionKind::Settings(s) => {
+                    // Overlay kind: never a conflict, but key references must
+                    // be structurally well-formed.
+                    validate_settings(contribution, s)?;
+                }
             }
         }
         Ok(())
@@ -315,6 +325,17 @@ impl ContributionRegistry {
                 ContributionKind::Guard(g) => {
                     next.guards
                         .insert((c.scope.clone(), g.name.clone()), g.clone());
+                }
+                ContributionKind::Settings(s) => {
+                    merge_settings(
+                        next.settings
+                            .entry(c.scope.clone())
+                            .or_insert(SettingsContribution {
+                                provider: None,
+                                approval: None,
+                            }),
+                        s,
+                    );
                 }
             }
         }
@@ -513,6 +534,17 @@ impl ContributionRegistry {
                 true
             }
         });
+        self.settings.retain(|s, c| {
+            if s == scope {
+                extras.push(Contribution {
+                    scope: s.clone(),
+                    kind: ContributionKind::Settings(c.clone()),
+                });
+                false
+            } else {
+                true
+            }
+        });
 
         removed_contributions.extend(extras);
         removed_contributions.sort_by(|a, b| snapshot_sort_key(a).cmp(&snapshot_sort_key(b)));
@@ -556,6 +588,11 @@ impl ContributionRegistry {
                 }
                 ContributionKind::Keymap(km) => {
                     next.keymaps.retain(|(s, e)| !(s == &c.scope && e.key == km.key));
+                }
+                ContributionKind::Settings(_) => {
+                    // One merged entry per scope: removing the scope's
+                    // settings drops that effective entry.
+                    next.settings.remove(&c.scope);
                 }
                 ContributionKind::Service(_) => {
                     return Err(ScopeError::InvalidContribution {
@@ -619,6 +656,12 @@ impl ContributionRegistry {
                 kind: ContributionKind::Keymap(km.clone()),
             });
         }
+        for (scope, c) in &self.settings {
+            out.push(Contribution {
+                scope: scope.clone(),
+                kind: ContributionKind::Settings(c.clone()),
+            });
+        }
         for (key, provider, deps) in self
             .services
             .lock()
@@ -651,6 +694,12 @@ impl ContributionRegistry {
     /// result of merging all applied overlays (later wins per top-level key).
     pub fn theme_overlay(&self, scope: &ScopePath, name: &str) -> Option<&ThemeContribution> {
         self.themes.get(&(scope.clone(), name.to_string()))
+    }
+
+    /// Merged settings view for `scope`: the single entry holding the result
+    /// of overlaying all applied settings contributions (later wins per field).
+    pub fn settings_for(&self, scope: &ScopePath) -> Option<&SettingsContribution> {
+        self.settings.get(scope)
     }
 
     /// Replaces a command registration. `previous_holder` must name the
@@ -810,6 +859,7 @@ impl ContributionRegistry {
             stages: self.stages.clone(),
             ui: self.ui.clone(),
             guards: self.guards.clone(),
+            settings: self.settings.clone(),
             services: Arc::clone(&self.services),
         }
     }
@@ -856,6 +906,84 @@ fn validate_ui_slot(scope: &ScopePath, slot: Option<&str>) -> Result<(), ScopeEr
     Ok(())
 }
 
+/// Settings are an overlay kind (never a conflict), but key references must be
+/// structurally well-formed: an empty env name or keychain coordinate cannot
+/// resolve a secret, so it is rejected as an invalid contribution.
+fn validate_settings(
+    contribution: &Contribution,
+    settings: &SettingsContribution,
+) -> Result<(), ScopeError> {
+    let Some(provider) = &settings.provider else {
+        return Ok(());
+    };
+    let Some(key) = &provider.key else {
+        return Ok(());
+    };
+    let valid = match key {
+        KeyReference::Env { name } => !name.is_empty(),
+        KeyReference::Keychain { service, account } => !service.is_empty() && !account.is_empty(),
+    };
+    if valid {
+        return Ok(());
+    }
+    Err(ScopeError::InvalidContribution {
+        scope: contribution.scope.clone(),
+        reason: format!("settings key reference `{key:?}` has an empty field"),
+    })
+}
+
+/// Field-wise overlay (R-19): an incoming `Some` overwrites, `None` leaves the
+/// existing value; nested `provider`/`approval` merge field-wise too.
+fn merge_settings(base: &mut SettingsContribution, incoming: &SettingsContribution) {
+    merge_provider(&mut base.provider, &incoming.provider);
+    merge_approval(&mut base.approval, &incoming.approval);
+}
+
+fn merge_provider(base: &mut Option<ProviderSettings>, incoming: &Option<ProviderSettings>) {
+    match (base, incoming) {
+        (Some(base), Some(incoming)) => {
+            if incoming.base_url.is_some() {
+                base.base_url = incoming.base_url.clone();
+            }
+            if incoming.model.is_some() {
+                base.model = incoming.model.clone();
+            }
+            if incoming.protocol.is_some() {
+                base.protocol = incoming.protocol.clone();
+            }
+            if incoming.key.is_some() {
+                base.key = incoming.key.clone();
+            }
+            if incoming.fake.is_some() {
+                base.fake = incoming.fake;
+            }
+        }
+        (slot, incoming) => {
+            if incoming.is_some() {
+                *slot = incoming.clone();
+            }
+        }
+    }
+}
+
+fn merge_approval(base: &mut Option<ApprovalSettings>, incoming: &Option<ApprovalSettings>) {
+    match (base, incoming) {
+        (Some(base), Some(incoming)) => {
+            if incoming.auto_approve.is_some() {
+                base.auto_approve = incoming.auto_approve;
+            }
+            if incoming.yolo.is_some() {
+                base.yolo = incoming.yolo;
+            }
+        }
+        (slot, incoming) => {
+            if incoming.is_some() {
+                *slot = incoming.clone();
+            }
+        }
+    }
+}
+
 /// Deterministic holder identity for service conflicts: `module@generation`.
 fn provider_identity(provider: &ServiceProvider) -> String {
     format!("{}@{}", provider.module_id, provider.generation)
@@ -874,6 +1002,7 @@ fn snapshot_sort_key(c: &Contribution) -> (String, &'static str, String, String,
         ContributionKind::ProjectionStage(p) => (p.slot.clone(), format!("{:010}", p.ordering)),
         ContributionKind::UiMount(u) => (u.name.clone(), String::new()),
         ContributionKind::Guard(g) => (g.name.clone(), String::new()),
+        ContributionKind::Settings(_) => (String::new(), String::new()),
     };
     (
         c.scope.to_string(),
@@ -1809,5 +1938,242 @@ mod tests {
         let err = registry.remove_contributions(&[svc]).unwrap_err();
         assert!(matches!(err, ScopeError::InvalidContribution { .. }));
         assert_eq!(registry.snapshot().len(), 6, "failed removal mutates nothing");
+    }
+
+    fn settings(scope: &ScopePath, s: SettingsContribution) -> Contribution {
+        Contribution {
+            scope: scope.clone(),
+            kind: ContributionKind::Settings(s),
+        }
+    }
+
+    fn provider_with_key(key: KeyReference) -> ProviderSettings {
+        ProviderSettings {
+            base_url: None,
+            model: None,
+            protocol: None,
+            key: Some(key),
+            fake: None,
+        }
+    }
+
+    #[test]
+    fn duplicate_settings_merge_field_wise_later_wins() {
+        let s = scope("app");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let first = settings(
+            &s,
+            SettingsContribution {
+                provider: Some(ProviderSettings {
+                    base_url: Some("https://a.example".into()),
+                    model: Some("m1".into()),
+                    protocol: None,
+                    key: None,
+                    fake: None,
+                }),
+                approval: Some(ApprovalSettings {
+                    auto_approve: Some(true),
+                    yolo: None,
+                }),
+            },
+        );
+        let second = settings(
+            &s,
+            SettingsContribution {
+                provider: Some(ProviderSettings {
+                    base_url: Some("https://b.example".into()),
+                    model: None,
+                    protocol: Some("openai".into()),
+                    key: Some(KeyReference::Env { name: "KEY".into() }),
+                    fake: Some(true),
+                }),
+                approval: Some(ApprovalSettings {
+                    auto_approve: None,
+                    yolo: Some(false),
+                }),
+            },
+        );
+        // overlay kind: two Settings contributions never conflict
+        registry.validate(&[first.clone(), second.clone()]).unwrap();
+        registry.apply(&s, &[first, second]).unwrap();
+
+        let merged = registry.settings_for(&s).expect("settings registered");
+        let p = merged.provider.as_ref().expect("provider present");
+        assert_eq!(
+            p.base_url.as_deref(),
+            Some("https://b.example"),
+            "later wins"
+        );
+        assert_eq!(
+            p.model.as_deref(),
+            Some("m1"),
+            "incoming None keeps existing"
+        );
+        assert_eq!(p.protocol.as_deref(), Some("openai"));
+        assert_eq!(p.key, Some(KeyReference::Env { name: "KEY".into() }));
+        assert_eq!(p.fake, Some(true));
+        let a = merged.approval.as_ref().expect("approval present");
+        assert_eq!(a.auto_approve, Some(true), "incoming None keeps existing");
+        assert_eq!(a.yolo, Some(false));
+
+        let count = registry
+            .snapshot()
+            .iter()
+            .filter(|c| matches!(c.kind, ContributionKind::Settings(_)))
+            .count();
+        assert_eq!(count, 1, "one effective settings entry per scope");
+    }
+
+    #[test]
+    fn settings_partial_overlay_does_not_clobber_earlier_fields() {
+        let s = scope("app");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        validate_and_apply(
+            &mut registry,
+            &s,
+            &[settings(
+                &s,
+                SettingsContribution {
+                    provider: Some(ProviderSettings {
+                        base_url: Some("https://a.example".into()),
+                        model: None,
+                        protocol: None,
+                        key: None,
+                        fake: None,
+                    }),
+                    approval: None,
+                },
+            )],
+        );
+        // a layer that only sets provider.model must not clobber base_url
+        validate_and_apply(
+            &mut registry,
+            &s,
+            &[settings(
+                &s,
+                SettingsContribution {
+                    provider: Some(ProviderSettings {
+                        base_url: None,
+                        model: Some("m2".into()),
+                        protocol: None,
+                        key: None,
+                        fake: None,
+                    }),
+                    approval: None,
+                },
+            )],
+        );
+        let merged = registry.settings_for(&s).expect("settings registered");
+        let p = merged.provider.as_ref().expect("provider present");
+        assert_eq!(p.base_url.as_deref(), Some("https://a.example"));
+        assert_eq!(p.model.as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn settings_empty_key_reference_is_rejected() {
+        let s = scope("app");
+        let registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let cases = [
+            KeyReference::Env {
+                name: String::new(),
+            },
+            KeyReference::Keychain {
+                service: String::new(),
+                account: "acct".into(),
+            },
+            KeyReference::Keychain {
+                service: "svc".into(),
+                account: String::new(),
+            },
+        ];
+        for key in cases {
+            let c = settings(
+                &s,
+                SettingsContribution {
+                    provider: Some(provider_with_key(key.clone())),
+                    approval: None,
+                },
+            );
+            let err = registry.validate(&[c]).unwrap_err();
+            assert!(
+                matches!(err, ScopeError::InvalidContribution { ref scope, .. } if scope == &s),
+                "empty key reference {key:?} must be rejected"
+            );
+        }
+        // a well-formed key reference validates
+        let ok = settings(
+            &s,
+            SettingsContribution {
+                provider: Some(provider_with_key(KeyReference::Keychain {
+                    service: "svc".into(),
+                    account: "acct".into(),
+                })),
+                approval: None,
+            },
+        );
+        registry.validate(&[ok]).unwrap();
+    }
+
+    #[test]
+    fn remove_scope_drops_settings() {
+        let s = scope("app");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        validate_and_apply(
+            &mut registry,
+            &s,
+            &[settings(
+                &s,
+                SettingsContribution {
+                    provider: Some(ProviderSettings {
+                        base_url: Some("https://a.example".into()),
+                        model: None,
+                        protocol: None,
+                        key: None,
+                        fake: None,
+                    }),
+                    approval: None,
+                },
+            )],
+        );
+        assert!(registry.settings_for(&s).is_some());
+        let removed = registry.remove_scope(&s, false).unwrap();
+        assert!(registry.settings_for(&s).is_none(), "settings dropped");
+        assert!(registry.snapshot().is_empty());
+        assert!(
+            removed
+                .contributions
+                .iter()
+                .any(|c| matches!(c.kind, ContributionKind::Settings(_)))
+        );
+    }
+
+    #[test]
+    fn settings_kind_does_not_alter_existing_kind_encodings() {
+        // the composition digest domain is unchanged for existing kinds: the
+        // externally-tagged byte shape of every pre-existing variant is stable.
+        assert_eq!(
+            serde_json::to_value(ContributionKind::Theme(ThemeContribution {
+                name: "t".into(),
+                overlay: json!({"a": 1}),
+            }))
+            .unwrap(),
+            json!({"Theme": {"name": "t", "overlay": {"a": 1}}})
+        );
+        assert_eq!(
+            ContributionKind::Settings(SettingsContribution {
+                provider: None,
+                approval: None,
+            })
+            .kind_tag(),
+            "settings"
+        );
+        assert_eq!(
+            serde_json::to_value(ContributionKind::Settings(SettingsContribution {
+                provider: None,
+                approval: None,
+            }))
+            .unwrap(),
+            json!({"Settings": {"provider": null, "approval": null}})
+        );
     }
 }

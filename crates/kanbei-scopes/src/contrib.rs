@@ -23,6 +23,7 @@ pub enum ContributionKind {
     ProjectionStage(ProjectionStageContribution),
     UiMount(UiMountContribution),
     Guard(GuardContribution),
+    Settings(SettingsContribution),
 }
 
 impl ContributionKind {
@@ -37,6 +38,7 @@ impl ContributionKind {
             ContributionKind::ProjectionStage(_) => "stage",
             ContributionKind::UiMount(_) => "ui",
             ContributionKind::Guard(_) => "guard",
+            ContributionKind::Settings(_) => "settings",
         }
     }
 }
@@ -116,4 +118,39 @@ pub struct GuardContribution {
     /// Entry name of the guard predicate.
     pub predicate: String,
     pub monotonic: bool,
+}
+
+/// A settings overlay: at most one effective entry per scope; later layers
+/// merge field-wise over earlier ones, so a partial layer never clobbers
+/// fields it does not set (R-19 layered/overlay semantics).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SettingsContribution {
+    pub provider: Option<ProviderSettings>,
+    pub approval: Option<ApprovalSettings>,
+}
+
+/// Provider-side settings (R-19): every field is optional so a layer can
+/// override just the parts it owns.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSettings {
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub protocol: Option<String>,
+    pub key: Option<KeyReference>,
+    pub fake: Option<bool>,
+}
+
+/// A reference to a secret, never the secret itself: resolved at use time
+/// from the environment or the platform keychain.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum KeyReference {
+    Env { name: String },
+    Keychain { service: String, account: String },
+}
+
+/// Approval-policy settings (R-19).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalSettings {
+    pub auto_approve: Option<bool>,
+    pub yolo: Option<bool>,
 }
