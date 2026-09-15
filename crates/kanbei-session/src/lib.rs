@@ -67,7 +67,7 @@ use kanbei_scopes::scope_tree::ScopeTree;
 use kanbei_scopes::contrib::SettingsContribution;
 use kanbei_services::ServiceRegistry;
 use kanbei_snapshot::ExecutionManifest;
-use kanbei_transcript::{TranscriptProjection, TranscriptView};
+pub use kanbei_transcript::{CollapseOverrides, TranscriptProjection, TranscriptView};
 use kanbei_vm::{GuestError, Vm};
 use serde_json::json;
 use thiserror::Error;

@@ -9,12 +9,14 @@
 use kanbei_core::envelope::Envelope;
 
 use crate::commit::resolve_payload;
-use crate::{Session, SessionError};
-use kanbei_transcript::{CollapseOverrides, TranscriptView};
+use crate::{Session, SessionError, TranscriptListener};
+use kanbei_transcript::{CollapseOverrides, TranscriptProjection, TranscriptView};
 
 impl Session {
     /// The transcript typed view, with the session-local collapse overrides
-    /// applied. A pure function of the envelopes applied so far.
+    /// applied. A function of the committed envelopes applied so far plus the
+    /// session-local inputs ([`Self::finalize_transcript_turn`] and the
+    /// provider-stream deltas).
     pub fn transcript_view(&self, overrides: &CollapseOverrides) -> TranscriptView {
         self.transcript.view(overrides)
     }
@@ -48,14 +50,27 @@ impl Session {
             }
         })?;
         transcript.finish_replay();
+        // The rebuild is a transcript change; a listener (the CLI) must observe
+        // the replayed view rather than push it manually after open.
+        self.notify_transcript();
         Ok(())
     }
 
     /// Fire the transcript-view observer (UI seam) with the current view.
     pub(crate) fn notify_transcript(&self) {
-        if let Some(listener) = &self.transcript_listener {
-            listener(&self.transcript.view(&CollapseOverrides::new()));
-        }
+        fire_transcript_view(self.transcript.as_ref(), &self.transcript_listener);
+    }
+}
+
+/// Fire the transcript-view observer for a projection borrow. The delta path
+/// holds a mutable borrow of the projection, so it cannot go through
+/// [`Session::notify_transcript`] (`&self`).
+pub(crate) fn fire_transcript_view(
+    projection: &dyn TranscriptProjection,
+    listener: &Option<TranscriptListener>,
+) {
+    if let Some(listener) = listener {
+        listener(&projection.view(&CollapseOverrides::new()));
     }
 }
 
@@ -111,9 +126,6 @@ mod tests {
         impl TranscriptProjection for Stub {
             fn name(&self) -> &str {
                 "stub"
-            }
-            fn version(&self) -> u32 {
-                0
             }
             fn apply(&mut self, _env: &Envelope) {
                 self.applies.fetch_add(1, Ordering::SeqCst);
@@ -206,5 +218,38 @@ mod tests {
             TranscriptView::default()
         );
         assert_eq!(session.transcript.name(), ConversationProjection::new().name());
+    }
+
+    /// The listener contract: it fires on a replayed turn (session open) and on
+    /// a finalized turn, and its view matches `transcript_view`.
+    #[test]
+    fn listener_fires_on_replay_and_finalize() {
+        let views = Arc::new(std::sync::Mutex::new(Vec::<TranscriptView>::new()));
+        let recorded = Arc::clone(&views);
+        let listener: crate::TranscriptListener = Arc::new(move |view: &TranscriptView| {
+            recorded.lock().unwrap().push(view.clone());
+        });
+        let mut session = Session::open(crate::SessionConfig {
+            dir: temp_dir("listener"),
+            transcript_listener: Some(listener),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            !views.lock().unwrap().is_empty(),
+            "the open replay fires the listener"
+        );
+        session
+            .commit(vec![event("user_message", json!({ "text": "hi" }))], None)
+            .unwrap();
+        let view = session.transcript_view(&CollapseOverrides::new());
+        assert_eq!(views.lock().unwrap().last().unwrap(), &view);
+        let before = views.lock().unwrap().len();
+        session.finalize_transcript_turn();
+        assert!(
+            views.lock().unwrap().len() > before,
+            "finalize fires the listener"
+        );
+        session.close().unwrap();
     }
 }

@@ -10,7 +10,7 @@
 
 use crate::tree::{Node, SemanticTree};
 use kanbei_transcript::{
-    BubbleRow, CollapseOverrides, ToolStep, TranscriptView, TurnState, TurnView,
+    BubbleRow, CollapseOverrides, StepStatus, ToolStep, TranscriptView, TurnState, TurnView,
 };
 
 /// One flat transcript row for the TUI (document order): text, theme style
@@ -24,10 +24,12 @@ pub struct TranscriptRow {
     pub turn: usize,
 }
 
-/// Whether a turn's thought bubble is open: the view's default (running), a
-/// stored per-view flag, or a live manual override.
+/// Whether a turn's thought bubble is open. `view()` already folds the
+/// running default into `turn.open`, but callers may render a view built with
+/// different overrides (the CLI's listener view uses none), so the live
+/// overrides are still OR'd on top.
 fn is_open(turn: &TurnView, n: usize, overrides: &CollapseOverrides) -> bool {
-    turn.state == TurnState::Running || turn.open || overrides.contains(n)
+    turn.open || overrides.contains(n)
 }
 
 /// The transcript as a semantic tree (the module-facing contract). A running
@@ -85,7 +87,7 @@ pub fn render_transcript(view: &TranscriptView, overrides: &CollapseOverrides) -
             let marker = if open { "▾" } else { "▸" };
             rows.children.push(Node::button(
                 id("t"),
-                format!("{marker} {}", turn.summary()),
+                format!("{marker} {}", turn_summary(turn)),
             ));
         }
         if let Some(answer) = &turn.response {
@@ -143,7 +145,7 @@ pub fn transcript_rows(view: &TranscriptView, overrides: &CollapseOverrides) -> 
         if turn.state != TurnState::Running {
             let marker = if open { "▾" } else { "▸" };
             rows.push(TranscriptRow {
-                text: format!("{marker} {}", turn.summary()),
+                text: format!("{marker} {}", turn_summary(turn)),
                 style: "thought".into(),
                 turn: n,
             });
@@ -167,14 +169,65 @@ pub fn transcript_rows(view: &TranscriptView, overrides: &CollapseOverrides) -> 
 fn step_line(step: &ToolStep) -> String {
     let mut out = format!(
         "  {} {}({})",
-        step.status.label(),
+        step_status_label(step.status),
         step.tool,
         truncate(&step.args, 120)
     );
-    if !step.detail.is_empty() {
-        out.push_str(&format!(" — {}", truncate(&step.detail, 160)));
+    let detail = step_detail(step);
+    if !detail.is_empty() {
+        out.push_str(&format!(" — {}", truncate(&detail, 160)));
     }
     out
+}
+
+/// The step's outcome detail: classification reason, error text, and
+/// serialized result, joined for display. The projection carries each raw and
+/// untruncated; the renderer owns the ` · ` join and the truncation.
+fn step_detail(step: &ToolStep) -> String {
+    let result = truncate(&step.result, 200);
+    [step.detail.as_str(), step.error.as_str(), result.as_str()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The collapsed summary line (Q5): state · steps · runs · tokens; a
+/// non-clean end appends the responsible reason.
+fn turn_summary(turn: &TurnView) -> String {
+    let mut out = format!(
+        "[{}] {} step(s), {} run(s), {}+{} tok",
+        state_symbol(turn.state),
+        turn.tools,
+        turn.runs,
+        turn.input_tokens,
+        turn.output_tokens
+    );
+    if turn.state != TurnState::Completed
+        && let Some(reason) = &turn.reason
+    {
+        out.push_str(&format!(" — {reason}"));
+    }
+    out
+}
+
+fn state_symbol(state: TurnState) -> &'static str {
+    match state {
+        TurnState::Running => "…",
+        TurnState::Completed => "✓",
+        TurnState::Failed => "✗",
+        TurnState::Blocked => "!",
+        TurnState::Interrupted => "?",
+    }
+}
+
+fn step_status_label(status: StepStatus) -> &'static str {
+    match status {
+        StepStatus::InFlight => "…",
+        StepStatus::Ok => "✓",
+        StepStatus::Interrupted => "✗",
+        StepStatus::Ambiguous => "?",
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

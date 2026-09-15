@@ -661,13 +661,10 @@ fn run_tui(opts: Options) -> i32 {
         .is_some_and(|a| a.auto_approve == Some(true) || a.yolo == Some(true));
 
     // Worker thread: the session already replayed the transcript projection at
-    // open (decision 30, launch = resume, R-19), so push its current view once,
-    // then drive turns. On Quit it closes the session (it owns it).
+    // open (decision 30, launch = resume, R-19), and the transcript listener
+    // pushed that replayed view as `Evt::View` — no manual push here.
     let worker = std::thread::spawn(move || {
         let mut driver = Driver::new(session);
-        let _ = evt_tx.send(Evt::View(
-            driver.session().transcript_view(&CollapseOverrides::new()),
-        ));
         loop {
             match cmd_rx.recv() {
                 Ok(Cmd::Submit(text)) => {

@@ -27,12 +27,13 @@ cargo run -p kanbei-cli --bin kanbei -- [DIR] [--model M] [--fake] [--auto-appro
 On a TTY the CLI runs a full-screen TUI; piped stdin falls back to the plain
 REPL.
 
-**TUI.** Launch is always resume: the transcript is a live projection of the
-session's committed envelopes, rebuilt on start from the canonical log. A
+**TUI.** Launch is always resume: the transcript is a projection service
+(`crates/kanbei-transcript`, decision 30) driven by the session over its
+committed envelopes and replayed from the canonical log on start. A
 turn's working segment renders as a thought bubble — expanded while the turn
-runs (live tool steps), then collapsed to a summary line (`state · steps ·
-runs · tokens · elapsed`, plus the reason on a non-clean end). Reopen any
-turn by clicking its summary or selecting it (arrows/`j`/`k`) and pressing
+runs (live tool steps + streaming text), then collapsed to a summary line
+(`state · steps · runs · tokens`, plus the reason on a non-clean end). Reopen
+any turn by clicking its summary or selecting it (arrows/`j`/`k`) and pressing
 `Enter`. The final answer renders below the bubble. The status bar shows
 `state · model · egress tokens · key hints`; scrollback covers the whole log
 (bottom-pinned, `↑`/`↓`/PageUp/Down to scroll).

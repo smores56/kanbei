@@ -38,19 +38,6 @@ pub enum OutcomeClass {
     Failed,
 }
 
-impl OutcomeClass {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            OutcomeClass::Progress => "progress",
-            OutcomeClass::CompletedGoal => "completed-goal",
-            OutcomeClass::NoProgress => "no-progress",
-            OutcomeClass::Waiting => "waiting",
-            OutcomeClass::Blocked => "blocked",
-            OutcomeClass::Failed => "failed",
-        }
-    }
-}
-
 /// Parse the `run_outcome` payload's terminal outcome. The scheduler
 /// serializes unit variants as strings and `Failed(FailureKind)` as an
 /// object with the kind string.
@@ -95,17 +82,6 @@ pub enum StepStatus {
     Ambiguous,
 }
 
-impl StepStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            StepStatus::InFlight => "…",
-            StepStatus::Ok => "✓",
-            StepStatus::Interrupted => "✗",
-            StepStatus::Ambiguous => "?",
-        }
-    }
-}
-
 /// One row of a turn's working segment (thought bubble).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BubbleRow {
@@ -124,8 +100,14 @@ pub struct ToolStep {
     /// Canonical argument JSON (display; truncated at render).
     pub args: String,
     pub status: StepStatus,
-    /// Outcome detail: error text, denial reason, or truncated output.
+    /// Classification reason (denial / interruption / ambiguity text), raw;
+    /// the renderer joins and truncates.
     pub detail: String,
+    /// Outcome error text, raw; the renderer joins and truncates.
+    pub error: String,
+    /// Serialized result payload (`null` → empty), raw and untruncated; the
+    /// renderer joins and truncates.
+    pub result: String,
 }
 
 /// The turn's rendered end-state.
@@ -144,23 +126,18 @@ pub enum TurnState {
 }
 
 impl TurnState {
-    pub fn symbol(self) -> &'static str {
-        match self {
-            TurnState::Running => "…",
-            TurnState::Completed => "✓",
-            TurnState::Failed => "✗",
-            TurnState::Blocked => "!",
-            TurnState::Interrupted => "?",
-        }
-    }
-
+    /// The end-state a recorded terminal outcome maps to: `Progress`/
+    /// `CompletedGoal` → Completed, `Failed` → Failed, the responsible-stop
+    /// classes → Blocked. No recorded outcome means nothing closed the turn
+    /// while it was active (the session died mid-turn) → Interrupted.
     pub fn from_outcome(last: Option<(OutcomeClass, Option<String>)>) -> Self {
         match last {
             Some((OutcomeClass::Progress | OutcomeClass::CompletedGoal, _)) => {
                 TurnState::Completed
             }
             Some((OutcomeClass::Failed, _)) => TurnState::Failed,
-            _ => TurnState::Blocked,
+            Some(_) => TurnState::Blocked,
+            None => TurnState::Interrupted,
         }
     }
 }
@@ -184,9 +161,10 @@ pub struct TurnView {
     pub tools: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    /// The last run's terminal outcome as recorded (replay safety: a
-    /// replayed turn whose driver result is unknown resolves its state from
-    /// this).
+    /// The current run's terminal outcome as recorded, cleared by a
+    /// superseding `run_start` (replay safety: a replayed turn whose driver
+    /// result is unknown resolves its state from this; `None` means nothing
+    /// closed the turn while it was active).
     pub last_outcome: Option<(OutcomeClass, Option<String>)>,
     /// Derived, per-view only: whether the turn's thought bubble is open
     /// (running, or the user re-opened it). Never stored in the projection
@@ -213,25 +191,6 @@ impl TurnView {
             open: false,
             streaming: None,
         }
-    }
-
-    /// The collapsed summary line (Q5): state · steps · runs · tokens; a
-    /// non-clean end appends the responsible reason.
-    pub fn summary(&self) -> String {
-        let mut out = format!(
-            "[{}] {} step(s), {} run(s), {}+{} tok",
-            self.state.symbol(),
-            self.tools,
-            self.runs,
-            self.input_tokens,
-            self.output_tokens
-        );
-        if !matches!(self.state, TurnState::Completed)
-            && let Some(reason) = &self.reason
-        {
-            out.push_str(&format!(" — {reason}"));
-        }
-        out
     }
 }
 
@@ -288,11 +247,9 @@ impl CollapseOverrides {
 /// driven by the session and yields a deterministic typed view. Inject a
 /// replacement through `SessionConfig::transcript`; the session and the UI
 /// need no changes. Mirrors the `ProviderEngine` seam shape.
-pub trait TranscriptProjection: Send + Sync {
+pub trait TranscriptProjection: Send {
     /// Implementation identity (diagnostics / egress pins).
     fn name(&self) -> &str;
-    /// Contract version of the view this projection produces.
-    fn version(&self) -> u32;
     /// Apply one committed envelope (the only canonical mutation entry point
     /// besides [`Self::finalize_turn`]/[`Self::finish_replay`]). Unknown kinds
     /// are kernel records the transcript does not surface.
@@ -301,9 +258,10 @@ pub trait TranscriptProjection: Send + Sync {
     /// stopped driving; the terminal `run_outcome` is already in the log).
     /// `None` = resolve from the recorded terminal outcome.
     fn finalize_turn(&mut self, last: Option<OutcomeClass>);
-    /// End of a replay (session open / resume): a turn still active has no
-    /// driver result — resolve it from its recorded terminal outcome, else
-    /// mark it interrupted (B-05: the log is the authority).
+    /// End of a replay (session open / resume): every turn still active has no
+    /// driver result — resolve it from its own recorded terminal outcome when
+    /// one closed its last run, else mark it interrupted (B-05: the log is the
+    /// authority).
     fn finish_replay(&mut self);
     /// Append a non-canonical provider-stream fragment to the in-flight
     /// partial (never committed).
@@ -390,6 +348,8 @@ impl ConversationProjection {
             args: payload.get("args").map(Value::to_string).unwrap_or_default(),
             status: StepStatus::InFlight,
             detail: String::new(),
+            error: String::new(),
+            result: String::new(),
         }));
     }
 
@@ -437,31 +397,25 @@ impl ConversationProjection {
         let error = payload
             .get("error")
             .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        // Carry the outcome components raw: joining and truncating is a
+        // presentation concern owned by the renderer.
+        let result = payload
+            .get("result")
+            .filter(|v| !v.is_null())
+            .map(Value::to_string)
             .unwrap_or_default();
-        let result_text = truncate(
-            &payload
-                .get("result")
-                .filter(|v| !v.is_null())
-                .map(Value::to_string)
-                .unwrap_or_default(),
-            200,
-        );
-        let detail_parts: Vec<&str> = [&detail, error, &result_text]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect();
         step.status = status;
-        step.detail = detail_parts.join(" · ");
+        step.detail = detail;
+        step.error = error;
+        step.result = result;
     }
 }
 
 impl TranscriptProjection for ConversationProjection {
     fn name(&self) -> &str {
         "conversation"
-    }
-
-    fn version(&self) -> u32 {
-        1
     }
 
     fn apply(&mut self, env: &Envelope) {
@@ -477,7 +431,14 @@ impl TranscriptProjection for ConversationProjection {
             }
             "run_start" => {
                 if let Some(i) = self.active() {
-                    self.turns[i].runs += 1;
+                    let turn = &mut self.turns[i];
+                    turn.runs += 1;
+                    // A new run supersedes the previous run's terminal record:
+                    // a turn still running at replay then has no outcome
+                    // applied while it was active, so its state must not be
+                    // resolved from an unrelated earlier outcome.
+                    turn.last_outcome = None;
+                    turn.reason = None;
                 }
             }
             "model_outcome" => {
@@ -559,18 +520,40 @@ impl TranscriptProjection for ConversationProjection {
             return;
         };
         let turn = &mut self.turns[i];
-        // The driver's result wins; a `None` result (no run reached a
-        // terminal outcome) falls back to the recorded `run_outcome`.
-        let effective = last
-            .map(|class| (class, None))
-            .or_else(|| turn.last_outcome.clone());
+        // The driver's observed class wins; it carries no reason, so reuse the
+        // reason recorded for the same class (the `run_outcome` kept it). A
+        // `None` result falls back to the recorded terminal outcome; when
+        // neither exists nothing closed the turn while it was active →
+        // Interrupted.
+        let effective = match last {
+            Some(class) => {
+                let reason = turn
+                    .last_outcome
+                    .as_ref()
+                    .filter(|(c, _)| *c == class)
+                    .and_then(|(_, r)| r.clone());
+                Some((class, reason))
+            }
+            None => turn.last_outcome.clone(),
+        };
+        // The driver supplies only the class; keep the displayed failure reason
+        // in sync with the effective outcome so the recorded reason survives
+        // (`last.map(|c| (c, None))` used to drop it).
+        if let Some((OutcomeClass::Failed, reason)) = &effective {
+            turn.reason = reason.clone();
+        }
         turn.state = TurnState::from_outcome(effective);
     }
 
     fn finish_replay(&mut self) {
-        if let Some(i) = self.active() {
-            let turn = &mut self.turns[i];
-            turn.state = TurnState::from_outcome(turn.last_outcome.clone());
+        // Every turn still Running at replay's end was closed live only by
+        // `finalize_turn` (not a log event): resolve it from its own recorded
+        // terminal outcome. A turn with none died mid-turn — its last outcome
+        // was cleared by the superseding `run_start` — so it is Interrupted.
+        for turn in &mut self.turns {
+            if turn.state == TurnState::Running {
+                turn.state = TurnState::from_outcome(turn.last_outcome.clone());
+            }
         }
     }
 
@@ -584,8 +567,13 @@ impl TranscriptProjection for ConversationProjection {
     }
 
     fn end_stream(&mut self) {
-        if let Some(i) = self.active() {
-            self.turns[i].streaming = None;
+        // Clear the partial on every Running turn: replay can transiently hold
+        // more than one (finalize is not a log event), and a partial must not
+        // survive on an earlier one.
+        for turn in &mut self.turns {
+            if turn.state == TurnState::Running {
+                turn.streaming = None;
+            }
         }
     }
 
@@ -609,16 +597,6 @@ impl TranscriptProjection for ConversationProjection {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        return s.to_string();
-    }
-    let mut out: String = chars[..max].iter().collect();
-    out.push('…');
-    out
 }
 
 #[cfg(test)]
@@ -762,7 +740,32 @@ mod tests {
         s.finalize_turn(None);
         assert_eq!(s.turns[0].state, TurnState::Failed);
         assert_eq!(s.turns[0].reason.as_deref(), Some("provider 500"));
-        assert!(s.turns[0].summary().contains("provider 500"));
+    }
+
+    /// A driver class passed to `finalize_turn` carries no reason, so the
+    /// reason recorded for the same class is preserved.
+    #[test]
+    fn finalize_preserves_the_recorded_reason_for_the_same_class() {
+        let mut s = ConversationProjection::new();
+        s.apply(&env(1, "user_message", json!({ "text": "hi" })));
+        s.apply(&env(2, "run_outcome", json!({
+            "run_id": "r",
+            "outcome": { "Failed": "Provider" },
+            "reason": "provider 500"
+        })));
+        s.finalize_turn(Some(OutcomeClass::Failed));
+        assert_eq!(s.turns[0].state, TurnState::Failed);
+        assert_eq!(s.turns[0].reason.as_deref(), Some("provider 500"));
+        // A different class is unrelated to the recorded reason.
+        let mut s = ConversationProjection::new();
+        s.apply(&env(1, "user_message", json!({ "text": "hi" })));
+        s.apply(&env(2, "run_outcome", json!({
+            "run_id": "r",
+            "outcome": { "Failed": "Provider" },
+            "reason": "provider 500"
+        })));
+        s.finalize_turn(Some(OutcomeClass::Progress));
+        assert_eq!(s.turns[0].state, TurnState::Completed);
     }
 
     #[test]
@@ -774,6 +777,56 @@ mod tests {
         })));
         s.finish_replay();
         assert_eq!(s.turns[0].state, TurnState::Blocked);
+    }
+
+    /// Resume identity: a turn closed live by `finalize_turn` (not a log
+    /// event) resolves from its recorded outcome at replay; a turn whose last
+    /// run never reached an outcome is Interrupted, and every leftover Running
+    /// turn is resolved, not just the last.
+    #[test]
+    fn replay_resolves_every_leftover_running_turn() {
+        let mut s = ConversationProjection::new();
+        s.apply(&env(1, "user_message", json!({ "text": "a" })));
+        s.apply(&env(2, "run_start", json!({})));
+        s.apply(&env(3, "run_outcome", json!({
+            "run_id": "r", "outcome": "Progress", "reason": null
+        })));
+        s.apply(&env(4, "user_message", json!({ "text": "b" })));
+        s.apply(&env(5, "run_start", json!({})));
+        s.finish_replay();
+        assert_eq!(s.turns[0].state, TurnState::Completed);
+        assert_eq!(s.turns[1].state, TurnState::Interrupted);
+    }
+
+    /// A mid-turn death (no outcome applied while the turn was active) is
+    /// Interrupted, and the live path (`finalize_turn(None)`) and the replayed
+    /// path agree.
+    #[test]
+    fn mid_turn_death_is_interrupted_and_matches_live() {
+        let stream = [
+            env(1, "user_message", json!({ "text": "hi" })),
+            env(2, "run_start", json!({})),
+            env(3, "model_outcome", model_outcome(Some("thinking"), &["fs.read"], 1, 2)),
+            env(
+                4,
+                "tool_intent",
+                json!({ "call_id": "c1", "tool": "fs.read", "args": { "path": "a" } }),
+            ),
+        ];
+        let mut live = ConversationProjection::new();
+        for env in &stream {
+            live.apply(env);
+        }
+        live.finalize_turn(None);
+        assert_eq!(live.turns[0].state, TurnState::Interrupted);
+
+        let mut replay = ConversationProjection::new();
+        for env in &stream {
+            replay.apply(env);
+        }
+        replay.finish_replay();
+        assert_eq!(replay.turns[0].state, TurnState::Interrupted);
+        assert_eq!(default_view(&live), default_view(&replay));
     }
 
     #[test]
@@ -923,5 +976,20 @@ mod tests {
         assert!(view.turns[0].open, "the in-flight partial renders in an open bubble");
         s.end_stream();
         assert_eq!(default_view(&s).turns[0].streaming, None);
+    }
+
+    /// A partial must not survive on an earlier Running turn when a later turn
+    /// is the active one at stream end (replay can hold several, since
+    /// finalize is not a log event).
+    #[test]
+    fn end_stream_clears_partials_on_every_running_turn() {
+        let mut s = ConversationProjection::new();
+        s.apply(&env(1, "user_message", json!({ "text": "a" })));
+        s.apply(&env(2, "run_start", json!({})));
+        s.apply_delta("partial");
+        s.apply(&env(3, "user_message", json!({ "text": "b" })));
+        s.end_stream();
+        assert_eq!(s.turns[0].streaming, None);
+        assert_eq!(s.turns[1].streaming, None);
     }
 }

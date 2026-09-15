@@ -18,7 +18,7 @@ use kanbei_scheduler::{
     Budgets, CognitionProvider, FailureKind, StepCommand, StepContext, StepError, StepResult,
     TerminalOutcome, Trigger, TriggerKind,
 };
-use kanbei_session::{Session, SessionConfig};
+use kanbei_session::{NewEvent, Session, SessionConfig, TranscriptListener, TranscriptView};
 
 /// An engine that streams scripted fragments and honours the cancel token
 /// between fragments — the stream boundary a user cancel lands on.
@@ -294,6 +294,87 @@ fn stream_without_cancel_completes() {
         .unwrap();
     assert_eq!(outcome, TerminalOutcome::CompletedGoal);
     assert_eq!(*seen.lock().unwrap(), vec!["he".to_string(), "llo".to_string()]);
+    session.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The transcript listener (UI seam) observes the replayed view at open and
+/// the in-flight partial on every delta, and sees it cleared when the stream
+/// ends — the streaming seam is live.
+#[test]
+fn transcript_listener_observes_replay_deltas_and_stream_end() {
+    let dir = dir("transcript");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let views = Arc::new(std::sync::Mutex::new(Vec::<TranscriptView>::new()));
+    let recorded = Arc::clone(&views);
+    let transcript_listener: TranscriptListener = Arc::new(move |view: &TranscriptView| {
+        recorded.lock().unwrap().push(view.clone());
+    });
+    let mut session = Session::open(SessionConfig {
+        dir: dir.clone(),
+        provider: Some(fake_config()),
+        provider_engine: Some(Box::new(StreamEngine {
+            fragments: vec!["he".into(), "llo".into()],
+        })),
+        cancel_flag: Some(cancel),
+        transcript_listener: Some(transcript_listener),
+        session_id: Some(Id128::generate()),
+        budgets: Budgets {
+            deadline_secs: Some(60),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(
+        !views.lock().unwrap().is_empty(),
+        "the open replay fires the listener"
+    );
+    session
+        .commit(
+            vec![NewEvent {
+                kind: "user_message".into(),
+                payload_schema: 1,
+                payload: serde_json::json!({ "text": "hi" }),
+                objects: Vec::new(),
+                refs: Vec::new(),
+            }],
+            None,
+        )
+        .unwrap();
+    session.observe_trigger(Trigger {
+        kind: TriggerKind::UserMessage,
+        referent: None,
+    });
+    let run = session.accept_wake().unwrap().unwrap();
+    session.run_start(run.run_id).unwrap();
+    let mut provider = ScriptedProvider {
+        commands: model_call_plan().into(),
+    };
+    let outcome = session
+        .cognition_loop(run.run_id, Trigger {
+            kind: TriggerKind::UserMessage,
+            referent: None,
+        }, &mut provider, render)
+        .unwrap();
+    assert_eq!(outcome, TerminalOutcome::CompletedGoal);
+
+    let seen = views.lock().unwrap();
+    let partials: Vec<Option<String>> = seen
+        .iter()
+        .flat_map(|v| v.turns.iter().map(|t| t.streaming.clone()))
+        .collect();
+    assert!(
+        partials.iter().any(|p| p.as_deref() == Some("he")),
+        "a delta view carries the in-flight partial"
+    );
+    assert!(partials.iter().any(|p| p.as_deref() == Some("hello")));
+    assert_eq!(
+        partials.last().cloned().flatten(),
+        None,
+        "stream end clears the partial"
+    );
+    drop(seen);
     session.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

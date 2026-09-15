@@ -421,10 +421,13 @@ impl Session {
         let cancel_ref = cancel.as_deref().unwrap_or(&no_cancel);
         let listener = self.delta_listener.clone();
         // Decision 30: partials have a home in the transcript projection; they
-        // are non-canonical and never committed.
+        // are non-canonical and never committed. The transcript-view observer
+        // fires per delta so the in-flight partial is observable.
+        let transcript_listener = self.transcript_listener.clone();
         let transcript = &mut self.transcript;
         let mut on_delta = |fragment: &str| {
             transcript.apply_delta(fragment);
+            crate::transcript::fire_transcript_view(transcript.as_ref(), &transcript_listener);
             if let Some(listener) = &listener {
                 listener(fragment);
             }
@@ -432,6 +435,7 @@ impl Session {
         let streamed = engine.complete_stream(&request, cancel_ref, &mut on_delta);
         // The stream ended (success or cancel/error): clear the partial.
         self.transcript.end_stream();
+        self.notify_transcript();
         let response = streamed.map_err(|e| match e {
             kanbei_provider::ProviderError::Cancelled { .. } => SessionError::Cancelled,
             e => SessionError::Provider(e.to_string()),
