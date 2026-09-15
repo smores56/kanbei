@@ -23,7 +23,10 @@ mod runtime;
 pub mod state;
 
 pub use host::ModuleHost;
-pub use lifecycle::{DisposalRecord, Generation, ModuleError, ModuleManager, ReplacementOutcome};
+pub use lifecycle::{
+    DisposalRecord, Generation, HookError, ModuleError, ModuleManager, ReplacementOutcome,
+    HOOK_WAIT,
+};
 pub use package::{install_package, ModuleOrigin, PackageError, PackageManifest, PACKAGE_SCHEMA};
 pub use runtime::{ActorError, GenerationRuntime};
 pub use state::{HeadFile, StateError, StateStore, StateUpdate};

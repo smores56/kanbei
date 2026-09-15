@@ -68,6 +68,18 @@ impl Scope {
         }
     }
 
+    /// The scope for a kernel-initiated hook (T9): depth 0, no generation
+    /// visited yet (the hooking generation is not itself on a `service_call`
+    /// chain — a hook must not join the T20 `visited` set), with its own
+    /// deadline.
+    pub(crate) fn hook(deadline: Instant) -> Self {
+        Self {
+            depth: 0,
+            visited: Vec::new(),
+            deadline,
+        }
+    }
+
     /// Advance across one hop to `provider`, enforcing the chain rules and
     /// returning the child scope the provider's actor runs under: depth + 1,
     /// the provider appended to the visited set, and the caller's absolute

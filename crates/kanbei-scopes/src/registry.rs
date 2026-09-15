@@ -29,9 +29,9 @@ use serde_json::Value;
 
 use crate::contrib::{
     ApprovalSettings, CommandContribution, Contribution, ContributionKind, GuardContribution,
-    KeyReference, KeymapContribution, ProjectionStageContribution, ProviderSettings,
-    ServiceContribution, SettingsContribution, ThemeContribution, ToolContribution,
-    UiMountContribution,
+    HookContribution, HookKind, KeyReference, KeymapContribution, ProjectionStageContribution,
+    ProviderSettings, ServiceContribution, SettingsContribution, ThemeContribution,
+    ToolContribution, UiMountContribution,
 };
 use crate::errors::ScopeError;
 
@@ -108,6 +108,9 @@ pub struct ContributionRegistry {
     stages: HashMap<(ScopePath, String, u32), ProjectionStageContribution>,
     ui: HashMap<(ScopePath, String), UiMountContribution>,
     guards: HashMap<(ScopePath, String), GuardContribution>,
+    /// Hooks keyed by `(scope, hook kind, name)`: duplicates conflict, but
+    /// distinct modules may hook the same kind (merge kind, like `keymap`).
+    hooks: HashMap<(ScopePath, HookKind, String), HookContribution>,
     /// Merged settings view: at most one effective entry per scope; later
     /// layers overlay field-wise over earlier ones (R-19).
     settings: HashMap<ScopePath, SettingsContribution>,
@@ -124,6 +127,7 @@ impl ContributionRegistry {
             stages: HashMap::new(),
             ui: HashMap::new(),
             guards: HashMap::new(),
+            hooks: HashMap::new(),
             settings: HashMap::new(),
             services,
         }
@@ -164,6 +168,7 @@ impl ContributionRegistry {
         let mut seen_stages: HashMap<(ScopePath, String, u32), String> = HashMap::new();
         let mut seen_ui: HashMap<(ScopePath, String), String> = HashMap::new();
         let mut seen_guards: HashMap<(ScopePath, String), (String, bool)> = HashMap::new();
+        let mut seen_hooks: HashMap<(ScopePath, HookKind, String), String> = HashMap::new();
         let published: HashMap<ServiceKey, ServiceProvider> = self
             .services
             .lock()
@@ -299,6 +304,22 @@ impl ContributionRegistry {
                     // be structurally well-formed.
                     validate_settings(contribution, s)?;
                 }
+                ContributionKind::Hook(h) => {
+                    if h.name.is_empty() || h.entry.is_empty() {
+                        return Err(ScopeError::InvalidContribution {
+                            scope: contribution.scope.clone(),
+                            reason: "hook name and entry must be non-empty".into(),
+                        });
+                    }
+                    let key = (contribution.scope.clone(), h.hook, h.name.clone());
+                    let holder = seen_hooks
+                        .get(&key)
+                        .or_else(|| self.hooks.get(&key).map(|e| &e.entry));
+                    if let Some(holder) = holder {
+                        return Err(conflict("hook", contribution, &h.name, holder, &h.entry));
+                    }
+                    seen_hooks.insert(key, h.entry.clone());
+                }
             }
         }
         Ok(())
@@ -370,6 +391,9 @@ impl ContributionRegistry {
                 }
                 ContributionKind::Guard(g) => {
                     next.guards.remove(&(c.scope.clone(), g.name.clone()));
+                }
+                ContributionKind::Hook(h) => {
+                    next.hooks.remove(&(c.scope.clone(), h.hook, h.name.clone()));
                 }
                 ContributionKind::Keymap(km) => {
                     next.keymaps.retain(|(s, e)| !(s == &c.scope && e.key == km.key));
@@ -452,6 +476,10 @@ impl ContributionRegistry {
                 ContributionKind::Guard(g) => {
                     next.guards
                         .insert((c.scope.clone(), g.name.clone()), g.clone());
+                }
+                ContributionKind::Hook(h) => {
+                    next.hooks
+                        .insert((c.scope.clone(), h.hook, h.name.clone()), h.clone());
                 }
                 ContributionKind::Settings(s) => {
                     merge_settings(
@@ -655,6 +683,17 @@ impl ContributionRegistry {
                 true
             }
         });
+        self.hooks.retain(|(s, _, _), c| {
+            if s == scope {
+                extras.push(Contribution {
+                    scope: s.clone(),
+                    kind: ContributionKind::Hook(c.clone()),
+                });
+                false
+            } else {
+                true
+            }
+        });
         self.keymaps.retain(|(s, km)| {
             if s == scope {
                 extras.push(Contribution {
@@ -717,6 +756,9 @@ impl ContributionRegistry {
                 }
                 ContributionKind::Guard(g) => {
                     next.guards.remove(&(c.scope.clone(), g.name.clone()));
+                }
+                ContributionKind::Hook(h) => {
+                    next.hooks.remove(&(c.scope.clone(), h.hook, h.name.clone()));
                 }
                 ContributionKind::Keymap(km) => {
                     next.keymaps.retain(|(s, e)| !(s == &c.scope && e.key == km.key));
@@ -782,6 +824,12 @@ impl ContributionRegistry {
                 kind: ContributionKind::Guard(c.clone()),
             });
         }
+        for ((scope, _, _), c) in &self.hooks {
+            out.push(Contribution {
+                scope: scope.clone(),
+                kind: ContributionKind::Hook(c.clone()),
+            });
+        }
         for (scope, km) in &self.keymaps {
             out.push(Contribution {
                 scope: scope.clone(),
@@ -832,6 +880,24 @@ impl ContributionRegistry {
     /// of overlaying all applied settings contributions (later wins per field).
     pub fn settings_for(&self, scope: &ScopePath) -> Option<&SettingsContribution> {
         self.settings.get(scope)
+    }
+
+    /// Every contribution registered for `hook`, ordered deterministically by
+    /// `(scope path, name)`. Multiple modules may hook the same kind, so this
+    /// never resolves to a single winner (unlike the unique-identity kinds).
+    pub fn hooks_for(&self, hook: HookKind) -> Vec<(ScopePath, HookContribution)> {
+        let mut out: Vec<(ScopePath, HookContribution)> = self
+            .hooks
+            .iter()
+            .filter(|((_, h, _), _)| *h == hook)
+            .map(|((scope, _, _), c)| (scope.clone(), c.clone()))
+            .collect();
+        out.sort_by(|(sa, ca), (sb, cb)| {
+            sa.to_string()
+                .cmp(&sb.to_string())
+                .then_with(|| ca.name.cmp(&cb.name))
+        });
+        out
     }
 
     /// Replaces a command registration. `previous_holder` must name the
@@ -991,6 +1057,7 @@ impl ContributionRegistry {
             stages: self.stages.clone(),
             ui: self.ui.clone(),
             guards: self.guards.clone(),
+            hooks: self.hooks.clone(),
             settings: self.settings.clone(),
             services: Arc::clone(&self.services),
         }
@@ -1040,6 +1107,9 @@ impl ContributionRegistry {
                 }
                 ContributionKind::Guard(g) => {
                     self.guards.remove(&(c.scope.clone(), g.name.clone()));
+                }
+                ContributionKind::Hook(h) => {
+                    self.hooks.remove(&(c.scope.clone(), h.hook, h.name.clone()));
                 }
                 ContributionKind::Keymap(km) => {
                     self.keymaps
@@ -1241,6 +1311,7 @@ fn snapshot_sort_key(c: &Contribution) -> (String, &'static str, String, String,
         ContributionKind::ProjectionStage(p) => (p.slot.clone(), format!("{:010}", p.ordering)),
         ContributionKind::UiMount(u) => (u.name.clone(), String::new()),
         ContributionKind::Guard(g) => (g.name.clone(), String::new()),
+        ContributionKind::Hook(h) => (h.name.clone(), String::new()),
         ContributionKind::Settings(_) => (String::new(), String::new()),
     };
     (
@@ -2732,5 +2803,146 @@ mod tests {
             None,
             "user provider field is gone"
         );
+    }
+    fn hook(scope: &ScopePath, name: &str, kind: HookKind, entry: &str) -> Contribution {
+        Contribution {
+            scope: scope.clone(),
+            kind: ContributionKind::Hook(HookContribution {
+                name: name.into(),
+                hook: kind,
+                entry: entry.into(),
+            }),
+        }
+    }
+
+    /// T9: hooks are a merge kind — two modules may hook the same kind, and
+    /// `hooks_for` orders them deterministically by (scope path, name).
+    #[test]
+    fn hooks_merge_across_modules_and_order_deterministically() {
+        let a = scope("a");
+        let b = scope("b");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        validate_and_apply(
+            &mut registry,
+            &b,
+            &[
+                hook(&b, "zeta", HookKind::OnTurnStart, "kb_on_turn_start"),
+                hook(&b, "alpha", HookKind::OnTurnStart, "kb_on_turn_start"),
+            ],
+        );
+        validate_and_apply(
+            &mut registry,
+            &a,
+            &[hook(&a, "one", HookKind::OnTurnStart, "kb_on_turn_start")],
+        );
+        validate_and_apply(
+            &mut registry,
+            &a,
+            &[hook(&a, "other", HookKind::OnToolIntent, "kb_on_tool_intent")],
+        );
+
+        let ordered = registry.hooks_for(HookKind::OnTurnStart);
+        let names: Vec<String> = ordered
+            .iter()
+            .map(|(s, h)| format!("{}:{}", s, h.name))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "/a:one".to_string(),
+                "/b:alpha".to_string(),
+                "/b:zeta".to_string()
+            ]
+        );
+        // The other hook kind is not mixed in.
+        let intents = registry.hooks_for(HookKind::OnToolIntent);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].1.name, "other");
+
+        // Hooks never occupy a precedence-replacement identity.
+        assert!(contribution_override_key(&hook(&a, "one", HookKind::OnTurnStart, "x")).is_none());
+    }
+
+    /// T9: an exact `(scope, hook, name)` duplicate conflicts; distinct names
+    /// in the same scope do not.
+    #[test]
+    fn duplicate_hook_in_scope_conflicts() {
+        let s = scope("app");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let h1 = hook(&s, "guard", HookKind::OnTurnStart, "e1");
+        let h2 = hook(&s, "guard", HookKind::OnTurnStart, "e2");
+
+        let err = registry.validate(&[h1.clone(), h2.clone()]).unwrap_err();
+        assert_eq!(
+            err,
+            ScopeError::Conflict {
+                kind: "hook",
+                scope: s.clone(),
+                name: "guard".into(),
+                holder: "e1".into(),
+                challenger: "e2".into(),
+            }
+        );
+
+        validate_and_apply(&mut registry, &s, &[h1]);
+        let err = registry.validate(&[h2]).unwrap_err();
+        assert!(matches!(err, ScopeError::Conflict { kind: "hook", .. }));
+
+        // A distinct name for the same hook kind merges.
+        registry
+            .validate(&[hook(&s, "other", HookKind::OnTurnStart, "e3")])
+            .unwrap();
+        // The same name under the other hook kind is a distinct key.
+        registry
+            .validate(&[hook(&s, "guard", HookKind::OnToolIntent, "e3")])
+            .unwrap();
+    }
+
+    /// T9: empty name/entry is an invalid contribution (no partial state).
+    #[test]
+    fn hook_name_and_entry_must_be_non_empty() {
+        let s = scope("app");
+        let registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let err = registry
+            .validate(&[hook(&s, "", HookKind::OnTurnStart, "e")])
+            .unwrap_err();
+        assert!(matches!(err, ScopeError::InvalidContribution { .. }));
+        let err = registry
+            .validate(&[hook(&s, "n", HookKind::OnTurnStart, "")])
+            .unwrap_err();
+        assert!(matches!(err, ScopeError::InvalidContribution { .. }));
+    }
+
+    /// T9: hook removal paths (mid-session and whole-scope) drop hooks.
+    #[test]
+    fn hook_removal_paths_drop_hooks() {
+        let a = scope("a");
+        let b = scope("b");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        validate_and_apply(
+            &mut registry,
+            &a,
+            &[hook(&a, "one", HookKind::OnTurnStart, "e1")],
+        );
+        validate_and_apply(
+            &mut registry,
+            &b,
+            &[hook(&b, "two", HookKind::OnTurnStart, "e2")],
+        );
+        assert_eq!(registry.hooks_for(HookKind::OnTurnStart).len(), 2);
+
+        registry
+            .remove_contributions(&[hook(&a, "one", HookKind::OnTurnStart, "e1")])
+            .unwrap();
+        let remaining = registry.hooks_for(HookKind::OnTurnStart);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].1.name, "two");
+
+        let removed = registry.remove_scope(&b, false).unwrap();
+        assert!(removed.contributions.iter().any(|c| matches!(
+            &c.kind,
+            ContributionKind::Hook(h) if h.name == "two"
+        )));
+        assert!(registry.hooks_for(HookKind::OnTurnStart).is_empty());
     }
 }

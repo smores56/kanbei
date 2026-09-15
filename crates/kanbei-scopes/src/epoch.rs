@@ -563,4 +563,62 @@ mod tests {
             "the lower service holder still resolves"
         );
     }
+
+    /// T9: existing kinds' serialized bytes are unchanged by the new variant,
+    /// so the composition digest domain stays stable for hook-free sets.
+    #[test]
+    fn existing_kind_serialization_is_stable() {
+        let kind = ContributionKind::Guard(GuardContribution {
+            name: "g".into(),
+            predicate: "p".into(),
+            monotonic: true,
+        });
+        assert_eq!(
+            serde_json::to_string(&kind).unwrap(),
+            r#"{"Guard":{"name":"g","predicate":"p","monotonic":true}}"#
+        );
+        let hook = ContributionKind::Hook(crate::contrib::HookContribution {
+            name: "h".into(),
+            hook: crate::contrib::HookKind::OnTurnStart,
+            entry: "kb_on_turn_start".into(),
+        });
+        assert_eq!(
+            serde_json::to_string(&hook).unwrap(),
+            r#"{"Hook":{"name":"h","hook":"on_turn_start","entry":"kb_on_turn_start"}}"#
+        );
+    }
+
+    /// T9: the composition digest includes hooks — and only when present.
+    #[test]
+    fn composition_digest_changes_only_once_a_hook_exists() {
+        let s = scope("app");
+        let base = full_set(&s);
+
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let mut store = CompositionStore::new(&registry);
+        store.stage_publish(&base, &mut registry).unwrap();
+        let without_hooks = store.current().digest;
+
+        // Re-publishing the identical hook-free set does not change the digest.
+        let mut registry2 = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let mut store2 = CompositionStore::new(&registry2);
+        store2.stage_publish(&base, &mut registry2).unwrap();
+        assert_eq!(store2.current().digest, without_hooks);
+
+        // Adding a hook contribution changes the digest.
+        let mut with_hook = base.clone();
+        with_hook.push(Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::Hook(crate::contrib::HookContribution {
+                name: "h".into(),
+                hook: crate::contrib::HookKind::OnTurnStart,
+                entry: "kb_on_turn_start".into(),
+            }),
+        });
+        let mut registry3 = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let mut store3 = CompositionStore::new(&registry3);
+        store3.stage_publish(&with_hook, &mut registry3).unwrap();
+        assert_ne!(store3.current().digest, without_hooks);
+        assert_eq!(store3.current().contributions.len(), base.len() + 1);
+    }
 }

@@ -42,8 +42,8 @@ use std::time::{Duration, Instant};
 use kanbei_capabilities::{ApprovalIntent, Broker, Capability, GrantScope, Principal};
 use kanbei_core::id::Id128;
 use kanbei_scopes::contrib::{
-    ApprovalSettings, Contribution, ContributionKind, ProviderSettings, SettingsContribution,
-    ThemeContribution, UiMountContribution,
+    ApprovalSettings, Contribution, ContributionKind, HookContribution, HookKind,
+    ProviderSettings, SettingsContribution, ThemeContribution, UiMountContribution,
 };
 use kanbei_services::{
     ReplaceIntent, ScopePath, ServiceContract, ServiceDependency, ServiceError, ServiceKey,
@@ -120,6 +120,9 @@ pub struct ModuleHost {
     /// UI component name → generation that mounted it (stale generations are
     /// removed on disposal, so a displaced mount cannot be resolved).
     ui_components: Mutex<HashMap<String, u64>>,
+    /// Hook `(kind, name)` → generation that declared it (mirrors
+    /// `ui_components`; stale generations are pruned on disposal).
+    hooks: Mutex<HashMap<(HookKind, String), u64>>,
     /// The kernel's canonical generation-currency predicate (shared with the
     /// `StateStore`). Mutating ops re-read it at their commit point so a
     /// generation retired mid-op cannot commit (R-02/C-03); the check is
@@ -151,6 +154,7 @@ impl ModuleHost {
             rejected_stale_effects,
             contributions: Mutex::new(HashMap::new()),
             ui_components: Mutex::new(HashMap::new()),
+            hooks: Mutex::new(HashMap::new()),
             current,
         }
     }
@@ -612,6 +616,47 @@ impl ModuleHost {
                     kind: ContributionKind::Theme(ThemeContribution { name, overlay }),
                 }
             }
+            "hook" => {
+                // T9: a named lifecycle hook. The shim multiplexes every hook
+                // over `kb_hot`, so `entry` names the guest function the
+                // wrapper dispatches to. A blank name is filled with the
+                // module id (a stable, module-sourced identity) so two
+                // modules hooking the same kind never collide.
+                let hook = match v.get("hook").and_then(Value::as_str) {
+                    Some("on_turn_start") => HookKind::OnTurnStart,
+                    Some("on_tool_intent") => HookKind::OnToolIntent,
+                    Some(other) => {
+                        return Err(format!("contribution_publish: unknown hook {other:?}"));
+                    }
+                    None => {
+                        return Err(
+                            "contribution_publish: hook must carry a \"hook\"".to_string()
+                        );
+                    }
+                };
+                let entry = v
+                    .get("entry")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| {
+                        "contribution_publish: hook must carry an \"entry\"".to_string()
+                    })?;
+                let name = v
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|n| !n.is_empty())
+                    .map(String::from)
+                    .unwrap_or_else(|| info.module_id.to_string());
+                self.ensure_current(info.generation)?;
+                self.hooks
+                    .lock()
+                    .expect("hooks lock poisoned")
+                    .insert((hook, name.clone()), info.generation);
+                Contribution {
+                    scope: info.scope.clone(),
+                    kind: ContributionKind::Hook(HookContribution { name, hook, entry }),
+                }
+            }
             "settings" => {
                 // Decision 28: a desired-state layer publishes typed settings
                 // (built-in defaults, user, project). A malformed payload is
@@ -666,6 +711,16 @@ impl ModuleHost {
             .copied()
     }
 
+    /// The generation that declared hook `(kind, name)` (session hook
+    /// resolution), if it is still live.
+    pub(crate) fn hook_generation(&self, hook: HookKind, name: &str) -> Option<u64> {
+        self.hooks
+            .lock()
+            .expect("hooks lock poisoned")
+            .get(&(hook, name.to_string()))
+            .copied()
+    }
+
     /// Forget a generation's staged contributions (disposal, R-02/C-03:
     /// displaced generations cannot act).
     pub(crate) fn drop_generation_contributions(&self, generation: u64) {
@@ -676,6 +731,10 @@ impl ModuleHost {
         self.ui_components
             .lock()
             .expect("ui components lock poisoned")
+            .retain(|_, g| *g != generation);
+        self.hooks
+            .lock()
+            .expect("hooks lock poisoned")
             .retain(|_, g| *g != generation);
     }
 }
@@ -938,6 +997,83 @@ mod tests {
             2,
             "malformed payloads stage nothing"
         );
+        drop(host);
+        teardown(dir, queue);
+    }
+
+    /// T9: op 7 accepts a `"kind":"hook"` payload, stages a hook
+    /// contribution, and records a resolvable `(kind, name) → generation`
+    /// mapping; malformed payloads are typed errors that stage nothing.
+    #[test]
+    fn contribution_publish_hook_parses_and_rejects_malformed() {
+        let (dir, queue, host) = host_with_generation("hook");
+        let i = info();
+        host.op_contribution_publish(
+            &i,
+            r#"{"kind":"hook","name":"guard_mod","hook":"on_turn_start","entry":"kb_on_turn_start"}"#,
+        )
+        .unwrap();
+        let published = host.published_contributions(1);
+        assert_eq!(published.len(), 1);
+        match &published[0].kind {
+            ContributionKind::Hook(h) => {
+                assert_eq!(h.name, "guard_mod");
+                assert_eq!(h.hook, HookKind::OnTurnStart);
+                assert_eq!(h.entry, "kb_on_turn_start");
+            }
+            other => panic!("expected a hook contribution, got {other:?}"),
+        }
+        assert_eq!(
+            host.hook_generation(HookKind::OnTurnStart, "guard_mod"),
+            Some(1)
+        );
+        assert_eq!(host.hook_generation(HookKind::OnToolIntent, "guard_mod"), None);
+
+        // A blank name is filled with the module's stable id.
+        host.op_contribution_publish(
+            &i,
+            r#"{"kind":"hook","name":"","hook":"on_tool_intent","entry":"kb_on_tool_intent"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            host.hook_generation(HookKind::OnToolIntent, &i.module_id.to_string()),
+            Some(1)
+        );
+
+        // Malformed payloads stage nothing and record no mapping.
+        for bad in [
+            r#"{"kind":"hook","name":"x","entry":"e"}"#,
+            r#"{"kind":"hook","name":"x","hook":"bogus","entry":"e"}"#,
+            r#"{"kind":"hook","name":"x","hook":"on_turn_start"}"#,
+        ] {
+            let err = host.op_contribution_publish(&i, bad).unwrap_err();
+            assert!(
+                err.starts_with("contribution_publish:"),
+                "typed error for {bad}: {err}"
+            );
+        }
+        assert_eq!(host.published_contributions(1).len(), 2);
+        drop(host);
+        teardown(dir, queue);
+    }
+
+    /// T9: disposal drops a generation's hook records.
+    #[test]
+    fn drop_generation_contributions_drops_hooks() {
+        let (dir, queue, host) = host_with_generation("hook-drop");
+        let i = info();
+        host.op_contribution_publish(
+            &i,
+            r#"{"kind":"hook","name":"guard_mod","hook":"on_turn_start","entry":"kb_on_turn_start"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            host.hook_generation(HookKind::OnTurnStart, "guard_mod"),
+            Some(1)
+        );
+        host.drop_generation_contributions(1);
+        assert_eq!(host.hook_generation(HookKind::OnTurnStart, "guard_mod"), None);
+        assert!(host.published_contributions(1).is_empty());
         drop(host);
         teardown(dir, queue);
     }

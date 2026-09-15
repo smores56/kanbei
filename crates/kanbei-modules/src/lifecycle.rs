@@ -31,11 +31,13 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use kanbei_capabilities::BrokerError;
 use kanbei_core::id::Id128;
 use kanbei_core::Digest;
 use kanbei_objects::{ObjectError, ObjectStore};
+use kanbei_scopes::contrib::HookKind;
 use kanbei_services::{
     replacement, ReplaceIntent, ScopePath, ServiceDependency, ServiceError, ServiceKey,
     ServiceProvider, ServiceRegistry,
@@ -45,7 +47,7 @@ use thiserror::Error;
 
 use crate::host::{ModuleHost, TokenInfo};
 use crate::package::{install_package, PackageManifest};
-use crate::runtime::{DRAIN_DEADLINE, GenerationRuntime, REPLY_TIMEOUT};
+use crate::runtime::{DRAIN_DEADLINE, GenerationRuntime, REPLY_TIMEOUT, Scope};
 use crate::state::{StateError, StateStore};
 
 /// The Luau activation shim: builds the `ctx` handle over `kb_host_call` and
@@ -53,6 +55,10 @@ use crate::state::{StateError, StateStore};
 /// and executed via `run_script` (see the module docs). Internal/unstable
 /// ABI. `service_publish` is op 6; the ops are documented on
 /// [`ModuleHost`].
+///
+/// T9: after activation it publishes one `hook` contribution per declared hook
+/// function (`kb_on_turn_start` / `kb_on_tool_intent`). The functions
+/// themselves are dispatched by [`HOT_MULTIPLEXER`].
 pub const ACTIVATION_SHIM: &str = r#"
 -- kanbei-modules M2 activation shim (internal/unstable ABI).
 local __kb_json = function(s)
@@ -87,7 +93,53 @@ if type(kb_on_activate) ~= "function" then
   error("kb_on_activate is not a function")
 end
 kb_on_activate(__ctx)
+-- T9: declare each hook the module defined. `kb_name`, when the module sets
+-- it, is the stable contribution name; otherwise the host fills the module id
+-- (so two modules hooking the same kind never collide).
+local function __kb_publish_hook(fn, entry, hook)
+  if type(fn) == "function" then
+    local name = type(kb_name) == "string" and kb_name or ""
+    __ctx.contribution_publish('{"kind":"hook","name":' .. __kb_json(name) .. ',"hook":"' .. hook .. '","entry":"' .. entry .. '"}')
+  end
+end
+__kb_publish_hook(kb_on_turn_start, "kb_on_turn_start", "on_turn_start")
+__kb_publish_hook(kb_on_tool_intent, "kb_on_tool_intent", "on_tool_intent")
 "#;
+
+/// T9 hook multiplexer: the guest caches exactly one callable entry (`kb_hot`)
+/// and `Instance::call_json_inner` rejects every other name, so named hook
+/// entry points are dispatched through a `kb_hot` wrapper. The wrapper is
+/// installed ONLY when the module declares at least one hook function, so a
+/// plain module's `kb_hot` is byte-identical to before. A kernel-initiated
+/// hook call arrives on `kb_hot` as the envelope
+/// `{"__kb_hook":"on_turn_start"|"on_tool_intent","context":<value>}`; anything
+/// else falls through to the module's original `kb_hot`.
+///
+/// Appended to the module source at compile time (the source cached by
+/// `kb_init`), and again ahead of [`ACTIVATION_SHIM`] so the discovery VM sees
+/// the same definitions. Internal/unstable ABI.
+pub const HOT_MULTIPLEXER: &str = r#"
+-- kanbei-modules T9 hook multiplexer (internal/unstable ABI).
+local __kb_orig_hot = kb_hot
+if type(kb_on_turn_start) == "function" or type(kb_on_tool_intent) == "function" then
+  kb_hot = function(x)
+    if type(x) == "table" then
+      if x.__kb_hook == "on_turn_start" and type(kb_on_turn_start) == "function" then
+        return kb_on_turn_start(x.context)
+      elseif x.__kb_hook == "on_tool_intent" and type(kb_on_tool_intent) == "function" then
+        return kb_on_tool_intent(x.context)
+      end
+    end
+    return __kb_orig_hot(x)
+  end
+end
+"#;
+
+/// Reply bound for a kernel-initiated hook call (T9). Deliberately short
+/// (order 100–250ms) and NOT the 10s [`REPLY_TIMEOUT`]: hooks are advisory
+/// lifecycle seams, so a wedged actor must not stall the kernel — the call
+/// returns within the bound and the session classifies the loss.
+pub const HOOK_WAIT: Duration = Duration::from_millis(200);
 
 /// The manager's per-module bookkeeping, shared with [`Generation`] so a
 /// direct `Generation::dispose` deregisters consistently (a disposed
@@ -420,7 +472,9 @@ impl ModuleManager {
         // atomically and the old head (and object store) stay untouched.
         Self::validate_state_schema(&self.state, manifest)?;
         let (package, _deduped) = install_package(&mut self.store, manifest)?;
-        let compiled = self.vm.compile(&manifest.source)?;
+        let compiled = self
+            .vm
+            .compile(&format!("{}\n{HOT_MULTIPLEXER}", manifest.source))?;
         let generation = self.next_generation;
         self.next_generation += 1;
         let dyn_host: Arc<dyn kanbei_vm::Host> = self.host.clone();
@@ -489,7 +543,7 @@ impl ModuleManager {
         runtime: &Arc<GenerationRuntime>,
         source: &str,
     ) -> Result<(), ModuleError> {
-        let script = format!("{source}\n{ACTIVATION_SHIM}");
+        let script = format!("{source}\n{HOT_MULTIPLEXER}\n{ACTIVATION_SHIM}");
         runtime
             .run_script(&script)
             .map_err(|e| ModuleError::Activation(format!("activation entry failed: {e}")))?
@@ -662,6 +716,11 @@ impl ModuleManager {
         self.host.ui_generation(component)
     }
 
+    /// The live generation that declared hook `(kind, name)`, if any.
+    pub fn hook_generation(&self, hook: HookKind, name: &str) -> Option<u64> {
+        self.host.hook_generation(hook, name)
+    }
+
     /// Direct kernel-side call of a generation's `kb_hot` (the kernel side of
     /// `service_call`; used by the UI host). Generation must be live.
     pub fn call_generation(&self, generation: u64, args: &str) -> Result<String, ModuleError> {
@@ -676,6 +735,85 @@ impl ModuleManager {
             .hot("kb_hot", args)
             .map_err(|e| ModuleError::Call(format!("generation {generation} is unavailable: {e}")))?
             .map_err(|e| ModuleError::Call(format!("generation {generation} failed: {e}")))
+    }
+
+    /// Invoke a kernel-initiated hook (T9) on `generation`: multiplexes over
+    /// `kb_hot` with the envelope
+    /// `{"__kb_hook":"<kind>","context":<context_json>}`. Runs under a FRESH
+    /// root scope (depth 0, empty visited, its own deadline) — hooks are
+    /// kernel-initiated and must not join a `service_call` chain.
+    ///
+    /// Bounded by `wait` (callers pass [`HOOK_WAIT`]; tests use a shorter
+    /// bound): a wedged actor surfaces as [`HookError::Timeout`] within the
+    /// bound. Failures stay structured so the session can classify
+    /// trap/timeout/invalid for its degrade policy — malformed decision JSON
+    /// comes back as the raw string and is parsed at the session layer.
+    pub fn call_hook(
+        &self,
+        generation: u64,
+        hook: HookKind,
+        context_json: &str,
+        wait: Duration,
+    ) -> Result<String, HookError> {
+        let runtime = self
+            .instances
+            .lock()
+            .expect("instances lock poisoned")
+            .get(&generation)
+            .cloned()
+            .ok_or(HookError::Gone)?;
+        let context: serde_json::Value =
+            serde_json::from_str(context_json).map_err(|_| HookError::Invalid)?;
+        let envelope = serde_json::json!({
+            "__kb_hook": hook.as_str(),
+            "context": context,
+        })
+        .to_string();
+        let scope = Scope::hook(Instant::now() + wait);
+        match runtime.hot_within("kb_hot", &envelope, wait, scope) {
+            Err(crate::runtime::ActorError::Wedged) => Err(HookError::Timeout),
+            Err(crate::runtime::ActorError::Gone) => Err(HookError::Gone),
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(e)) => Err(HookError::from_guest(e)),
+        }
+    }
+
+    /// Respawn a module under a NEW generation id (T9): dispose the current
+    /// generation through the canonical teardown path (token-first, broker
+    /// prune, contribution drop, drain) and re-activate the SAME package. The
+    /// generation id and token are never reused, and the manifest is read back
+    /// byte-identically from the object store, so the package/composition
+    /// digest is unchanged.
+    pub fn respawn(&mut self, module_id: Id128) -> Result<u64, ModuleError> {
+        let generation = *self
+            .tables
+            .lock()
+            .expect("lifecycle tables lock poisoned")
+            .current
+            .get(&module_id)
+            .ok_or(ModuleError::NotActivated { module_id })?;
+        let package = *self
+            .tables
+            .lock()
+            .expect("lifecycle tables lock poisoned")
+            .packages
+            .get(&generation)
+            .ok_or_else(|| {
+                ModuleError::InvalidInput(format!(
+                    "respawn: no package recorded for generation {generation}"
+                ))
+            })?;
+        let bytes = self.store.get(&package)?;
+        let manifest: PackageManifest = serde_json::from_slice(&bytes).map_err(|e| {
+            ModuleError::InvalidInput(format!("respawn: stored package is not a manifest: {e}"))
+        })?;
+        // Canonical teardown (T7/T18): token-first, generation-scoped broker
+        // prune, contribution drop, then drain the actor. Services are
+        // unpublished unconditionally — the re-activation re-publishes them.
+        self.host.teardown_generation(generation, true);
+        self.drop_generation(module_id, generation);
+        let new = self.activate(&manifest)?;
+        Ok(new.generation)
     }
 
     pub fn snapshot(&self) -> Vec<(Id128, u64, Digest)> {
@@ -765,6 +903,46 @@ impl Drop for ModuleManager {
             .collect();
         for runtime in runtimes {
             let _ = runtime.shutdown(DRAIN_DEADLINE);
+        }
+    }
+}
+
+/// Why a kernel-initiated hook call did not produce a decision (T9).
+///
+/// Deliberately structured (not flattened into [`ModuleError::Call`]) so the
+/// session's degrade policy can classify the outcome:
+/// - [`HookError::Trap`] — the guest trapped/exhausted (fuel, epoch, memory,
+///   host timeout, generation budget);
+/// - [`HookError::Timeout`] — the actor did not answer within the bound
+///   (wedged; outcome unknown, the queued command still executes);
+/// - [`HookError::Invalid`] — the actor answered with a guest/return error (the
+///   session classifies malformed decision JSON itself);
+/// - [`HookError::Gone`] — the actor is gone or the generation was never live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum HookError {
+    #[error("hook call trapped (fuel/epoch/memory/host-timeout/budget)")]
+    Trap,
+    #[error("hook call timed out: the actor is wedged (outcome unknown)")]
+    Timeout,
+    #[error("hook call returned an invalid result")]
+    Invalid,
+    #[error("hook call target generation is gone")]
+    Gone,
+}
+
+impl HookError {
+    /// Classify a guest-side error: trap-class outcomes are retryable/degrade
+    /// as `Trap`; everything else (returned error codes, retirement, host
+    /// string errors) is `Invalid`.
+    fn from_guest(e: GuestError) -> Self {
+        match e {
+            GuestError::Trap(_)
+            | GuestError::Fuel { .. }
+            | GuestError::Epoch
+            | GuestError::OutOfMemory
+            | GuestError::HostTimeout { .. }
+            | GuestError::GenerationBudget { .. } => HookError::Trap,
+            _ => HookError::Invalid,
         }
     }
 }

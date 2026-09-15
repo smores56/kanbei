@@ -24,6 +24,7 @@ pub enum ContributionKind {
     UiMount(UiMountContribution),
     Guard(GuardContribution),
     Settings(SettingsContribution),
+    Hook(HookContribution),
 }
 
 impl ContributionKind {
@@ -39,12 +40,14 @@ impl ContributionKind {
             ContributionKind::UiMount(_) => "ui",
             ContributionKind::Guard(_) => "guard",
             ContributionKind::Settings(_) => "settings",
+            ContributionKind::Hook(_) => "hook",
         }
     }
 
     /// The unique identity this contribution occupies within its kind, or
-    /// `None` for the layered/overlay kinds (`keymap`, `theme`, `settings`)
-    /// and for `guard` (monotonicity forbids implicit replacement).
+    /// `None` for the layered/overlay kinds (`keymap`, `theme`, `settings`),
+    /// for `guard` (monotonicity forbids implicit replacement), and for `hook`
+    /// (multiple modules may hook the same kind — hooks always merge).
     ///
     /// Decision 28 precedence-driven implicit replacement: a higher-precedence
     /// layer replaces the holder of the same `(scope, identity)` key; layers
@@ -62,7 +65,8 @@ impl ContributionKind {
             ContributionKind::Keymap(_)
             | ContributionKind::Theme(_)
             | ContributionKind::Guard(_)
-            | ContributionKind::Settings(_) => return None,
+            | ContributionKind::Settings(_)
+            | ContributionKind::Hook(_) => return None,
         };
         Some(identity)
     }
@@ -183,4 +187,35 @@ pub enum KeyReference {
 pub struct ApprovalSettings {
     pub auto_approve: Option<bool>,
     pub yolo: Option<bool>,
+}
+
+/// The kernel-initiated lifecycle seams a module may hook (T9). Hooks are
+/// multiplexed over the guest's single cached entry point (`kb_hot`); see
+/// `kanbei-modules`'s activation shim and `HOT_MULTIPLEXER`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum HookKind {
+    OnTurnStart,
+    OnToolIntent,
+}
+
+impl HookKind {
+    /// The stable wire name used on the guest/kernel envelope.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HookKind::OnTurnStart => "on_turn_start",
+            HookKind::OnToolIntent => "on_tool_intent",
+        }
+    }
+}
+
+/// A hook: a merge-only contribution (like `keymap`/`guard`) — multiple
+/// modules may hook the same [`HookKind`], so precedence never replaces a
+/// hook. `name` identifies the contribution within `(scope, hook)`;
+/// `entry` names the guest function the multiplexer must dispatch to.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HookContribution {
+    pub name: String,
+    pub hook: HookKind,
+    pub entry: String,
 }

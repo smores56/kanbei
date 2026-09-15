@@ -13,10 +13,11 @@ use kanbei_capabilities::{Capability, PolicyTemplate, TrustClass};
 use kanbei_core::queue::DurabilityQueue;
 use kanbei_core::{Digest, Id128};
 use kanbei_modules::{
-    install_package, ActorError, HeadFile, ModuleError, ModuleManager, ModuleOrigin, PackageError,
-    PackageManifest, StateError, StateStore, StateUpdate,
+    install_package, ActorError, HeadFile, HookError, ModuleError, ModuleManager, ModuleOrigin,
+    PackageError, PackageManifest, StateError, StateStore, StateUpdate, HOOK_WAIT,
 };
 use kanbei_objects::ObjectStore;
+use kanbei_scopes::contrib::{ContributionKind, HookKind};
 use kanbei_services::{ScopePath, ServiceDependency, ServiceKey, ServiceRegistry};
 use kanbei_vm::{GuestError, Host, Vm, VmConfig};
 
@@ -1160,5 +1161,302 @@ fn restore_head_puts_a_reset_head_back() {
     assert_eq!(back.seq, h.seq);
     assert_eq!(bytes, br#"{"a":1}"#.to_vec());
     drop(state);
+    cleanup(dir, queue);
+}
+
+// --- T9 hooks: multiplexed named entry points + call_hook + respawn --------
+
+/// A module declaring both hooks. Its `kb_hot` stays a normal hot entry (the
+/// multiplexer only intercepts the hook envelope); `kb_name` is the stable
+/// hook contribution name.
+const HOOK_MODULE: &str = r#"
+kb_name = "hook_mod"
+function kb_on_activate(ctx) end
+function kb_hot(x)
+  if type(x) == "table" and x.kind == "plain" then return "plain" end
+  return "orig"
+end
+function kb_on_turn_start(context)
+  return { decision = context.decision or "continue" }
+end
+function kb_on_tool_intent(context)
+  return { decision = "deny", tool = context.tool }
+end
+"#;
+
+/// A hook that blocks in a host op (used to wedge the actor) — mirrors
+/// `T4_HOST_CALL` but on the hook entry.
+const WEDGE_HOOK: &str = r#"
+kb_name = "wedge_mod"
+function kb_on_activate(ctx) end
+function kb_hot(x) return "hot" end
+function kb_on_turn_start(context)
+  return kb_host_call(1, '{"key":"planner"}')
+end
+"#;
+
+/// A hook that never returns (fuel exhaustion → trap).
+const TRAP_HOOK: &str = r#"
+kb_name = "trap_mod"
+function kb_on_activate(ctx) end
+function kb_hot(x) return "hot" end
+function kb_on_turn_start(context)
+  local n = 0
+  while true do n = n + 1 end
+end
+"#;
+
+/// A hook returning a non-serializable value (a function) — the guest's JSON
+/// serializer rejects it, surfacing a guest return error.
+const BAD_RESULT_HOOK: &str = r#"
+kb_name = "bad_mod"
+function kb_on_activate(ctx) end
+function kb_hot(x) return "hot" end
+function kb_on_turn_start(context)
+  return function() end
+end
+"#;
+
+fn hook_vm() -> Vm {
+    match Vm::load(no_epoch()) {
+        Ok(vm) => vm,
+        Err(GuestError::NotBuilt) => {
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root")
+        }
+        Err(e) => panic!("Vm::load failed: {e}"),
+    }
+}
+
+/// T9: the activation shim discovers declared hooks, stages a hook
+/// contribution, and the `kb_hot` multiplexer dispatches the kernel envelope
+/// to the named entry — a deny/continue decision comes back to the caller.
+#[test]
+fn hook_module_dispatches_named_entry_and_stages_contribution() {
+    let vm = hook_vm();
+    let (dir, mut manager, queue) = manager_setup("hook-dispatch", vm);
+    let id = Id128::generate();
+    let g = manager
+        .activate(&manifest(id, HOOK_MODULE, vec![]))
+        .unwrap();
+
+    // The shim staged exactly the two declared hooks.
+    let published = manager.published_contributions(g.generation);
+    let hooks: Vec<_> = published
+        .iter()
+        .filter_map(|c| match &c.kind {
+            ContributionKind::Hook(h) => Some((h.hook, h.name.clone(), h.entry.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hooks.len(), 2, "both hooks declared: {hooks:?}");
+    assert!(hooks
+        .iter()
+        .any(|(k, n, e)| *k == HookKind::OnTurnStart && n == "hook_mod" && e == "kb_on_turn_start"));
+    assert!(hooks
+        .iter()
+        .any(|(k, n, e)| *k == HookKind::OnToolIntent && n == "hook_mod" && e == "kb_on_tool_intent"));
+    assert_eq!(
+        manager.hook_generation(HookKind::OnTurnStart, "hook_mod"),
+        Some(g.generation)
+    );
+
+    // The envelope dispatches to kb_on_turn_start; the decision comes back.
+    let out = manager
+        .call_hook(g.generation, HookKind::OnTurnStart, r#"{"decision":"deny"}"#, HOOK_WAIT)
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["decision"], "deny");
+
+    // And to kb_on_tool_intent.
+    let out = manager
+        .call_hook(g.generation, HookKind::OnToolIntent, r#"{"tool":"rm"}"#, HOOK_WAIT)
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["decision"], "deny");
+    assert_eq!(v["tool"], "rm");
+
+    // Anything else falls through to the original kb_hot (byte-identical
+    // behavior for the non-hook path).
+    let out = manager.call_generation(g.generation, r#"{"kind":"plain"}"#).unwrap();
+    assert_eq!(out, "\"plain\"");
+
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// T9: a plain module (no declared hooks) keeps its original `kb_hot` — the
+/// multiplexer installs nothing.
+#[test]
+fn module_without_hooks_keeps_original_kb_hot() {
+    let vm = hook_vm();
+    let (dir, mut manager, queue) = manager_setup("hook-plain", vm);
+    let id = Id128::generate();
+    let g = manager.activate(&manifest(id, TRIVIAL_HOT, vec![])).unwrap();
+
+    // No hook contributions are staged.
+    assert!(
+        manager
+            .published_contributions(g.generation)
+            .iter()
+            .all(|c| !matches!(c.kind, ContributionKind::Hook(_)))
+    );
+    // The original kb_hot still answers (`x * 2`).
+    assert_eq!(manager.call_generation(g.generation, "21").unwrap(), "42");
+
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// T9: a wedged actor surfaces `HookError::Timeout` within the bound.
+#[test]
+fn wedged_hook_times_out_within_the_bound() {
+    let vm = hook_vm();
+    let (dir, mut manager, queue) = manager_setup("hook-wedge", vm);
+    let id = Id128::generate();
+    let g = manager.activate(&manifest(id, WEDGE_HOOK, vec![])).unwrap();
+    let state = manager.state();
+    let guard = state.lock().unwrap();
+
+    let started = Instant::now();
+    let err = manager
+        .call_hook(
+            g.generation,
+            HookKind::OnTurnStart,
+            "{}",
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+    assert_eq!(err, HookError::Timeout);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the hook call must return within the bound"
+    );
+
+    // Unblock so the actor can finish and be drained cleanly.
+    drop(guard);
+    drop(state);
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// T9: a trapping hook (fuel exhaustion) surfaces `HookError::Trap`.
+#[test]
+fn trapping_hook_returns_trap() {
+    // Enough fuel for the shim + activation, little enough that the hook's
+    // infinite loop exhausts it.
+    let vm = Vm::load(VmConfig {
+        fuel_per_call: 20_000_000,
+        epoch_deadline: u64::MAX,
+        ..Default::default()
+    })
+    .unwrap();
+    let (dir, mut manager, queue) = manager_setup("hook-trap", vm);
+    let id = Id128::generate();
+    let g = manager.activate(&manifest(id, TRAP_HOOK, vec![])).unwrap();
+    let err = manager
+        .call_hook(g.generation, HookKind::OnTurnStart, "{}", HOOK_WAIT)
+        .unwrap_err();
+    assert_eq!(err, HookError::Trap);
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// T9: a non-serializable hook result and an invalid context both surface as
+/// `HookError::Invalid`; a well-formed but semantically malformed decision is
+/// returned raw for the session to classify.
+#[test]
+fn invalid_hook_inputs_and_results_are_structured() {
+    let vm = hook_vm();
+    let (dir, mut manager, queue) = manager_setup("hook-invalid", vm);
+    let id = Id128::generate();
+    let g = manager
+        .activate(&manifest(id, BAD_RESULT_HOOK, vec![]))
+        .unwrap();
+
+    // Invalid context JSON is rejected before any call.
+    assert_eq!(
+        manager
+            .call_hook(g.generation, HookKind::OnTurnStart, "not json", HOOK_WAIT)
+            .unwrap_err(),
+        HookError::Invalid
+    );
+    // A non-serializable guest result is a guest return error → Invalid.
+    assert_eq!(
+        manager
+            .call_hook(g.generation, HookKind::OnTurnStart, "{}", HOOK_WAIT)
+            .unwrap_err(),
+        HookError::Invalid
+    );
+
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+
+    // A raw (session-classified) malformed decision is returned as-is.
+    let vm = hook_vm();
+    let (dir, mut manager, queue) = manager_setup("hook-raw", vm);
+    let id = Id128::generate();
+    let g = manager
+        .activate(&manifest(id, HOOK_MODULE, vec![]))
+        .unwrap();
+    let raw = manager
+        .call_hook(g.generation, HookKind::OnTurnStart, "{}", HOOK_WAIT)
+        .unwrap();
+    // Valid JSON, but not an object the session can read a decision from.
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&raw).unwrap()["decision"], "continue");
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// T9: respawn yields a new generation id, the old actor is unavailable, the
+/// composition is unchanged, and the module's `kb_hot` works afterward.
+#[test]
+fn respawn_rotates_generation_and_preserves_composition() {
+    let vm = hook_vm();
+    let (dir, mut manager, queue) = manager_setup("respawn", vm);
+    let id = Id128::generate();
+    let g = manager
+        .activate(&manifest(id, HOOK_MODULE, vec![]))
+        .unwrap();
+    let old_generation = g.generation;
+    let before = manager.published_contributions(old_generation);
+    let before_snapshot = manager.snapshot();
+
+    let new_generation = manager.respawn(id).unwrap();
+    assert_ne!(new_generation, old_generation, "generation ids are never reused");
+    assert!(!manager.generation_current(old_generation));
+    assert!(manager.call_generation(old_generation, "{}").is_err());
+    assert_eq!(manager.snapshot()[0].1, new_generation);
+
+    // Same package → identical staged contributions and digest.
+    assert_eq!(manager.published_contributions(new_generation), before);
+    assert_eq!(manager.snapshot()[0].2, before_snapshot[0].2);
+    assert_eq!(
+        manager.hook_generation(HookKind::OnTurnStart, "hook_mod"),
+        Some(new_generation)
+    );
+
+    // The new generation's multiplexed hook and plain hot both work.
+    let out = manager
+        .call_hook(
+            new_generation,
+            HookKind::OnTurnStart,
+            r#"{"decision":"continue"}"#,
+            HOOK_WAIT,
+        )
+        .unwrap();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap()["decision"], "continue");
+    assert_eq!(
+        manager.call_generation(new_generation, r#"{"kind":"plain"}"#).unwrap(),
+        "\"plain\""
+    );
+
+    drop(g);
+    drop(manager);
     cleanup(dir, queue);
 }
