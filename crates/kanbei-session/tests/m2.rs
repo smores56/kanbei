@@ -369,8 +369,10 @@ fn replace_module_swaps_generation_and_records_delta() {
         reg.lock().unwrap().resolve(&svc_key("greeter"), 1, &root()),
         Err(ServiceError::VersionMismatch { .. })
     ));
-    // composition epoch bumped; the delta records removed (old) + added (new)
-    assert_eq!(session.composition().epoch, 2);
+    // composition epoch bumped by the atomic publish AND by the D re-seed that
+    // re-syncs the composition store after the config-layer overlay recompose;
+    // the delta records removed (old) + added (new)
+    assert_eq!(session.composition().epoch, 3);
     let envs = envelopes(&dir.path().join("log.zst"));
     assert_eq!(envs.len(), 2);
     assert_eq!(envs[1].kind, "composition_changed");
@@ -662,6 +664,48 @@ fn invalid_config_opens_safe_mode() {
             .unwrap()
             .contains("compile")
     );
+    session.close().unwrap();
+}
+
+/// F: a safe-mode activation that drops NO layer (the failing layer never
+/// activated, so the surviving stack is just the built-in) must not re-seed the
+/// composition store — the in-memory epoch would advance with no matching
+/// canonical event.
+#[test]
+fn safe_mode_without_a_drop_does_not_advance_the_epoch() {
+    require_guest();
+    let dir = TempDir::new("safe-no-drop");
+    let id = Id128::generate();
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![manifest(id, "local x = = 1", vec![])],
+        ..Default::default()
+    })
+    .unwrap();
+    let reference_dir = TempDir::new("safe-no-drop-ref");
+    let reference = Session::open(SessionConfig {
+        dir: reference_dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest()],
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        session.composition().epoch,
+        reference.composition().epoch,
+        "no drop → no re-seed → the same epoch as a plain built-in open"
+    );
+    // and no canonical removal was claimed either
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert!(
+        !envs.iter().any(|e| e.kind == "composition_changed"
+            && e.payload["delta"]["removed"]
+                .as_array()
+                .is_some_and(|r| !r.is_empty())),
+        "no composition_changed records a removal when nothing was dropped"
+    );
+    reference.close().unwrap();
     session.close().unwrap();
 }
 
@@ -1050,21 +1094,18 @@ fn project_layer_overrides_user_ui_mount() {
     session.close().unwrap();
 }
 
-/// Decision 28 extends to `ContributionKind::Service`: a higher-precedence
-/// config layer implicitly takes over a service key held by a strictly
-/// lower-precedence active layer, instead of tripping the conflict trap and
-/// dropping the whole non-builtin stack to safe mode. Exactly the higher
-/// provider reaches the registry and the composition.
+/// C trust check: a service takeover requires more than precedence — an
+/// UNTRUSTED `WorkspaceConfig` layer may NOT supersede a TRUSTED `UserConfig`
+/// holder. The activation conflicts and the session drops to safe mode
+/// exactly like any other disallowed conflict; the built-in state survives.
 #[test]
-fn workspace_layer_supersedes_user_service_key() {
+fn workspace_layer_cannot_supersede_user_service_key() {
     require_guest();
-    let dir = TempDir::new("service-override");
+    let dir = TempDir::new("service-override-blocked");
     let user = manifest(Id128::generate(), PUBLISHER, vec![]);
-    let user_id = user.module_id;
     let mut project = manifest(Id128::generate(), REPLACER, vec![]);
     project.origin = ModuleOrigin::WorkspaceConfig;
     project.trust_class = TrustClass::Workspace;
-    let project_id = project.module_id;
     let session = Session::open(SessionConfig {
         dir: dir.path().to_path_buf(),
         engine: Some(no_epoch()),
@@ -1072,7 +1113,57 @@ fn workspace_layer_supersedes_user_service_key() {
         ..Default::default()
     })
     .unwrap();
-    // the workspace layer's v2 provider is the one that resolves
+    // Only the built-in generation survives: the untrusted workspace layer
+    // could not displace the trusted user provider, so its activation
+    // conflicted and safe mode dropped both non-builtin layers.
+    let snapshot = session.modules().unwrap().snapshot();
+    assert_eq!(snapshot.len(), 1, "only the built-in survives");
+    assert_eq!(snapshot[0].0, builtin_config_manifest().module_id);
+    assert!(
+        session
+            .modules()
+            .unwrap()
+            .services()
+            .lock()
+            .unwrap()
+            .resolve(&svc_key("greeter"), 1, &root())
+            .is_err(),
+        "neither contender's greeter publication remains"
+    );
+    // The disallowed takeover is an explicit conflict, recorded canonically.
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert_eq!(
+        envs.iter()
+            .filter(|e| e.kind == "safe_mode_activated")
+            .count(),
+        1,
+        "the blocked takeover records one safe-mode fact"
+    );
+    session.close().unwrap();
+}
+
+/// C trust check, positive direction: a TRUSTED `UserConfig` layer may
+/// supersede an UNTRUSTED `WorkspaceConfig` holder regardless of rank, so the
+/// user can always reclaim a service key a cloned workspace published first.
+#[test]
+fn user_layer_supersedes_workspace_service_key() {
+    require_guest();
+    let dir = TempDir::new("service-override-user");
+    // The workspace layer activates FIRST (rank 2) and publishes the key; the
+    // user layer activates second (rank 1) and reclaims it.
+    let mut project = manifest(Id128::generate(), PUBLISHER, vec![]);
+    project.origin = ModuleOrigin::WorkspaceConfig;
+    project.trust_class = TrustClass::Workspace;
+    let project_id = project.module_id;
+    let user = manifest(Id128::generate(), REPLACER, vec![]);
+    let user_id = user.module_id;
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest(), project, user],
+        ..Default::default()
+    })
+    .unwrap();
     let provider = session
         .modules()
         .unwrap()
@@ -1082,27 +1173,17 @@ fn workspace_layer_supersedes_user_service_key() {
         .resolve(&svc_key("greeter"), 2, &root())
         .unwrap()
         .clone();
-    assert_eq!(provider.module_id, project_id);
-    assert_ne!(provider.module_id, user_id);
-    assert_eq!(provider.generation, 3, "builtin=1, user=2, workspace=3");
-    // the composition holds exactly the higher provider
-    let providers: Vec<ServiceProvider> = session
-        .composition()
-        .contributions
-        .iter()
-        .filter_map(|c| match &c.kind {
-            kanbei_scopes::contrib::ContributionKind::Service(s) => Some(s.provider.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(providers.len(), 1);
-    assert_eq!(providers[0].module_id, project_id);
-    session.close().unwrap();
+    assert_eq!(
+        provider.module_id, user_id,
+        "the trusted user layer reclaimed the key from the workspace holder"
+    );
+    assert_ne!(provider.module_id, project_id);
     let envs = envelopes(&dir.path().join("log.zst"));
     assert!(
         !envs.iter().any(|e| e.kind == "safe_mode_activated"),
-        "the takeover is a legitimate override, not an activation failure"
+        "the trust-allowed takeover is a legitimate override"
     );
+    session.close().unwrap();
 }
 
 /// Negative: a service conflict from an EQUAL-precedence layer is NOT
@@ -1347,6 +1428,62 @@ fn discovery_error_records_canonical_safe_mode_fact() {
     assert_eq!(envs.len(), 2, "built-in activation + the discovery fact");
     assert_eq!(envs[0].kind, "composition_changed");
     assert_eq!(envs[1].kind, "safe_mode_activated");
-    assert_eq!(envs[1].payload["reason"].as_str(), Some(reason));
+    // F: the reason carries a distinct prefix so consumers can tell a discovery
+    // degradation from an activation failure.
+    let recorded = envs[1].payload["reason"].as_str().unwrap();
+    assert!(
+        recorded.starts_with("config discovery degraded: "),
+        "discovery reason has a distinct prefix: {recorded}"
+    );
+    assert!(recorded.contains(reason));
+    session.close().unwrap();
+}
+
+/// F: when config activation ALREADY entered safe mode, a coincident discovery
+/// degradation must not commit a SECOND safe-mode fact — exactly one activation
+/// reason is canonical.
+#[test]
+fn discovery_error_does_not_double_commit_after_activation_safe_mode() {
+    require_guest();
+    let dir = TempDir::new("discovery-dedupe");
+    let bad_project = PackageManifest {
+        schema: kanbei_modules::PACKAGE_SCHEMA,
+        module_id: Id128::generate(),
+        origin: ModuleOrigin::WorkspaceConfig,
+        trust_class: TrustClass::Workspace,
+        scope: root(),
+        deps: vec![],
+        capabilities: vec![],
+        source: "local x = = 1".to_string(),
+        state_schema: None,
+        state_key: None,
+    };
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest(), bad_project],
+        config_discovery_error: Some("cannot read config layer /nope/init.lua".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert_eq!(
+        envs.iter()
+            .filter(|e| e.kind == "safe_mode_activated")
+            .count(),
+        1,
+        "only the activation failure is recorded, not a duplicate discovery fact"
+    );
+    let reason = envs
+        .iter()
+        .find(|e| e.kind == "safe_mode_activated")
+        .unwrap()
+        .payload["reason"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !reason.starts_with("config discovery degraded: "),
+        "the single fact is the activation failure, not the discovery one"
+    );
     session.close().unwrap();
 }

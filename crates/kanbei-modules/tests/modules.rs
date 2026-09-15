@@ -426,6 +426,37 @@ fn generation_replacement_rebinds_and_stales_old_token() {
     cleanup(dir, queue);
 }
 
+/// F: `force_deactivate` tears a generation down even when its services still
+/// have dependents — the safe-mode drop path, where the committed removal must
+/// be TRUE rather than a best-effort no-op.
+#[test]
+fn force_deactivate_removes_a_generation_with_dependents() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("force-deactivate", vm);
+    let id = Id128::generate();
+    manager.activate(&manifest(id, A_PUBLISH_S1, vec![])).unwrap();
+    // C publishes a service depending on svc v1.
+    manager.activate(&manifest(Id128::generate(), C_USES_SVC, vec![])).unwrap();
+    // Normal deactivate refuses while the dependent is attached...
+    assert!(matches!(
+        manager.deactivate(id),
+        Err(ModuleError::DependentsRemain { .. })
+    ));
+    // ...but force_deactivate removes the generation and its service.
+    manager.force_deactivate(id).unwrap();
+    assert!(
+        manager
+            .services()
+            .lock()
+            .unwrap()
+            .resolve(&svc_key("svc"), 1, &root())
+            .is_err(),
+        "the forced teardown unpublished the generation's service"
+    );
+    drop(manager);
+    cleanup(dir, queue);
+}
+
 #[test]
 fn service_call_routes_to_provider_kb_hot() {
     let vm = load_vm();

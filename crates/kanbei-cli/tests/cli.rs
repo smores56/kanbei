@@ -1,18 +1,19 @@
 //! End-to-end REPL tests: pipe lines into the built `kanbei` binary with a
-//! project `.kanbei/init.lua` selecting the config-driven fake engine (no
+//! trusted USER config `init.lua` selecting the config-driven fake engine (no
 //! network, deterministic answer). The shipped binary has no provider or
 //! approval argv flags any more — config layers drive the wiring (decision
 //! 28), so these tests are also the regression guard that config, not argv,
-//! drives the session.
+//! drives the session. `provider.fake` is a SENSITIVE field (A): only the
+//! trusted `$XDG_CONFIG_HOME` layer may select it, never a cloned project.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A root-scope Luau config layer selecting the scripted fake provider.
-const FAKE_CONFIG: &str = r#"-- project config: scripted fake provider (no network).
+const FAKE_CONFIG: &str = r#"-- user config: scripted fake provider (no network).
 function kb_on_activate(ctx)
   ctx.contribution_publish('{"kind":"settings","provider":{"fake":true}}')
 end
@@ -31,16 +32,14 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn write_fake_config(dir: &Path) {
-    let config_dir = dir.join(".kanbei");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::write(config_dir.join("init.lua"), FAKE_CONFIG).unwrap();
-}
-
 /// Spawn the binary with the process-level provider env cleared and an isolated
-/// empty `XDG_CONFIG_HOME`, so only the project config layer is in play.
+/// `XDG_CONFIG_HOME` seeded with a TRUSTED user fake layer (A: an untrusted
+/// project layer's `provider.fake` is stripped), so only config drives wiring.
 fn command(args: &[&str], stdin: &str) -> std::process::Child {
     let xdg = temp_dir("xdg");
+    let config_dir = xdg.join("kanbei");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("init.lua"), FAKE_CONFIG).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_kanbei"))
         .args(args)
         .env("XDG_CONFIG_HOME", xdg)
@@ -74,7 +73,6 @@ fn run(args: &[&str], stdin: &str) -> (String, String) {
 #[test]
 fn config_driven_fake_repl_answers_and_exits() {
     let dir = temp_dir("repl");
-    write_fake_config(&dir);
     let (stdout, stderr) = run(&[&dir.to_string_lossy()], "hello\n/exit\n");
     assert!(
         stdout.contains("kanbei ready"),
@@ -88,7 +86,6 @@ fn config_driven_fake_repl_answers_and_exits() {
 #[test]
 fn config_driven_fake_status_shows_session() {
     let dir = temp_dir("status");
-    write_fake_config(&dir);
     let (stdout, stderr) = run(&[&dir.to_string_lossy()], "/status\n/exit\n");
     assert!(
         stderr.contains("next_seq"),
@@ -101,7 +98,6 @@ fn config_driven_fake_status_shows_session() {
 #[test]
 fn config_driven_fake_eof_exits_cleanly() {
     let dir = temp_dir("eof");
-    write_fake_config(&dir);
     let (stdout, _stderr) = run(&[&dir.to_string_lossy()], "one\n");
     assert!(stdout.contains("kanbei ready"), "stdout: {stdout:?}");
     let _ = std::fs::remove_dir_all(&dir);

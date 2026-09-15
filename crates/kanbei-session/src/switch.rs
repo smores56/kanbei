@@ -39,9 +39,9 @@ impl Session {
     /// disposable and rebuilt at open). The fork's config choice is the last
     /// `branch_transition` `config_choice.current` or `composition_changed`
     /// package digest at or before the checkpoint seq; that package manifest
-    /// is activated at open, and a choice whose package is absent from the
-    /// source store (a superseded config on a multi-branch history) yields a
-    /// storage-only fork. The new session then commits one canonical `forked`
+    /// is activated at open. A choice whose package is absent from the source
+    /// store fails with a typed `MissingConfigLayer` error (the restored stack
+    /// must not silently change). The new session then commits one canonical `forked`
     /// event (schema 1): `{source_session, checkpoint_seq,
     /// checkpoint_snapshot, follow, grants, config, frontier_seq}` with
     /// refs = [snapshot, memory roots, config package, workspace manifests] —
@@ -213,28 +213,15 @@ impl Session {
         // The config choice at the checkpoint: the FULL ordered layer stack is
         // activated at open (F5) — not just the top layer — so the fork's
         // merged settings/composition reflect built-in defaults + every user/
-        // project layer. A digest missing from the source store is skipped
-        // (best-effort); the top survives as the `config` payload/ref meaning.
+        // project layer. A digest missing from the source store FAILS LOUD with
+        // a typed error (B) instead of silently dropping a layer and changing
+        // the restored stack; the original digests are reused verbatim (never
+        // re-serialized) so the restored identity is byte-identical.
         let layer_digests: Vec<Digest> =
             self.config_choice_at(checkpoint.seq)?.unwrap_or_default();
-        let config_layers: Vec<PackageManifest> = layer_digests
-            .iter()
-            .filter_map(|digest| {
-                self.store
-                    .get(digest)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            })
-            .collect();
-        let loaded_digests: Vec<Digest> = config_layers
-            .iter()
-            .map(|m| {
-                Digest::new(
-                    &serde_json::to_vec(m).expect("package manifest serialization cannot fail"),
-                )
-            })
-            .collect();
-        let config_digest = loaded_digests.last().copied();
+        let config_layers = load_config_layers(&self.store, &layer_digests)?;
+        let loaded_digests: Vec<Digest> = layer_digests.clone();
+        let config_digest = layer_digests.last().copied();
 
         // Open the forked session: the overridden lane fields (dir, identity,
         // policy, broker, memory root, config layers, project) beat anything
@@ -837,4 +824,93 @@ fn resolve_fork_object(fork: &Session, digest: &Digest) -> Result<Vec<u8>, Sessi
     Err(SessionError::Snapshot(format!(
         "fork object {digest} is missing from the fork session and memory stores"
     )))
+}
+
+/// Loads the ordered config-layer manifests a fork will re-activate, reusing
+/// the recorded package digests verbatim (never re-serialized, so the restored
+/// identity is byte-identical). A digest whose package is absent from the store
+/// is a typed `MissingConfigLayer` error (B): the restored stack must fail loud
+/// rather than silently change.
+fn load_config_layers(
+    store: &kanbei_objects::ObjectStore,
+    digests: &[Digest],
+) -> Result<Vec<PackageManifest>, SessionError> {
+    let mut layers = Vec::with_capacity(digests.len());
+    for digest in digests {
+        let bytes = store
+            .get(digest)
+            .map_err(|_| SessionError::MissingConfigLayer { digest: *digest })?;
+        let manifest: PackageManifest = serde_json::from_slice(&bytes).map_err(|e| {
+            SessionError::Snapshot(format!(
+                "config layer package {digest} is not a manifest: {e}"
+            ))
+        })?;
+        layers.push(manifest);
+    }
+    Ok(layers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kanbei_objects::ObjectStore;
+    use std::sync::Arc;
+
+    fn store(tag: &str) -> (std::path::PathBuf, ObjectStore) {
+        let dir = std::env::temp_dir().join(format!(
+            "kb-session-load-layers-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let queue = Arc::new(kanbei_core::queue::DurabilityQueue::start("kb-load-layers-test"));
+        (dir.clone(), ObjectStore::open(&dir, queue).unwrap())
+    }
+
+    fn manifest(id: Id128) -> PackageManifest {
+        PackageManifest {
+            schema: kanbei_modules::PACKAGE_SCHEMA,
+            module_id: id,
+            origin: kanbei_modules::ModuleOrigin::UserConfig,
+            trust_class: kanbei_capabilities::TrustClass::User,
+            scope: kanbei_services::ScopePath(vec![]),
+            deps: vec![],
+            capabilities: vec![],
+            source: "function kb_hot(x) return x end".into(),
+            state_schema: None,
+            state_key: None,
+        }
+    }
+
+    /// A present package loads and its recorded digest is reused verbatim.
+    #[test]
+    fn loads_present_layers_with_original_digests() {
+        let (dir, mut store) = store("present");
+        let bytes = serde_json::to_vec(&manifest(Id128::generate())).unwrap();
+        let digest = store.install(&bytes).unwrap();
+        let layers = load_config_layers(&store, &[digest]).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(
+            Digest::new(&serde_json::to_vec(&layers[0]).unwrap()),
+            digest,
+            "the original digest round-trips"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A missing package is a typed error, never a silent drop.
+    #[test]
+    fn missing_layer_package_is_a_typed_error() {
+        let (dir, store) = store("missing");
+        let missing = Digest::new(b"no such config package");
+        let err = load_config_layers(&store, &[missing]).unwrap_err();
+        assert!(
+            matches!(err, SessionError::MissingConfigLayer { digest } if digest == missing),
+            "expected MissingConfigLayer, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

@@ -952,3 +952,83 @@ fn fork_without_memory_records_follow_head() {
     receipt.session.close().unwrap();
     source.close().unwrap();
 }
+
+/// B: a `continue_from` → replace → fork sequence must restore exactly the LIVE
+/// stack. The replayed baseline and the `composition_changed` deltas share one
+/// key space (module id), so the replacement updates the baseline entry in
+/// place instead of pushing a duplicate and leaving the stale layer behind.
+#[test]
+fn fork_after_continue_and_replace_restores_exact_live_stack() {
+    require_guest();
+    let dir = TempDir::new("config-continue-replace");
+    let source_id = Id128::generate();
+    let builtin = builtin_config_manifest();
+    let user = settings_manifest(
+        Id128::generate(),
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
+        r#"{"kind":"settings","provider":{"base_url":"https://user"}}"#,
+    );
+    let project_id = Id128::generate();
+    let project = settings_manifest(
+        project_id,
+        ModuleOrigin::WorkspaceConfig,
+        TrustClass::Workspace,
+        r#"{"kind":"settings","provider":{"model":"project-model"}}"#,
+    );
+    let mut source = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        memory_root: Some(dir.path().join("memory")),
+        session_id: Some(source_id),
+        config_layers: vec![builtin.clone(), user.clone(), project],
+        engine: Some(no_epoch()),
+        ..Default::default()
+    })
+    .unwrap();
+    let cp = source.create_checkpoint(None).unwrap();
+    source.continue_from(&cp).unwrap();
+
+    // Replace the workspace layer AFTER the branch transition: the delta names
+    // its module id, which the replayed baseline must also key by.
+    let replacement = settings_manifest(
+        project_id,
+        ModuleOrigin::WorkspaceConfig,
+        TrustClass::Workspace,
+        r#"{"kind":"settings","provider":{"model":"replaced-model"}}"#,
+    );
+    source.replace_module(project_id, replacement.clone()).unwrap();
+    let expected = vec![
+        package_digest(&builtin),
+        package_digest(&user),
+        package_digest(&replacement),
+    ];
+    assert_eq!(
+        source.config_layer_digests(),
+        expected,
+        "the replace updated the live stack in place"
+    );
+
+    let cp2 = source.create_checkpoint(None).unwrap();
+    let fork_dir = dir.path().join("fork");
+    let mut opts = fork_options(&fork_dir);
+    opts.config.engine = Some(no_epoch());
+    let receipt = source.fork(&cp2, opts).unwrap();
+
+    assert_eq!(
+        receipt.session.config_layer_digests(),
+        expected,
+        "the fork restores exactly the live stack — no duplicate, no stale layer"
+    );
+    assert_eq!(
+        receipt
+            .session
+            .host_settings()
+            .provider
+            .as_ref()
+            .and_then(|p| p.model.as_deref()),
+        Some("replaced-model"),
+        "the fork's merged settings reflect the replacement"
+    );
+    receipt.session.close().unwrap();
+    source.close().unwrap();
+}

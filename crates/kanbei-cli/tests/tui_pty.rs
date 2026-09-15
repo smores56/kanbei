@@ -56,16 +56,18 @@ fn tui_drives_a_fake_turn_and_exits_clean() {
     )
     .expect("tcsetwinsize");
 
-    // Fresh session dir (empty replay) for this run; its project config drives
-    // the scripted fake provider (decision 28 — no argv flags).
+    // Fresh session dir (empty replay) for this run. The scripted fake provider
+    // comes from a TRUSTED user config layer (A: an untrusted project layer's
+    // `provider.fake` is stripped).
     let dir = std::env::temp_dir().join(format!("kanbei-tui-test-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
-    let config_dir = dir.join(".kanbei");
+    let xdg = std::env::temp_dir().join(format!("kanbei-tui-xdg-{}", std::process::id()));
+    let config_dir = xdg.join("kanbei");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("init.lua"),
-        r#"-- project config: scripted fake provider (no network).
+        r#"-- user config: scripted fake provider (no network).
 function kb_on_activate(ctx)
   ctx.contribution_publish('{"kind":"settings","provider":{"fake":true}}')
 end
@@ -75,8 +77,6 @@ end
 "#,
     )
     .unwrap();
-    let xdg = std::env::temp_dir().join(format!("kanbei-tui-xdg-{}", std::process::id()));
-    std::fs::create_dir_all(&xdg).unwrap();
 
     // Second master handle for sending keystrokes to the child (dupped
     // before the reader thread takes `master`).

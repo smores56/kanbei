@@ -526,6 +526,25 @@ impl ModuleManager {
         Ok(drain.record(generation, "deactivation"))
     }
 
+    /// As [`Self::deactivate`], but tears the generation down even when its
+    /// published services still have dependents (safe-mode drop, F2): the
+    /// caller has decided the committed removal is true, so the teardown must
+    /// not silently no-op. Services are unpublished unconditionally.
+    pub fn force_deactivate(&mut self, module_id: Id128) -> Result<DisposalRecord, ModuleError> {
+        let generation = *self
+            .tables
+            .lock()
+            .expect("lifecycle tables lock poisoned")
+            .current
+            .get(&module_id)
+            .ok_or(ModuleError::NotActivated { module_id })?;
+        // Invalidate the token and unpublish the generation's effects BEFORE
+        // dropping it (token-first, mirroring `deactivate`).
+        self.host.teardown_generation(generation, true);
+        let drain = self.drop_generation(module_id, generation);
+        Ok(drain.record(generation, "deactivation"))
+    }
+
     /// Generation replacement (R-25/C-05): activates the new generation first
     /// (its activation may re-publish the module's services via
     /// `service_publish` — the same-module replace intent), then disposes the

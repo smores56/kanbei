@@ -82,6 +82,7 @@ mod builtin_config;
 mod commit;
 mod discovery;
 mod elements;
+mod settings_gate;
 mod recovery;
 mod switch;
 use recovery::{decode_record, recover_or_fresh, shutdown_queue};
@@ -654,6 +655,10 @@ pub struct Session {
     /// lower-precedence contributions it implicitly replaces, and the ordered
     /// package digests are the restore source of truth for fork/continue.
     config_layers: Vec<ConfigLayer>,
+    /// Whether this open already committed a canonical `safe_mode_activated`
+    /// fact (F). Used to avoid double-committing when a discovery degradation
+    /// accompanies an activation failure.
+    safe_mode_committed: bool,
     /// The memory roots pinned by the checkpoint this branch continues from
     /// (wave 2 consumes them).
     pinned_roots: Option<PinnedRoots>,
@@ -1097,6 +1102,7 @@ impl Session {
             config_manifest: None,
             host_settings: SettingsContribution::default(),
             config_layers: Vec::new(),
+            safe_mode_committed: false,
             pinned_roots: None,
             child_provider,
             #[cfg(feature = "otel")]
@@ -1123,11 +1129,14 @@ impl Session {
         // non-builtin layer drops the non-builtin layers and keeps the
         // built-in generation active in safe mode (R-01/C-02).
         session.activate_config_layers(config_layers)?;
-        // F14: a discovery read failure is a canonical safe-mode fact, not
-        // just a stderr line — the caller degraded to built-in-only layers and
-        // the log must say so.
-        if let Some(reason) = config_discovery_error {
-            session.commit_safe_mode(&reason)?;
+        // F14/F: a discovery read failure is recorded as a canonical fact, but
+        // it is NOT an activation failure — give the reason a distinct prefix so
+        // consumers can tell "degraded by discovery" from "activation failed".
+        // When activation already entered safe mode, do not double-commit.
+        if let Some(reason) = config_discovery_error
+            && !session.safe_mode_committed
+        {
+            session.commit_safe_mode(&format!("config discovery degraded: {reason}"))?;
         }
 
         // M4 recovery facts: commit the pending backlinks (R-11), then the
@@ -1641,6 +1650,8 @@ pub enum SessionError {
     Envelope(EnvelopeError),
     #[error("event references missing object: {digest}")]
     MissingObject { digest: Digest },
+    #[error("config layer package {digest} is missing from the store; the fork cannot restore it")]
+    MissingConfigLayer { digest: Digest },
     #[error("invalid input: {0}")]
     InvalidInput(String),
     #[error("snapshot: {0}")]

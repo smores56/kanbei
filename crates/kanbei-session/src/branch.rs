@@ -328,10 +328,11 @@ impl Session {
     }
 
     /// The ORDERED (LOW→HIGH) config-layer package digests active at `at_seq`
-    /// (F5): replaying `composition_changed` `initiator: "config"` events —
-    /// `delta.added` upserts by module id (a replacement updates in place),
-    /// `delta.removed` drops the named module — and re-baselining at a
-    /// `branch_transition`'s recorded `config_choice`. None for sessions that
+    /// (F5/B): replaying `composition_changed` `initiator: "config"` events and
+    /// re-baselining at a `branch_transition`'s recorded `config_choice`. The
+    /// replay keys ONE key space — the module id, carrying the package digest as
+    /// the value — so a removal/replacement after a `continue_from` matches the
+    /// baseline entry instead of pushing a duplicate. None for sessions that
     /// never activated a config layer.
     pub(crate) fn config_choice_at(&self, at_seq: u64) -> Result<Option<Vec<Digest>>, SessionError> {
         let log_path = self.log_path.clone();
@@ -346,8 +347,9 @@ impl Session {
                     continue;
                 }
                 match env.kind.as_str() {
-                    // A branch point re-baselines the stack it recorded (the
-                    // ordered `layers` when present, else the top `current`).
+                    // A branch point re-baselines the stack it recorded. The
+                    // `layers` are ordered digests; resolve each to its module
+                    // id (the one key space) from the package manifest object.
                     "branch_transition" => {
                         let Some(choice) = env.payload.get("config_choice") else {
                             continue;
@@ -357,17 +359,18 @@ impl Session {
                                 .iter()
                                 .filter_map(|v| v.as_str())
                                 .filter_map(|s| s.parse::<Digest>().ok())
-                                .map(|d| (d.to_string(), d))
+                                .map(|d| (self.config_layer_module_key(d), d))
                                 .collect();
                         } else if let Some(current) = choice
                             .get("current")
                             .and_then(|c| c.as_str())
                             .and_then(|c| c.parse::<Digest>().ok())
                         {
-                            layers = vec![(current.to_string(), current)];
+                            layers = vec![(self.config_layer_module_key(current), current)];
                         }
                     }
-                    // Config-layer activation/replacement/removal deltas.
+                    // Config-layer activation/replacement/removal deltas, keyed
+                    // by module id in BOTH `added` and `removed`.
                     "composition_changed" => {
                         if env.payload.get("initiator").and_then(|i| i.as_str()) != Some("config") {
                             continue;
@@ -392,11 +395,14 @@ impl Session {
                                 else {
                                     continue;
                                 };
+                                // The module id is the one key space; an old
+                                // delta without one resolves it from the package
+                                // object, falling back to the digest string.
                                 let key = a
                                     .get("module_id")
                                     .and_then(|m| m.as_str())
                                     .map(str::to_string)
-                                    .unwrap_or_else(|| pkg.to_string());
+                                    .unwrap_or_else(|| self.config_layer_module_key(pkg));
                                 match layers.iter_mut().find(|(k, _)| *k == key) {
                                     Some(existing) => existing.1 = pkg,
                                     None => layers.push((key, pkg)),
@@ -413,6 +419,19 @@ impl Session {
         } else {
             Ok(Some(layers.into_iter().map(|(_, d)| d).collect()))
         }
+    }
+
+    /// The module id a config-layer package digest names, read from the package
+    /// manifest object. Falls back to the digest string when the package is
+    /// absent from the store or unreadable — the fork then fails loud on the
+    /// missing layer rather than keying against a stale digest.
+    fn config_layer_module_key(&self, digest: Digest) -> String {
+        self.store
+            .get(&digest)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<kanbei_modules::PackageManifest>(&bytes).ok())
+            .map(|m| m.module_id.to_string())
+            .unwrap_or_else(|| digest.to_string())
     }
 
     /// Switch the memory-follow policy (M6 wave 2): `FollowHead` releases the

@@ -182,6 +182,20 @@ fn bootstrap_provider(provider: Option<&ProviderSettings>) -> Option<ProviderCon
     })
 }
 
+/// Whether a provider key was explicitly configured: either the config set
+/// `provider.key`, or the documented bootstrap env mode is in play (the base
+/// URL also came from `KANBEI_PROVIDER_URL`, so the default
+/// `KANBEI_PROVIDER_KEY` env is being used deliberately). A keyless endpoint
+/// (ollama/vLLM) configured only by `provider.base_url` is NOT explicit — the
+/// open-time probe must not force it storage-only.
+fn bootstrap_key_is_explicit(provider: Option<&ProviderSettings>) -> bool {
+    if provider.and_then(|p| p.key.as_ref()).is_some() {
+        return true;
+    }
+    provider.and_then(|p| p.base_url.as_ref()).is_none()
+        && std::env::var("KANBEI_PROVIDER_URL").is_ok()
+}
+
 /// Config `provider.protocol` → wire protocol; absent/unknown = the
 /// OpenAI-compatible default.
 fn parse_protocol(protocol: Option<&str>) -> WireProtocol {
@@ -216,22 +230,34 @@ impl SettingsSource for CliSettings {
             // The scripted one-shot engine for smoke runs.
             (Some(Box::new(RepeatedEngine::fake())), None)
         } else if let Some(config) = bootstrap {
-            // F12: open-time key availability probe for a real engine. The
-            // scripted fake engine needs no key, so it is exempt. On failure
-            // the CLI degrades to a storage-only session (never fails open)
-            // and prints an actionable, secret-free line.
-            if let Err(e) = config.key.probe(&config.provider) {
-                eprintln!(
-                    "kanbei: provider key unavailable ({e}); \
-                     starting storage-only — the session runs without model calls"
-                );
-                (None, None)
-            } else {
-                let protocol = parse_protocol(provider.and_then(|p| p.protocol.as_deref()));
+            // F12/F: open-time key availability probe for a real engine — only
+            // when a key was explicitly configured. A keyless endpoint must not
+            // be probed against the default `KANBEI_PROVIDER_KEY` env. The
+            // scripted fake engine needs no key, so it is exempt. On failure the
+            // CLI degrades to storage-only (never fails open) and prints an
+            // actionable, secret-free line ONCE, not on every layer resolve.
+            let protocol = parse_protocol(provider.and_then(|p| p.protocol.as_deref()));
+            let build_engine = |config: ProviderConfig| {
                 (
                     Some(kanbei_provider::engine_for(&config, protocol)),
                     Some(config),
                 )
+            };
+            if bootstrap_key_is_explicit(provider) {
+                if let Err(e) = config.key.probe(&config.provider) {
+                    static PROBE_NOTICE: std::sync::Once = std::sync::Once::new();
+                    PROBE_NOTICE.call_once(|| {
+                        eprintln!(
+                            "kanbei: provider key unavailable ({e}); \
+                             starting storage-only — the session runs without model calls"
+                        );
+                    });
+                    (None, None)
+                } else {
+                    build_engine(config)
+                }
+            } else {
+                build_engine(config)
             }
         } else {
             (None, None)
@@ -1321,5 +1347,25 @@ mod tests {
             "unavailable key → no provider engine"
         );
         assert!(resolved.provider.is_none());
+    }
+
+    /// F: a keyless endpoint configured only by `provider.base_url` (ollama/
+    /// vLLM) must NOT be probed against the default `KANBEI_PROVIDER_KEY` env —
+    /// the engine stays wired even though no key is available.
+    #[test]
+    fn cli_keyless_config_base_url_keeps_engine() {
+        let source = CliSettings {
+            interactive: None,
+            yolo: Default::default(),
+        };
+        let keyless: SettingsContribution =
+            serde_json::from_str(r#"{"provider":{"base_url":"http://localhost:11434/v1","model":"llama"}}"#)
+                .unwrap();
+        let resolved = source.resolve(&keyless);
+        assert!(
+            resolved.provider_engine.is_some(),
+            "a keyless endpoint keeps its provider engine"
+        );
+        assert!(resolved.provider.is_some(), "the config is retained");
     }
 }

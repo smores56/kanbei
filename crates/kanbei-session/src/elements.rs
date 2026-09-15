@@ -1,5 +1,6 @@
 //! Module subsystem: config activation, generation replacement, effect dispatch, state-head CAS, retention, and UI staleness.
 
+use crate::settings_gate::{gate_settings_contributions, settings_supersede_allowed};
 use crate::{ConfigActivation, ConfigLayer, Session, FaultPoint, NewEvent, SessionError};
 use kanbei_core::digest::Digest;
 use kanbei_core::id::Id128;
@@ -84,15 +85,18 @@ impl Session {
                 .filter(|l| l.rank != 0)
                 .cloned()
                 .collect();
-            // Drop every activated non-builtin layer (best-effort: a layer with
-            // dependents stays, but safe mode is still recorded).
+            // Drop every activated non-builtin layer. F: force the teardown so
+            // the committed `delta.removed` and the config-identity drop are
+            // TRUE — a best-effort `deactivate` that no-ops on
+            // `DependentsRemain` would leave a live generation behind while the
+            // canonical log claimed it was removed.
             if let Some(manager) = self.modules.as_mut() {
                 for (m, _) in activated
                     .iter()
                     .rev()
                     .filter(|(m, _)| m.origin != ModuleOrigin::Builtin)
                 {
-                    let _ = manager.deactivate(m.module_id);
+                    let _ = manager.force_deactivate(m.module_id);
                 }
             }
             // The dropped layers' generations are no longer active: forget their
@@ -161,10 +165,14 @@ impl Session {
             // generations. After this, the canonical log, the composition,
             // and the config identity all agree: no later fork/branch can pin
             // the stale pre-drop composition or restore a dropped layer.
-            self.composition.reseed(&self.registry);
-            self.config_digest = self.config_layers.last().map(|l| l.package);
-            self.config_manifest = self.config_layers.last().map(|l| l.manifest.clone());
+            //
+            // F: re-seed only when a layer was ACTUALLY dropped — otherwise the
+            // in-memory epoch advances with no matching event, and the
+            // composition store would drift from the canonical log.
             if !dropped_layers.is_empty() {
+                self.composition.reseed(&self.registry);
+                self.config_digest = self.config_layers.last().map(|l| l.package);
+                self.config_manifest = self.config_layers.last().map(|l| l.manifest.clone());
                 let epoch = self.composition.current().epoch;
                 let composition_digest = self.composition.current().digest;
                 let comp_bytes = self.composition.current().to_canonical_bytes();
@@ -247,30 +255,63 @@ impl Session {
     }
 
     /// Rebuilds the merged settings overlays after a config module replacement
-    /// (F6). Settings are a merge-only overlay: precedence displacement cannot
+    /// (F6/D). Settings are a merge-only overlay: precedence displacement cannot
     /// un-merge a replaced generation's contribution, so a stale `yolo`/
-    /// `auto_approve` would survive a swap to a benign generation. Replay the
-    /// surviving layers' overlays from scratch (their settings AND themes, so
-    /// the recompose does not drop a surviving theme), including the new
-    /// generation the caller already recorded in `config_layers`, then
-    /// re-resolve the runtime wiring. `old_settings_scopes` names the scopes
-    /// the replaced generation contributed settings to, so a scope that no
-    /// surviving layer touches is cleared too.
+    /// `auto_approve` would survive a swap to a benign generation. Replay every
+    /// surviving layer's overlays from scratch (their settings AND themes),
+    /// including the new generation the caller already recorded in
+    /// `config_layers`, then re-resolve the runtime wiring.
+    ///
+    /// `recompose_overlays` wipes the WHOLE scope, so the replay must also carry
+    /// the NON-config modules' overlays (D): recomposing only the config layers
+    /// would destroy an unrelated module's theme overlay on an ordinary config
+    /// replace. Non-config overlays form the base; the config layers (LOW→HIGH)
+    /// layer on top. `old_settings_scopes` names the scopes the replaced
+    /// generation contributed settings to, so a scope that no surviving layer
+    /// touches is cleared too.
+    ///
+    /// The registry mutation happens AFTER `publish_planned` snapshotted the
+    /// composition, so the composition store is re-seeded here to keep
+    /// `composition.current()` in step with `registry.snapshot()` before the
+    /// canonical commit.
     fn recompose_settings_after_replace(&mut self, old_settings_scopes: Vec<ScopePath>) {
         let Some(manager) = self.modules.as_ref() else {
             return;
         };
+        let config_module_ids: HashSet<Id128> =
+            self.config_layers.iter().map(|l| l.module_id).collect();
         let mut overlays: Vec<Contribution> = Vec::new();
         let mut scopes = old_settings_scopes;
+        let push_overlay = |c: Contribution, scopes: &mut Vec<ScopePath>, overlays: &mut Vec<Contribution>| {
+            scopes.push(c.scope.clone());
+            overlays.push(c);
+        };
+        // Base: every non-config module's settings/theme overlays survive.
+        for (module_id, generation, _package) in manager.snapshot() {
+            if config_module_ids.contains(&module_id) {
+                continue;
+            }
+            for c in manager.published_contributions(generation) {
+                if matches!(
+                    &c.kind,
+                    ContributionKind::Settings(_) | ContributionKind::Theme(_)
+                ) {
+                    push_overlay(c, &mut scopes, &mut overlays);
+                }
+            }
+        }
+        // Config layers, LOW→HIGH, trust-gated exactly like activation/replace
+        // (A): an untrusted layer can never re-introduce a stripped sensitive
+        // field on the recompose path.
         for layer in &self.config_layers {
-            for c in manager.published_contributions(layer.generation) {
-                match &c.kind {
-                    ContributionKind::Settings(_) => {
-                        scopes.push(c.scope.clone());
-                        overlays.push(c);
-                    }
-                    ContributionKind::Theme(_) => overlays.push(c),
-                    _ => {}
+            let mut published = manager.published_contributions(layer.generation);
+            gate_settings_contributions(layer.manifest.origin, &mut published);
+            for c in published {
+                if matches!(
+                    &c.kind,
+                    ContributionKind::Settings(_) | ContributionKind::Theme(_)
+                ) {
+                    push_overlay(c, &mut scopes, &mut overlays);
                 }
             }
         }
@@ -279,6 +320,10 @@ impl Session {
         for scope in scopes {
             self.registry.recompose_overlays(&scope, &overlays);
         }
+        // D: the recompose mutated the registry out of band — re-sync the
+        // composition store so `composition.current().digest`/`contributions`
+        // match `registry.snapshot()` before the canonical commit.
+        self.composition.reseed(&self.registry);
         self.host_settings = self
             .registry
             .settings_for(&crate::builtin_config::root_scope())
@@ -289,6 +334,7 @@ impl Session {
 
     /// Commits the canonical `safe_mode_activated` fact with the failure reason.
     pub(crate) fn commit_safe_mode(&mut self, reason: &str) -> Result<(), SessionError> {
+        self.safe_mode_committed = true;
         self.commit(
             vec![NewEvent {
                 kind: "safe_mode_activated".into(),
@@ -351,10 +397,21 @@ impl Session {
         {
             let reg = self.services.lock().expect("services lock poisoned");
             for (key, provider, _) in reg.snapshot() {
-                let lower = self
+                let holder = self
                     .config_layers
                     .iter()
-                    .any(|l| l.rank < my_rank && l.generation == provider.generation);
+                    .find(|l| l.generation == provider.generation);
+                // C: precedence alone is not enough — an untrusted layer may
+                // never displace a trusted holder (the `settings_supersede_
+                // allowed` trust rule).
+                let lower = holder.is_some_and(|l| {
+                    settings_supersede_allowed(
+                        manifest.origin,
+                        my_rank,
+                        l.manifest.origin,
+                        l.rank,
+                    )
+                });
                 if lower {
                     supersede.insert(key.clone());
                     superseded.push((key, provider));
@@ -687,9 +744,12 @@ impl Session {
                 .collect(),
         };
         plan.removed.extend(old_published);
-        staged
-            .contributions
-            .extend(manager.published_contributions(new_generation));
+        // A: the new generation's settings are trust-gated exactly like
+        // activation — a replacement must not re-introduce an untrusted
+        // layer's stripped sensitive fields.
+        let mut new_published = manager.published_contributions(new_generation);
+        gate_settings_contributions(new_manifest.origin, &mut new_published);
+        staged.contributions.extend(new_published);
         if let Err(e) = self
             .composition
             .publish_planned(&staged, &mut self.registry, &plan)
@@ -703,6 +763,14 @@ impl Session {
         // new generation as the active layer and rebuild the merged settings
         // from the surviving layers before the canonical commit (so the
         // post-manifest pins the refreshed wiring).
+        //
+        // E: keep the pre-swap layer so a failed canonical commit rolls the
+        // config identity back instead of naming a dead generation.
+        let prior_layer: Option<ConfigLayer> = self
+            .config_layers
+            .iter()
+            .find(|l| l.module_id == module_id)
+            .cloned();
         let is_config_layer = self
             .config_layers
             .iter_mut()
@@ -749,6 +817,13 @@ impl Session {
             Some(composition_digest),
         );
         if let Err(e) = receipt {
+            // E: the canonical commit failed — restore the pre-swap config
+            // identity so it never names the dead generation.
+            if let Some(prior) = prior_layer
+                && let Some(slot) = self.config_layers.iter_mut().find(|l| l.module_id == module_id)
+            {
+                *slot = prior;
+            }
             if let Some(m) = self.modules.as_mut() {
                 let _ = m.deactivate(module_id);
             }
@@ -922,63 +997,155 @@ impl Session {
     }
 }
 
-// ---------- settings trust gate (F2) ----------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{SessionConfig, builtin_config_manifest};
+    use kanbei_capabilities::TrustClass;
+    use kanbei_core::id::Id128;
+    use kanbei_modules::PackageManifest;
+    use kanbei_vm::{VmConfig, Vm};
 
-/// The origins trusted to publish sensitive settings fields (F2). Everything
-/// else (`WorkspaceConfig`, `Agent`, `UserInstalled`) is repo- or agent-
-/// supplied: a cloned workspace can otherwise auto-approve tools
-/// (`approval.yolo`/`auto_approve`) or exfiltrate a secret
-/// (`provider.base_url`/`provider.key`) through the CLI's settings source.
-fn origin_is_trusted_for_settings(origin: ModuleOrigin) -> bool {
-    matches!(origin, ModuleOrigin::Builtin | ModuleOrigin::UserConfig)
-}
-
-/// Filters the settings contributions a generation publishes before they are
-/// staged/merged (F2).
-///
-/// Every layer's `provider.base_url` is validated here — an invalid value
-/// (not `http`/`https` with a host) is dropped so a malformed URL can never
-/// drive the engine. Untrusted layers additionally have every sensitive field
-/// removed: `approval.auto_approve`, `approval.yolo`, `provider.base_url`,
-/// `provider.key`. Non-sensitive fields (`provider.model`,
-/// `provider.protocol`, `provider.fake`) pass through for every origin.
-fn gate_settings_contributions(origin: ModuleOrigin, contributions: &mut [Contribution]) {
-    let trusted = origin_is_trusted_for_settings(origin);
-    for c in contributions.iter_mut() {
-        let ContributionKind::Settings(settings) = &mut c.kind else {
-            continue;
-        };
-        if let Some(provider) = settings.provider.as_mut() {
-            if provider.base_url.as_deref().is_some_and(|u| !valid_base_url(u)) {
-                provider.base_url = None;
-            }
-            if !trusted {
-                provider.base_url = None;
-                provider.key = None;
-            }
-        }
-        if !trusted
-            && let Some(approval) = settings.approval.as_mut()
-        {
-            approval.auto_approve = None;
-            approval.yolo = None;
+    fn no_epoch() -> VmConfig {
+        VmConfig {
+            fuel_per_call: u64::MAX,
+            epoch_deadline: u64::MAX,
+            ..Default::default()
         }
     }
-}
 
-/// `http`/`https` with a non-empty host. Deliberately structural (no `url`
-/// dependency): scheme `://`, and a host before any path/query/fragment.
-fn valid_base_url(url: &str) -> bool {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return false;
-    };
-    if scheme != "http" && scheme != "https" {
-        return false;
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kb-elements-unit-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    !host.is_empty()
+
+    fn manifest(module_id: Id128, origin: ModuleOrigin, source: &str) -> PackageManifest {
+        PackageManifest {
+            schema: kanbei_modules::PACKAGE_SCHEMA,
+            module_id,
+            origin,
+            trust_class: TrustClass::User,
+            scope: crate::builtin_config::root_scope(),
+            deps: vec![],
+            capabilities: vec![],
+            source: source.to_string(),
+            state_schema: None,
+            state_key: None,
+        }
+    }
+
+    fn settings_source(payload: &str) -> String {
+        format!(
+            "function kb_on_activate(ctx) ctx.contribution_publish('{payload}') end\nfunction kb_hot(x) return x end"
+        )
+    }
+
+    /// D: recomposing after a config-module replace must preserve a NON-config
+    /// module's theme overlay (it is not a config layer, so recomposing only the
+    /// config layers would wipe it), and the composition store must be re-synced
+    /// to the registry before the canonical commit.
+    #[test]
+    fn config_replace_preserves_non_config_overlay_and_reseeds_composition() {
+        if Vm::load(no_epoch()).is_err() {
+            eprintln!("guest wasm not built; skipping");
+            return;
+        }
+        let dir = temp_dir("recompose");
+        let settings_id = Id128::generate();
+        let settings = manifest(
+            settings_id,
+            ModuleOrigin::UserConfig,
+            &settings_source(
+                r#"{"kind":"settings","provider":{"model":"m"},"approval":{"yolo":true}}"#,
+            ),
+        );
+        let mut session = Session::open(SessionConfig {
+            dir: dir.clone(),
+            engine: Some(no_epoch()),
+            config_layers: vec![builtin_config_manifest(), settings],
+            ..Default::default()
+        })
+        .unwrap();
+        // A NON-config module: activated directly through the manager, so it is
+        // NOT in `config_layers`, and its theme overlay is applied to the
+        // registry as if the session had published it.
+        let theme_manifest = manifest(
+            Id128::generate(),
+            ModuleOrigin::UserInstalled,
+            &settings_source(r##"{"kind":"theme","name":"accent","overlay":{"bg":"#111"}}"##),
+        );
+        let theme_module = theme_manifest.module_id;
+        let generation = session
+            .modules
+            .as_mut()
+            .expect("modules enabled")
+            .activate(&theme_manifest)
+            .unwrap()
+            .generation;
+        let theme_contribution = session
+            .modules
+            .as_ref()
+            .unwrap()
+            .published_contributions(generation)
+            .into_iter()
+            .find(|c| matches!(&c.kind, ContributionKind::Theme(_)))
+            .expect("theme contribution staged");
+        session.registry.apply(&crate::builtin_config::root_scope(), &[theme_contribution]).unwrap();
+        // sanity: the overlay is live.
+        assert!(
+            session
+                .registry
+                .theme_overlay(&crate::builtin_config::root_scope(), "accent")
+                .is_some()
+        );
+
+        // Replace the config layer with a benign generation.
+        let benign = manifest(
+            settings_id,
+            ModuleOrigin::UserConfig,
+            &settings_source(r#"{"kind":"settings","provider":{"model":"benign"}}"#),
+        );
+        session.replace_module(settings_id, benign).unwrap();
+
+        assert!(
+            session
+                .registry
+                .theme_overlay(&crate::builtin_config::root_scope(), "accent")
+                .is_some(),
+            "the non-config module's theme overlay survives the config replace"
+        );
+        assert_eq!(
+            session.composition.current().digest,
+            kanbei_scopes::epoch::CompositionStore::new(&session.registry)
+                .current()
+                .digest,
+            "composition.current() matches f(registry.snapshot()) after the replace"
+        );
+        // The composition SNAPSHOT must also carry the recomposed settings, not
+        // the stale pre-recompose merge (yolo was replaced away).
+        assert!(
+            session
+                .composition
+                .current()
+                .contributions
+                .iter()
+                .all(|c| match &c.kind {
+                    ContributionKind::Settings(s) =>
+                        s.approval.as_ref().and_then(|a| a.yolo) != Some(true),
+                    _ => true,
+                }),
+            "the composition snapshot carries no stale yolo"
+        );
+        let _ = theme_module;
+        session.close().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
