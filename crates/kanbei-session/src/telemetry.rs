@@ -148,6 +148,24 @@ impl Session {
         );
     }
 
+    /// The resolved object-store dir: the XDG session dir under a layout, else
+    /// `<cfg.dir>/objects` (decision 33).
+    fn objects_dir(&self) -> std::path::PathBuf {
+        match &self.cfg.layout {
+            Some(layout) => layout.session_dir(self.session_id).join("objects"),
+            None => self.cfg.dir.join("objects"),
+        }
+    }
+
+    /// The resolved disposable projection path: layout-global under a layout,
+    /// else `<memory_root>/projection.sqlite`.
+    fn projection_path(&self) -> std::path::PathBuf {
+        match &self.cfg.layout {
+            Some(layout) => layout.projection_path(),
+            None => self.memory_root.join("projection.sqlite"),
+        }
+    }
+
     /// Emit the storage gauges (filesystem observations + canonical seq):
     /// objects count/bytes, log bytes/seq, projection bytes.
     pub(crate) fn telemetry_storage(&self) -> Result<(), SessionError> {
@@ -160,7 +178,7 @@ impl Session {
         // second read_dir + per-file stat) on EVERY run outcome.
         let mut objects_count: i64 = 0;
         let mut objects_bytes: i64 = 0;
-        for entry in std::fs::read_dir(self.cfg.dir.join("objects"))? {
+        for entry in std::fs::read_dir(self.objects_dir())? {
             let entry = entry?;
             let meta = entry.metadata()?;
             if !meta.is_file() {
@@ -196,12 +214,7 @@ impl Session {
             self.next_seq.saturating_sub(1) as i64,
             &[("session_id", AttrValue::Str(session_id.clone()))],
         );
-        let memory_root = self
-            .cfg
-            .memory_root
-            .clone()
-            .unwrap_or_else(|| self.cfg.dir.join("memory"));
-        match std::fs::metadata(memory_root.join("projection.sqlite")) {
+        match std::fs::metadata(self.projection_path()) {
             Ok(md) => t.metric(
                 "kanbei.projection.bytes",
                 md.len() as i64,

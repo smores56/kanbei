@@ -1364,11 +1364,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
     /// refs, R-12/M-01). The dirsync is barriered before returning so the
     /// object is durable before any referencing frame.
     fn memory_install(&self, scope: &MemoryScope, bytes: &[u8]) -> Result<Digest, SessionError> {
-        let memory_root = self
-            .cfg
-            .memory_root
-            .clone()
-            .unwrap_or_else(|| self.cfg.dir.join("memory"));
+        let memory_root = self.memory_root.clone();
         let objects_dir = memory_root.join(scope.dir_name()).join("objects");
         let queue = Arc::new(kanbei_core::queue::DurabilityQueue::start("kb-mem-install"));
         let mut store = kanbei_objects::ObjectStore::open(&objects_dir, Arc::clone(&queue))

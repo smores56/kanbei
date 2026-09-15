@@ -1,5 +1,6 @@
 //! Session switching: independent forks, adoption of fork outcomes, verbatim import, and the fork helpers.
 
+use crate::layout::copy_dir_all;
 use crate::recovery::{recover_bound_project, recover_session_id};
 use crate::{AdoptReceipt, CheckpointRef, ForkOptions, ForkReceipt, NewEvent, PinnedRoots, QuiesceRecord, QuiescedIntent, Session, SessionConfig, SessionError};
 use std::path::{Path, PathBuf};
@@ -173,12 +174,11 @@ impl Session {
         // committing frame. A checkpoint without a pinned root means the
         // actor had no head at the fork point — nothing is copied and the
         // new actor opens empty.
-        let source_memory_root = self
-            .cfg
-            .memory_root
-            .clone()
-            .unwrap_or_else(|| self.cfg.dir.join("memory"));
-        let target_memory_root = target_dir.join("memory");
+        let source_memory_root = self.memory_root.clone();
+        let target_memory_root = match &options.config.layout {
+            Some(layout) => layout.memory_root(),
+            None => target_dir.join("memory"),
+        };
         if let Some(lifetime_root) = facts.memory_root {
             let scope_dir = kanbei_memory::MemoryScope::Lifetime.dir_name();
             copy_dir_all(
@@ -731,23 +731,6 @@ fn fork_floor_broker(
         digests.push(grant.grant_digest);
     }
     Ok((broker, digests))
-}
-
-/// Recursive directory copy (the memory-seeding path; the target never
-/// pre-exists, so copies never merge).
-fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_all(&from, &to)?;
-        } else {
-            std::fs::copy(&from, &to)?;
-        }
-    }
-    Ok(())
 }
 
 /// Truncates a copied memory-scope transition log after the frame that

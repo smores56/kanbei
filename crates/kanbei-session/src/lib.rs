@@ -84,9 +84,11 @@ mod commit;
 mod discovery;
 mod elements;
 mod settings_gate;
+mod layout;
 mod recovery;
 mod switch;
 mod transcript;
+use layout::{resolve_and_migrate, write_manifest};
 use recovery::{decode_record, recover_or_fresh, shutdown_queue};
 pub use builtin_config::{
     BUILTIN_CONFIG_SOURCE, builtin_config_manifest, builtin_config_module_id, root_scope,
@@ -616,6 +618,9 @@ pub struct Session {
     next_seq: u64,
     current_snapshot: Option<Digest>,
     log_path: PathBuf,
+    /// The resolved memory substrate root (`cfg.memory_root` override, else the
+    /// layout's `memory/`, else `<cfg.dir>/memory`).
+    memory_root: PathBuf,
     cfg: SessionConfig,
     // --- M2 subsystems ---
     /// The kernel-owned shared service registry: the module host publishes
@@ -755,8 +760,29 @@ impl Session {
     /// a canonical `safe_mode_activated` event — the session remains usable
     /// (R-01/C-02, decision 28).
     pub fn open(mut cfg: SessionConfig) -> Result<Self, SessionError> {
-        std::fs::create_dir_all(&cfg.dir)?;
-        let log_path = cfg.dir.join("log.zst");
+        // Storage root (decision 33): without a layout `cfg.dir` is the session
+        // root exactly as before; with one the session dir is derived from the
+        // layout and `cfg.dir` is only the legacy source a migration reads.
+        let session_layout = cfg.layout.clone();
+        let (session_dir, session_id) = match &session_layout {
+            None => {
+                let id = cfg.session_id.unwrap_or_else(Id128::generate);
+                (cfg.dir.clone(), id)
+            }
+            Some(layout) => {
+                let memory_root = cfg
+                    .memory_root
+                    .clone()
+                    .unwrap_or_else(|| layout.memory_root());
+                let id = resolve_and_migrate(layout, cfg.session_id, &cfg.dir, &memory_root)?;
+                (layout.session_dir(id), id)
+            }
+        };
+        std::fs::create_dir_all(&session_dir)?;
+        let log_path = match &session_layout {
+            None => session_dir.join("log.zst"),
+            Some(_) => session_dir.join("events.jsonl.zst"),
+        };
         let recovered = recover_or_fresh(&log_path)?;
         let queue = Arc::new(DurabilityQueue::start(&format!(
             "kb-session-{}",
@@ -769,7 +795,17 @@ impl Session {
                 return Err(e.into());
             }
         };
-        let mut store = match ObjectStore::open(&cfg.dir.join("objects"), Arc::clone(&queue)) {
+        // Persist the identity as `session.json` (decision 33), after the log
+        // opens so a resolver never sees a manifest whose log is not durable.
+        if let Some(layout) = &session_layout
+            && let Err(e) = write_manifest(layout, session_id)
+        {
+            drop(log);
+            shutdown_queue(queue);
+            return Err(e);
+        }
+        let objects_dir = session_dir.join("objects");
+        let mut store = match ObjectStore::open(&objects_dir, Arc::clone(&queue)) {
             Ok(store) => store,
             Err(e) => {
                 drop(log);
@@ -814,14 +850,14 @@ impl Session {
             Ok(vm) => {
                 let vm_engine_digest = vm.engine_digest();
                 let mut state = kanbei_modules::StateStore::open(
-                    &cfg.dir.join("state"),
+                    &session_dir.join("state"),
                     Arc::clone(&queue),
                     Arc::new(|_| false),
                 );
                 state.set_max_state_bytes(cfg.max_state_bytes);
                 let manager = ModuleManager::new(
                     vm,
-                    ObjectStore::open(&cfg.dir.join("objects"), Arc::clone(&queue))?,
+                    ObjectStore::open(&objects_dir, Arc::clone(&queue))?,
                     state,
                     Arc::clone(&services),
                 )?;
@@ -861,17 +897,16 @@ impl Session {
         let budgets = cfg.budgets;
         let breaker_floors = cfg.breaker_floors;
         let provider_config = cfg.provider.clone();
-        let session_id = cfg.session_id.unwrap_or_else(Id128::generate);
         #[cfg(feature = "otel")]
         let telemetry = cfg.telemetry.take();
 
         // ---- M4 memory substrate wiring (R-11) ----
         // Canonical memory is load-bearing: corrupt memory state is a hard
         // open error (safe mode is config-only, never memory).
-        let memory_root = cfg
-            .memory_root
-            .clone()
-            .unwrap_or_else(|| cfg.dir.join("memory"));
+        let memory_root = cfg.memory_root.clone().unwrap_or_else(|| match &session_layout {
+            None => cfg.dir.join("memory"),
+            Some(layout) => layout.memory_root(),
+        });
         std::fs::create_dir_all(&memory_root)?;
         let memory_fault = cfg.memory_fault.clone();
         let project_id = cfg.project;
@@ -916,9 +951,14 @@ impl Session {
             }
             None => (None, None),
         };
-        let mut memory_index =
-            kanbei_retrieval::MemoryIndex::open(&memory_root.join("projection.sqlite"))
-                .map_err(SessionError::Retrieval)?;
+        // The projection is disposable and layout-global (decision 33), one
+        // per state root rather than per session.
+        let projection_path = match &session_layout {
+            Some(layout) => layout.projection_path(),
+            None => memory_root.join("projection.sqlite"),
+        };
+        let mut memory_index = kanbei_retrieval::MemoryIndex::open(&projection_path)
+            .map_err(SessionError::Retrieval)?;
         {
             let lifetime_fold = memory_lifetime
                 .fold(memory_lifetime.head())
@@ -1124,6 +1164,7 @@ impl Session {
             next_seq,
             current_snapshot,
             log_path,
+            memory_root,
             cfg,
             services,
             scopes,
@@ -1247,7 +1288,7 @@ impl Session {
                     payload_schema: 1,
                     payload: json!({
                         "project_id": project_id.to_string(),
-                        "memory_root": memory_root.to_string_lossy(),
+                        "memory_root": session.memory_root.to_string_lossy(),
                     }),
                     objects: Vec::new(),
                     refs: Vec::new(),
@@ -1670,6 +1711,12 @@ impl Session {
     pub fn close(self) -> Result<(), SessionError> {
         #[cfg(feature = "otel")]
         self.telemetry_flush()?;
+        // Keep the persisted identity in sync (decision 33): `created_us` is
+        // only known once the first frame exists, which for a fresh session is
+        // after open wrote the initial manifest.
+        if let Some(layout) = &self.cfg.layout {
+            write_manifest(layout, self.session_id)?;
+        }
         let Session {
             log,
             store,
