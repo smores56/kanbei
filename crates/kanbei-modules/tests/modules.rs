@@ -30,9 +30,12 @@ fn tmp_dir(tag: &str) -> PathBuf {
 }
 
 fn cleanup(dir: PathBuf, queue: Arc<DurabilityQueue>) {
-    let queue = Arc::try_unwrap(queue)
-        .unwrap_or_else(|_| panic!("durability queue Arc still shared"));
-    queue.shutdown().unwrap();
+    // Best-effort: a detached generation actor can still hold a clone while it
+    // winds down, so requiring sole ownership raced. Mirrors kanbei-session's
+    // shutdown_queue.
+    if let Ok(queue) = Arc::try_unwrap(queue) {
+        queue.shutdown().unwrap();
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
