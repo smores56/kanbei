@@ -119,6 +119,18 @@ pub struct BoundMount {
     pub denied_intents: u64,
     /// Intents the last reduce returned, awaiting capability intersection.
     pending_intents: Vec<UiIntent>,
+    /// The mount's contribution may have changed: the next composition
+    /// rebuilds the composite (decision 22 event-driven composition). A
+    /// non-degraded dirty mount re-invokes the guest `ui_render`; a degraded
+    /// one is recomposed from its preserved tree with no guest call. Cleared
+    /// at the composition attempt so a repaint never re-enters the guest and
+    /// a fault is not retried per frame. Set on binding, reduce, refresh,
+    /// resize, and reduce/refresh faults (which swap in a placeholder).
+    dirty: bool,
+    /// Guest `ui_render` invocations since binding. Test observability for
+    /// "was the guest on the frame loop?" (decision 22): a pure repaint must
+    /// leave this unchanged.
+    pub render_calls: u64,
 }
 
 impl BoundMount {
@@ -144,6 +156,8 @@ impl BoundMount {
             last_error: None,
             denied_intents: 0,
             pending_intents: Vec::new(),
+            dirty: true,
+            render_calls: 0,
         }
     }
 }
@@ -801,6 +815,7 @@ impl Session {
                     mount.last_error = Some(e.to_string());
                     mount.tree =
                         Some(fallback::placeholder_tree(&mount.component, &e.to_string()));
+                    mount.dirty = true;
                     continue;
                 }
             };
@@ -813,6 +828,7 @@ impl Session {
                         &mount.component,
                         mount.last_error.as_deref().unwrap_or("reduce failed"),
                     ));
+                    mount.dirty = true;
                     continue;
                 }
             };
@@ -824,6 +840,9 @@ impl Session {
                 .unwrap_or_default();
             mount.degraded = false;
             mount.last_error = None;
+            // The reducer may have changed state: recompose this mount on the
+            // next frame (decision 22).
+            mount.dirty = true;
         }
     }
 
@@ -937,11 +956,13 @@ impl Session {
         Ok(())
     }
 
-    /// Render every mount's tree through its generation, kernel-validate
-    /// each (accessibility pass is kernel-owned, per mount), and compose the
-    /// validated trees into one synthetic root (slot order = child order).
-    /// A mount fault contributes its placeholder and degrades only that
-    /// mount. Returns None only when there is nothing to render.
+    /// Compose the mount trees into one synthetic root (slot order = child
+    /// order). Event-driven (decision 22): a mount with a clear dirty flag
+    /// contributes its cached last-valid tree without a guest call, so a
+    /// repaint never re-enters Wasm; a dirty mount is re-rendered and
+    /// kernel-validated, and a fault preserves its last-valid tree and
+    /// degrades only that mount. Returns None only when there is nothing to
+    /// render.
     fn ui_render_module_tree(&mut self) -> Option<SemanticTree> {
         self.fault(FaultPoint::BeforeUiRender);
         let result = self.ui_render_module_tree_inner();
@@ -952,26 +973,40 @@ impl Session {
     fn ui_render_module_tree_inner(&mut self) -> Option<SemanticTree> {
         let host = self.ui_host.as_mut()?;
         let manager = self.modules.as_ref()?;
-        let mut composed: Vec<(String, SemanticTree)> = Vec::with_capacity(host.mounts.len());
+        // Event-driven composition (decision 22): only mounts whose state
+        // changed since the last composition re-enter the guest. A repaint
+        // (scroll/focus/selection) finds every flag clear and returns the
+        // cached composite natively.
+        let mut changed = false;
         for mount in host.mounts.iter_mut() {
-            let tree = if mount.degraded {
-                // Degraded mounts keep their placeholder (no render call).
-                mount.tree.clone().unwrap_or_else(|| {
-                    fallback::placeholder_tree(&mount.component, "module degraded")
-                })
-            } else {
-                match Self::render_mount(manager, mount) {
-                    Some(tree) => tree,
-                    None => mount.tree.clone().unwrap_or_else(|| {
-                        fallback::placeholder_tree(&mount.component, "render failed")
-                    }),
-                }
-            };
-            composed.push((mount.slot.clone(), tree));
+            if !mount.dirty {
+                continue;
+            }
+            mount.dirty = false;
+            changed = true;
+            if mount.degraded {
+                // A degraded mount keeps its last tree (placeholder or
+                // last-valid); the guest is not retried until a successful
+                // reduce clears the flag.
+                continue;
+            }
+            Self::render_mount(manager, mount);
         }
-        let refs: Vec<(&str, &SemanticTree)> = composed
+        if !changed && let Some(tree) = host.last_tree.as_ref() {
+            return Some(tree.clone());
+        }
+        for mount in host.mounts.iter_mut() {
+            if mount.tree.is_none() {
+                mount.tree = Some(fallback::placeholder_tree(
+                    &mount.component,
+                    "render failed",
+                ));
+            }
+        }
+        let refs: Vec<(&str, &SemanticTree)> = host
+            .mounts
             .iter()
-            .map(|(slot, tree)| (slot.as_str(), tree))
+            .filter_map(|m| m.tree.as_ref().map(|t| (m.slot.as_str(), t)))
             .collect();
         let composite = SemanticTree::compose(&refs);
         host.last_tree = Some(composite.clone());
@@ -979,19 +1014,21 @@ impl Session {
     }
 
     /// Render one mount's tree through its generation and kernel-validate it
-    /// (accessibility pass is kernel-owned, R-27). On any fault the mount is
-    /// degraded with a placeholder and None is returned; other mounts are
-    /// untouched (M8 fault isolation).
-    fn render_mount(manager: &ModuleManager, mount: &mut BoundMount) -> Option<SemanticTree> {
+    /// (accessibility pass is kernel-owned, R-27), storing the validated tree
+    /// on the mount. A fault degrades the mount but PRESERVES its last-valid
+    /// tree: the composite keeps rendering the previous good tree until the
+    /// mount's state changes again (decision 22 fault → last-valid). The
+    /// caller supplies a placeholder only when the mount never had a valid
+    /// tree.
+    fn render_mount(manager: &ModuleManager, mount: &mut BoundMount) {
+        mount.render_calls += 1;
         let payload = json!({ "entry": "ui_render", "state": mount.reducer_state });
         let out = match manager.call_generation(mount.generation, &payload.to_string()) {
             Ok(out) => out,
             Err(e) => {
                 mount.degraded = true;
                 mount.last_error = Some(e.to_string());
-                mount.tree =
-                    Some(fallback::placeholder_tree(&mount.component, &e.to_string()));
-                return None;
+                return;
             }
         };
         let v: Value = match serde_json::from_str(&out) {
@@ -999,11 +1036,7 @@ impl Session {
             Err(e) => {
                 mount.degraded = true;
                 mount.last_error = Some(format!("ui_render: invalid result JSON: {e}"));
-                mount.tree = Some(fallback::placeholder_tree(
-                    &mount.component,
-                    mount.last_error.as_deref().unwrap_or("render failed"),
-                ));
-                return None;
+                return;
             }
         };
         let tree = match SemanticTree::from_json(&v) {
@@ -1011,11 +1044,7 @@ impl Session {
             Err(e) => {
                 mount.degraded = true;
                 mount.last_error = Some(format!("ui_render: invalid tree: {e}"));
-                mount.tree = Some(fallback::placeholder_tree(
-                    &mount.component,
-                    mount.last_error.as_deref().unwrap_or("render failed"),
-                ));
-                return None;
+                return;
             }
         };
         let errors: Vec<String> = accessibility::validate(&tree)
@@ -1026,16 +1055,11 @@ impl Session {
         if !errors.is_empty() {
             mount.degraded = true;
             mount.last_error = Some(format!("accessibility: {}", errors.join("; ")));
-            mount.tree = Some(fallback::placeholder_tree(
-                &mount.component,
-                mount.last_error.as_deref().unwrap_or("invalid tree"),
-            ));
-            return None;
+            return;
         }
-        mount.tree = Some(tree.clone());
+        mount.tree = Some(tree);
         mount.degraded = false;
         mount.last_error = None;
-        Some(tree)
     }
 
     /// Push a kernel facts refresh to every non-degraded mount (e.g. after a
@@ -1065,12 +1089,15 @@ impl Session {
                         mount.reducer_state =
                             v.get("state").cloned().unwrap_or(mount.reducer_state.clone());
                     }
+                    // An explicit refresh forces a recomposition.
+                    mount.dirty = true;
                 }
                 Err(e) => {
                     mount.degraded = true;
                     mount.last_error = Some(e.to_string());
                     mount.tree =
                         Some(fallback::placeholder_tree(&mount.component, &e.to_string()));
+                    mount.dirty = true;
                 }
             }
         }
@@ -1092,6 +1119,11 @@ impl Session {
                 let size = terminal.size()?;
                 if size != host.size {
                     host.size = size;
+                    // A resize is a composition state change: the guest may
+                    // lay out for the new surface (decision 22).
+                    for mount in host.mounts.iter_mut() {
+                        mount.dirty = true;
+                    }
                 }
             }
             None => return Ok(()),

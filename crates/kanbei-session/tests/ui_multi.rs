@@ -407,6 +407,126 @@ fn atomic_fallback_two_mounts() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A single-mount module whose `ui_render` returns a valid tree once and then
+/// an invalid one: exercises the fault → last-valid path. The module-level
+/// counter persists across `call_generation` calls on one generation instance.
+fn flaky_render_module() -> PackageManifest {
+    let source = r#"
+local renders = 0
+function kb_on_activate(ctx)
+  ctx.contribution_publish('{"kind":"ui","name":"cache_ui","component":"cache_comp","slot":"main"}')
+end
+function kb_hot(d)
+  if d.entry == "ui_reduce" then
+    return { state = d.state, intents = {} }
+  elseif d.entry == "ui_render" then
+    renders = renders + 1
+    if renders > 1 then
+      return { root = { id = "r", kind = "carousel" } }
+    end
+    return { root = { id = "root", kind = "stack", children = {
+      { id = "title", kind = "text", spans = { { text = "last valid" } } },
+    } } }
+  end
+  error("unknown entry")
+end
+"#;
+    PackageManifest {
+        schema: kanbei_modules::PACKAGE_SCHEMA,
+        module_id: Id128::generate(),
+        origin: ModuleOrigin::UserConfig,
+        trust_class: TrustClass::Builtin,
+        scope: kanbei_services::ScopePath(vec!["root".into()]),
+        deps: Vec::new(),
+        capabilities: Vec::new(),
+        source: source.to_string(),
+        state_schema: None,
+        state_key: None,
+    }
+}
+
+/// Decision 22 event-driven composition: a pure repaint re-renders the cached
+/// composite natively and performs ZERO guest `ui_render` calls.
+#[test]
+fn repaint_does_not_reenter_guest() {
+    let (dir, mut session) = open("cache-repaint");
+    require_guest();
+    session
+        .activate_ui(ui_module("main_ui", "main_comp", "main", TrustClass::Builtin, false))
+        .unwrap();
+    session.ui_render_frame().unwrap();
+    let first = session.ui().unwrap().mounts[0].render_calls;
+    assert!(first >= 1, "the initial composition renders the guest");
+    for _ in 0..5 {
+        session.ui_render_frame().unwrap();
+    }
+    assert_eq!(
+        session.ui().unwrap().mounts[0].render_calls,
+        first,
+        "repaint must not re-enter the guest"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Decision 22: a state change (a reduce) recomposes exactly once; the
+/// following repaint is served from the cache.
+#[test]
+fn state_change_recomposes_once() {
+    let (dir, mut session) = open("cache-once");
+    require_guest();
+    session
+        .activate_ui(ui_module("main_ui", "main_comp", "main", TrustClass::Builtin, false))
+        .unwrap();
+    session.ui_render_frame().unwrap();
+    let before = session.ui().unwrap().mounts[0].render_calls;
+    session.ui_handle_input(b"a").unwrap();
+    session.ui_render_frame().unwrap();
+    let after = session.ui().unwrap().mounts[0].render_calls;
+    assert_eq!(after, before + 1, "one guest render per state change");
+    session.ui_render_frame().unwrap();
+    assert_eq!(
+        session.ui().unwrap().mounts[0].render_calls,
+        after,
+        "the repaint after the recomposition is cached"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Decision 22 fault policy: a recomposition fault keeps the previous
+/// last-valid tree and is not retried on subsequent repaints.
+#[test]
+fn render_fault_keeps_last_valid_without_retry() {
+    let (dir, mut session) = open("cache-fault");
+    require_guest();
+    session.activate_ui(flaky_render_module()).unwrap();
+    session.ui_render_frame().unwrap();
+    assert!(body(&session).contains("last valid"), "first tree is valid");
+    let after_first = session.ui().unwrap().mounts[0].render_calls;
+
+    // state change → recompose → the guest returns an invalid tree
+    session.ui_handle_input(b"a").unwrap();
+    session.ui_render_frame().unwrap();
+    assert!(session.ui().unwrap().degraded, "fault degrades the mount");
+    assert!(body(&session).contains("last valid"), "last-valid tree preserved");
+    assert!(
+        !body(&session).contains("UI component faulted"),
+        "no placeholder replaces a valid tree"
+    );
+    let after_fault = session.ui().unwrap().mounts[0].render_calls;
+    assert_eq!(after_fault, after_first + 1, "the fault is one render attempt");
+
+    for _ in 0..5 {
+        session.ui_render_frame().unwrap();
+    }
+    assert_eq!(
+        session.ui().unwrap().mounts[0].render_calls,
+        after_fault,
+        "a faulted mount is not retried per frame"
+    );
+    assert!(body(&session).contains("last valid"), "still the last-valid tree");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A single-mount UI fixture whose tree carries a non-modal button, a
 /// non-modal overlay button, and a higher-z modal `layer` holding an input +
 /// button: the kernel confines the focus ring to the modal.
