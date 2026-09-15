@@ -16,6 +16,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use kanbei_capabilities::Grant;
 use kanbei_core::digest::Digest;
 use kanbei_core::id::Id128;
 use kanbei_modules::{HOOK_WAIT, HookError, ModuleManager};
@@ -484,9 +485,18 @@ impl crate::Session {
     pub(crate) fn rebind_hooks(&mut self) {
         let Some(manager) = self.modules.as_ref() else {
             self.hooks = HookSet::default();
+            self.hook_respawned.clear();
             return;
         };
         self.hooks.rebuild(&self.registry, manager);
+        // NEW-7: a module that left the active set must not stay marked as
+        // respawned — otherwise re-activating it could never respawn again.
+        let active: HashSet<Id128> = manager
+            .snapshot()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        self.hook_respawned.retain(|id| active.contains(id));
     }
 
     /// Clear per-composition fault recovery state: every binding gets a fresh
@@ -516,7 +526,6 @@ impl crate::Session {
         if evaluation.faults.is_empty() {
             return evaluation;
         }
-        let elapsed = started.elapsed();
         // Commit one fact per fault. A failed commit is NOT swallowed (H): the
         // binding is backed off and never respawned off a fact that never
         // landed.
@@ -551,7 +560,6 @@ impl crate::Session {
                 );
             }
         }
-        let remaining = HOOK_WAIT.saturating_sub(elapsed);
         let mut respawned_any = false;
         let mut respawned_ids: Vec<Id128> = Vec::new();
         for (i, fault) in evaluation.faults.iter().enumerate() {
@@ -562,6 +570,10 @@ impl crate::Session {
             if self.hooks.is_backed_off(&scope, kind, &name) {
                 continue;
             }
+            // NEW-4: recompute the per-decision budget every iteration — the
+            // fact commits and every earlier respawn consumed wall time, so N
+            // faulty bindings must not each get the full budget.
+            let remaining = HOOK_WAIT.saturating_sub(started.elapsed());
             // Backoff when the drain cannot complete in the remaining budget,
             // or when this module already consumed its one respawn since the
             // last composition rebind (no per-decision storm, G).
@@ -571,22 +583,59 @@ impl crate::Session {
                 self.hooks.set_backoff(&scope, kind, &name);
                 continue;
             }
-            let Some(manager) = self.modules.as_mut() else {
-                continue;
+            // F: capture the dead generation's grants before the respawn's
+            // teardown retires them, so they can be re-pinned to the fresh
+            // generation below.
+            let rescued = self.broker.grants_for_generation(fault.binding.generation);
+            let old_generation = fault.binding.generation;
+            let respawned = match self.modules.as_mut() {
+                Some(manager) => {
+                    manager.respawn_bounded(fault.binding.module_id, remaining)
+                }
+                None => continue,
             };
-            match manager.respawn_bounded(fault.binding.module_id, remaining) {
-                Ok(_) => {
+            match respawned {
+                Ok(generation) => {
                     self.hook_respawned.insert(fault.binding.module_id);
+                    self.refresh_respawned_grants(&rescued, old_generation, generation);
                     respawned_any = true;
                     respawned_ids.push(fault.binding.module_id);
                 }
-                Err(_) => self.hooks.set_backoff(&scope, kind, &name),
+                Err(_) => {
+                    // The module is gone either way: drop its dead-generation
+                    // grants rather than leave them pinned forever.
+                    self.broker.retire_generation(old_generation);
+                    self.hooks.set_backoff(&scope, kind, &name);
+                }
             }
         }
         if respawned_any {
             self.rebind_after_respawn(&respawned_ids);
         }
         evaluation
+    }
+
+    /// Re-pin grants that named a respawned module's dead generation (F): the
+    /// session broker is not the module host's broker, so its generation-bound
+    /// grants (e.g. the builtin UI's append/cancel) survive a respawn still
+    /// naming the dead generation and deny the fresh one. Retire the old pin,
+    /// then re-issue the grants under the fresh generation through the same
+    /// respawn choke point as the rebind. A failed re-add stays fail-closed
+    /// (the module simply has no grant).
+    fn refresh_respawned_grants(
+        &mut self,
+        rescued: &[Grant],
+        old_generation: u64,
+        generation: u64,
+    ) {
+        self.broker.retire_generation(old_generation);
+        for grant in rescued {
+            let mut grant = grant.clone();
+            grant.principal.generation = generation;
+            grant.module_generation = generation;
+            grant.grant_digest = grant.derive_digest();
+            let _ = self.broker.add_grant(grant);
+        }
     }
 
     /// Re-resolve every generation-bound session state after a respawn (F):

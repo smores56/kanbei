@@ -2435,7 +2435,7 @@ fn render_memory_source(root: Digest, fold: &RootFold) -> MemoryFragmentSource {
         text.push_str(&format!("{} | {}\n", claim.kind, claim.content));
     }
     if text.len() > 16 * 1024 {
-        text.truncate(16 * 1024);
+        truncate_utf8(&mut text, 16 * 1024);
         text.push_str("…[truncated]");
     }
     let sensitivity = fold
@@ -2450,5 +2450,39 @@ fn render_memory_source(root: Digest, fold: &RootFold) -> MemoryFragmentSource {
         text,
         sensitivity,
         claim_digests: fold.claims.iter().map(|(d, _)| *d).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NEW-5: a memory fragment longer than the 16 KiB cap with a multibyte
+    /// claim must truncate on a char boundary (plain `String::truncate` would
+    /// panic here).
+    #[test]
+    fn memory_source_render_truncates_on_a_char_boundary() {
+        let claim = Claim {
+            schema: MEMORY_CLAIM_SCHEMA,
+            claim_id: Id128::generate(),
+            kind: "decision".into(),
+            content: "é".repeat(9000),
+            owner: Principal {
+                session: Id128::generate(),
+                generation: 1,
+                run: None,
+            },
+            visibility_scope: MemoryScope::Lifetime,
+            provenance: ClaimProvenance::new_ordinary(Id128::generate(), 1),
+            observed_at: None,
+            valid_from: None,
+            sensitivity: "public".into(),
+        };
+        let mut fold = empty_fold();
+        fold.claims.push((claim.digest(), claim));
+
+        let source = render_memory_source(Digest::new(b"root"), &fold);
+        assert!(source.text.ends_with("…[truncated]"));
+        assert!(source.text.len() <= 16 * 1024 + "…[truncated]".len());
     }
 }

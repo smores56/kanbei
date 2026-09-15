@@ -697,6 +697,9 @@ impl Session {
                 // generation current; try to remove it.
                 if !manager.generation_current(old_generation) {
                     let _ = manager.deactivate(module_id);
+                    // NEW-7: a deactivated module must not keep its respawn
+                    // marker, or a re-activation could never respawn again.
+                    self.hook_respawned.remove(&module_id);
                 }
                 return Err(e.into());
             }

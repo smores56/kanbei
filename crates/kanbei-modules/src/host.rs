@@ -53,6 +53,7 @@ use kanbei_vm::Host;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
+use crate::package::ModuleOrigin;
 use crate::runtime::{ActorError, GenerationRuntime, Scope, REPLY_TIMEOUT};
 use crate::state::{StateStore, StateUpdate};
 
@@ -75,6 +76,10 @@ pub(crate) const SERVICE_CALL_WAIT: Duration = Duration::from_secs(4);
 pub(crate) struct TokenInfo {
     pub generation: u64,
     pub module_id: Id128,
+    /// The manifest origin of this generation. The host applies the same trust
+    /// predicate as the settings gate to hook contributions at the publish
+    /// boundary (NEW-1): an untrusted origin cannot occupy a hook key.
+    pub origin: ModuleOrigin,
     pub scope: ScopePath,
     /// The module's declared service dependencies (manifest `deps`) — the
     /// caller-side version contract for `service_call`.
@@ -643,6 +648,17 @@ impl ModuleHost {
                     .map(String::from)
                     .unwrap_or_else(|| info.module_id.to_string());
                 self.ensure_current(info.generation)?;
+                // NEW-1: an untrusted origin may not hold a lifecycle hook at
+                // the host boundary. If it could, an untrusted module publishing
+                // first would occupy the `(scope, kind, name)` key, and a later
+                // TRUSTED module's publish would be refused as `Occupied`,
+                // silently unbinding the trusted hook (the activation shim
+                // ignores publish errors) — a fail-open squat. Hooks are
+                // advisory, so ignoring the untrusted publish is safe: no
+                // lingering entry, no error to swallow.
+                if !info.origin.is_trusted() {
+                    return Ok("ok".into());
+                }
                 {
                     let mut hooks = self.hooks.lock().expect("hooks lock poisoned");
                     match hooks.entry((info.scope.clone(), hook, name.clone())) {
@@ -859,6 +875,7 @@ mod tests {
             TokenInfo {
                 generation: 1,
                 module_id: Id128::generate(),
+                origin: ModuleOrigin::UserConfig,
                 scope: ScopePath(vec!["root".into()]),
                 deps: Vec::new(),
                 state_key: None,
@@ -894,6 +911,7 @@ mod tests {
         TokenInfo {
             generation: 1,
             module_id: Id128::generate(),
+            origin: ModuleOrigin::UserConfig,
             scope: ScopePath(vec!["root".into()]),
             deps: Vec::new(),
             state_key: None,
@@ -1117,6 +1135,7 @@ mod tests {
         let info_for = |generation: u64, scope: &ScopePath| TokenInfo {
             generation,
             module_id: Id128::generate(),
+            origin: ModuleOrigin::UserConfig,
             scope: scope.clone(),
             deps: Vec::new(),
             state_key: None,
@@ -1171,6 +1190,7 @@ mod tests {
                     TokenInfo {
                         generation,
                         module_id,
+                        origin: ModuleOrigin::UserConfig,
                         scope,
                         deps: Vec::new(),
                         state_key: None,

@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kanbei_capabilities::TrustClass;
+use kanbei_capabilities::{Capability, TrustClass};
 use kanbei_core::envelope::Envelope;
 use kanbei_core::id::Id128;
 use kanbei_log::for_each_frame;
@@ -789,4 +789,101 @@ fn gated_broker(session_id: Id128) -> kanbei_capabilities::Broker {
     grant.grant_digest = grant.derive_digest();
     broker.add_grant(grant).unwrap();
     broker
+}
+
+/// F: a session broker with a Builtin-class template allowing `session.append`
+/// and one grant pinned to `generation` — used to prove a respawn re-pins
+/// generation-bound grants.
+fn respawn_grant_broker(session_id: Id128, generation: u64) -> kanbei_capabilities::Broker {
+    use kanbei_capabilities::{Broker, Capability, Grant, GrantScope, PolicyTemplate};
+    let mut broker = Broker::new();
+    broker
+        .add_template(PolicyTemplate {
+            trust_class: TrustClass::Builtin,
+            allow: vec![Capability::new("session".into(), vec!["append".into()])],
+            deny: vec![],
+            require_approval: vec![],
+            version: 1,
+            monotonic: true,
+        })
+        .unwrap();
+    let mut grant = Grant {
+        grant_digest: kanbei_core::digest::Digest::new(b"placeholder"),
+        principal: kanbei_capabilities::Principal {
+            session: session_id,
+            generation,
+            run: None,
+        },
+        module_generation: generation,
+        capability: Capability::new("session".into(), vec!["append".into()]),
+        scope: GrantScope::Session,
+        expiry: None,
+        budget: None,
+        purpose: Some("respawn grant refresh".into()),
+        policy_version: 1,
+    };
+    grant.grant_digest = grant.derive_digest();
+    broker.add_grant(grant).unwrap();
+    broker
+}
+
+/// F: a hook-fault respawn re-pins the module's generation-bound grants to the
+/// fresh generation (the teardown retired the old ones), so the respawned
+/// module is not locked out. Without the fix the fresh generation has NoGrant.
+#[test]
+fn respawn_refreshes_generation_bound_grants() {
+    require_guest();
+    let dir = TempDir::new("respawn-grants");
+    let session_id = Id128::generate();
+    let m = manifest(Id128::generate(), RETRY_TOOL);
+    let mut session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(trap_engine()),
+        config_layers: vec![m],
+        session_id: Some(session_id),
+        broker: respawn_grant_broker(session_id, 1),
+        ..Default::default()
+    })
+    .unwrap();
+    let initial = session.modules().unwrap().snapshot()[0].1;
+    assert_eq!(initial, 1, "precondition: the first config layer is generation 1");
+    let want = Capability::new("session".into(), vec!["append".into()]);
+    assert!(
+        grant_check(&session, session_id, initial, &want),
+        "precondition: the pinned generation holds the grant"
+    );
+
+    // Fault the hook once so the module respawns on a fresh generation.
+    let (run_id, _trigger) = start_run(&mut session);
+    let _ = session
+        .tool_call(run_id, principal(&session), "fs.read", json!({ "path": "a" }))
+        .unwrap();
+    let fresh = session.modules().unwrap().snapshot()[0].1;
+    assert!(fresh > initial, "the module must have respawned");
+
+    assert!(
+        grant_check(&session, session_id, fresh, &want),
+        "the respawned module must not be locked out of its grants"
+    );
+    assert!(
+        !grant_check(&session, session_id, initial, &want),
+        "the dead generation's grant must be retired"
+    );
+    session.close().unwrap();
+}
+
+/// Whether `generation` currently passes `session`'s broker for `want`.
+fn grant_check(session: &Session, session_id: Id128, generation: u64, want: &Capability) -> bool {
+    session
+        .broker()
+        .check(
+            &kanbei_capabilities::Principal {
+                session: session_id,
+                generation,
+                run: None,
+            },
+            want,
+            session.broker().policy_version(),
+        )
+        .is_ok()
 }

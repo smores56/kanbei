@@ -1217,6 +1217,15 @@ function kb_on_turn_start(context)
 end
 "#;
 
+/// A module whose activation performs a host op, so holding the shared state
+/// lock wedges its (re)activation (NEW-3 regression).
+const SLOW_ACTIVATE: &str = r#"
+function kb_on_activate(ctx)
+  kb_host_call(1, '{"key":"slow_activate"}')
+end
+function kb_hot(x) return "hot" end
+"#;
+
 fn hook_vm() -> Vm {
     match Vm::load(no_epoch()) {
         Ok(vm) => vm,
@@ -1497,6 +1506,144 @@ fn hook_call_is_nonce_authenticated() {
             "spoof must fall through: {spoof}"
         );
     }
+
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// NEW-1: an untrusted origin cannot squat a hook key and suppress a trusted
+/// module's hook. The untrusted publish is ignored at the host boundary, so it
+/// leaves no occupied entry and the trusted module binds regardless of
+/// activation order.
+#[test]
+fn untrusted_hook_cannot_squat_a_trusted_hook_key() {
+    let vm = hook_vm();
+    let (dir, mut manager, queue) = manager_setup("hook-squat", vm);
+
+    // Untrusted first: it must not occupy (root, OnTurnStart, "hook_mod").
+    let mut untrusted = manifest(Id128::generate(), HOOK_MODULE, vec![]);
+    untrusted.origin = ModuleOrigin::WorkspaceConfig;
+    let squatter = manager.activate(&untrusted).unwrap();
+    assert_eq!(
+        manager.hook_generation(&root(), HookKind::OnTurnStart, "hook_mod"),
+        None,
+        "an untrusted hook publish must not occupy a key"
+    );
+    assert!(
+        manager
+            .published_contributions(squatter.generation)
+            .iter()
+            .all(|c| !matches!(c.kind, ContributionKind::Hook(_))),
+        "an untrusted hook contribution must not be staged"
+    );
+
+    // A trusted module with the same key still binds to its own generation.
+    let trusted = manager
+        .activate(&manifest(Id128::generate(), HOOK_MODULE, vec![]))
+        .unwrap();
+    assert_eq!(
+        manager.hook_generation(&root(), HookKind::OnTurnStart, "hook_mod"),
+        Some(trusted.generation),
+        "the trusted hook must bind despite the earlier untrusted publish"
+    );
+    let out = manager
+        .call_hook(
+            trusted.generation,
+            HookKind::OnTurnStart,
+            r#"{"decision":"deny"}"#,
+            HOOK_WAIT,
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()["decision"],
+        "deny"
+    );
+
+    drop(squatter);
+    drop(trusted);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// NEW-3: a respawn whose `kb_on_activate` wedges is bounded by the respawn
+/// activation budget, not the 10s reply timeout — a hook-fault respawn must not
+/// stall a decision for seconds.
+#[test]
+fn respawn_activation_is_bounded() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("respawn-bounded", vm);
+    let id = Id128::generate();
+    // Activation calls a host op, so holding the state lock wedges the
+    // respawn-time activation.
+    let g = manager.activate(&manifest(id, SLOW_ACTIVATE, vec![])).unwrap();
+
+    let state = manager.state();
+    let guard = state.lock().unwrap();
+    let started = Instant::now();
+    let err = manager
+        .respawn_bounded(id, Duration::from_millis(200))
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    drop(guard);
+    drop(state);
+
+    assert!(
+        matches!(err, ModuleError::Activation(_)),
+        "a wedged respawn activation must fail, got {err:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "respawn activation must be bounded, not the 10s reply timeout: {elapsed:?}"
+    );
+
+    drop(g);
+    drop(manager);
+    cleanup(dir, queue);
+}
+
+/// NEW-6: a retire while the actor is busy must not lose the stop request. The
+/// actor's command channel is full, so only the sticky stop flag can reach it.
+#[test]
+fn retire_while_busy_is_not_dropped() {
+    let vm = load_vm();
+    let (dir, mut manager, queue) = manager_setup("retire-busy", vm);
+    let id = Id128::generate();
+    let g = manager.activate(&manifest(id, T4_HOST_CALL, vec![])).unwrap();
+    let runtime = Arc::clone(&g.runtime);
+
+    // Hold the state lock so the actor's host call blocks; a second request
+    // then fills the capacity-1 command channel.
+    let state = manager.state();
+    let guard = state.lock().unwrap();
+    let busy = {
+        let r = Arc::clone(&runtime);
+        std::thread::spawn(move || {
+            let _ = r.hot("kb_hot", "{}");
+        })
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    let queued = {
+        let r = Arc::clone(&runtime);
+        std::thread::spawn(move || {
+            let _ = r.hot("kb_hot", "{}");
+        })
+    };
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Retire while busy: `try_send` cannot enqueue the `Shutdown`.
+    manager.host().retire(g.generation, "test: retire while busy");
+    drop(guard);
+    drop(state);
+    busy.join().unwrap();
+    queued.join().unwrap();
+    // Give the actor a poll interval to observe the sticky stop flag.
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert!(
+        matches!(runtime.hot("kb_hot", "{}"), Err(ActorError::Gone)),
+        "the actor must have stopped even though its channel was full"
+    );
 
     drop(g);
     drop(manager);

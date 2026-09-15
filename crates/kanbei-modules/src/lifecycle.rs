@@ -150,6 +150,13 @@ fn hot_multiplexer(nonce: &str) -> String {
 /// returns within the bound and the session classifies the loss.
 pub const HOOK_WAIT: Duration = Duration::from_millis(200);
 
+/// Respawn-time activation bound (NEW-3). A hook-fault respawn re-runs the
+/// module's `kb_on_activate`; without this bound that wedge would wait the full
+/// 10s [`REPLY_TIMEOUT`], so a hook whose activation wedges would stall the
+/// decision for seconds and violate "never blocks the run". Bounded to the hook
+/// budget, it degrades within the same per-decision window.
+const RESPAWN_ACTIVATION_WAIT: Duration = HOOK_WAIT;
+
 /// The manager's per-module bookkeeping, shared with [`Generation`] so a
 /// direct `Generation::dispose` deregisters consistently (a disposed
 /// generation must not appear in `current` or the manifest snapshot).
@@ -488,6 +495,19 @@ impl ModuleManager {
         manifest: &PackageManifest,
         supersede: &HashSet<ServiceKey>,
     ) -> Result<Generation, ModuleError> {
+        self.activate_bounded(manifest, supersede, REPLY_TIMEOUT)
+    }
+
+    /// As [`Self::activate_with_supersede`], but the activation entry
+    /// (`kb_on_activate`) waits at most `activation_wait` for the actor, and the
+    /// rollback drain is bounded by the same span (NEW-3: a hook-fault respawn
+    /// must not stall a decision for the full reply timeout).
+    fn activate_bounded(
+        &mut self,
+        manifest: &PackageManifest,
+        supersede: &HashSet<ServiceKey>,
+        activation_wait: Duration,
+    ) -> Result<Generation, ModuleError> {
         // R-07/C-F1: validate the declared state schema against the existing
         // head BEFORE any side effect, so an incompatible generation is rejected
         // atomically and the old head (and object store) stay untouched.
@@ -514,6 +534,7 @@ impl ModuleManager {
         let info = TokenInfo {
             generation,
             module_id: manifest.module_id,
+            origin: manifest.origin,
             scope: manifest.scope.clone(),
             deps: manifest.deps.clone(),
             state_key: manifest.state_key.clone(),
@@ -532,12 +553,13 @@ impl ModuleManager {
             tables.packages.insert(generation, package);
             tables.hook_nonces.insert(generation, hook_nonce.clone());
         }
-        if let Err(e) = self.run_activation(&runtime, &manifest.source, &hook_nonce) {
+        if let Err(e) = self.run_activation(&runtime, &manifest.source, &hook_nonce, activation_wait) {
             // Roll back atomically (C-F2): invalidate the token and unpublish
             // anything the failed activation staged (services, contributions, UI
             // mounts) BEFORE shutting the actor down, so no in-flight op can
             // re-publish against a generation we are tearing down. Then drop the
-            // kernel's handles and drain.
+            // kernel's handles and drain, bounded by the same activation wait so
+            // a wedged activation cannot extend the stall (NEW-3).
             self.host.teardown_generation(generation, true);
             self.instances.lock().expect("instances lock poisoned").remove(&generation);
             {
@@ -547,7 +569,7 @@ impl ModuleManager {
                 tables.packages.remove(&generation);
                 tables.hook_nonces.remove(&generation);
             }
-            let _ = runtime.shutdown(DRAIN_DEADLINE);
+            let _ = runtime.shutdown(DRAIN_DEADLINE.min(activation_wait));
             return Err(e);
         }
         Ok(Generation {
@@ -569,13 +591,14 @@ impl ModuleManager {
         runtime: &Arc<GenerationRuntime>,
         source: &str,
         hook_nonce: &str,
+        wait: Duration,
     ) -> Result<(), ModuleError> {
         let script = format!(
             "{source}\n{}\n{ACTIVATION_SHIM}",
             hot_multiplexer(hook_nonce)
         );
         runtime
-            .run_script(&script)
+            .run_script_within(&script, wait)
             .map_err(|e| ModuleError::Activation(format!("activation entry failed: {e}")))?
             .map_err(|e| ModuleError::Activation(format!("activation entry failed: {e}")))
     }
@@ -866,7 +889,7 @@ impl ModuleManager {
         // unpublished unconditionally — the re-activation re-publishes them.
         self.host.teardown_generation(generation, true);
         self.drop_generation_with(module_id, generation, drain_budget);
-        let new = self.activate(&manifest)?;
+        let new = self.activate_bounded(&manifest, &HashSet::new(), RESPAWN_ACTIVATION_WAIT)?;
         Ok(new.generation)
     }
 

@@ -165,6 +165,11 @@ pub struct GenerationRuntime {
     /// Set when the actor thread panicked (so a disposal does not claim a clean
     /// quiesce). Its store was still dropped during unwinding.
     panicked: AtomicBool,
+    /// Sticky stop flag (NEW-6): `request_shutdown` sets it so a stop request
+    /// survives a full command channel (the actor polls it). Without this a
+    /// retired generation whose actor was busy would never observe the dropped
+    /// `Shutdown` and its store would leak.
+    stop: Arc<AtomicBool>,
     /// The scope of the command the actor is executing right now (T20). The
     /// kernel host reads this for the calling generation in `service_call`;
     /// the actor is blocked inside the call while it is set, so the read is
@@ -186,6 +191,7 @@ impl GenerationRuntime {
         let (tx, rx) = mpsc::sync_channel(1);
         let in_flight = Arc::new(AtomicUsize::new(0));
         let scope: Arc<Mutex<Option<Scope>>> = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
         // Fail closed on thread exhaustion: activation reports the io error
         // rather than aborting the process.
         let join = thread::Builder::new()
@@ -193,7 +199,8 @@ impl GenerationRuntime {
             .spawn({
                 let in_flight = Arc::clone(&in_flight);
                 let scope = Arc::clone(&scope);
-                move || run(instance, rx, &in_flight, &scope)
+                let stop = Arc::clone(&stop);
+                move || run(instance, rx, &in_flight, &scope, &stop)
             })?;
         Ok(Arc::new(Self {
             generation,
@@ -203,6 +210,7 @@ impl GenerationRuntime {
             in_flight,
             abandoned,
             panicked: AtomicBool::new(false),
+            stop,
             scope,
         }))
     }
@@ -212,17 +220,20 @@ impl GenerationRuntime {
         self.in_flight.load(Ordering::Acquire)
     }
 
-    /// Run the activation script on the actor thread, waiting up to the
-    /// runtime's default reply deadline. The invocation runs under a fresh root
-    /// scope (this generation is the only hop on the chain).
-    pub(crate) fn run_script(&self, source: &str) -> Result<Result<(), GuestError>, ActorError> {
-        let scope = Scope::root(self.generation, Instant::now() + self.reply_timeout);
-        self.request(self.reply_timeout, Some(scope), |reply, scope| {
-            Cmd::RunScript {
-                source: source.to_string(),
-                reply,
-                scope,
-            }
+    /// Run the activation script on the actor thread, waiting up to `wait` for
+    /// the reply. The invocation runs under a fresh root scope (this generation
+    /// is the only hop on the chain). Callers bound the wait so a wedged
+    /// activation cannot stall past the caller's budget (NEW-3).
+    pub(crate) fn run_script_within(
+        &self,
+        source: &str,
+        wait: Duration,
+    ) -> Result<Result<(), GuestError>, ActorError> {
+        let scope = Scope::root(self.generation, Instant::now() + wait);
+        self.request(wait, Some(scope), |reply, scope| Cmd::RunScript {
+            source: source.to_string(),
+            reply,
+            scope,
         })
     }
 
@@ -283,10 +294,13 @@ impl GenerationRuntime {
 
     /// Best-effort, non-blocking stop request (for the vm's `retire` path, which
     /// runs on a worker and must not block on a drain). The command channel is
-    /// capacity-1: a busy actor means the request is dropped, and the caller's
-    /// later drain (or the actor's own idle loop) handles the stop.
+    /// capacity-1, so a busy actor's `Shutdown` would be dropped (a lost stop
+    /// that leaks the store, NEW-6); the sticky `stop` flag guarantees the
+    /// actor observes the request on its next poll whatever the channel state.
     pub(crate) fn request_shutdown(&self) {
+        self.stop.store(true, Ordering::Release);
         let (done, _never) = mpsc::sync_channel(1);
+        // Prompt wake when the actor is idle; the flag covers the full case.
         let _ = self.tx.try_send(Cmd::Shutdown { done });
     }
 
@@ -390,6 +404,11 @@ fn send_bounded(tx: &SyncSender<Cmd>, cmd: Cmd, deadline: Instant) -> Result<(),
     }
 }
 
+/// How long the actor blocks on its command channel before re-checking the
+/// sticky stop flag (NEW-6). Short enough to observe a stop promptly, long
+/// enough that an idle actor does not spin.
+const STOP_POLL: Duration = Duration::from_millis(25);
+
 /// The actor loop: sole owner of the store for the thread's lifetime. It
 /// publishes the scope of the command it is running on `scope` for the duration
 /// of the call, then clears it.
@@ -398,8 +417,19 @@ fn run(
     rx: Receiver<Cmd>,
     in_flight: &AtomicUsize,
     scope: &Mutex<Option<Scope>>,
+    stop: &AtomicBool,
 ) {
-    while let Ok(cmd) = rx.recv() {
+    loop {
+        // NEW-6: a stop request must not be lost if the channel was full; the
+        // sticky flag is authoritative and checked every poll.
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let cmd = match rx.recv_timeout(STOP_POLL) {
+            Ok(cmd) => cmd,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match cmd {
             Cmd::RunScript {
                 source,

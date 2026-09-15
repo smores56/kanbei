@@ -317,6 +317,20 @@ impl Broker {
         Ok(())
     }
 
+    /// Clones the grants bound to `generation` (either the principal's
+    /// generation or the `module_generation` pin). Used by the session's
+    /// respawn choke point to re-pin a respawned module's grants after its
+    /// teardown retired them (F).
+    pub fn grants_for_generation(&self, generation: u64) -> Vec<Grant> {
+        self.grants
+            .iter()
+            .filter(|g| {
+                g.principal.generation == generation || g.module_generation == generation
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Forget a retired generation's grants and budget consumption (T7/R-02):
     /// a displaced generation's parked intents must not recheck OK (`NoGrant`),
     /// and its budget entries must not accumulate forever / inflate
