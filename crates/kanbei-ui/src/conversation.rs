@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use kanbei_core::envelope::Envelope;
 
-use crate::tree::{Node, NodeKind, SemanticTree};
+use crate::tree::{Node, SemanticTree};
 
 /// The turn's terminal classification (UI vocabulary for the scheduler's
 /// `TerminalOutcome`, kept dependency-free).
@@ -508,66 +508,67 @@ impl ConversationState {
     /// bubbles collapse on completion, expand on demand); a running turn is
     /// always expanded (Q5: live steps + spinner).
     pub fn tree(&self, expanded: &HashSet<String>) -> SemanticTree {
-        let mut root = Node::new("root", NodeKind::Root)
-            .child(Node::new("conv", NodeKind::List));
-        let list = &mut root.children[0];
+        // The former semantic rows are primitive compositions: a user message
+        // or answer is a styled `text`, a working step is a `code` line, the
+        // live spinner is a styled `text`, and the turn toggle is a `button`.
+        let mut root = Node::stack("root").child(Node::col("conv"));
+        let rows = &mut root.children[0];
         for (n, turn) in self.turns.iter().enumerate() {
             let id = |s: &str| format!("{s}{n}");
-            list.children.push(
-                Node::new(id("u"), NodeKind::User)
-                    .with_content(format!("❯ {}", turn.user)),
-            );
+            rows.children.push(Node::styled_text(
+                id("u"),
+                format!("❯ {}", turn.user),
+                "user",
+            ));
             let open = turn.state == TurnState::Running
                 || expanded.contains(&format!("t{n}"));
             if open && !turn.thoughts.is_empty() {
                 for (k, row) in turn.thoughts.iter().enumerate() {
                     match row {
                         BubbleRow::Text(text) => {
-                            list.children.push(
-                                Node::new(id(&format!("b{k}")), NodeKind::Thought)
-                                    .with_content(indent(text, 2)),
-                            );
+                            rows.children.push(Node::styled_text(
+                                id(&format!("b{k}")),
+                                indent(text, 2),
+                                "thought",
+                            ));
                         }
                         BubbleRow::Step(step) => {
-                            list.children.push(
-                                Node::new(id(&format!("b{k}")), NodeKind::Code)
-                                    .with_content(step_line(step)),
+                            rows.children.push(
+                                Node::code(id(&format!("b{k}")), step_line(step)),
                             );
                         }
                         BubbleRow::Notice(text) => {
-                            list.children.push(
-                                Node::new(id(&format!("b{k}")), NodeKind::Thought)
-                                    .with_content(indent(text, 2))
-                                    .with_style("status"),
-                            );
+                            rows.children.push(Node::styled_text(
+                                id(&format!("b{k}")),
+                                indent(text, 2),
+                                "status",
+                            ));
                         }
                     }
                 }
                 if turn.state == TurnState::Running {
-                    list.children.push(
-                        Node::new(id("p"), NodeKind::Progress)
-                            .with_content("  … working"),
-                    );
+                    rows.children.push(Node::styled_text(
+                        id("p"),
+                        "  … working",
+                        "progress",
+                    ));
                 }
             }
             if turn.state != TurnState::Running {
                 let marker = if open { "▾" } else { "▸" };
-                list.children.push(
-                    Node::new(id("t"), NodeKind::Group)
-                        .with_content(format!("{marker} {}", turn.summary()))
-                        .focusable(),
-                );
+                rows.children.push(Node::button(
+                    id("t"),
+                    format!("{marker} {}", turn.summary()),
+                ));
             }
             if let Some(answer) = &turn.response {
-                list.children.push(
-                    Node::new(id("r"), NodeKind::Response)
-                        .with_content(indent(answer, 1)),
-                );
+                rows.children.push(Node::styled_text(
+                    id("r"),
+                    indent(answer, 1),
+                    "response",
+                ));
             }
-            list.children.push(
-                Node::new(id("d"), NodeKind::Divider)
-                    .with_content("─".repeat(2)),
-            );
+            rows.children.push(Node::styled_text(id("d"), "─".repeat(2), "divider"));
         }
         SemanticTree::new(root)
     }
@@ -868,22 +869,27 @@ mod tests {
         ));
         // running: the bubble is open with the step row + spinner
         let t = s.tree(&HashSet::new());
-        let kinds: Vec<NodeKind> = t.nodes().iter().map(|n| n.kind).collect();
-        assert!(kinds.contains(&NodeKind::Code));
-        assert!(kinds.contains(&NodeKind::Progress));
+        let kinds: Vec<crate::NodeKind> = t.nodes().iter().map(|n| n.kind()).collect();
+        assert!(kinds.contains(&crate::NodeKind::Code), "a tool step is code");
+        let text: Vec<String> = t.nodes().iter().map(|n| n.content()).collect();
+        assert!(text.iter().any(|c| c.contains("… working")), "spinner is a text row");
+        assert!(t.focusable().is_empty(), "no turn toggle while running");
         s.apply(&env(5, "model_outcome", model_outcome(Some("done"), &[], 3, 4)));
         s.finalize_turn(Some((OutcomeClass::Progress, None)));
         // collapsed: no step row, summary + response present
         let t = s.tree(&HashSet::new());
-        let content: Vec<String> = t.nodes().iter().map(|n| n.content.clone()).collect();
-        assert!(!content.iter().any(|c| c.contains("fs.read")));
-        assert!(content.iter().any(|c| c.starts_with("▸")));
-        assert!(content.iter().any(|c| c.contains("done")));
+        let text: Vec<String> = t.nodes().iter().map(|n| n.content()).collect();
+        assert!(!text.iter().any(|c| c.contains("fs.read")));
+        assert!(text.iter().any(|c| c.starts_with("▸")));
+        assert!(text.iter().any(|c| c.contains("done")));
+        // the collapsed summary is a focusable button
+        assert_eq!(t.focusable().len(), 1);
+        assert_eq!(t.focusable()[0].kind(), crate::NodeKind::Button);
         // expanded: the step row comes back
         let t = s.tree(&HashSet::from([format!("t{}", 0)]));
-        let content: Vec<String> = t.nodes().iter().map(|n| n.content.clone()).collect();
-        assert!(content.iter().any(|c| c.contains("fs.read")));
-        assert!(content.iter().any(|c| c.starts_with("▾")));
+        let text: Vec<String> = t.nodes().iter().map(|n| n.content()).collect();
+        assert!(text.iter().any(|c| c.contains("fs.read")));
+        assert!(text.iter().any(|c| c.starts_with("▾")));
     }
 
     #[test]

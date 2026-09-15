@@ -531,7 +531,7 @@ impl Session {
                         .as_ref()
                         .and_then(|t| t.node(id))
                     {
-                        Some(n) if n.kind == NodeKind::Button => UiEventKind::Activate(id.to_string()),
+                        Some(n) if n.kind() == NodeKind::Button => UiEventKind::Activate(id.to_string()),
                         _ => kind,
                     },
                     _ => kind,

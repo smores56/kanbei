@@ -256,8 +256,8 @@ function kb_hot(d)
       -- host-side render fault: unknown node kind
       return { root = { id = "r", kind = "carousel" } }
     end
-    return { root = { id = "root", kind = "root", children = {
-      { id = "input", kind = "input", content = tostring(s.draft or ""), focusable = true },
+    return { root = { id = "root", kind = "stack", children = {
+      { id = "input", kind = "input", content = tostring(s.draft or "") },
     } } }
   end
   error("unknown entry")

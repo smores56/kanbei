@@ -40,19 +40,19 @@ end
 
 local function tree_for(s)
   if type(s) ~= "table" then s = empty_state() end
-  local lines = {}
+  local items = {}
   for _, entry in ipairs(s.log or {}) do
-    table.insert(lines, { id = "log_" .. tostring(entry.seq), kind = "list_item", content = tostring(entry.text) })
+    table.insert(items, { id = "log_" .. tostring(entry.seq), label = tostring(entry.text) })
   end
   local draft = s.draft
   if type(draft) ~= "string" then draft = "" end
   return {
     root = {
-      id = "root", kind = "root",
+      id = "root", kind = "stack",
       children = {
-        { id = "header", kind = "header", content = "kanbei workbench" },
-        { id = "log", kind = "list", children = lines },
-        { id = "input", kind = "input", content = draft, focusable = true },
+        { id = "header", kind = "text", spans = { { text = "kanbei workbench", style = "header" } } },
+        { id = "log", kind = "list", items = items },
+        { id = "input", kind = "input", content = draft },
       },
     },
   }

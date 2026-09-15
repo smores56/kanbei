@@ -8,7 +8,7 @@
 //!
 //! All three are pure Rust and module-free (consistency 13).
 
-use crate::tree::{Node, NodeKind, SemanticTree};
+use crate::tree::{Node, SemanticTree};
 
 pub const STALE_PREFIX: &str = "composition stale";
 
@@ -22,13 +22,18 @@ pub fn staleness_text(reason: &str) -> String {
 /// (R-27 fault class 2). The caller marks the module degraded alongside.
 pub fn placeholder_tree(component: &str, error: &str) -> SemanticTree {
     SemanticTree::new(
-        Node::new("root", NodeKind::Root)
-            .child(Node::new("header", NodeKind::Header).with_content(format!("kanbei — {component}")))
-            .child(
-                Node::new("fault", NodeKind::Placeholder)
-                    .with_content(format!("UI component faulted: {error}")),
-            )
-            .child(Node::new("hint", NodeKind::Text).with_content("Ctrl-X Ctrl-S enters safe mode")),
+        Node::stack("root")
+            .child(Node::styled_text(
+                "header",
+                format!("kanbei — {component}"),
+                "header",
+            ))
+            .child(Node::styled_text(
+                "fault",
+                format!("UI component faulted: {error}"),
+                "error",
+            ))
+            .child(Node::text("hint", "Ctrl-X Ctrl-S enters safe mode")),
     )
 }
 
@@ -48,13 +53,14 @@ impl FallbackUi {
     /// The fallback semantic tree (kernel-authored, module-free).
     pub fn tree(&self) -> SemanticTree {
         SemanticTree::new(
-            Node::new("root", NodeKind::Root)
-                .child(Node::new("header", NodeKind::Header).with_content("kanbei safe mode"))
-                .child(Node::new("msg", NodeKind::Text).with_content(&self.message))
-                .child(Node::new("hint", NodeKind::Text).with_content(
+            Node::stack("root")
+                .child(Node::styled_text("header", "kanbei safe mode", "header"))
+                .child(Node::text("msg", &self.message))
+                .child(Node::text(
+                    "hint",
                     "Kernel fallback UI: modules are not rendering. Restart to restore the workbench.",
                 ))
-                .child(Node::new("input", NodeKind::Input).with_content("").focusable()),
+                .child(Node::input("input", "")),
         )
     }
 }
@@ -71,8 +77,9 @@ mod tests {
     #[test]
     fn placeholder_is_kernel_tree() {
         let t = placeholder_tree("workbench", "reduce failed");
-        assert_eq!(t.root.kind, NodeKind::Root);
-        assert!(t.nodes().iter().any(|n| n.kind == NodeKind::Placeholder));
+        assert_eq!(t.root.kind(), crate::NodeKind::Stack);
+        assert!(t.nodes().iter().any(|n| n.content().contains("UI component faulted")));
+        assert!(crate::accessibility::is_valid(&t));
     }
 
     #[test]

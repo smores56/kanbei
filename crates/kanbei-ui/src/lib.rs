@@ -42,4 +42,4 @@ pub use theme::{Color, Style, Theme};
 pub use tui::{
     build_viewport, key_to_input, resolve_style, total_rows, transcript_paragraph, Row, StyledRow,
 };
-pub use tree::{Node, NodeKind, SemanticTree, TreeError};
+pub use tree::{ListItem, Node, NodeKind, NodeProps, SemanticTree, Span, TreeError};

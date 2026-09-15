@@ -100,15 +100,15 @@ function kb_hot(d)
   elseif d.entry == "ui_render" then
     local s = d.state
     if type(s) ~= "table" then s = fresh() end
-    local lines = {}
+    local items = {}
     for _, k in ipairs(s.seen or {}) do
-      table.insert(lines, { id = "seen_" .. #lines, kind = "list_item", content = tostring(k) })
+      table.insert(items, { id = "seen_" .. #items, label = tostring(k) })
     end
-    return { root = { id = "root", kind = "root", children = {
-      { id = "title", kind = "text", content = "panel {NAME}" },
-      { id = "events", kind = "list", children = lines },
-      { id = "{NAME}_input", kind = "input", content = tostring(s.draft or ""), focusable = true },
-      { id = "{NAME}_btn", kind = "button", content = "{NAME} button", focusable = true },
+    return { root = { id = "root", kind = "stack", children = {
+      { id = "title", kind = "text", spans = { { text = "panel {NAME}" } } },
+      { id = "events", kind = "list", items = items },
+      { id = "{NAME}_input", kind = "input", content = tostring(s.draft or "") },
+      { id = "{NAME}_btn", kind = "button", label = "{NAME} button" },
     } } }
   end
   error("unknown entry: " .. tostring(d.entry))

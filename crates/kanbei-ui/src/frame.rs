@@ -78,6 +78,17 @@ impl TerminalFrame {
             self.set(row, i as u16, ch, style);
         }
     }
+
+    /// Write one pre-wrapped row of per-character styles; a focused row is
+    /// drawn uniformly in reverse video (the kernel's focus highlight).
+    pub fn write_chars(&mut self, row: u16, chars: &[(char, String)], focused: bool) {
+        let cols = self.cols as usize;
+        for (i, (ch, style)) in chars.iter().take(cols).enumerate() {
+            let ch = if ch.is_control() { ' ' } else { *ch };
+            let style = if focused { "selected" } else { style.as_str() };
+            self.set(row, i as u16, ch, style);
+        }
+    }
 }
 
 /// Everything the renderer needs. Status/staleness/degraded are kernel-owned
@@ -108,10 +119,11 @@ pub enum RenderError {
     TooSmall { rows: u16 },
 }
 
+/// One body line: a node plus its pre-styled segments. The segments carry
+/// per-span theme styles, so a `text` node's spans survive into cells.
 pub struct BodyLine<'a> {
     pub node: &'a Node,
-    pub text: String,
-    pub style: String,
+    pub spans: Vec<(String, String)>,
 }
 
 /// Render the tree into cells. Layout (top to bottom):
@@ -130,23 +142,15 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
     }
     let mut frame = TerminalFrame::blank(ctx.size.0, ctx.size.1);
 
-    // 1. banner + header rows.
-    let banner_row: Option<usize> = ctx.staleness.map(|_| 0);
-    let header_row = if banner_row.is_some() { 1 } else { 0 };
+    // 1. banner row. There is no header kind: a module composes its title as
+    // the first `text` row of the body, so titled workbenches occupy the same
+    // top row they did when the kernel special-cased headers.
     if let Some(reason) = ctx.staleness {
         frame.write_line(0, &crate::fallback::staleness_text(reason), "banner", false);
     }
-    let header = ctx
-        .tree
-        .nodes()
-        .into_iter()
-        .find(|n| n.kind == NodeKind::Header);
-    if let Some(h) = header {
-        let text: String = h.content.chars().take(cols).collect();
-        frame.write_line(header_row as u16, &text, "header", false);
-    }
+    let body_start = if ctx.staleness.is_some() { 1 } else { 0 };
 
-    // 2. body lines (header and input nodes are kernel-rendered elsewhere).
+    // 2. body lines (input nodes are kernel-rendered on the bottom row).
     let mut lines: Vec<BodyLine> = Vec::new();
     collect_lines(&ctx.tree.root, &mut lines);
 
@@ -166,7 +170,6 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
     }
 
     // Viewport: keep the focused line visible; tail when unfocused.
-    let body_start = header_row + 1;
     let body_rows = rows.saturating_sub(body_start + 2); // status + input rows
     let focused_idx = ctx
         .focus
@@ -181,13 +184,13 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
     let mut row = body_start;
     for line in lines.iter().skip(top) {
         let focused = Some(line.node.id.as_str()) == ctx.focus.focused.as_deref();
-        let segs = wrap(&line.text, cols);
-        for (seg_row, text) in segs.iter().enumerate() {
+        let segs = wrap_spans(&line.spans, cols);
+        for (seg_row, chars) in segs.iter().enumerate() {
             let r = row + seg_row;
             if r >= body_start + body_rows {
                 break;
             }
-            frame.write_line(r as u16, text, &line.style, focused);
+            frame.write_chars(r as u16, chars, focused);
         }
         row += segs.len();
         if row >= body_start + body_rows {
@@ -203,7 +206,7 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
     let input_row = rows - 1;
     let mut input_text = "> ".to_string();
     if let Some(node) = &input_node {
-        input_text.push_str(&node.content);
+        input_text.push_str(&node.content());
     }
     let input_text: String = input_text.chars().take(cols).collect();
     frame.write_line(input_row as u16, &input_text, "input", false);
@@ -226,71 +229,84 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
     })
 }
 
-/// Depth-first body lines. `Header` and `Input` nodes are kernel-rendered
-/// (top/bottom rows) and skipped here.
+/// Depth-first body lines. Layout kinds recurse (siblings in ascending z
+/// order, so a higher z paints later and occludes); `input` nodes are
+/// kernel-rendered on the bottom row and skipped here.
 pub(crate) fn collect_lines<'a>(node: &'a Node, out: &mut Vec<BodyLine<'a>>) {
-    match node.kind {
-        NodeKind::Root | NodeKind::List => {
-            for child in &node.children {
+    match node.kind() {
+        NodeKind::Stack | NodeKind::Row | NodeKind::Col | NodeKind::Layer => {
+            for child in sorted_children(node) {
                 collect_lines(child, out);
             }
         }
-        NodeKind::Header | NodeKind::Input => {}
-        NodeKind::ListItem | NodeKind::Text | NodeKind::Status | NodeKind::Button => {
-            out.push(BodyLine {
-                node,
-                text: node.content.clone(),
-                style: node
-                    .style
-                    .clone()
-                    .unwrap_or_else(|| match node.kind {
-                        NodeKind::Status => "status".to_string(),
-                        NodeKind::Placeholder => "error".to_string(),
-                        _ => DEFAULT_STYLE.to_string(),
-                    }),
-            });
+        NodeKind::List => {
+            // A list's items are its rows; children (if any) follow.
+            for item in node.items() {
+                out.push(BodyLine {
+                    node,
+                    spans: vec![(item.label.clone(), DEFAULT_STYLE.to_string())],
+                });
+            }
+            for child in sorted_children(node) {
+                collect_lines(child, out);
+            }
         }
-        NodeKind::Placeholder => {
-            out.push(BodyLine {
-                node,
-                text: node.content.clone(),
-                style: "error".to_string(),
-            });
-        }
-        NodeKind::User
-        | NodeKind::Response
-        | NodeKind::Thought
-        | NodeKind::Group
-        | NodeKind::Progress
-        | NodeKind::Code
-        | NodeKind::Divider
-        | NodeKind::KeymapHint => {
-            out.push(BodyLine {
-                node,
-                text: node.content.clone(),
-                style: node
-                    .style
-                    .clone()
-                    .unwrap_or_else(|| kind_default_style(node.kind).to_string()),
-            });
-        }
+        NodeKind::Text => out.push(BodyLine {
+            node,
+            spans: styled_spans(node, DEFAULT_STYLE),
+        }),
+        NodeKind::Code => out.push(BodyLine {
+            node,
+            spans: styled_spans(node, "tool"),
+        }),
+        NodeKind::Button => out.push(BodyLine {
+            node,
+            spans: vec![(node.content(), DEFAULT_STYLE.to_string())],
+        }),
+        NodeKind::Input => {}
     }
 }
 
-/// Default style name for a conversation node kind when the node carries no
-/// explicit style (both renderers resolve it through the theme).
-pub(crate) fn kind_default_style(kind: NodeKind) -> &'static str {
-    match kind {
-        NodeKind::Status | NodeKind::KeymapHint => "status",
-        NodeKind::Placeholder => "error",
-        NodeKind::User => "user",
-        NodeKind::Response => "response",
-        NodeKind::Thought | NodeKind::Group => "thought",
-        NodeKind::Progress => "progress",
-        NodeKind::Code => "tool",
-        NodeKind::Divider => "divider",
-        _ => DEFAULT_STYLE,
+/// Siblings in ascending z (stable, so equal-z siblings keep document order).
+fn sorted_children(node: &Node) -> Vec<&Node> {
+    let mut children: Vec<&Node> = node.children.iter().collect();
+    children.sort_by_key(|c| c.z());
+    children
+}
+
+/// A text/code node's spans with the kind's default style where a span names
+/// none.
+fn styled_spans(node: &Node, default: &str) -> Vec<(String, String)> {
+    node.spans()
+        .iter()
+        .map(|s| {
+            (
+                s.text.clone(),
+                s.style.clone().unwrap_or_else(|| default.to_string()),
+            )
+        })
+        .collect()
+}
+
+/// Split styled segments into pre-wrapped rows of per-character styles. `\n`
+/// forces a row break; a row fills to `cols` first.
+fn wrap_spans(spans: &[(String, String)], cols: usize) -> Vec<Vec<(char, String)>> {
+    let mut rows: Vec<Vec<(char, String)>> = Vec::new();
+    let mut cur: Vec<(char, String)> = Vec::new();
+    for (text, style) in spans {
+        for ch in text.chars() {
+            if ch == '\n' {
+                rows.push(std::mem::take(&mut cur));
+                continue;
+            }
+            if cur.len() >= cols {
+                rows.push(std::mem::take(&mut cur));
+            }
+            cur.push((ch, style.clone()));
+        }
     }
+    rows.push(cur);
+    rows
 }
 
 /// Split into lines (on '\n') then char-wrap each to `cols`.
@@ -313,7 +329,7 @@ pub(crate) fn wrap(text: &str, cols: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::fallback;
-    use crate::{Node, SemanticTree};
+    use crate::{ListItem, Node, SemanticTree};
 
     fn ctx<'a>(
         tree: &'a SemanticTree,
@@ -334,14 +350,13 @@ mod tests {
 
     fn tree() -> SemanticTree {
         SemanticTree::new(
-            Node::new("root", NodeKind::Root)
-                .child(Node::new("h", NodeKind::Header).with_content("kanbei"))
-                .child(
-                    Node::new("list", NodeKind::List)
-                        .child(Node::new("a", NodeKind::ListItem).with_content("first"))
-                        .child(Node::new("b", NodeKind::ListItem).with_content("second")),
-                )
-                .child(Node::new("input", NodeKind::Input).with_content("hi").focusable()),
+            Node::stack("root")
+                .child(Node::styled_text("h", "kanbei", "header"))
+                .child(Node::list(
+                    "list",
+                    vec![ListItem::new("a", "first"), ListItem::new("b", "second")],
+                ))
+                .child(Node::input("input", "hi")),
         )
     }
 
@@ -382,19 +397,17 @@ mod tests {
     #[test]
     fn viewport_keeps_focus_visible() {
         let t = SemanticTree::new(
-            Node::new("root", NodeKind::Root).child(
-                Node::new("list", NodeKind::List).child(
-                    Node::new("top", NodeKind::ListItem)
-                        .with_content("line one, far above")
-                        .focusable(),
-                ),
-            ),
+            Node::stack("root").child(Node::styled_text(
+                "top",
+                "line one, far above",
+                "response",
+            )),
         );
         let mut f = FocusModel::new();
         f.focused = Some("top".into());
         let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
         assert_eq!(out.viewport_top, 0);
-        assert_eq!(out.frame.row_text(1), "line one, far above");
+        assert_eq!(out.frame.row_text(0), "line one, far above");
     }
 
     #[test]
@@ -402,22 +415,54 @@ mod tests {
         let t = tree();
         let f = FocusModel::new();
         let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
-        // 10 rows: banner/header(1) + body(7) + status + input; 2 lines fit
+        // 10 rows: body(8) + status + input; all 3 body lines fit
+        assert_eq!(out.frame.row_text(0), "kanbei");
         assert_eq!(out.frame.row_text(1), "first");
         assert_eq!(out.frame.row_text(2), "second");
     }
 
     #[test]
     fn wraps_long_lines() {
+        let t = SemanticTree::new(Node::stack("root").child(Node::text(
+            "t",
+            "0123456789 0123456789, wrapped tail",
+        )));
+        let f = FocusModel::new();
+        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
+        assert_eq!(out.frame.row_text(0), "0123456789 012345678");
+        assert_eq!(out.frame.row_text(1), "9, wrapped tail");
+    }
+
+    #[test]
+    fn renders_sibling_z_in_ascending_paint_order() {
         let t = SemanticTree::new(
-            Node::new("root", NodeKind::Root).child(
-                Node::new("t", NodeKind::Text).with_content("0123456789 0123456789, wrapped tail"),
-            ),
+            Node::stack("root")
+                .child(Node::stack_z("high", 3).child(Node::text("a", "high")))
+                .child(Node::stack_z("low", -1).child(Node::text("b", "low"))),
         );
         let f = FocusModel::new();
         let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
-        assert_eq!(out.frame.row_text(1), "0123456789 012345678");
-        assert_eq!(out.frame.row_text(2), "9, wrapped tail");
+        assert_eq!(out.frame.row_text(0), "low");
+        assert_eq!(out.frame.row_text(1), "high");
+    }
+
+    #[test]
+    fn spans_keep_their_styles() {
+        let t = SemanticTree::new(
+            Node::stack("root").child(Node::text_spans(
+                "t",
+                vec![
+                    crate::Span::styled("ab", "user"),
+                    crate::Span::plain("cd"),
+                ],
+            )),
+        );
+        let f = FocusModel::new();
+        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
+        assert_eq!(out.frame.row_text(0), "abcd");
+        assert_eq!(out.frame.cell(0, 0).style, "user");
+        assert_eq!(out.frame.cell(0, 1).style, "user");
+        assert_eq!(out.frame.cell(0, 2).style, DEFAULT_STYLE);
     }
 
     #[test]
@@ -432,13 +477,10 @@ mod tests {
 
     #[test]
     fn controls_blanked() {
-        let t = SemanticTree::new(
-            Node::new("root", NodeKind::Root)
-                .child(Node::new("t", NodeKind::Text).with_content("a\tb")),
-        );
+        let t = SemanticTree::new(Node::stack("root").child(Node::text("t", "a\tb")));
         let f = FocusModel::new();
         let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
-        assert_eq!(out.frame.row_text(1), "a b");
+        assert_eq!(out.frame.row_text(0), "a b");
     }
 
     #[test]
@@ -446,7 +488,7 @@ mod tests {
         let p = fallback::placeholder_tree("workbench", "reduce failed");
         let f = FocusModel::new();
         let out = render(&ctx(&p, &f, "idle", &Theme::default_theme())).unwrap();
-        let body: String = (1..8).map(|r| out.frame.row_text(r)).collect::<Vec<_>>().join("|");
+        let body: String = (0..8).map(|r| out.frame.row_text(r)).collect::<Vec<_>>().join("|");
         assert!(body.contains("UI component faulted"), "body: {body}");
         assert!(body.contains("reduce failed"), "body: {body}");
 

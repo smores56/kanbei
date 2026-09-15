@@ -54,8 +54,8 @@ impl FocusModel {
             }
         }
         if let Some(node) = self.focused_node(tree) {
-            if node.kind == crate::NodeKind::Input {
-                self.caret = self.caret.min(node.content.chars().count());
+            if node.kind() == crate::NodeKind::Input {
+                self.caret = self.caret.min(node.content().chars().count());
             } else {
                 self.caret = 0;
             }
@@ -80,7 +80,7 @@ impl FocusModel {
         let ring: Vec<&Node> = tree
             .subtree(root_id)
             .into_iter()
-            .filter(|n| n.focusable && !n.disabled)
+            .filter(|n| n.is_focusable())
             .collect();
         self.move_ring(dir, ring);
     }
@@ -89,9 +89,9 @@ impl FocusModel {
         match dir {
             FocusDirection::Left | FocusDirection::Right => {
                 if let Some(node) = self.focused_node_ring(&ring)
-                    && node.kind == crate::NodeKind::Input
+                    && node.kind() == crate::NodeKind::Input
                 {
-                    let len = node.content.chars().count();
+                    let len = node.content().chars().count();
                     match dir {
                         FocusDirection::Left => self.caret = self.caret.saturating_sub(1),
                         FocusDirection::Right => self.caret = (self.caret + 1).min(len),
@@ -147,10 +147,10 @@ impl FocusModel {
     /// The caret the renderer draws for `node`: only the focused input node
     /// carries a caret, clamped to its content length.
     pub fn caret_for(&self, node: &Node) -> usize {
-        if node.kind == crate::NodeKind::Input
+        if node.kind() == crate::NodeKind::Input
             && self.focused.as_deref() == Some(node.id.as_str())
         {
-            return self.caret.min(node.content.chars().count());
+            return self.caret.min(node.content().chars().count());
         }
         0
     }
@@ -224,14 +224,14 @@ impl KeyClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Node, NodeKind};
+    use crate::Node;
 
     fn tree() -> SemanticTree {
         SemanticTree::new(
-            Node::new("root", NodeKind::Root)
-                .child(Node::new("a", NodeKind::Button).focusable())
-                .child(Node::new("input", NodeKind::Input).with_content("hi").focusable())
-                .child(Node::new("b", NodeKind::Button).focusable()),
+            Node::stack("root")
+                .child(Node::button("a", "a"))
+                .child(Node::input("input", "hi"))
+                .child(Node::button("b", "b")),
         )
     }
 
@@ -289,13 +289,12 @@ mod tests {
     #[test]
     fn within_mount_ring_restricts_arrows() {
         let a = SemanticTree::new(
-            Node::new("root", NodeKind::Root)
-                .child(Node::new("input", NodeKind::Input).with_content("x").focusable())
-                .child(Node::new("btn", NodeKind::Button).focusable()),
+            Node::stack("root")
+                .child(Node::input("input", "x"))
+                .child(Node::button("btn", "btn")),
         );
         let b = SemanticTree::new(
-            Node::new("root", NodeKind::Root)
-                .child(Node::new("input", NodeKind::Input).with_content("y").focusable()),
+            Node::stack("root").child(Node::input("input", "y")),
         );
         let composite = SemanticTree::compose(&[("main", &a), ("status", &b)]);
         let mut f = FocusModel::new();

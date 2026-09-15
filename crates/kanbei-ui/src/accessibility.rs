@@ -48,13 +48,15 @@ fn walk(node: &crate::Node, disabled_ancestor: bool, issues: &mut Vec<Issue>) {
     if node.id.is_empty() {
         issues.push(Issue::error(&node.id, "node has an empty id"));
     }
-    if node.focusable && node.content.is_empty() && node.kind != NodeKind::Input {
+    // Focusability is intrinsic to the interactive kinds; an input may be
+    // empty (an empty prompt), the others need a label to be interactive.
+    if node.is_interactive() && node.kind() != NodeKind::Input && node.label().is_empty() {
         issues.push(Issue::error(&node.id, "focusable node has no label/content"));
     }
-    if node.focusable && disabled {
+    if node.is_interactive() && disabled {
         issues.push(Issue::error(&node.id, "focusable node is inside a disabled subtree"));
     }
-    if node.content.chars().any(|c| c.is_control()) {
+    if node.label().chars().any(|c| c.is_control()) {
         issues.push(Issue::warning(&node.id, "content contains control characters"));
     }
     for child in &node.children {
@@ -70,7 +72,7 @@ pub fn is_valid(tree: &SemanticTree) -> bool {
 
 pub fn focusable_node_has_label(tree: &SemanticTree, id: &str) -> bool {
     tree.node(id)
-        .map(|n| n.focusable && !n.content.is_empty())
+        .map(|n| n.is_focusable() && !n.label().is_empty())
         .unwrap_or(false)
 }
 
@@ -85,37 +87,44 @@ pub fn issues_for(tree: &SemanticTree, id: &str) -> Vec<Issue> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Node, NodeKind};
+    use crate::{ListItem, Node};
 
     #[test]
     fn valid_tree_has_no_errors() {
         let t = SemanticTree::new(
-            Node::new("root", NodeKind::Root)
-                .child(Node::new("a", NodeKind::Button).with_content("go").focusable()),
+            Node::stack("root").child(Node::button("a", "go")),
         );
         assert!(is_valid(&t));
         assert!(validate(&t).is_empty());
     }
 
     #[test]
-    fn focusable_without_label_is_error() {
-        let t = SemanticTree::new(
-            Node::new("root", NodeKind::Root)
-                .child(Node::new("a", NodeKind::Button).focusable()),
-        );
+    fn selectable_list_without_label_is_error() {
+        let t = SemanticTree::new(Node::stack("root").child(Node::list(
+            "l",
+            vec![ListItem::new("i", "").selectable()],
+        )));
         assert!(!is_valid(&t));
-        let issues = issues_for(&t, "a");
+        let issues = issues_for(&t, "l");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].severity, Severity::Error);
     }
 
     #[test]
+    fn empty_button_is_not_focusable() {
+        let t = SemanticTree::new(Node::stack("root").child(Node::button("a", "")));
+        // the label requirement is part of the focusable predicate
+        assert!(t.focusable().is_empty());
+        assert!(is_valid(&t));
+    }
+
+    #[test]
     fn disabled_subtree_focusable_is_error() {
         let t = SemanticTree::new(
-            Node::new("root", NodeKind::Root).child(
-                Node::new("list", NodeKind::List)
+            Node::stack("root").child(
+                Node::col("col")
                     .disabled()
-                    .child(Node::new("a", NodeKind::Button).with_content("x").focusable()),
+                    .child(Node::button("a", "x")),
             ),
         );
         let issues = issues_for(&t, "a");
@@ -124,10 +133,7 @@ mod tests {
 
     #[test]
     fn control_chars_are_warnings() {
-        let t = SemanticTree::new(
-            Node::new("root", NodeKind::Root)
-                .child(Node::new("t", NodeKind::Text).with_content("a\tb")),
-        );
+        let t = SemanticTree::new(Node::stack("root").child(Node::text("t", "a\tb")));
         let issues = issues_for(&t, "t");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].severity, Severity::Warning);
@@ -136,7 +142,7 @@ mod tests {
     #[test]
     fn empty_ids_reported() {
         let t = SemanticTree::new(
-            Node::new("root", NodeKind::Root).child(Node::new("", NodeKind::Text).with_content("x")),
+            Node::stack("root").child(Node::text("", "x")),
         );
         assert!(validate(&t).iter().any(|i| i.node_id.is_empty()));
     }
