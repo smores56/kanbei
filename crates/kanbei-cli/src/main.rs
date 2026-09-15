@@ -1,15 +1,16 @@
 //! kanbei — a terminal REPL over the kanbei driver.
 //!
-//! Usage: `kanbei [DIR] [--model M] [--fake] [--auto-approve] [--yolo]`
+//! Usage: `kanbei [DIR]`
 //!
 //! DIR defaults to `$KANBEI_DIR`, then `.` (the session dir). The session dir
 //! is also the project-config root: `discover_config_layers` activates the
 //! built-in defaults, then `$XDG_CONFIG_HOME/kanbei/init.lua` (or
-//! `$HOME/.config/kanbei/init.lua`), then `<DIR>/.kanbei/init.lua`. Provider:
-//! `--fake` (a scripted one-shot engine for smoke runs) or
-//! `KANBEI_PROVIDER_URL` / `KANBEI_PROVIDER_KEY` / `KANBEI_PROVIDER_MODEL`
-//! (an OpenAI-compatible chat-completions endpoint; `--model` overrides the
-//! env). `fs_root` is the session dir.
+//! `$HOME/.config/kanbei/init.lua`), then `<DIR>/.kanbei/init.lua`. The
+//! provider and approval wiring — engine, base URL, model, protocol, key
+//! reference, auto-approval, yolo — comes from the merged config layers
+//! through [`CliSettings`] (decision 28), not argv. Bootstrap exception:
+//! `KANBEI_PROVIDER_URL` / `KANBEI_PROVIDER_KEY` are read as env fallbacks
+//! when config does not supply them; config wins. `fs_root` is the session dir.
 //!
 //! The REPL reads one user message per line and drives the resulting wakes
 //! to quiescence: the model's final answer is printed to stdout; intermediate
@@ -35,10 +36,13 @@ use kanbei_core::id::Id128;
 use kanbei_driver::{Driver, Turn};
 use kanbei_modules::PackageManifest;
 use kanbei_provider::{
-    CompletionRequest, CompletionResponse, FinishReason, HttpEngine, KeySource, ProviderConfig,
-    ProviderEngine, ProviderError, Usage,
+    CompletionRequest, CompletionResponse, FinishReason, KeySource, ProviderConfig,
+    ProviderEngine, ProviderError, Usage, WireProtocol,
 };
-use kanbei_session::{Session, SessionConfig, SessionError};
+use kanbei_scopes::contrib::{KeyReference, ProviderSettings, SettingsContribution};
+use kanbei_session::{
+    ApprovalResolver, Session, SessionConfig, SessionError, SessionSettings, SettingsSource,
+};
 use kanbei_tools::{ApprovalParked, ToolRegistry};
 use kanbei_ui::{
     build_viewport, key_to_input, resolve_style, total_rows, transcript_paragraph,
@@ -56,15 +60,14 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
-const USAGE: &str = "usage: kanbei [DIR] [--model M] [--fake] [--auto-approve] [--yolo]";
+const USAGE: &str = "usage: kanbei [DIR]";
 
+/// Bootstrap-only CLI options (decision 28): argv/env no longer carry provider
+/// or approval wiring — that lives in the config layers. `dir` is the session
+/// layout root and the project-config root.
 #[derive(Debug)]
 struct Options {
     dir: PathBuf,
-    model: Option<String>,
-    fake: bool,
-    auto_approve: bool,
-    yolo: bool,
 }
 
 impl Options {
@@ -73,11 +76,6 @@ impl Options {
             dir: std::env::var("KANBEI_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from(".")),
-            model: std::env::var("KANBEI_PROVIDER_MODEL").ok(),
-            fake: false,
-            auto_approve: false,
-            yolo: std::env::var("KANBEI_YOLO")
-                .is_ok_and(|v| !v.is_empty() && v != "0" && v != "false"),
         }
     }
 }
@@ -85,32 +83,14 @@ impl Options {
 fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut opts = Options::from_env();
     let mut positional: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--fake" => opts.fake = true,
-            "--auto-approve" => opts.auto_approve = true,
-            "--yolo" => opts.yolo = true,
-            "--model" => {
-                i += 1;
-                opts.model = Some(
-                    args.get(i)
-                        .cloned()
-                        .ok_or_else(|| "missing value for --model".to_string())?,
-                );
-            }
-            _ if args[i].starts_with("--model=") => {
-                opts.model = Some(args[i][8..].to_string());
-            }
-            s if !s.starts_with('-') => {
-                if positional.is_some() {
-                    return Err(format!("unexpected argument: {s}"));
-                }
-                positional = Some(s.to_string());
-            }
-            other => return Err(format!("unknown argument: {other}")),
+    for arg in args {
+        if arg.starts_with('-') {
+            return Err(format!("unknown argument: {arg}"));
         }
-        i += 1;
+        if positional.is_some() {
+            return Err(format!("unexpected argument: {arg}"));
+        }
+        positional = Some(arg.clone());
     }
     if let Some(dir) = positional {
         opts.dir = PathBuf::from(dir);
@@ -118,8 +98,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     Ok(opts)
 }
 
-/// `--fake` engine: replays one scripted response on every call — smoke
-/// runs only (real runs wire KANBEI_PROVIDER_*).
+/// The config `provider.fake` engine: replays one scripted response on every
+/// call — smoke runs only (real runs set a `provider.base_url`).
 struct RepeatedEngine {
     cfg: ProviderConfig,
     response: CompletionResponse,
@@ -164,21 +144,97 @@ impl ProviderEngine for RepeatedEngine {
     }
 }
 
-fn http_config(opts: &Options) -> Result<ProviderConfig, String> {
-    let base_url = std::env::var("KANBEI_PROVIDER_URL")
-        .map_err(|_| "KANBEI_PROVIDER_URL is required (or use --fake)".to_string())?;
-    Ok(ProviderConfig {
+/// Bootstrap provider config: config `provider` settings override the
+/// `KANBEI_PROVIDER_URL` / `KANBEI_PROVIDER_KEY` env fallback (the documented
+/// bootstrap exception), so config wins when present. None when neither
+/// supplies a base URL — the session then runs storage-only.
+fn bootstrap_provider(provider: Option<&ProviderSettings>) -> Option<ProviderConfig> {
+    let base_url = provider
+        .and_then(|p| p.base_url.clone())
+        .or_else(|| std::env::var("KANBEI_PROVIDER_URL").ok())?;
+    let key = match provider.and_then(|p| p.key.as_ref()) {
+        Some(KeyReference::Env { name }) => KeySource::Env(name.clone()),
+        Some(KeyReference::Keychain { service, account }) => KeySource::Keychain {
+            service: service.clone(),
+            account: account.clone(),
+        },
+        None => KeySource::Env("KANBEI_PROVIDER_KEY".into()),
+    };
+    let model = provider
+        .and_then(|p| p.model.clone())
+        .unwrap_or_else(|| "default".into());
+    Some(ProviderConfig {
         provider: "http".into(),
-        model: opts
-            .model
-            .clone()
-            .unwrap_or_else(|| "default".into()),
+        model,
         base_url,
-        key: KeySource::Env("KANBEI_PROVIDER_KEY".into()),
+        key,
         temperature: None,
         max_tokens: None,
         timeout: std::time::Duration::from_secs(60),
     })
+}
+
+/// Config `provider.protocol` → wire protocol; absent/unknown = the
+/// OpenAI-compatible default.
+fn parse_protocol(protocol: Option<&str>) -> WireProtocol {
+    match protocol {
+        Some("anthropic") => WireProtocol::Anthropic,
+        _ => WireProtocol::OpenAI,
+    }
+}
+
+/// The CLI's config→runtime mapping (decision 28): the merged settings drive
+/// the provider engine/config, the yolo broker + session id, and the approval
+/// resolver. `interactive` is the resolver for the non-auto case (the REPL's
+/// stdin prompt or the TUI's cross-thread rendezvous).
+struct CliSettings {
+    interactive: Option<ApprovalResolver>,
+}
+
+impl SettingsSource for CliSettings {
+    fn resolve(&self, settings: &SettingsContribution) -> SessionSettings {
+        let provider = settings.provider.as_ref();
+        let fake = provider.and_then(|p| p.fake).unwrap_or(false);
+        let bootstrap = bootstrap_provider(provider);
+        let (provider_engine, provider_config): (
+            Option<Box<dyn ProviderEngine>>,
+            Option<ProviderConfig>,
+        ) = if fake {
+            // The scripted one-shot engine for smoke runs.
+            (Some(Box::new(RepeatedEngine::fake())), None)
+        } else if let Some(config) = bootstrap {
+            let protocol = parse_protocol(provider.and_then(|p| p.protocol.as_deref()));
+            (
+                Some(kanbei_provider::engine_for(&config, protocol)),
+                Some(config),
+            )
+        } else {
+            (None, None)
+        };
+
+        let approval = settings.approval.as_ref();
+        let yolo = approval.and_then(|a| a.yolo).unwrap_or(false);
+        let auto = yolo || approval.and_then(|a| a.auto_approve).unwrap_or(false);
+        let (broker, session_id) = if yolo {
+            let id = Id128::generate();
+            (Some(yolo_broker(id)), Some(id))
+        } else {
+            (None, None)
+        };
+        let approval_resolver = if auto {
+            Some(Arc::new(|_p: &ApprovalParked| true) as ApprovalResolver)
+        } else {
+            self.interactive.clone()
+        };
+
+        SessionSettings {
+            provider_engine,
+            provider: provider_config,
+            broker,
+            approval_resolver,
+            session_id,
+        }
+    }
 }
 
 /// The interactive approval stand-in for the driver's approval resolver:
@@ -300,16 +356,6 @@ fn repl(driver: &mut Driver) {
     }
 }
 
-/// Build the provider engine for the run (`--fake` or the wire endpoint).
-fn build_engine(opts: &Options) -> Result<Box<dyn ProviderEngine>, String> {
-    if opts.fake {
-        Ok(Box::new(RepeatedEngine::fake()))
-    } else {
-        let cfg = http_config(opts)?;
-        Ok(Box::new(HttpEngine::new(cfg)))
-    }
-}
-
 /// The M2 fuel recipe (module activation and host-ABI round-trips exceed the
 /// 1M default per call) plus the R-24 bounds: a finite relative epoch (500
 /// ticks ~= 5 s, matching `call_timeout`) so a runaway guest is interrupted
@@ -385,24 +431,16 @@ fn discover_config_layers_or_default(dir: &Path) -> Vec<PackageManifest> {
 }
 
 /// Piped-stdin path: the plain line REPL.
-fn run_repl(opts: Options, engine: Box<dyn ProviderEngine>) {
-    let yolo_id = opts.yolo.then(Id128::generate);
+fn run_repl(opts: Options) {
+    let interactive: ApprovalResolver = Arc::new(interactive_approve);
     let session = match Session::open(SessionConfig {
         dir: opts.dir.clone(),
         stream: "cli".into(),
         engine: Some(cli_engine()),
-        provider_engine: Some(engine),
         fs_root: opts.dir.clone(),
         config_layers: discover_config_layers_or_default(&opts.dir),
-        broker: yolo_id
-            .as_ref()
-            .map(|id| yolo_broker(*id))
-            .unwrap_or_default(),
-        session_id: yolo_id,
-        approval_resolver: Some(Arc::new(if opts.auto_approve {
-            |_p| true
-        } else {
-            interactive_approve
+        settings: Some(Arc::new(CliSettings {
+            interactive: Some(interactive),
         })),
         ..Default::default()
     }) {
@@ -501,11 +539,7 @@ impl Ui {
     }
 }
 
-fn run_tui(opts: Options, engine: Box<dyn ProviderEngine>) -> i32 {
-    let model = opts
-        .model
-        .unwrap_or_else(|| if opts.fake { "fake".into() } else { "default".into() });
-
+fn run_tui(opts: Options) -> i32 {
     // main ⇄ worker channels. The worker owns the driver + session and drives
     // turns to quiescence; the main thread renders and routes input, so the
     // UI stays responsive while a turn runs (R-27 UI boundary).
@@ -515,35 +549,28 @@ fn run_tui(opts: Options, engine: Box<dyn ProviderEngine>) -> i32 {
 
     // Observer + approval seams: commit_listener fires on the committing
     // (worker) thread per resolved envelope; the resolver does a cross-thread
-    // rendezvous (the worker blocks until the UI answers y/n).
+    // rendezvous (the worker blocks until the UI answers y/n). The config
+    // settings decide auto-approval; the rendezvous is the interactive fallback.
     let commit_tx = evt_tx.clone();
     let approval_tx = evt_tx.clone();
-    let yolo_id = opts.yolo.then(Id128::generate);
-    let auto = opts.auto_approve || opts.yolo;
+    let interactive: ApprovalResolver = Arc::new(move |p: &ApprovalParked| {
+        let (reply_tx, reply_rx) = mpsc::channel::<bool>();
+        let _ = approval_tx.send(Evt::Approval(ApprovalReq {
+            action: p.approval.action.clone(),
+            args: p.approval.args.to_string(),
+            reply: reply_tx,
+        }));
+        reply_rx.recv().unwrap_or(false)
+    });
     let cancel_cfg = cancel_flag.clone();
     let cfg = SessionConfig {
         dir: opts.dir.clone(),
         stream: "cli".into(),
         engine: Some(cli_engine()),
-        provider_engine: Some(engine),
         fs_root: opts.dir.clone(),
         config_layers: discover_config_layers_or_default(&opts.dir),
-        broker: yolo_id
-            .as_ref()
-            .map(|id| yolo_broker(*id))
-            .unwrap_or_default(),
-        session_id: yolo_id,
-        approval_resolver: Some(Arc::new(move |p: &ApprovalParked| {
-            if auto {
-                return true;
-            }
-            let (reply_tx, reply_rx) = mpsc::channel::<bool>();
-            let _ = approval_tx.send(Evt::Approval(ApprovalReq {
-                action: p.approval.action.clone(),
-                args: p.approval.args.to_string(),
-                reply: reply_tx,
-            }));
-            reply_rx.recv().unwrap_or(false)
+        settings: Some(Arc::new(CliSettings {
+            interactive: Some(interactive),
         })),
         commit_listener: Some(Arc::new(move |env: &Envelope| {
             let _ = commit_tx.send(Evt::Envelope(env.clone()));
@@ -559,6 +586,19 @@ fn run_tui(opts: Options, engine: Box<dyn ProviderEngine>) -> i32 {
             return 2;
         }
     };
+
+    // The settings-resolved wiring drives the UI's labeled model and the
+    // auto-approval status line (decision 28).
+    let settings = session.host_settings();
+    let model = settings
+        .provider
+        .as_ref()
+        .and_then(|p| p.model.clone())
+        .unwrap_or_else(|| "default".into());
+    let auto = settings
+        .approval
+        .as_ref()
+        .is_some_and(|a| a.auto_approve == Some(true) || a.yolo == Some(true));
 
     // Worker thread: replay the canonical log (launch = resume, R-19), then
     // drive turns. On Quit it closes the session (it owns it).
@@ -1102,17 +1142,10 @@ fn main() {
             exit(2);
         }
     };
-    let engine = match build_engine(&opts) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("kanbei: {e}");
-            exit(2);
-        }
-    };
     let code = if std::io::stdin().is_terminal() {
-        run_tui(opts, engine)
+        run_tui(opts)
     } else {
-        run_repl(opts, engine);
+        run_repl(opts);
         0
     };
     exit(code);
@@ -1123,23 +1156,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_flags_and_positional() {
-        let args: Vec<String> = ["--model", "m1", "--fake", "--auto-approve", "/tmp/x"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let opts = parse_args(&args).unwrap();
-        assert!(opts.fake && opts.auto_approve);
-        assert_eq!(opts.model.as_deref(), Some("m1"));
+    fn parse_positional_dir() {
+        let opts = parse_args(&["/tmp/x".into()]).unwrap();
         assert_eq!(opts.dir, PathBuf::from("/tmp/x"));
     }
 
+    /// Decision 28: the provider/approval flags are gone — argv is
+    /// bootstrap-only (`DIR`).
     #[test]
-    fn parse_yolo_flag() {
-        let args: Vec<String> = ["--yolo", "/tmp/z"].iter().map(|s| s.to_string()).collect();
-        let opts = parse_args(&args).unwrap();
-        assert!(opts.yolo);
-        assert_eq!(opts.dir, PathBuf::from("/tmp/z"));
+    fn parse_rejects_removed_flags() {
+        for flag in [
+            "--fake",
+            "--auto-approve",
+            "--yolo",
+            "--model",
+            "--model=m",
+        ] {
+            assert!(
+                parse_args(&[flag.to_string()]).is_err(),
+                "removed flag still accepted: {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_unknown_and_dangling() {
+        assert!(parse_args(&["--nope".into()]).is_err());
+        assert!(parse_args(&["a".to_string(), "b".to_string()]).is_err());
     }
 
     #[test]
@@ -1162,18 +1205,43 @@ mod tests {
         }
     }
 
+    /// The settings source maps a config `fake` provider to the scripted engine
+    /// and `yolo` to a broker + session id.
     #[test]
-    fn parse_equals_form() {
-        let args: Vec<String> = ["--model=m2", "/tmp/y"].iter().map(|s| s.to_string()).collect();
-        let opts = parse_args(&args).unwrap();
-        assert_eq!(opts.model.as_deref(), Some("m2"));
-        assert_eq!(opts.dir, PathBuf::from("/tmp/y"));
-    }
+    fn cli_settings_resolves_config_driven_wiring() {
+        let interactive: ApprovalResolver = Arc::new(|_| false);
+        let source = CliSettings {
+            interactive: Some(interactive),
+        };
+        let fake: SettingsContribution =
+            serde_json::from_str(r#"{"provider":{"fake":true}}"#).unwrap();
+        let resolved = source.resolve(&fake);
+        assert_eq!(resolved.provider_engine.unwrap().identity(), "fake");
+        assert!(resolved.provider.is_none());
 
-    #[test]
-    fn parse_rejects_unknown_and_dangling() {
-        assert!(parse_args(&["--nope".into()]).is_err());
-        assert!(parse_args(&["--model".into()]).is_err());
-        assert!(parse_args(&["a".to_string(), "b".to_string()]).is_err());
+        let http: SettingsContribution = serde_json::from_str(
+            r#"{"provider":{"base_url":"https://x","model":"m","protocol":"anthropic"}}"#,
+        )
+        .unwrap();
+        let resolved = source.resolve(&http);
+        assert_eq!(resolved.provider_engine.unwrap().identity(), "http");
+        assert_eq!(resolved.provider.unwrap().model, "m");
+
+        let yolo: SettingsContribution = serde_json::from_str(r#"{"approval":{"yolo":true}}"#).unwrap();
+        let resolved = source.resolve(&yolo);
+        assert!(resolved.broker.is_some(), "yolo wires a broker");
+        assert!(resolved.session_id.is_some(), "yolo wires a session id");
+        assert!(
+            resolved.approval_resolver.is_some(),
+            "yolo implies auto-approval"
+        );
+
+        let plain: SettingsContribution = serde_json::from_str(r#"{"approval":{"auto_approve":false}}"#).unwrap();
+        let resolved = source.resolve(&plain);
+        assert!(
+            resolved.approval_resolver.is_some(),
+            "the interactive resolver remains the fallback"
+        );
+        assert!(resolved.broker.is_none(), "no yolo → no broker override");
     }
 }

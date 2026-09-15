@@ -1,6 +1,7 @@
 //! TUI integration test (C4): spawns the real `kanbei` binary on a
-//! pseudo-terminal and drives one scripted turn end-to-end with the
-//! `--fake` engine. The rendered byte stream is the only observable
+//! pseudo-terminal and drives one scripted turn end-to-end with a
+//! config-driven `provider.fake` engine (no argv flags, no network). The
+//! rendered byte stream is the only observable
 //! surface of a full-screen TUI, so assertions target single-span rows
 //! (each transcript row renders as one styled span, hence contiguous)
 //! and a clean Ctrl-Q exit.
@@ -55,10 +56,27 @@ fn tui_drives_a_fake_turn_and_exits_clean() {
     )
     .expect("tcsetwinsize");
 
-    // Fresh session dir (empty replay) for this run.
+    // Fresh session dir (empty replay) for this run; its project config drives
+    // the scripted fake provider (decision 28 — no argv flags).
     let dir = std::env::temp_dir().join(format!("kanbei-tui-test-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
+    let config_dir = dir.join(".kanbei");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("init.lua"),
+        r#"-- project config: scripted fake provider (no network).
+function kb_on_activate(ctx)
+  ctx.contribution_publish('{"kind":"settings","provider":{"fake":true}}')
+end
+function kb_hot(dispatch)
+  return dispatch
+end
+"#,
+    )
+    .unwrap();
+    let xdg = std::env::temp_dir().join(format!("kanbei-tui-xdg-{}", std::process::id()));
+    std::fs::create_dir_all(&xdg).unwrap();
 
     // Second master handle for sending keystrokes to the child (dupped
     // before the reader thread takes `master`).
@@ -85,8 +103,12 @@ fn tui_drives_a_fake_turn_and_exits_clean() {
     let slave_out = std::fs::File::from(slave.as_fd().try_clone_to_owned().expect("dup slave"));
     let slave_err = std::fs::File::from(slave.as_fd().try_clone_to_owned().expect("dup slave"));
     let mut child = Command::new(EXE)
-        .arg("--fake")
         .env("KANBEI_DIR", &dir)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env_remove("KANBEI_PROVIDER_URL")
+        .env_remove("KANBEI_PROVIDER_KEY")
+        .env_remove("KANBEI_PROVIDER_MODEL")
+        .env_remove("KANBEI_YOLO")
         .stdin(slave)
         .stdout(slave_out)
         .stderr(slave_err)

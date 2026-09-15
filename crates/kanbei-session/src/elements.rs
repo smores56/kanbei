@@ -91,7 +91,39 @@ impl Session {
             .settings_for(&crate::builtin_config::root_scope())
             .cloned()
             .unwrap_or_default();
+        self.apply_settings();
         Ok(())
+    }
+
+    /// Resolves the merged config-layer settings through
+    /// [`SessionConfig::settings`](crate::SessionConfig::settings) and applies
+    /// each `Some` field as an override of the bootstrap (`SessionConfig`)
+    /// value; `None` fields fall back. No-op when no source is configured —
+    /// today's behavior is preserved exactly.
+    ///
+    /// Called after a layer's composition publishes and before its canonical
+    /// commit, so the config event's post-manifest pins the resolved
+    /// `provider_config` (decision 28 ordering).
+    fn apply_settings(&mut self) {
+        let Some(source) = self.cfg.settings.clone() else {
+            return;
+        };
+        let resolved = source.resolve(&self.host_settings);
+        if let Some(engine) = resolved.provider_engine {
+            self.provider = Some(engine);
+        }
+        if let Some(provider) = resolved.provider {
+            self.provider_config = Some(provider);
+        }
+        if let Some(broker) = resolved.broker {
+            self.broker = broker;
+        }
+        if let Some(resolver) = resolved.approval_resolver {
+            self.approval_resolver = Some(resolver);
+        }
+        if let Some(id) = resolved.session_id {
+            self.session_id = id;
+        }
     }
 
     /// Commits the canonical `safe_mode_activated` fact with the failure reason.
@@ -204,6 +236,16 @@ impl Session {
             return Err(e.into());
         }
         self.fault(FaultPoint::AfterConfigActivation);
+        // Decision 28: re-snapshot the merged settings and resolve the runtime
+        // wiring BEFORE the canonical commit, so this event's post-manifest
+        // pins the settings-resolved `provider_config` (and the session runs
+        // with the resolved engine/broker/resolver).
+        self.host_settings = self
+            .registry
+            .settings_for(&crate::builtin_config::root_scope())
+            .cloned()
+            .unwrap_or_default();
+        self.apply_settings();
         // 9 — commit the canonical event. The composition's canonical bytes
         // are pinned as an object (its digest = the epoch digest, so the ref
         // is closure-valid) and the event references the package + composition

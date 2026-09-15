@@ -111,6 +111,34 @@ pub type CommitListener = Arc<dyn Fn(&Envelope) + Send + Sync>;
 /// works) but not observed.
 pub type DeltaListener = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Desired-state settings seam (decision 28): resolves the running session's
+/// wiring from the merged config-layer [`SettingsContribution`].
+///
+/// The kernel does not interpret settings itself — it hands the merged overlay
+/// to the host's source, which owns the mapping from config fields to concrete
+/// engines/brokers/resolvers. This keeps secret material and engine
+/// construction out of the canonical layer while letting config drive the
+/// session.
+pub trait SettingsSource: Send + Sync {
+    fn resolve(&self, settings: &kanbei_scopes::contrib::SettingsContribution) -> SessionSettings;
+}
+
+/// The runtime wiring a [`SettingsSource`] resolves from config settings. Each
+/// `Some` field overrides the corresponding [`SessionConfig`] value; `None`
+/// falls back to it (so a partial settings overlay never clears wiring the
+/// bootstrap env supplied).
+#[derive(Default)]
+pub struct SessionSettings {
+    /// Provider engine override; None = keep the `SessionConfig` engine (or
+    /// the one built from `provider`/`protocol`).
+    pub provider_engine: Option<Box<dyn kanbei_provider::ProviderEngine>>,
+    /// Provider config override (also the manifest's `provider_config` pin).
+    pub provider: Option<kanbei_provider::ProviderConfig>,
+    pub broker: Option<kanbei_capabilities::Broker>,
+    pub approval_resolver: Option<ApprovalResolver>,
+    pub session_id: Option<Id128>,
+}
+
 /// Session configuration. `dir` is the session layout root: `<dir>/log.zst`
 /// (append log), `<dir>/objects/` (object store), and `<dir>/state/` (module
 /// state heads).
@@ -130,6 +158,11 @@ pub struct SessionConfig {
     /// config generation. A failed non-builtin layer drops every non-builtin
     /// layer and keeps the built-in generation active (safe mode, R-01/C-02).
     pub config_layers: Vec<PackageManifest>,
+    /// Desired-state settings factory (decision 28); None = no settings seam
+    /// (today's argv/env-derived behavior). Resolved AFTER the config layers
+    /// activate and BEFORE the composition commit, so the settings-resolved
+    /// `provider` is pinned in that event's post-manifest.
+    pub settings: Option<Arc<dyn SettingsSource>>,
     /// Module state-head size ceiling (R-07); default 1 MB.
     pub max_state_bytes: usize,
     /// Retention policy plugin; default [`StoreAllPolicy`].
@@ -220,6 +253,7 @@ impl Default for SessionConfig {
             object_min: 8192,
             fault: None,
             config_layers: Vec::new(),
+            settings: None,
             max_state_bytes: 1024 * 1024,
             policy: Arc::new(StoreAllPolicy),
             engine: None,
