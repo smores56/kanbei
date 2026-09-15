@@ -716,14 +716,17 @@ impl Session {
 /// stays parked for explicit `resolve_approval`; otherwise the resolved
 /// outcome (already dispatched + committed by the resolve).
 fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionError> {
-    let Some(last) = self.approvals.back() else {
+    let Some(last) = self.approvals.back().cloned() else {
         return Ok(None);
     };
     let digest = last.approval.digest;
     let Some(resolver) = self.approval_resolver.clone() else {
         return Ok(None);
     };
-    if !resolver(last) {
+    // Present the parked approval before the resolver blocks the driver, so
+    // the user sees the gate and the action it binds.
+    self.fire_present_hook();
+    if !resolver(&last) {
         return Ok(None);
     }
     self.resolve_approval(&digest, true)
@@ -2178,10 +2181,13 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                 )?;
                 return Ok(TerminalOutcome::Blocked);
             }
+            // Host-command boundary: repaint before the next model/tool step
+            // so the user row, thought/tool rows and the live working
+            // indicator appear as they happen (not only after the turn).
+            self.fire_present_hook();
             let command = provider
                 .step(&context, &trigger, last.as_ref())
-                .map_err(|e| SessionError::InvalidInput(format!("cognition step: {e}")))?;
-            match command {
+                .map_err(|e| SessionError::InvalidInput(format!("cognition step: {e}")))?;            match command {
                 StepCommand::ModelCall(_) => {
                     // The staged projection's lowered messages are the
                     // request; the M3 fallback renders the raw context. The

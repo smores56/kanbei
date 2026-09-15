@@ -122,6 +122,15 @@ pub type DeltaListener = Arc<dyn Fn(&str) + Send + Sync>;
 /// observed (read on demand with [`Session::transcript_view`]).
 pub type TranscriptListener = Arc<dyn Fn(&TranscriptView) + Send + Sync>;
 
+/// Presentation hook (UI seam): the session calls this at host-command
+/// boundaries where the UI should repaint before the session blocks or takes a
+/// long step — a cognition step boundary and just before an approval resolver
+/// parks (so the pending approval is on screen while the resolver waits). It
+/// receives the live session because only the session owner can render the
+/// current frame; None = the CLI never presents mid-turn (the kernel still
+/// presents after the turn).
+pub type PresentHook = Arc<dyn Fn(&mut Session) + Send + Sync>;
+
 /// Desired-state settings seam (decision 28): resolves the running session's
 /// wiring from the merged config-layer [`SettingsContribution`].
 ///
@@ -250,6 +259,10 @@ pub struct SessionConfig {
     /// Transcript-view observer (UI seam); called when the projection changes.
     /// None = read on demand with [`Session::transcript_view`].
     pub transcript_listener: Option<TranscriptListener>,
+    /// Presentation hook (UI seam); called at host-command boundaries so a
+    /// CLI can show live progress and a parked approval. None = no mid-turn
+    /// presentation.
+    pub present_hook: Option<PresentHook>,
     // --- M4 memory substrate + context projection ---
     /// Memory substrate root (canonical XDG state). None = cfg.dir.join("memory").
     pub memory_root: Option<PathBuf>,
@@ -306,6 +319,7 @@ impl Default for SessionConfig {
             delta_listener: None,
             transcript: None,
             transcript_listener: None,
+            present_hook: None,
             memory_root: None,
             project: None,
             memory_fault: None,
@@ -639,6 +653,8 @@ pub struct Session {
     transcript: Box<dyn TranscriptProjection>,
     /// Transcript-view observer (UI seam); called when the projection changes.
     transcript_listener: Option<TranscriptListener>,
+    /// Presentation hook (UI seam); called at host-command boundaries.
+    present_hook: Option<PresentHook>,
     /// Session-local manual collapse overrides (decision 9): ephemeral
     /// presentation, never part of the projection, applied when the transcript
     /// view is built for the render context. A resumed session recreates the
@@ -836,6 +852,7 @@ impl Session {
             .take()
             .unwrap_or_else(|| Box::new(kanbei_transcript::ConversationProjection::new()));
         let transcript_listener = cfg.transcript_listener.clone();
+        let present_hook = cfg.present_hook.clone();
         let budgets = cfg.budgets;
         let breaker_floors = cfg.breaker_floors;
         let provider_config = cfg.provider.clone();
@@ -1130,6 +1147,7 @@ impl Session {
             delta_listener,
             transcript,
             transcript_listener,
+            present_hook,
             transcript_overrides: CollapseOverrides::new(),
             fs_root,
             session_id,

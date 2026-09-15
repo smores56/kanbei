@@ -859,6 +859,16 @@ impl ModuleHost {
             .map(|t| t.module_id)
     }
 
+    /// The manifest origin of a live generation, if any (the session UI host
+    /// trust-gates the render context's transcript on it).
+    pub(crate) fn generation_origin(&self, generation: u64) -> Option<ModuleOrigin> {
+        self.tokens
+            .read()
+            .expect("tokens lock poisoned")
+            .get(&generation)
+            .map(|t| t.origin)
+    }
+
     /// The generation that declared hook `(scope, kind, name)` (session hook
     /// resolution), if it is still live.
     pub(crate) fn hook_generation(

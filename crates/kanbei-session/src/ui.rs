@@ -120,6 +120,16 @@ pub struct BoundMount {
     /// Last focused node id within this mount (original ids); restored when
     /// Tab cycles back into the mount.
     pub focus: Option<String>,
+    /// Session-local collapse overrides for THIS mount only (decision 32
+    /// amendment): a mount's `toggle_collapse` intent is presentation-only and
+    /// never reaches another mount's overrides or the kernel's session-global
+    /// overrides.
+    pub collapse: CollapseOverrides,
+    /// Whether the mount's manifest origin is trusted (`ModuleOrigin::
+    /// is_trusted`). An untrusted mount receives an EMPTY `context.transcript`
+    /// (decision 32 amendment): prompts, model output and tool results are
+    /// not exposed to repo/agent/install-supplied modules.
+    pub trusted: bool,
     /// Opaque reducer state returned by the mount's `ui_reduce`.
     pub reducer_state: Value,
     /// Runtime component fault flag (R-27 fault class 2): the kernel renders
@@ -139,6 +149,12 @@ pub struct BoundMount {
     /// a fault is not retried per frame. Set on binding, reduce, refresh,
     /// resize, and reduce/refresh faults (which swap in a placeholder).
     dirty: bool,
+    /// The render context JSON handed to this mount's last composition. A
+    /// change to ANY context component (transcript, status, size, focus,
+    /// selection, viewport, or this mount's own collapse overrides) marks the
+    /// mount dirty (decision 32 amendment). Per mount because the transcript
+    /// is trust-gated.
+    last_context: Option<Value>,
     /// Guest `ui_render` invocations since binding. Test observability for
     /// "was the guest on the frame loop?" (decision 22): a pure repaint must
     /// leave this unchanged.
@@ -153,6 +169,7 @@ impl BoundMount {
         component: String,
         generation: u64,
         module_id: Option<Id128>,
+        trusted: bool,
     ) -> Self {
         BoundMount {
             scope,
@@ -163,12 +180,15 @@ impl BoundMount {
             module_id,
             tree: None,
             focus: None,
+            collapse: CollapseOverrides::new(),
+            trusted,
             reducer_state: Value::Null,
             degraded: false,
             last_error: None,
             denied_intents: 0,
             pending_intents: Vec::new(),
             dirty: true,
+            last_context: None,
             render_calls: 0,
         }
     }
@@ -215,11 +235,6 @@ pub struct UiHost {
     /// so the shell can highlight the selected row. Native: moving it never
     /// re-enters Wasm.
     pub selection: Option<String>,
-    /// The transcript view handed to the guest on the most recent composition.
-    /// A change (commit, override toggle, streaming delta) marks every mount
-    /// dirty so the shell recomposes exactly when its context changed
-    /// (decision 22).
-    last_transcript: Option<TranscriptView>,
     pub last_status: String,
 }
 
@@ -262,7 +277,6 @@ impl UiHost {
             size: (24, 80),
             viewport_top: 0,
             selection: None,
-            last_transcript: None,
             last_status: "idle".to_string(),
         };
         host.sync_summary();
@@ -422,6 +436,9 @@ impl Session {
                 let _ = theme.apply_overlay(&overlay.overlay);
             }
             let module_id = manager.generation_module_id(generation);
+            let trusted = manager
+                .generation_origin(generation)
+                .is_some_and(ModuleOrigin::is_trusted);
             bound.push(BoundMount::new(
                 scope,
                 slot,
@@ -429,6 +446,7 @@ impl Session {
                 component,
                 generation,
                 module_id,
+                trusted,
             ));
         }
         self.ui_host = if bound.is_empty() {
@@ -452,6 +470,11 @@ impl Session {
     pub fn ui_status_text(&self) -> String {
         if self.ui_host.as_ref().is_none_or(|u| u.safe_mode) {
             return "safe mode".to_string();
+        }
+        if let Some(parked) = self.approvals.back() {
+            // An approval gate outranks run state: the status line names the
+            // action the user must approve or deny.
+            return format!("approval: {}", parked.approval.action);
         }
         if self.scheduler.is_paused() {
             return "paused".to_string();
@@ -499,9 +522,7 @@ impl Session {
                     outcome.repaint = true;
                     return Ok(outcome);
                 }
-                let mut events = host.decoder.feed(bytes);
-                events.extend(host.decoder.finish());
-                events
+                host.decoder.feed(bytes)
             }
             None => return Ok(outcome),
         };
@@ -576,6 +597,17 @@ impl Session {
             outcome.denied = host.denied_intents;
         }
         Ok(outcome)
+    }
+
+    /// Flush a partial escape/UTF-8 sequence at terminal EOF/close. The
+    /// decoder only drops the leftover bytes (no event survives
+    /// sanitization), so this is a close-path no-op in effect; it must NOT run
+    /// after every read — flushing mid-burst would exit paste mode and drop a
+    /// sequence split across reads.
+    pub fn ui_flush_input(&mut self) {
+        if let Some(host) = self.ui_host.as_mut() {
+            let _ = host.decoder.finish();
+        }
     }
 
     /// Enter kernel safe mode from the reserved chord: canonical fact +
@@ -654,7 +686,7 @@ impl Session {
             _ => {
                 let focused = self.ui_host.as_ref().and_then(|u| u.focus.focused.clone());
                 let tree = self.ui_host.as_ref().and_then(|u| u.last_tree.clone());
-                let kind = match event.to_ui(focused.as_deref()) {
+                let kind = match event.to_ui() {
                     Some(k) => k,
                     None => return Ok(()),
                 };
@@ -912,7 +944,15 @@ impl Session {
                 // the kernel applies it under the view build, so it carries no
                 // capability (decisions 9/32).
                 if let UiIntent::ToggleCollapse { turn } = intent {
-                    self.toggle_transcript_collapse(turn);
+                    // Presentation-only and mount-scoped (decision 32
+                    // amendment): toggle the EMITTING mount's own overrides,
+                    // never another mount's or the kernel's session-global set.
+                    if let Some(host) = self.ui_host.as_mut()
+                        && let Some(mount) = host.mounts.get_mut(mount_index)
+                    {
+                        mount.collapse.toggle(turn);
+                        mount.dirty = true;
+                    }
                     outcome.intents_applied += 1;
                     continue;
                 }
@@ -1023,6 +1063,7 @@ impl Session {
             focus: &host.focus,
             size,
             status: &status,
+            selection: host.selection.as_deref(),
             staleness: host.staleness.as_deref(),
             degraded: host.degraded,
         };
@@ -1048,39 +1089,62 @@ impl Session {
     }
 
     fn ui_render_module_tree_inner(&mut self) -> Option<SemanticTree> {
-        // The render context is kernel-owned (decision 32): the transcript
-        // view (with the session-local collapse overrides already applied), the
-        // kernel status, the surface size, and the native focus/selection/
-        // viewport state. Build it from `self` BEFORE borrowing the host.
-        let overrides = self.transcript_overrides.clone();
-        let transcript = self.transcript_view(&overrides);
+        // The render context is kernel-owned (decision 32) and PER MOUNT: the
+        // transcript is trust-gated and each mount carries its own collapse
+        // overrides (32 amendments), so both are built before the mutable host
+        // borrow. The status/size/focus/selection/viewport pieces are shared.
+        let global = self.transcript_overrides.clone();
         let status = self.ui_status_text();
-        let host = self.ui_host.as_mut()?;
+        let (size, focus, selection, viewport_top, scopes) = {
+            let host = self.ui_host.as_ref()?;
+            (
+                host.size,
+                host.focus.focused.clone(),
+                host.selection.clone(),
+                host.viewport_top as u32,
+                host.mounts
+                    .iter()
+                    .map(|m| (m.collapse.clone(), m.trusted))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (rows, cols) = size;
+        let contexts: Vec<Value> = scopes
+            .iter()
+            .map(|(collapse, trusted)| {
+                let transcript = if *trusted {
+                    let mut overrides = global.clone();
+                    // The session-global overrides (CLI/test API) layer UNDER
+                    // the mount's own intent-driven overrides.
+                    overrides.union_with(collapse);
+                    self.transcript_view(&overrides)
+                } else {
+                    // Untrusted origin: status/size/navigation, no transcript.
+                    TranscriptView::default()
+                };
+                json!({
+                    "transcript": serde_json::to_value(&transcript).unwrap_or(Value::Null),
+                    "status": &status,
+                    "size": { "cols": cols, "rows": rows },
+                    "focus": &focus,
+                    "selection": &selection,
+                    "viewport_top": viewport_top,
+                })
+            })
+            .collect();
         let manager = self.modules.as_ref()?;
-        // The transcript is part of the guest's context, so a change to it
-        // (commit, override toggle, streaming delta) is a composition state
-        // change exactly like a reducer change (decision 22).
-        if host.last_transcript.as_ref() != Some(&transcript) {
-            for mount in host.mounts.iter_mut() {
-                mount.dirty = true;
-            }
-            host.last_transcript = Some(transcript.clone());
-        }
-        let (rows, cols) = host.size;
-        let context = json!({
-            "transcript": serde_json::to_value(&transcript).unwrap_or(Value::Null),
-            "status": status,
-            "size": { "cols": cols, "rows": rows },
-            "focus": host.focus.focused.clone(),
-            "selection": host.selection.clone(),
-            "viewport_top": host.viewport_top as u32,
-        });
-        // Event-driven composition (decision 22): only mounts whose state
-        // changed since the last composition re-enter the guest. A repaint
-        // (scroll/focus/selection) finds every flag clear and returns the
-        // cached composite natively.
+        let host = self.ui_host.as_mut()?;
+        // Event-driven composition (decision 22): a mount whose context is
+        // unchanged since its last composition is cached natively, so a pure
+        // repaint never re-enters Wasm. ANY context component change
+        // (transcript/status/size/focus/selection/viewport/overrides) dirties
+        // the mount that renders it (decision 32 amendment).
         let mut changed = false;
-        for mount in host.mounts.iter_mut() {
+        for (mount, context) in host.mounts.iter_mut().zip(contexts.iter()) {
+            if mount.last_context.as_ref() != Some(context) {
+                mount.dirty = true;
+                mount.last_context = Some(context.clone());
+            }
             if !mount.dirty {
                 continue;
             }
@@ -1092,7 +1156,7 @@ impl Session {
                 // reduce clears the flag.
                 continue;
             }
-            Self::render_mount(manager, mount, &context);
+            Self::render_mount(manager, mount, context);
         }
         if !changed && let Some(tree) = host.last_tree.as_ref() {
             return Some(tree.clone());
@@ -1258,6 +1322,7 @@ impl Session {
                 focus: &host.focus,
                 size,
                 status: "safe mode",
+                selection: None,
                 staleness: host.staleness.as_deref(),
                 degraded: false,
             };

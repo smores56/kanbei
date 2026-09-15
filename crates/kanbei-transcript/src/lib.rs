@@ -242,6 +242,13 @@ impl CollapseOverrides {
             self.expanded.insert(key);
         }
     }
+
+    /// Merge another override set into this one (union). The kernel uses it to
+    /// layer a mount's own overrides over the session-local set: a module's
+    /// collapse toggle reaches only that mount's render context.
+    pub fn union_with(&mut self, other: &CollapseOverrides) {
+        self.expanded.extend(other.expanded.iter().cloned());
+    }
 }
 
 /// The replaceable typed contract (decision 30): a transcript projection is

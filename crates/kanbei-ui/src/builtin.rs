@@ -77,6 +77,20 @@ local function trunc(s, max)
   return clamp(s, max) .. "…"
 end
 
+-- Drop the last UTF-8 character: step over continuation bytes (0x80..0xBF) so
+-- a backspace never splits a multibyte sequence (the kernel counts chars).
+local function delete_last(s)
+  s = str(s)
+  local n = #s
+  while n > 0 do
+    local b = string.byte(s, n)
+    if b < 128 or b >= 192 then break end
+    n = n - 1
+  end
+  if n == 0 then return "" end
+  return string.sub(s, 1, n - 1)
+end
+
 local function indent(text)
   return (string.gsub(str(text), "\n", "\n "))
 end
@@ -135,10 +149,17 @@ local function turn_summary(t)
     tostring(tonumber(t.input_tokens) or 0) .. "+" ..
     tostring(tonumber(t.output_tokens) or 0) .. " tok"
   if state ~= "Completed" and type(t.reason) == "string" then
-    out = out .. " — " .. t.reason
+    out = out .. " — " .. trunc(t.reason, 160)
   end
-  return out
+  return trunc(out, 300)
 end
+
+-- Transcript node caps: a long session must never exceed the kernel's
+-- MAX_TREE_NODES (4096) or the mount degrades to a placeholder. Render only
+-- the tail turns and elide the rest, with a hard node budget as backstop.
+local MAX_TURNS = 40
+local MAX_THOUGHTS = 400
+local MAX_TRANSCRIPT_NODES = 3000
 
 -- The transcript region: turn rows, thought/tool rows, the live working
 -- indicator, the settled collapse header (an activatable button), the answer,
@@ -146,40 +167,66 @@ end
 local function transcript_nodes(ctx)
   local turns = list(list(ctx.transcript).turns)
   local nodes = {}
-  for n, t in ipairs(turns) do
+  local total = #turns
+  local first = 1
+  if total > MAX_TURNS then first = total - MAX_TURNS + 1 end
+  if first > 1 then
+    table.insert(nodes, txt("elide_turns",
+      "… " .. tostring(first - 1) .. " earlier turn(s)", "status"))
+  end
+  local full = false
+  local function add(node)
+    if #nodes >= MAX_TRANSCRIPT_NODES then
+      full = true
+      return
+    end
+    table.insert(nodes, node)
+  end
+  for n = first, total do
+    if full then break end
+    local t = turns[n]
     local open = t.open == true
     local state = str(t.state)
     local base = "t" .. (n - 1)
-    table.insert(nodes, txt(base .. "_u", "❯ " .. trunc(t.user, 4000), "user"))
+    add(txt(base .. "_u", "❯ " .. trunc(t.user, 4000), "user"))
     if open then
-      for k, row in ipairs(list(t.thoughts)) do
+      local thoughts = list(t.thoughts)
+      for k, row in ipairs(thoughts) do
+        if k > MAX_THOUGHTS then
+          add(txt(base .. "_more",
+            "  … " .. tostring(#thoughts - MAX_THOUGHTS) .. " more", "status"))
+          break
+        end
         local id = base .. "_b" .. k
         if type(row.Text) == "string" then
-          table.insert(nodes, txt(id, "  " .. trunc(row.Text, 4000), "thought"))
+          add(txt(id, "  " .. trunc(row.Text, 4000), "thought"))
         elseif type(row.Notice) == "string" then
-          table.insert(nodes, txt(id, "  " .. trunc(row.Notice, 4000), "status"))
+          add(txt(id, "  " .. trunc(row.Notice, 4000), "status"))
         elseif type(row.Step) == "table" then
-          table.insert(nodes, code(id, step_line(row.Step)))
+          add(code(id, step_line(row.Step)))
         end
       end
     end
     if open then
       if type(t.streaming) == "string" then
-        table.insert(nodes, txt(base .. "_s", "  " .. trunc(t.streaming, 4000), "thought"))
+        add(txt(base .. "_s", "  " .. trunc(t.streaming, 4000), "thought"))
       end
       if state == "Running" then
-        table.insert(nodes, txt(base .. "_p", "  … working", "progress"))
+        add(txt(base .. "_p", "  … working", "progress"))
       end
     end
     if state ~= "Running" then
       local marker = "▸"
       if open then marker = "▾" end
-      table.insert(nodes, button(base, marker .. " " .. turn_summary(t)))
+      add(button(base, marker .. " " .. turn_summary(t)))
     end
     if type(t.response) == "string" then
-      table.insert(nodes, txt(base .. "_r", trunc(indent(t.response), 4000), "response"))
+      add(txt(base .. "_r", trunc(indent(t.response), 4000), "response"))
     end
-    table.insert(nodes, txt(base .. "_d", "──", "divider"))
+    add(txt(base .. "_d", "──", "divider"))
+  end
+  if full then
+    table.insert(nodes, txt("elide_nodes", "… transcript truncated", "status"))
   end
   return nodes
 end
@@ -263,7 +310,7 @@ local function reduce(d)
   if kind == "char" and type(e.text) == "string" then
     s.draft = str(s.draft) .. e.text
   elseif kind == "backspace" then
-    s.draft = string.sub(str(s.draft), 1, #str(s.draft) - 1)
+    s.draft = delete_last(s.draft)
   elseif kind == "enter" then
     local text = str(s.draft)
     s.draft = ""

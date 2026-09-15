@@ -1,4 +1,4 @@
-//! kanbei — a terminal REPL over the kanbei driver.
+//! kanbei — the kanbei driver on the UI host.
 //!
 //! Usage: `kanbei [DIR]`
 //!
@@ -20,11 +20,15 @@
 //! (`provider.model`) are config fields now, so a repo's config layer cannot
 //! be silently overridden by env. `fs_root` is the session dir.
 //!
-//! The REPL reads one user message per line and drives the resulting wakes
-//! to quiescence: the model's final answer is printed to stdout; intermediate
-//! tool round-trips are canonical facts (inspect with `/history`). Commands:
-//! `/status`, `/history [N]`, `/export DIR`, `/resume` (after a breaker
-//! pause), `/exit`.
+//! On a TTY the binary runs the full-screen TUI: the kernel UI host renders
+//! the frames, and the built-in workbench shell (a module-authored Maki layout)
+//! composes the transcript/status/composer from the kernel render context
+//! (decisions 31/32). The transcript view is presented live during a turn, not
+//! only after it completes. When stdin is not a TTY it falls back to the line
+//! REPL. REPL: one user message per line, driving wakes to quiescence; the
+//! model's final answer is printed to stdout and intermediate tool round-trips
+//! are canonical facts (inspect with `/history`). Commands: `/status`,
+//! `/history [N]`, `/export DIR`, `/resume` (after a breaker pause), `/exit`.
 
 use std::io::{IsTerminal, Read, Write};
 use std::os::fd::AsFd;
@@ -32,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kanbei_capabilities::{
@@ -505,8 +509,10 @@ fn run_repl(opts: Options) {
 
 // ---------- full-screen TUI (TTY path) ----------
 
-/// Worker→main events: only the interactive approval rendezvous crosses back —
-/// the worker owns the session and does all rendering (decision 13).
+/// Worker→main events: the interactive approval rendezvous and the kernel's
+/// quit. The worker owns the session and does all rendering (decision 13); it
+/// presents live from the session's presentation hook, so the main thread does
+/// not need to ask for frames mid-turn.
 enum Evt {
     /// An approval-gated intent parked during a turn; the UI decides it (y/n)
     /// and replies on `reply`.
@@ -519,14 +525,27 @@ enum Evt {
 enum Cmd {
     /// Feed raw terminal bytes through the kernel UI boundary.
     Input(Vec<u8>),
+    /// Repaint (e.g. after a terminal resize) without input.
+    Present,
     /// Shut down (the worker closes the session and returns).
     Quit,
 }
 
 /// One approval request the UI must decide. `reply` carries the decision back
-/// to the worker's resolver (which blocks until answered).
+/// to the worker's resolver (which blocks until answered); `action`/`args` are
+/// the parked intent's identity, logged when the gate appears.
 struct ApprovalReq {
+    action: String,
+    args: String,
     reply: mpsc::Sender<bool>,
+}
+
+/// The one-key decision for a pending approval (or quit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalAction {
+    Approve,
+    Deny,
+    Quit,
 }
 
 fn run_tui(opts: Options) -> i32 {
@@ -538,13 +557,25 @@ fn run_tui(opts: Options) -> i32 {
     let (evt_tx, evt_rx) = mpsc::channel::<Evt>();
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
+    // Presentation slot: the worker owns the terminal, but the session's
+    // presentation hook fires from inside the worker's turn and must paint
+    // too, so both reach it through one shared handle (single-threaded use).
+    let present_slot: Arc<Mutex<Option<TermiosTerminal>>> = Arc::new(Mutex::new(None));
+    let hook_slot = present_slot.clone();
+
     // Approval seam: the resolver does a cross-thread rendezvous (the worker
     // blocks until the UI answers y/n). The config settings decide
-    // auto-approval; the rendezvous is the interactive fallback.
+    // auto-approval; the rendezvous is the interactive fallback. The session
+    // presents the parked gate before calling it (the presentation hook), so
+    // the user sees the approval and its action while this blocks.
     let approval_tx = evt_tx.clone();
-    let interactive: ApprovalResolver = Arc::new(move |_p: &ApprovalParked| {
+    let interactive: ApprovalResolver = Arc::new(move |p: &ApprovalParked| {
         let (reply_tx, reply_rx) = mpsc::channel::<bool>();
-        let _ = approval_tx.send(Evt::Approval(ApprovalReq { reply: reply_tx }));
+        let _ = approval_tx.send(Evt::Approval(ApprovalReq {
+            action: p.approval.action.clone(),
+            args: p.approval.args.to_string(),
+            reply: reply_tx,
+        }));
         reply_rx.recv().unwrap_or(false)
     });
     let cancel_cfg = cancel_flag.clone();
@@ -561,6 +592,11 @@ fn run_tui(opts: Options) -> i32 {
             yolo: Default::default(),
         })),
         cancel_flag: Some(cancel_cfg),
+        // Live presentation at host-command boundaries (a cognition step and
+        // the approval gate), so the transcript updates as it happens.
+        present_hook: Some(Arc::new(move |session: &mut Session| {
+            present_session(session, &hook_slot);
+        })),
         ..Default::default()
     };
 
@@ -590,6 +626,7 @@ fn run_tui(opts: Options) -> i32 {
         eprintln!("kanbei: could not open the terminal");
         return 2;
     };
+    *present_slot.lock().expect("present slot") = Some(present_term);
     let guard = match TerminalGuard::new(&mut raw_term) {
         Ok(g) => g,
         Err(e) => {
@@ -602,33 +639,42 @@ fn run_tui(opts: Options) -> i32 {
         return 2;
     }
 
-    // Worker: renders/presents after every command and drives a submitted
-    // turn. Rendering is event-driven (decision 22): only a command or a
-    // completed turn repaints; a scroll/focus repaint never re-enters Wasm.
+    // Worker: owns the session and presents at every command boundary. During
+    // a turn the session's presentation hook paints the live frames, so the
+    // worker here only covers before/after the turn.
     let quit_tx = evt_tx.clone();
+    let worker_slot = present_slot.clone();
     let worker = std::thread::spawn(move || {
         let mut driver = Driver::new(session);
-        let mut term = present_term;
-        present(&mut driver, &mut term);
-        // A `Cmd::Quit` (or a dropped sender) ends the loop; the session closes
-        // below.
-        while let Ok(Cmd::Input(bytes)) = cmd_rx.recv() {
-            match driver.session_mut().ui_handle_input(&bytes) {
-                Ok(outcome) => {
-                    if outcome.quit {
-                        let _ = quit_tx.send(Evt::Quit);
-                        break;
+        present_session(driver.session_mut(), &worker_slot);
+        loop {
+            match cmd_rx.recv() {
+                Ok(Cmd::Input(bytes)) => match driver.session_mut().ui_handle_input(&bytes) {
+                    Ok(outcome) => {
+                        if outcome.quit {
+                            let _ = quit_tx.send(Evt::Quit);
+                            break;
+                        }
+                        if outcome.submitted {
+                            // Show the user row and the live working
+                            // indicator before the turn blocks this thread.
+                            present_session(driver.session_mut(), &worker_slot);
+                            if let Err(e) = driver.drive_to_quiescence() {
+                                tui_log(&format!("turn failed: {e}"));
+                            }
+                        }
                     }
-                    if outcome.submitted
-                        && let Err(e) = driver.drive_to_quiescence()
-                    {
-                        eprintln!("kanbei: turn failed: {e}");
-                    }
-                }
-                Err(e) => eprintln!("kanbei: ui input failed: {e}"),
+                    Err(e) => tui_log(&format!("ui input failed: {e}")),
+                },
+                Ok(Cmd::Present) => {}
+                Ok(Cmd::Quit) | Err(_) => break,
             }
-            present(&mut driver, &mut term);
+            present_session(driver.session_mut(), &worker_slot);
         }
+        // Close path: flush a partial escape/UTF-8 sequence buffered by the
+        // reader. Never per read — that would exit paste mode and drop a
+        // sequence split across reads.
+        driver.session_mut().ui_flush_input();
         let _ = driver.into_session().close();
     });
 
@@ -653,12 +699,18 @@ fn run_tui(opts: Options) -> i32 {
         }
     });
 
-    let mut pending: Option<mpsc::Sender<bool>> = None;
+    let mut pending: Option<ApprovalReq> = None;
     let mut quit = false;
+    // Resize without a keystroke: poll the surface size and ask the worker to
+    // repaint when it changes (the worker's present dirties the mounts).
+    let mut last_size = crossterm::terminal::size().ok();
     loop {
         while let Ok(evt) = evt_rx.try_recv() {
             match evt {
-                Evt::Approval(req) => pending = Some(req.reply),
+                Evt::Approval(req) => {
+                    tui_log(&format!("approval pending: {} {}", req.action, req.args));
+                    pending = Some(req);
+                }
                 Evt::Quit => quit = true,
             }
         }
@@ -667,34 +719,54 @@ fn run_tui(opts: Options) -> i32 {
         }
         match input_rx.recv_timeout(Duration::from_millis(16)) {
             Ok(bytes) => {
-                // Ctrl-C interrupts an in-flight model call at the stream
-                // boundary (decision 13). Every other key, including Ctrl-Q,
-                // dispatches through the kernel keymap (decision 29).
-                if bytes.contains(&0x03) {
-                    cancel_flag.store(true, Ordering::SeqCst);
-                }
-                if let Some(reply) = pending.take() {
+                // An approval gate takes the next key as its single-keystroke
+                // decision (Ctrl-Q still quits; Ctrl-C denies).
+                if let Some(req) = pending.take() {
                     match approval_decision(&bytes) {
-                        Some(decision) => {
-                            reply.send(decision).ok();
+                        Some(ApprovalAction::Approve) => {
+                            req.reply.send(true).ok();
                         }
-                        None => pending = Some(reply),
+                        Some(ApprovalAction::Deny) => {
+                            req.reply.send(false).ok();
+                        }
+                        Some(ApprovalAction::Quit) => {
+                            req.reply.send(false).ok();
+                            cancel_flag.store(true, Ordering::SeqCst);
+                            quit = true;
+                        }
+                        None => pending = Some(req),
                     }
                     continue;
+                }
+                // Ctrl-C interrupts an in-flight model call at the stream
+                // boundary (decision 13). Only a standalone Ctrl-C counts:
+                // scanning the burst would cancel on paste content. Every other
+                // key, including Ctrl-Q, dispatches through the kernel keymap.
+                if bytes.first() == Some(&0x03) {
+                    cancel_flag.store(true, Ordering::SeqCst);
                 }
                 if cmd_tx.send(Cmd::Input(bytes)).is_err() {
                     break;
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(size) = crossterm::terminal::size()
+                    && Some(size) != last_size
+                {
+                    last_size = Some(size);
+                    let _ = cmd_tx.send(Cmd::Present);
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    // If an approval is pending, deny it to unblock the worker's resolver
-    // before joining (a blocked resolver would hang the join).
-    if let Some(reply) = pending {
-        reply.send(false).ok();
+    // Shut down: set the cancel flag so the active run ends at its next
+    // boundary, deny a pending approval to unblock the worker's resolver
+    // before joining (a blocked resolver would hang the join), then quit.
+    cancel_flag.store(true, Ordering::SeqCst);
+    if let Some(req) = pending {
+        req.reply.send(false).ok();
     }
     let _ = cmd_tx.send(Cmd::Quit);
     let _ = worker.join();
@@ -704,21 +776,38 @@ fn run_tui(opts: Options) -> i32 {
 }
 
 /// Present the session's canonical frame through the kernel terminal boundary.
-fn present(driver: &mut Driver, term: &mut TermiosTerminal) {
-    if let Err(e) = driver.session_mut().ui_present(term) {
-        eprintln!("kanbei: present failed: {e}");
+/// Errors go to the TUI log: stderr is the alternate screen.
+fn present_session(session: &mut Session, slot: &Arc<Mutex<Option<TermiosTerminal>>>) {
+    let mut guard = slot.lock().expect("present slot");
+    if let Some(term) = guard.as_mut()
+        && let Err(e) = session.ui_present(term)
+    {
+        tui_log(&format!("present failed: {e}"));
     }
 }
 
-/// The y/n decision in one input burst, if any (approval keys only).
-fn approval_decision(bytes: &[u8]) -> Option<bool> {
-    if bytes.iter().any(|b| matches!(b, b'y' | b'Y')) {
-        return Some(true);
+/// TUI diagnostics to a log file, never stderr (which the alternate screen
+/// owns; a stray write scribbles the frame).
+fn tui_log(message: &str) {
+    let path = std::env::temp_dir().join("kanbei-tui.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{message}");
     }
-    if bytes.iter().any(|b| matches!(b, b'n' | b'N' | 0x03)) {
-        return Some(false);
+}
+/// The decision carried by ONE keystroke. Only the first byte counts: scanning
+/// the whole burst would let paste content ("yes please") decide, and a burst
+/// may hold several keys.
+fn approval_decision(bytes: &[u8]) -> Option<ApprovalAction> {
+    match bytes.first()? {
+        b'y' | b'Y' => Some(ApprovalAction::Approve),
+        b'n' | b'N' | 0x03 => Some(ApprovalAction::Deny),
+        0x11 => Some(ApprovalAction::Quit),
+        _ => None,
     }
-    None
 }
 
 /// Two terminal handles over the process's tty: stdin (raw mode, bytes) and
@@ -908,5 +997,26 @@ mod tests {
             "a keyless endpoint keeps its provider engine"
         );
         assert!(resolved.provider.is_some(), "the config is retained");
+    }
+
+    /// The approval decision is the FIRST keystroke of the burst: a paste (or
+    /// any multi-byte burst) with a trailing `y`/`n` must not decide.
+    #[test]
+    fn approval_decision_is_single_keystroke() {
+        assert_eq!(approval_decision(b"y"), Some(ApprovalAction::Approve));
+        assert_eq!(approval_decision(b"N"), Some(ApprovalAction::Deny));
+        assert_eq!(approval_decision(b"\x03"), Some(ApprovalAction::Deny));
+        assert_eq!(approval_decision(b"\x11"), Some(ApprovalAction::Quit));
+        assert_eq!(
+            approval_decision(b"nyes please"),
+            Some(ApprovalAction::Deny),
+            "a later 'y' must not override the first key"
+        );
+        assert_eq!(
+            approval_decision(b"\x1b[200~y"),
+            None,
+            "paste content is not a decision"
+        );
+        assert_eq!(approval_decision(b""), None);
     }
 }

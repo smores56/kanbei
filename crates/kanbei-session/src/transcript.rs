@@ -60,6 +60,15 @@ impl Session {
     pub(crate) fn notify_transcript(&self) {
         fire_transcript_view(self.transcript.as_ref(), &self.transcript_listener);
     }
+
+    /// Fire the presentation hook (UI seam), if configured: a host-command
+    /// boundary where the UI should repaint before the session blocks
+    /// (approval resolver) or advances (cognition step).
+    pub(crate) fn fire_present_hook(&mut self) {
+        if let Some(hook) = self.present_hook.clone() {
+            hook(self);
+        }
+    }
 }
 
 /// Fire the transcript-view observer for a projection borrow. The delta path

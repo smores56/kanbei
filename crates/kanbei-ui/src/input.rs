@@ -87,8 +87,11 @@ impl InputDecoder {
                     InputEvent::Backspace
                 }
                 0x0d | 0x0a => {
+                    // A newline inside a paste is DRAFT content, never a
+                    // submit: the paste arrives as one burst and the user has
+                    // not pressed Enter.
                     self.pending.remove(0);
-                    InputEvent::Enter
+                    InputEvent::Char('\n')
                 }
                 c if c < 0x20 => {
                     self.pending.remove(0);
@@ -263,17 +266,15 @@ impl InputDecoder {
 
 impl InputEvent {
     /// Events that carry user intent to a module reducer. Everything else is
-    /// kernel-handled (navigation, focus, reserved actions). Enter resolves
-    /// against the focused node: a focused button activates, otherwise the
-    /// input submits.
-    pub fn to_ui(&self, focused_node: Option<&str>) -> Option<UiEventKind> {
+    /// kernel-handled (navigation, focus, reserved actions). Enter is reported
+    /// as an Enter; the kernel resolves it against the focused node's KIND
+    /// (a focused button activates, anything else submits), so the decoder
+    /// never guesses activation from a mere focus id.
+    pub fn to_ui(&self) -> Option<UiEventKind> {
         match self {
             InputEvent::Char(c) => Some(UiEventKind::Char(*c)),
             InputEvent::Backspace => Some(UiEventKind::Backspace),
-            InputEvent::Enter => match focused_node {
-                Some(id) => Some(UiEventKind::Activate(id.to_string())),
-                None => Some(UiEventKind::Enter),
-            },
+            InputEvent::Enter => Some(UiEventKind::Enter),
             _ => None,
         }
     }
@@ -461,15 +462,28 @@ mod tests {
     #[test]
     fn to_ui_mapping() {
         assert_eq!(
-            InputEvent::Char('x').to_ui(None),
+            InputEvent::Char('x').to_ui(),
             Some(UiEventKind::Char('x'))
         );
-        assert_eq!(InputEvent::Backspace.to_ui(None), Some(UiEventKind::Backspace));
-        assert_eq!(InputEvent::ArrowUp.to_ui(None), None);
-        assert_eq!(
-            InputEvent::Enter.to_ui(Some("btn")),
-            Some(UiEventKind::Activate("btn".into()))
+        assert_eq!(InputEvent::Backspace.to_ui(), Some(UiEventKind::Backspace));
+        assert_eq!(InputEvent::ArrowUp.to_ui(), None);
+        // Enter is kind-agnostic here; the kernel resolves the focused node.
+        assert_eq!(InputEvent::Enter.to_ui(), Some(UiEventKind::Enter));
+    }
+
+    /// A newline inside a bracketed paste is draft content, never a submit
+    /// (a multi-line paste must not fire a turn at the first newline).
+    #[test]
+    fn paste_newline_does_not_submit() {
+        let mut d = InputDecoder::new();
+        let out = d.feed(b"\x1b[200~a\r\nb\x1b[201~");
+        assert!(
+            !out.contains(&InputEvent::Enter),
+            "paste newline decoded as Enter: {out:?}"
         );
-        assert_eq!(InputEvent::Enter.to_ui(None), Some(UiEventKind::Enter));
+        assert!(
+            out.contains(&InputEvent::Char('\n')),
+            "paste newline preserved as draft content: {out:?}"
+        );
     }
 }

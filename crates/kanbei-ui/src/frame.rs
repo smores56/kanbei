@@ -28,6 +28,10 @@ pub struct RenderContext<'a> {
     pub size: (u16, u16),
     /// Kernel status text (e.g. run state).
     pub status: &'a str,
+    /// The native selection pointer (a body node id): the last non-input node
+    /// focus landed on. Rendered with the `selected` style so the selection
+    /// survives focus moving onto the composer input.
+    pub selection: Option<&'a str>,
     pub staleness: Option<&'a str>,
     pub degraded: bool,
 }
@@ -161,14 +165,15 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
     };
     let mut row = body_start;
     for line in lines.iter().skip(top) {
-        let focused = Some(line.node.id.as_str()) == ctx.focus.focused.as_deref();
+        let emphasized = Some(line.node.id.as_str()) == ctx.focus.focused.as_deref()
+            || Some(line.node.id.as_str()) == ctx.selection;
         let segs = wrap_spans(&line.spans, cols);
         for (seg_row, chars) in segs.iter().enumerate() {
             let r = row + seg_row;
             if r >= body_start + body_rows {
                 break;
             }
-            let line = body_line(theme, chars, focused);
+            let line = body_line(theme, chars, emphasized);
             paint_line(&mut buf, r as u16, &line, cols as u16);
         }
         row += segs.len();
@@ -451,6 +456,7 @@ mod tests {
             focus,
             size: (10, 20),
             status,
+            selection: None,
             staleness: None,
             degraded: false,
         }
@@ -486,9 +492,31 @@ mod tests {
         assert_eq!(out.cell_style(9, 2), resolve_style(&theme, Some("input")));
     }
 
+    /// Decision 32 amendment: `selection` is applied natively — the selected
+    /// body node renders with the `selected` style even when focus is
+    /// elsewhere (e.g. on the composer input).
     #[test]
-    fn banner_and_degraded_overlays() {
+    fn selection_highlights_natively() {
         let t = tree();
+        let f = FocusModel::new();
+        let theme = Theme::default_theme();
+        let mut c = ctx(&t, &f, "idle", &theme);
+        c.selection = Some("h");
+        let out = render(&c).unwrap();
+        assert_eq!(
+            out.cell_style(0, 0),
+            resolve_style(&theme, Some("selected")),
+            "the selected node is highlighted"
+        );
+        assert_ne!(
+            out.cell_style(1, 0),
+            resolve_style(&theme, Some("selected")),
+            "an unselected row keeps its own style"
+        );
+    }
+
+    #[test]
+    fn banner_and_degraded_overlays() {        let t = tree();
         let f = FocusModel::new();
         let theme = Theme::default_theme();
         let mut c = ctx(&t, &f, "idle", &theme);

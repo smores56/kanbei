@@ -235,3 +235,45 @@ fn provider_error_releases_the_run_slot() {
     assert_eq!(turn.answer.as_deref(), Some("recovered"));
     driver.into_session().close().unwrap();
 }
+
+/// Live presentation: the session's presentation hook fires at every cognition
+/// step boundary, so the shipped CLI can render frames DURING a turn (the
+/// tool round-trip gives at least two steps) rather than only after it.
+#[test]
+fn present_hook_fires_at_step_boundaries() {
+    let (dir, _g) = fresh("present-hook");
+    let fake = Arc::new(FakeEngine::new(
+        fake_cfg(),
+        vec![
+            resp(
+                None,
+                vec![call("c1", "fs.read", json!({ "path": "notes.txt" }))],
+                FinishReason::ToolCalls,
+            ),
+            resp(Some("done"), vec![], FinishReason::Stop),
+        ],
+    ));
+    let calls = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&calls);
+    let session = Session::open(SessionConfig {
+        dir: dir.clone(),
+        stream: "present-hook".into(),
+        provider_engine: Some(Box::new(SharedFake(fake))),
+        fs_root: dir.clone(),
+        approval_resolver: Some(Arc::new(|_p| true)),
+        present_hook: Some(Arc::new(move |_s| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        })),
+        ..Default::default()
+    })
+    .unwrap();
+    std::fs::write(dir.join("notes.txt"), "hi").unwrap();
+    let mut driver = Driver::new(session);
+    driver.user_turn("read notes.txt").unwrap();
+    assert!(
+        calls.load(Ordering::Relaxed) >= 2,
+        "the hook must fire per step, saw {}",
+        calls.load(Ordering::Relaxed)
+    );
+    driver.into_session().close().unwrap();
+}

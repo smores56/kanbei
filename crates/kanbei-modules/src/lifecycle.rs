@@ -46,7 +46,7 @@ use kanbei_vm::{GuestError, Vm};
 use thiserror::Error;
 
 use crate::host::{ModuleHost, TokenInfo};
-use crate::package::{install_package, PackageManifest};
+use crate::package::{install_package, ModuleOrigin, PackageManifest};
 use crate::runtime::{DRAIN_DEADLINE, GenerationRuntime, REPLY_TIMEOUT, Scope};
 use crate::state::{StateError, StateStore};
 
@@ -773,6 +773,12 @@ impl ModuleManager {
     /// ownership attribution).
     pub fn generation_module_id(&self, generation: u64) -> Option<Id128> {
         self.host.generation_module_id(generation)
+    }
+
+    /// The manifest origin of a live generation, if any (UI render-context
+    /// trust gate).
+    pub fn generation_origin(&self, generation: u64) -> Option<ModuleOrigin> {
+        self.host.generation_origin(generation)
     }
 
     /// The live generation that declared hook `(scope, kind, name)`, if any
