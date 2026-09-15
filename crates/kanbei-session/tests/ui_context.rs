@@ -13,11 +13,11 @@ use kanbei_session::Session;
 
 use common::{input_row, open, require_guest};
 
-/// The visible body text of the last rendered frame (header row..status bar,
-/// excluding the kernel status bar and input line).
+/// The visible text of the last rendered frame: the tree owns the whole
+/// surface, so every row counts.
 fn body(session: &Session) -> String {
     let frame = session.ui().unwrap().last_frame().unwrap().clone();
-    (0..frame.rows() - 2)
+    (0..frame.rows())
         .map(|r| frame.row_text(r))
         .collect::<Vec<_>>()
         .join("|")
@@ -115,7 +115,7 @@ fn builtin_shell_renders_empty_transcript() {
         "shell header: {:?}",
         frame.row_text(0)
     );
-    assert_eq!(input_row(&frame), ">", "composer prompt with no draft");
+    assert_eq!(input_row(&frame), "❯", "composer prompt with no draft");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -381,7 +381,7 @@ fn backspace_is_char_safe() {
     session.ui_handle_input(b"\x7f").unwrap();
     session.ui_render_frame().unwrap();
     let frame = session.ui().unwrap().last_frame().unwrap().clone();
-    assert_eq!(input_row(&frame), "> a", "backspace removed the whole char");
+    assert_eq!(input_row(&frame), "❯ a", "backspace removed the whole char");
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -50,11 +50,15 @@ use kanbei_provider::{
     CompletionRequest, CompletionResponse, FinishReason, KeySource, ProviderConfig,
     ProviderEngine, ProviderError, Usage, WireProtocol,
 };
-use kanbei_scopes::contrib::{KeyReference, ProviderSettings, SettingsContribution};
+use kanbei_scopes::contrib::{
+    KeyContext, KeyReference, Keybinding, ProviderSettings, SettingsContribution,
+};
+use kanbei_scopes::registry::keymap_winner_in;
 use kanbei_session::{
     ApprovalResolver, Session, SessionConfig, SessionSettings, SettingsSource,
 };
 use kanbei_tools::{ApprovalParked, ToolRegistry};
+use kanbei_ui::input::InputDecoder;
 use kanbei_ui::terminal::{TerminalGuard, TermiosTerminal};
 use kanbei_vm::VmConfig;
 
@@ -619,6 +623,11 @@ fn run_tui(opts: Options) -> i32 {
         eprintln!("kanbei: built-in UI activation failed: {e}");
         return 2;
     }
+    // The resolved keymap, captured before the worker owns the session: the
+    // approval rendezvous blocks the worker mid-turn, so the main thread must
+    // classify that one key against the SAME bindings the session routes with
+    // (decision 8) instead of an ad-hoc byte mapping.
+    let keybindings = session.ui_keybindings();
 
     // Terminal lifecycle: raw mode through the kernel boundary (restored by
     // the guard on every exit path), alternate screen through crossterm.
@@ -720,9 +729,12 @@ fn run_tui(opts: Options) -> i32 {
         match input_rx.recv_timeout(Duration::from_millis(16)) {
             Ok(bytes) => {
                 // An approval gate takes the next key as its single-keystroke
-                // decision (Ctrl-Q still quits; Ctrl-C denies).
+                // decision (Ctrl-Q still quits; Ctrl-C denies). The decision
+                // comes from the resolved keymap under the modal context — the
+                // same bindings `ui_handle_input` routes with — not an ad-hoc
+                // byte map (decision 8).
                 if let Some(req) = pending.take() {
-                    match approval_decision(&bytes) {
+                    match key_action(&keybindings, &bytes, true).and_then(approval_action) {
                         Some(ApprovalAction::Approve) => {
                             req.reply.send(true).ok();
                         }
@@ -739,10 +751,10 @@ fn run_tui(opts: Options) -> i32 {
                     continue;
                 }
                 // Ctrl-C interrupts an in-flight model call at the stream
-                // boundary (decision 13). Only a standalone Ctrl-C counts:
-                // scanning the burst would cancel on paste content. Every other
-                // key, including Ctrl-Q, dispatches through the kernel keymap.
-                if bytes.first() == Some(&0x03) {
+                // boundary (decision 13). The key is `cancel_run` in the
+                // resolved keymap (decision 8), so a remap is honored; a burst
+                // that does not lead with the bound key leaves the flag alone.
+                if key_action(&keybindings, &bytes, false) == Some("cancel_run") {
                     cancel_flag.store(true, Ordering::SeqCst);
                 }
                 if cmd_tx.send(Cmd::Input(bytes)).is_err() {
@@ -798,14 +810,27 @@ fn tui_log(message: &str) {
         let _ = writeln!(file, "{message}");
     }
 }
-/// The decision carried by ONE keystroke. Only the first byte counts: scanning
-/// the whole burst would let paste content ("yes please") decide, and a burst
-/// may hold several keys.
-fn approval_decision(bytes: &[u8]) -> Option<ApprovalAction> {
-    match bytes.first()? {
-        b'y' | b'Y' => Some(ApprovalAction::Approve),
-        b'n' | b'N' | 0x03 => Some(ApprovalAction::Deny),
-        0x11 => Some(ApprovalAction::Quit),
+/// The action the resolved keymap binds to the FIRST key of `bytes` under
+/// `ctx` (decision 8). Only the first decoded event counts: scanning the whole
+/// burst would let paste content ("yes please") decide. The bytes decode
+/// through the kernel's own `InputDecoder`, so escape/paste handling matches
+/// the session path.
+fn key_action<'a>(bindings: &'a [Keybinding], bytes: &[u8], modal: bool) -> Option<&'a str> {
+    let key = InputDecoder::new()
+        .feed(bytes)
+        .into_iter()
+        .next()?
+        .key_name()?;
+    let ctx = KeyContext { modal, overlay: false };
+    keymap_winner_in(bindings, &key, ctx).map(|binding| binding.action.as_str())
+}
+
+/// The approval decision an action id carries (the built-in modal bindings).
+fn approval_action(action: &str) -> Option<ApprovalAction> {
+    match action {
+        "approve" => Some(ApprovalAction::Approve),
+        "deny" => Some(ApprovalAction::Deny),
+        "quit" => Some(ApprovalAction::Quit),
         _ => None,
     }
 }
@@ -999,24 +1024,62 @@ mod tests {
         assert!(resolved.provider.is_some(), "the config is retained");
     }
 
-    /// The approval decision is the FIRST keystroke of the burst: a paste (or
-    /// any multi-byte burst) with a trailing `y`/`n` must not decide.
+    /// The builtin layer's approval/cancel bindings, mirrored for the
+    /// classifier test (the real definitions live in `BUILTIN_CONFIG_SOURCE`
+    /// and are asserted there).
+    fn modal_bindings() -> Vec<Keybinding> {
+        let binding = |key: &str, modal: bool, action: &str| Keybinding {
+            key: key.into(),
+            context: if modal {
+                kanbei_scopes::contrib::ContextPredicate::Modal
+            } else {
+                kanbei_scopes::contrib::ContextPredicate::Always
+            },
+            action: action.into(),
+            origin: Default::default(),
+            owner: None,
+        };
+        vec![
+            binding("ctrl-c", false, "cancel_run"),
+            binding("ctrl-q", false, "quit"),
+            binding("y", true, "approve"),
+            binding("Y", true, "approve"),
+            binding("n", true, "deny"),
+            binding("N", true, "deny"),
+            binding("ctrl-c", true, "deny"),
+        ]
+    }
+
+    /// The approval decision is keymap-driven (decision 8) and is the FIRST
+    /// keystroke of the burst: a paste (or any multi-byte burst) with a
+    /// trailing `y`/`n` must not decide.
     #[test]
-    fn approval_decision_is_single_keystroke() {
-        assert_eq!(approval_decision(b"y"), Some(ApprovalAction::Approve));
-        assert_eq!(approval_decision(b"N"), Some(ApprovalAction::Deny));
-        assert_eq!(approval_decision(b"\x03"), Some(ApprovalAction::Deny));
-        assert_eq!(approval_decision(b"\x11"), Some(ApprovalAction::Quit));
+    fn approval_decision_is_keymap_driven_single_keystroke() {
+        let kbs = modal_bindings();
+        let decide = |bytes: &[u8]| key_action(&kbs, bytes, true).and_then(approval_action);
+        assert_eq!(decide(b"y"), Some(ApprovalAction::Approve));
+        assert_eq!(decide(b"N"), Some(ApprovalAction::Deny));
+        assert_eq!(decide(b"\x03"), Some(ApprovalAction::Deny), "modal ctrl-c denies");
+        assert_eq!(decide(b"\x11"), Some(ApprovalAction::Quit));
         assert_eq!(
-            approval_decision(b"nyes please"),
+            decide(b"nyes please"),
             Some(ApprovalAction::Deny),
             "a later 'y' must not override the first key"
         );
         assert_eq!(
-            approval_decision(b"\x1b[200~y"),
+            decide(b"\x1b[200~y"),
             None,
             "paste content is not a decision"
         );
-        assert_eq!(approval_decision(b""), None);
+        assert_eq!(decide(b""), None);
+    }
+
+    /// Ctrl-C cancel is the `cancel_run` binding outside the approval gate; the
+    /// approval letters are modal-only, so they do not cancel a run.
+    #[test]
+    fn cancel_decision_is_keymap_driven() {
+        let kbs = modal_bindings();
+        assert_eq!(key_action(&kbs, b"\x03", false), Some("cancel_run"));
+        assert_eq!(key_action(&kbs, b"y", false), None);
     }
 }

@@ -293,7 +293,12 @@ local function shell(s, ctx)
     table.insert(children, { id = "shell_picker", kind = "list", items = picker })
   end
   table.insert(children, { id = "transcript", kind = "col", children = transcript_nodes(ctx) })
-  table.insert(children, { id = "input", kind = "input", content = str(s.draft) })
+  -- The composer is the module's own row: a prompt span plus the input
+  -- primitive, which the kernel lays out and places the caret in.
+  table.insert(children, { id = "composer", kind = "row", children = {
+    txt("composer_prompt", "❯"),
+    { id = "input", kind = "input", content = str(s.draft) },
+  } })
   return { root = { id = "root", kind = "stack", children = children } }
 end
 

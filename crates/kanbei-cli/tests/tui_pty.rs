@@ -115,8 +115,8 @@ end
         .spawn()
         .expect("spawn kanbei");
 
-    // 1. The shell comes up: the module header carries the kernel status and
-    //    the kernel status bar shows the same state.
+    // 1. The shell comes up: the module-authored header alone carries the
+    //    kernel status (the kernel draws no status bar of its own).
     assert!(
         wait_for(&buf, "kanbei · idle", BOOT_TIMEOUT),
         "TUI did not render the shell header\n---\n{}",

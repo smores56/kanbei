@@ -3,11 +3,10 @@
 //! so every higher layer (user, project) overrides just the fields it owns via
 //! the registry's field-wise settings overlay.
 //!
-//! Unlike the built-in UI generation ([`crate::Session::activate_builtin_ui`],
-//! which mints a fresh `Id128::generate()`), this generation is immutable
-//! content: its module id and package digest are derived from the source, so
-//! rebuilds/reopens address the same identity (R-08 stable ModuleId +
-//! immutable content hash).
+//! This generation is immutable content: its module id and package digest are
+//! derived from the source, so rebuilds/reopens address the same identity
+//! (R-08 stable ModuleId + immutable content hash). The built-in UI generation
+//! derives its id the same way ([`crate::builtin_ui_module_id`]).
 
 use kanbei_capabilities::TrustClass;
 use kanbei_core::Digest;
@@ -28,12 +27,21 @@ function kb_on_activate(ctx)
     '"approval":{"auto_approve":false,"yolo":false}}')
   -- Decision 29: the built-in layer ships the kernel's default bindings so
   -- making Ctrl-C/Ctrl-Q/Ctrl-L remappable does not drop run cancellation,
-  -- quit, or repaint out of the box. Origin is kernel-stamped as `builtin`
+  -- quit, or repaint out of the box. Origin is kernel-stamped as `builtin`.
+  -- The approval gate is a modal context (decision 8): y/n decide the parked
+  -- approval through the same keymap path as every key, and Ctrl-C denies it
+  -- (the modal deny outranks the always cancel_run), so no ad-hoc key mapping
+  -- is needed.
   ctx.contribution_publish(
     '{"kind":"keymap","bindings":[' ..
     '{"key":"ctrl-c","context":"always","action":"cancel_run"},' ..
     '{"key":"ctrl-q","context":"always","action":"quit"},' ..
-    '{"key":"ctrl-l","context":"always","action":"repaint"}]}')
+    '{"key":"ctrl-l","context":"always","action":"repaint"},' ..
+    '{"key":"y","context":"modal","action":"approve"},' ..
+    '{"key":"Y","context":"modal","action":"approve"},' ..
+    '{"key":"n","context":"modal","action":"deny"},' ..
+    '{"key":"N","context":"modal","action":"deny"},' ..
+    '{"key":"ctrl-c","context":"modal","action":"deny"}]}')
 end
 
 function kb_hot(dispatch)
@@ -131,5 +139,8 @@ mod tests {
         assert!(m.source.contains(r#""kind":"settings""#));
         assert!(m.source.contains(r#""kind":"keymap""#), "built-in defaults ship bindings");
         assert!(m.source.contains(r#""action":"cancel_run""#));
+        assert!(m.source.contains(r#""action":"approve""#));
+        assert!(m.source.contains(r#""action":"deny""#));
+        assert!(m.source.contains(r#""context":"modal""#), "approval keys are modal");
     }
 }

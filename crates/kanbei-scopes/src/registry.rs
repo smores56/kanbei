@@ -86,6 +86,23 @@ pub fn contribution_override_key(c: &Contribution) -> Option<(ScopePath, String)
         .map(|identity| (c.scope.clone(), identity))
 }
 
+/// The registry-wide winning binding within a keybinding snapshot (see
+/// [`ContributionRegistry::keybindings`]): same ranking as
+/// [`ContributionRegistry::keymap_winner`], so a caller classifying against a
+/// snapshot resolves the same action the registry would.
+pub fn keymap_winner_in<'a>(
+    bindings: &'a [Keybinding],
+    key: &str,
+    ctx: KeyContext,
+) -> Option<&'a Keybinding> {
+    bindings
+        .iter()
+        .enumerate()
+        .filter(|(_, kb)| kb.key == key && kb.context.matches(ctx))
+        .max_by_key(|(i, kb)| (kb.context.rank(), kb.origin.rank(), *i))
+        .map(|(_, kb)| kb)
+}
+
 /// The typed contribution registries.
 ///
 /// `apply` is transactional for the registry's own maps: it builds the merged
@@ -928,6 +945,15 @@ impl ContributionRegistry {
             .filter(|(_, (_, kb))| kb.key == key && kb.context.matches(ctx))
             .max_by_key(|(i, (_, kb))| (kb.context.rank(), kb.origin.rank(), *i))
             .map(|(_, (s, kb))| (s, kb))
+    }
+
+    /// Every registered keybinding in insertion order (the winner tie-break
+    /// order), for a caller outside the registry that must classify a key
+    /// against the resolved keymap (e.g. a CLI relaying a decision to a
+    /// session blocked in an approval rendezvous). Scope is dropped: dispatch
+    /// is registry-wide (see [`keymap_winner`](Self::keymap_winner)).
+    pub fn keybindings(&self) -> Vec<Keybinding> {
+        self.keymaps.iter().map(|(_, kb)| kb.clone()).collect()
     }
 
     /// Merged overlay view for `(scope, name)`: the single entry holding the

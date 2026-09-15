@@ -18,7 +18,7 @@ use kanbei_session::{Session, SessionConfig};
 
 mod common;
 use common::{
-    engine, has_user_message, input_row, open, plain_module, require_guest, tempdir, ui_module,
+    engine, frame_text, has_user_message, open, plain_module, require_guest, tempdir, ui_module,
 };
 
 /// A broker pre-granting `session:append` to the generation that will be
@@ -57,16 +57,10 @@ fn broker_with_append_grant(session_id: Id128, generation: u64) -> Broker {
     broker
 }
 
-/// The visible body text of the last rendered frame (excludes the kernel
-/// status bar and the input line).
+/// The visible body text of the last rendered frame: the tree owns the whole
+/// surface, so every row counts.
 fn body(session: &Session) -> String {
-    let frame = session.ui().unwrap().last_frame().unwrap().clone();
-    // the module composes its own title as the first text row, so body starts
-    // at row 0
-    (0..frame.rows() - 2)
-        .map(|r| frame.row_text(r))
-        .collect::<Vec<_>>()
-        .join("|")
+    frame_text(session.ui().unwrap().last_frame().unwrap())
 }
 
 /// Both mounts' trees appear in the composite frame, in slot order.
@@ -147,7 +141,10 @@ fn fan_out_reducers() {
     let text = body(&session);
     // both reducers received the char; only the focused (aux) mount drafted
     assert_eq!(text.matches("char:a").count(), 2, "both reducers saw the event: {text}");
-    assert_eq!(input_row(&session.ui().unwrap().last_frame().unwrap()), "> a");
+    assert!(
+        frame_text(&session.ui().unwrap().last_frame().unwrap()).contains("❯ a"),
+        "the focused mount's composer holds the draft"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -302,7 +299,10 @@ fn deactivation_unbinds_replaced_mount() {
     session.ui_handle_input(b"\t").unwrap();
     session.ui_handle_input(b"a").unwrap();
     session.ui_render_frame().unwrap();
-    assert_eq!(input_row(&session.ui().unwrap().last_frame().unwrap()), "> a");
+    assert!(
+        frame_text(&session.ui().unwrap().last_frame().unwrap()).contains("❯ a"),
+        "the remaining mount's composer drafted"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -361,7 +361,10 @@ fn fault_isolation() {
     session.ui_handle_input(b"\t\x1b[Z").unwrap();
     session.ui_handle_input(b"y").unwrap();
     session.ui_render_frame().unwrap();
-    assert_eq!(input_row(&session.ui().unwrap().last_frame().unwrap()), "> y");
+    assert!(
+        frame_text(&session.ui().unwrap().last_frame().unwrap()).contains("❯ y"),
+        "the healthy mount's composer drafted"
+    );
     let outcome = session.ui_handle_input(b"\n").unwrap();
     assert_eq!(outcome.intents_applied, 1, "healthy mount's intent applies");
     session.flush().unwrap();

@@ -25,8 +25,9 @@
 //!
 //! Composition rule (M8): the composite root is a synthetic, never-focusable
 //! `Root` node whose children are the mount roots in slot order; the kernel
-//! status bar and the focused input line stay kernel-owned at the bottom,
-//! exactly as in the single-mount workbench.
+//! lays out and presents the composed tree (decision 22) and owns only its
+//! fallback/staleness/safe-mode chrome (R-27) — the module authors the shell's
+//! status/header/input rows.
 
 use std::io;
 
@@ -235,7 +236,6 @@ pub struct UiHost {
     /// so the shell can highlight the selected row. Native: moving it never
     /// re-enters Wasm.
     pub selection: Option<String>,
-    pub last_status: String,
 }
 
 /// What one `ui_handle_input` pass did.
@@ -277,7 +277,6 @@ impl UiHost {
             size: (24, 80),
             viewport_top: 0,
             selection: None,
-            last_status: "idle".to_string(),
         };
         host.sync_summary();
         host
@@ -307,6 +306,15 @@ impl UiHost {
     }
 }
 
+/// The built-in UI generation's deterministic module id: derived from its
+/// immutable source the same way the built-in config layer derives its own
+/// ([`crate::builtin_config`]), so re-activation addresses the same identity
+/// (R-08 stable ModuleId + immutable content hash) instead of minting a fresh
+/// id each time.
+pub fn builtin_ui_module_id() -> Id128 {
+    crate::builtin_config::config_module_id(kanbei_ui::BUILTIN_UI_SOURCE.as_bytes())
+}
+
 impl Session {
     /// Activate a UI module generation through the standard contribution
     /// contract: atomic config-activation path (validate → OCC publish →
@@ -329,7 +337,7 @@ impl Session {
     pub fn activate_builtin_ui(&mut self) -> Result<u64, SessionError> {
         let manifest = PackageManifest {
             schema: kanbei_modules::PACKAGE_SCHEMA,
-            module_id: Id128::generate(),
+            module_id: builtin_ui_module_id(),
             origin: ModuleOrigin::Builtin,
             trust_class: kanbei_capabilities::TrustClass::Builtin,
             scope: kanbei_services::ScopePath(vec!["root".into()]),
@@ -466,7 +474,15 @@ impl Session {
         self.ui_host.as_mut()
     }
 
-    /// The kernel status text for the status bar.
+    /// A snapshot of the resolved keybindings, for a caller outside the session
+    /// that must classify a key against the same keymap the kernel routes with
+    /// (the CLI relaying an approval/cancel decision while a turn blocks the
+    /// session in the approval rendezvous).
+    pub fn ui_keybindings(&self) -> Vec<Keybinding> {
+        self.registry.keybindings()
+    }
+
+    /// The kernel status text for the shell's status/header contribution.
     pub fn ui_status_text(&self) -> String {
         if self.ui_host.as_ref().is_none_or(|u| u.safe_mode) {
             return "safe mode".to_string();
@@ -576,6 +592,18 @@ impl Session {
                             }
                             "quit" => outcome.quit = true,
                             "repaint" => outcome.repaint = true,
+                            // Approval-gate keys (decision 8): the built-in
+                            // layer binds `approve`/`deny` under the modal
+                            // context, so a parked approval is decided by the
+                            // SAME keymap path as every other key — not a
+                            // parallel Rust mapping. The rendezvous itself
+                            // stays a session/kernel concern. With nothing
+                            // parked the actions fall through to the module
+                            // (a dialog may define its own approve/deny).
+                            "approve" | "deny" if !self.approvals.is_empty() => {
+                                self.resolve_pending_approval(binding.action == "approve")?;
+                                outcome.repaint = true;
+                            }
                             _ => {
                                 // Route by OWNERSHIP first: the action id is
                                 // its owner module's namespace; only fall back
@@ -639,7 +667,9 @@ impl Session {
         let key = event.key_name()?;
         let host = self.ui_host.as_ref()?;
         let ctx = KeyContext {
-            modal: host.focus.boundary().is_some(),
+            // A parked approval is a modal gate (decision 8): its
+            // approve/deny bindings are live under the `modal` context.
+            modal: host.focus.boundary().is_some() || !self.approvals.is_empty(),
             overlay: host
                 .last_tree
                 .as_ref()
@@ -653,6 +683,16 @@ impl Session {
             action: binding.action.clone(),
             owner: binding.owner,
         })
+    }
+
+    /// Resolve the newest parked approval through the keymap's
+    /// `approve`/`deny` action. No-op when nothing is parked (the action is
+    /// still the binding's to own).
+    fn resolve_pending_approval(&mut self, approve: bool) -> Result<(), SessionError> {
+        if let Some(digest) = self.approvals.back().map(|p| p.approval.digest) {
+            self.resolve_approval(&digest, approve)?;
+        }
+        Ok(())
     }
 
     /// Forward one non-reserved event: navigation stays kernel-side; text
@@ -1048,11 +1088,9 @@ impl Session {
             }
         };
         let size = self.ui_host.as_ref().map(|h| h.size).unwrap_or((24, 80));
-        let status = self.ui_status_text();
         let Some(host) = self.ui_host.as_mut() else {
             return Ok(());
         };
-        host.last_status = status.clone();
         host.sync_summary();
         // The tree is authoritative for modal containment: enter/leave the
         // topmost modal boundary and clamp focus before rendering.
@@ -1062,10 +1100,8 @@ impl Session {
             theme: &host.theme,
             focus: &host.focus,
             size,
-            status: &status,
             selection: host.selection.as_deref(),
             staleness: host.staleness.as_deref(),
-            degraded: host.degraded,
         };
         let output = render(&ctx).map_err(|e| SessionError::InvalidInput(e.to_string()))?;
         host.viewport_top = output.viewport_top;
@@ -1321,10 +1357,8 @@ impl Session {
                 theme: &host.theme,
                 focus: &host.focus,
                 size,
-                status: "safe mode",
                 selection: None,
                 staleness: host.staleness.as_deref(),
-                degraded: false,
             };
             let output = render(&ctx).map_err(|e| io::Error::other(e.to_string()))?;
             host.last_frame = Some(output);
@@ -1367,5 +1401,24 @@ fn binding_is_degraded(binding: &Keybinding, host: &UiHost) -> bool {
             .iter()
             .any(|m| m.degraded && m.module_id == Some(owner)),
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The built-in UI generation is immutable content: its module id derives
+    /// from the source, so re-activation/reopen address the same identity
+    /// (R-08) rather than a freshly minted one.
+    #[test]
+    fn builtin_ui_module_id_is_deterministic() {
+        assert_eq!(builtin_ui_module_id(), builtin_ui_module_id());
+        assert_eq!(builtin_ui_module_id().to_string().len(), 21);
+        assert_ne!(
+            builtin_ui_module_id(),
+            crate::builtin_config::builtin_config_module_id(),
+            "distinct sources derive distinct identities"
+        );
     }
 }

@@ -92,7 +92,7 @@ pub use builtin_config::{
     BUILTIN_CONFIG_SOURCE, builtin_config_manifest, builtin_config_module_id, root_scope,
 };
 pub use discovery::{DiscoveryError, discover_config_layers};
-pub use ui::{UiHost, UiIntent, UiOutcome, UI_INTENT_RESOURCE};
+pub use ui::{UiHost, UiIntent, UiOutcome, UI_INTENT_RESOURCE, builtin_ui_module_id};
 
 /// The bounded recent-event ring size: the trajectory render covers the
 /// full canonical history, but the CONTENT is these most-recent events.

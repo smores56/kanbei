@@ -1,8 +1,10 @@
 //! Kernel-owned rendering: `SemanticTree + Theme -> ratatui::Buffer`
-//! (architecture.md UI model). The layout is deterministic and module-free:
-//! banner/header rows on top, body in the middle, kernel status bar and the
-//! focused input line at the bottom. Luau/Wasm never draws cells (R-27,
-//! consistency 13).
+//! (architecture.md UI model). The composed tree owns the whole surface: the
+//! module authors layout, z-order and the status/header/input rows, and the
+//! kernel lays the tree out deterministically and overlays only its own
+//! chrome — the staleness banner, the focused input's caret and the
+//! safe-mode/render-fault fallbacks (R-27). Luau/Wasm never draws cells
+//! (consistency 13).
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -14,26 +16,25 @@ use crate::theme::{DEFAULT_STYLE, Theme};
 use crate::tree::{Node, NodeKind, SemanticTree};
 use crate::tui::resolve_style;
 
-/// Minimum terminal rows for a usable frame: banner/header + body + status +
-/// input.
-pub const MIN_ROWS: usize = 4;
+/// Minimum terminal rows for a usable frame: the staleness banner plus at
+/// least one tree row.
+pub const MIN_ROWS: usize = 2;
 
-/// Everything the renderer needs. Status/staleness/degraded are kernel-owned
-/// overlays; the tree and focus come from the module-facing side.
+/// Everything the renderer needs. Staleness is the kernel's only overlay; the
+/// tree (layout, status, input) and focus come from the module-facing side.
 pub struct RenderContext<'a> {
     pub tree: &'a SemanticTree,
     pub theme: &'a Theme,
     pub focus: &'a FocusModel,
     /// Terminal size in (rows, cols).
     pub size: (u16, u16),
-    /// Kernel status text (e.g. run state).
-    pub status: &'a str,
     /// The native selection pointer (a body node id): the last non-input node
     /// focus landed on. Rendered with the `selected` style so the selection
     /// survives focus moving onto the composer input.
     pub selection: Option<&'a str>,
+    /// Kernel-owned staleness banner (R-27 composition fault), overlaid on the
+    /// last-valid tree.
     pub staleness: Option<&'a str>,
-    pub degraded: bool,
 }
 
 /// The kernel's rendered surface: the ratatui [`Buffer`] it composed plus the
@@ -98,18 +99,40 @@ pub enum RenderError {
 
 /// One body line: a node plus its pre-styled segments. The segments carry
 /// per-span theme styles, so a `text` node's spans survive into cells.
+///
+/// `input` names the input node laid out within the line (directly or nested
+/// in a `row`) with its char column offset, so the kernel can place the caret
+/// from the tree rather than a kernel-built string (decision 22).
 pub struct BodyLine<'a> {
     pub node: &'a Node,
     pub spans: Vec<(String, String)>,
+    pub input: Option<(&'a Node, usize)>,
 }
 
-/// Render the tree into a ratatui [`Buffer`]. Layout (top to bottom):
-/// 1. staleness banner (when present), then the first header node;
-/// 2. body: depth-first lines (list items, text wrapped to the width, status
-///    and button nodes); scrolled so the focused node stays visible;
-/// 3. kernel status bar;
-/// 4. the input line: `> ` + focused input content with the caret drawn in
-///    reverse video.
+impl<'a> BodyLine<'a> {
+    fn plain(node: &'a Node, spans: Vec<(String, String)>) -> Self {
+        BodyLine {
+            node,
+            spans,
+            input: None,
+        }
+    }
+
+    /// Whether the line carries the focused node (directly or as its input).
+    fn has_focus(&self, focused: Option<&str>) -> bool {
+        let id = self.node.id.as_str();
+        id == focused.unwrap_or_default()
+            || self
+                .input
+                .is_some_and(|(n, _)| Some(n.id.as_str()) == focused)
+    }
+}
+
+/// Render the tree into a ratatui [`Buffer`]. The composed tree owns the whole
+/// surface: layout kinds lay out depth-first (siblings in ascending z order),
+/// `input` nodes are ordinary lines, and the frame is sized to the terminal.
+/// The kernel overlays only its own chrome — the staleness banner, the focused
+/// input's caret — and keeps scrolling/focus/selection native (decision 22).
 ///
 /// Styles are resolved through the theme here, so every cell carries its final
 /// ratatui style and the present path paints the buffer as-is.
@@ -123,58 +146,54 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
     let mut buf = Buffer::empty(Rect::new(0, 0, cols as u16, rows as u16));
     let theme = ctx.theme;
 
-    // 1. banner row. There is no header kind: a module composes its title as
-    // the first `text` row of the body, so titled workbenches occupy the same
-    // top row they did when the kernel special-cased headers.
+    // Staleness banner (R-27 composition fault): the kernel is the only source
+    // of chrome that does not come from the tree.
     if let Some(reason) = ctx.staleness {
         let line = plain_line(theme, &crate::fallback::staleness_text(reason), "banner", cols);
         paint_line(&mut buf, 0, &line, cols as u16);
     }
     let body_start = if ctx.staleness.is_some() { 1 } else { 0 };
 
-    // 2. body lines (input nodes are kernel-rendered on the bottom row).
     let mut lines: Vec<BodyLine> = Vec::new();
     collect_lines(&ctx.tree.root, &mut lines);
 
-    // 3. input node selection for the bottom row.
-    let input_node = ctx
-        .tree
-        .input_node(ctx.focus.focused.as_deref())
-        .cloned();
-
-    // 4. status bar text.
-    let mut status = ctx.status.to_string();
-    if ctx.degraded {
-        status.push_str(" [degraded]");
-    }
-    if ctx.staleness.is_some() {
-        status.push_str(" [stale]");
-    }
-
-    // Viewport: keep the focused line visible; tail when unfocused.
-    let body_rows = rows.saturating_sub(body_start + 2); // status + input rows
-    let focused_idx = ctx
-        .focus
-        .focused
-        .as_deref()
-        .and_then(|id| lines.iter().position(|l| l.node.id == id));
+    // Viewport: keep the focused line visible; tail when unfocused. The whole
+    // remaining frame is body — no reserved status/input rows.
+    let body_rows = rows.saturating_sub(body_start);
+    let focused_idx = lines
+        .iter()
+        .position(|l| l.has_focus(ctx.focus.focused.as_deref()));
     let max_top = lines.len().saturating_sub(body_rows);
     let top = match focused_idx {
         Some(f) => f.min(max_top),
         None => max_top,
     };
     let mut row = body_start;
+    // The focused input's frame row and caret column, resolved from the tree.
+    let mut caret: Option<(u16, u16)> = None;
     for line in lines.iter().skip(top) {
-        let emphasized = Some(line.node.id.as_str()) == ctx.focus.focused.as_deref()
-            || Some(line.node.id.as_str()) == ctx.selection;
+        let is_input = line.node.kind() == NodeKind::Input;
+        let emphasized = !is_input
+            && (line.has_focus(ctx.focus.focused.as_deref())
+                || Some(line.node.id.as_str()) == ctx.selection);
         let segs = wrap_spans(&line.spans, cols);
         for (seg_row, chars) in segs.iter().enumerate() {
             let r = row + seg_row;
             if r >= body_start + body_rows {
                 break;
             }
-            let line = body_line(theme, chars, emphasized);
-            paint_line(&mut buf, r as u16, &line, cols as u16);
+            if seg_row == 0
+                && let Some((node, offset)) = line.input
+                && ctx.focus.focused.as_deref() == Some(node.id.as_str())
+            {
+                // Keep the caret on the last content char when it sits past the
+                // end, so a focused-but-empty composer still shows a caret box.
+                let len = node.content().chars().count();
+                let at = ctx.focus.caret_for(node).min(len.saturating_sub(1));
+                caret = Some((r as u16, (offset + at) as u16));
+            }
+            let painted = body_line(theme, chars, emphasized);
+            paint_line(&mut buf, r as u16, &painted, cols as u16);
         }
         row += segs.len();
         if row >= body_start + body_rows {
@@ -182,35 +201,18 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
         }
     }
 
-    // Status bar.
-    let status_row = rows - 2;
-    let line = plain_line(theme, &status, "status", cols);
-    paint_line(&mut buf, status_row as u16, &line, cols as u16);
-
-    // Input line with caret.
-    let input_row = rows - 1;
-    let mut input_text = "> ".to_string();
-    if let Some(node) = &input_node {
-        input_text.push_str(&node.content());
-    }
-    let input_text: String = input_text.chars().take(cols).collect();
-    let line = plain_line(theme, &input_text, "input", cols);
-    paint_line(&mut buf, input_row as u16, &line, cols as u16);
-    // Caret: reverse-video at the caret offset into the prompt+content
-    // (prompt is the 2-char "> " prefix), clamped to the visible text.
-    let caret = match &input_node {
-        Some(node) => ctx.focus.caret_for(node),
-        None => 0,
-    };
-    let caret = (caret + 2).min(input_text.chars().count().saturating_sub(1));
-    if let Some(ch) = input_text.chars().nth(caret)
-        && ch != ' '
+    // Caret: reverse-video over the focused input's character at the tree-
+    // resolved offset. A caret on a blank cell is invisible, matching the
+    // kernel's prior "no caret on space" behavior.
+    if let Some((r, c)) = caret
+        && c < cols as u16
     {
-        let cell = &mut buf[(caret as u16, input_row as u16)];
-        // The old cell writer placed the raw char (even a control) and merely
-        // restyled the cell, so mirror that rather than the sanitized run.
-        cell.set_char(ch);
-        cell.set_style(resolve_style(theme, Some("selected")));
+        let ch = buf[(c, r)].symbol().chars().next().unwrap_or(' ');
+        if ch != ' ' {
+            let cell = &mut buf[(c, r)];
+            cell.set_char(ch);
+            cell.set_style(resolve_style(theme, Some("selected")));
+        }
     }
 
     Ok(RenderOutput {
@@ -298,8 +300,9 @@ pub(crate) fn collect_lines<'a>(node: &'a Node, out: &mut Vec<BodyLine<'a>>) {
             // scheme (not equal split): a child contributes its natural width
             // and `render` wraps the merged line to the viewport, so the result
             // is deterministic and total-width-safe. The band's anchor node is
-            // its first contributing child, keeping focus/viewport lookup
-            // meaningful for the leading column.
+            // its first INPUT child when it has one (the composer row), else
+            // its first contributing child, keeping focus/viewport/caret
+            // lookup meaningful.
             let columns: Vec<Vec<BodyLine<'a>>> = sorted_children(node)
                 .into_iter()
                 .map(|child| {
@@ -319,6 +322,7 @@ pub(crate) fn collect_lines<'a>(node: &'a Node, out: &mut Vec<BodyLine<'a>>) {
             for band in 0..bands {
                 let mut spans: Vec<(String, String)> = Vec::new();
                 let mut anchor: Option<&'a Node> = None;
+                let mut input: Option<(&'a Node, usize)> = None;
                 for (col, lines) in columns.iter().enumerate() {
                     let width = widths[col];
                     if !spans.is_empty() {
@@ -326,7 +330,14 @@ pub(crate) fn collect_lines<'a>(node: &'a Node, out: &mut Vec<BodyLine<'a>>) {
                     }
                     match lines.get(band) {
                         Some(line) => {
-                            if anchor.is_none() {
+                            // An input child anchors the band (and records its
+                            // column) so the composer's focus and caret resolve
+                            // to the input, not the prompt.
+                            if line.input.is_some() || line.node.kind() == NodeKind::Input {
+                                let node = line.input.map(|(n, _)| n).unwrap_or(line.node);
+                                input = Some((node, spans_width(&spans)));
+                                anchor = Some(node);
+                            } else if anchor.is_none() {
                                 anchor = Some(line.node);
                             }
                             spans.extend(line.spans.iter().cloned());
@@ -343,35 +354,39 @@ pub(crate) fn collect_lines<'a>(node: &'a Node, out: &mut Vec<BodyLine<'a>>) {
                     }
                 }
                 if let Some(anchor) = anchor {
-                    out.push(BodyLine { node: anchor, spans });
+                    out.push(BodyLine {
+                        node: anchor,
+                        spans,
+                        input,
+                    });
                 }
             }
         }
         NodeKind::List => {
             // A list's items are its rows; children (if any) follow.
             for item in node.items() {
-                out.push(BodyLine {
+                out.push(BodyLine::plain(
                     node,
-                    spans: vec![(item.label.clone(), DEFAULT_STYLE.to_string())],
-                });
+                    vec![(item.label.clone(), DEFAULT_STYLE.to_string())],
+                ));
             }
             for child in sorted_children(node) {
                 collect_lines(child, out);
             }
         }
-        NodeKind::Text => out.push(BodyLine {
+        NodeKind::Text => out.push(BodyLine::plain(node, styled_spans(node, DEFAULT_STYLE))),
+        NodeKind::Code => out.push(BodyLine::plain(node, styled_spans(node, "tool"))),
+        NodeKind::Button => out.push(BodyLine::plain(
             node,
-            spans: styled_spans(node, DEFAULT_STYLE),
-        }),
-        NodeKind::Code => out.push(BodyLine {
+            vec![(node.content(), DEFAULT_STYLE.to_string())],
+        )),
+        // The input is an ordinary tree line (decision 6): the module authors
+        // it and the kernel places the caret.
+        NodeKind::Input => out.push(BodyLine {
             node,
-            spans: styled_spans(node, "tool"),
+            spans: vec![(node.content(), "input".to_string())],
+            input: Some((node, 0)),
         }),
-        NodeKind::Button => out.push(BodyLine {
-            node,
-            spans: vec![(node.content(), DEFAULT_STYLE.to_string())],
-        }),
-        NodeKind::Input => {}
     }
 }
 
@@ -447,7 +462,6 @@ mod tests {
     fn ctx<'a>(
         tree: &'a SemanticTree,
         focus: &'a FocusModel,
-        status: &'a str,
         theme: &'a Theme,
     ) -> RenderContext<'a> {
         RenderContext {
@@ -455,10 +469,8 @@ mod tests {
             theme,
             focus,
             size: (10, 20),
-            status,
             selection: None,
             staleness: None,
-            degraded: false,
         }
     }
 
@@ -481,15 +493,16 @@ mod tests {
         f.revalidate(&t);
         f.caret = 1;
         let theme = Theme::default_theme();
-        let out = render(&ctx(&t, &f, "idle", &theme)).unwrap();
+        let out = render(&ctx(&t, &f, &theme)).unwrap();
         assert_eq!(out.row_text(0), "kanbei");
         assert_eq!(out.row_text(1), "first");
         assert_eq!(out.row_text(2), "second");
-        assert_eq!(out.row_text(8), "idle");
-        assert_eq!(out.row_text(9), "> hi");
-        // caret at offset 1 is reverse-video; the prompt cell is the input style
-        assert_eq!(out.cell_style(9, 3), resolve_style(&theme, Some("selected")));
-        assert_eq!(out.cell_style(9, 2), resolve_style(&theme, Some("input")));
+        // The input is an ordinary tree line, not a kernel-pinned bottom row.
+        assert_eq!(out.row_text(3), "hi");
+        assert_eq!(out.row_text(9), "", "no kernel status/input chrome");
+        // caret at content offset 1 is reverse-video; the lead cell is input style
+        assert_eq!(out.cell_style(3, 1), resolve_style(&theme, Some("selected")));
+        assert_eq!(out.cell_style(3, 0), resolve_style(&theme, Some("input")));
     }
 
     /// Decision 32 amendment: `selection` is applied natively — the selected
@@ -500,7 +513,7 @@ mod tests {
         let t = tree();
         let f = FocusModel::new();
         let theme = Theme::default_theme();
-        let mut c = ctx(&t, &f, "idle", &theme);
+        let mut c = ctx(&t, &f, &theme);
         c.selection = Some("h");
         let out = render(&c).unwrap();
         assert_eq!(
@@ -515,20 +528,21 @@ mod tests {
         );
     }
 
+    /// The staleness banner is the kernel's only overlay (R-27): it shifts the
+    /// last-valid tree down without inventing a status/input row.
     #[test]
-    fn banner_and_degraded_overlays() {        let t = tree();
+    fn staleness_banner_overlays_last_valid_tree() {
+        let t = tree();
         let f = FocusModel::new();
         let theme = Theme::default_theme();
-        let mut c = ctx(&t, &f, "idle", &theme);
+        let mut c = ctx(&t, &f, &theme);
         c.size = (10, 40);
         c.staleness = Some("publish failed");
-        c.degraded = true;
         let out = render(&c).unwrap();
         assert!(out.row_text(0).starts_with("composition stale"));
         assert_eq!(out.row_text(1), "kanbei");
-        assert!(out.row_text(8).contains("idle"));
-        assert!(out.row_text(8).contains("[degraded]"));
-        assert!(out.row_text(8).contains("[stale]"));
+        assert_eq!(out.row_text(2), "first");
+        assert_eq!(out.row_text(4), "hi");
     }
 
     #[test]
@@ -542,7 +556,7 @@ mod tests {
         );
         let mut f = FocusModel::new();
         f.focused = Some("top".into());
-        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
+        let out = render(&ctx(&t, &f, &Theme::default_theme())).unwrap();
         assert_eq!(out.viewport_top, 0);
         assert_eq!(out.row_text(0), "line one, far above");
     }
@@ -551,11 +565,12 @@ mod tests {
     fn scrolls_to_tail_without_focus() {
         let t = tree();
         let f = FocusModel::new();
-        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
-        // 10 rows: body(8) + status + input; all 3 body lines fit
+        let out = render(&ctx(&t, &f, &Theme::default_theme())).unwrap();
+        // 10 rows of body; the whole tree (incl. input) fits.
         assert_eq!(out.row_text(0), "kanbei");
         assert_eq!(out.row_text(1), "first");
         assert_eq!(out.row_text(2), "second");
+        assert_eq!(out.row_text(3), "hi", "input scrolls with the body");
     }
 
     #[test]
@@ -565,7 +580,7 @@ mod tests {
             "0123456789 0123456789, wrapped tail",
         )));
         let f = FocusModel::new();
-        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
+        let out = render(&ctx(&t, &f, &Theme::default_theme())).unwrap();
         assert_eq!(out.row_text(0), "0123456789 012345678");
         assert_eq!(out.row_text(1), "9, wrapped tail");
     }
@@ -578,7 +593,7 @@ mod tests {
                 .child(Node::stack_z("low", -1).child(Node::text("b", "low"))),
         );
         let f = FocusModel::new();
-        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
+        let out = render(&ctx(&t, &f, &Theme::default_theme())).unwrap();
         assert_eq!(out.row_text(0), "low");
         assert_eq!(out.row_text(1), "high");
     }
@@ -596,7 +611,7 @@ mod tests {
         );
         let f = FocusModel::new();
         let theme = Theme::default_theme();
-        let out = render(&ctx(&t, &f, "idle", &theme)).unwrap();
+        let out = render(&ctx(&t, &f, &theme)).unwrap();
         assert_eq!(out.row_text(0), "abcd");
         assert_eq!(out.cell_style(0, 0), resolve_style(&theme, Some("user")));
         assert_eq!(out.cell_style(0, 1), resolve_style(&theme, Some("user")));
@@ -616,7 +631,7 @@ mod tests {
             ),
         );
         let f = FocusModel::new();
-        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
+        let out = render(&ctx(&t, &f, &Theme::default_theme())).unwrap();
         assert_eq!(out.row_text(0), "left right");
         assert_eq!(out.row_text(1), "", "row consumes a single band");
 
@@ -628,7 +643,7 @@ mod tests {
                     .child(Node::text("b", "right")),
             ),
         );
-        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
+        let out = render(&ctx(&t, &f, &Theme::default_theme())).unwrap();
         assert_eq!(out.row_text(0), "left");
         assert_eq!(out.row_text(1), "right");
     }
@@ -650,7 +665,7 @@ mod tests {
             ),
         );
         let f = FocusModel::new();
-        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
+        let out = render(&ctx(&t, &f, &Theme::default_theme())).unwrap();
         assert_eq!(out.row_text(0), "A B1");
         assert_eq!(out.row_text(1), "  B2", "the column offset is kept");
     }
@@ -660,16 +675,16 @@ mod tests {
         let t = tree();
         let f = FocusModel::new();
         let theme = Theme::default_theme();
-        let mut c = ctx(&t, &f, "idle", &theme);
-        c.size = (2, 10);
-        assert!(matches!(render(&c), Err(RenderError::TooSmall { rows: 2 })));
+        let mut c = ctx(&t, &f, &theme);
+        c.size = (1, 10);
+        assert!(matches!(render(&c), Err(RenderError::TooSmall { rows: 1 })));
     }
 
     #[test]
     fn controls_blanked() {
         let t = SemanticTree::new(Node::stack("root").child(Node::text("t", "a\tb")));
         let f = FocusModel::new();
-        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
+        let out = render(&ctx(&t, &f, &Theme::default_theme())).unwrap();
         assert_eq!(out.row_text(0), "a b");
     }
 
@@ -677,16 +692,19 @@ mod tests {
     fn placeholder_and_fallback_renders() {
         let p = fallback::placeholder_tree("workbench", "reduce failed");
         let f = FocusModel::new();
-        let out = render(&ctx(&p, &f, "idle", &Theme::default_theme())).unwrap();
+        let out = render(&ctx(&p, &f, &Theme::default_theme())).unwrap();
         let body: String = (0..8).map(|r| out.row_text(r)).collect::<Vec<_>>().join("|");
         assert!(body.contains("UI component faulted"), "body: {body}");
         assert!(body.contains("reduce failed"), "body: {body}");
 
         let fb = fallback::FallbackUi::new("kernel render fault");
         let tree = fb.tree();
-        let out = render(&ctx(&tree, &f, "safe mode", &Theme::default_theme())).unwrap();
+        let out = render(&ctx(&tree, &f, &Theme::default_theme())).unwrap();
         assert_eq!(out.row_text(0), "kanbei safe mode");
-        assert_eq!(out.row_text(9), ">");
+        // The fallback tree's input is an ordinary line: the kernel no longer
+        // paints a "> " prompt on a reserved bottom row.
+        let rows: Vec<String> = (0..out.rows()).map(|r| out.row_text(r)).collect();
+        assert!(rows.iter().all(|r| !r.contains("> ")), "no kernel prompt: {rows:?}");
     }
 
     /// Pin the whole visible frame the ratatui engine emits for a
@@ -698,13 +716,13 @@ mod tests {
         f.revalidate(&t);
         f.caret = 1;
         let theme = Theme::default_theme();
-        let out = render(&ctx(&t, &f, "idle", &theme)).unwrap();
+        let out = render(&ctx(&t, &f, &theme)).unwrap();
         let rows: Vec<String> = (0..10).map(|r| out.row_text(r)).collect();
-        assert_eq!(rows.join("|"), "kanbei|first|second||||||idle|> hi");
+        assert_eq!(rows.join("|"), "kanbei|first|second|hi||||||");
         assert_eq!(out.viewport_top, 0);
-        assert_eq!(out.cell_style(9, 0), resolve_style(&theme, Some("input")));
+        assert_eq!(out.cell_style(3, 0), resolve_style(&theme, Some("input")));
         assert_eq!(
-            out.cell_style(9, 3),
+            out.cell_style(3, 1),
             resolve_style(&theme, Some("selected"))
         );
     }
@@ -728,16 +746,16 @@ mod tests {
                 reverse: true,
             },
         );
-        let out = render(&ctx(&t, &f, "idle", &theme)).unwrap();
-        // The caret (offset 1 + two-char prompt) takes the re-themed style...
+        let out = render(&ctx(&t, &f, &theme)).unwrap();
+        // The caret (content offset 1) takes the re-themed style...
         assert_eq!(
-            out.cell_style(9, 3),
+            out.cell_style(3, 1),
             resolve_style(&theme, Some("selected"))
         );
-        // ...and the prompt keeps the input style.
-        assert_eq!(out.cell_style(9, 2), resolve_style(&theme, Some("input")));
+        // ...and the lead cell keeps the input style.
+        assert_eq!(out.cell_style(3, 0), resolve_style(&theme, Some("input")));
         assert_ne!(
-            out.cell_style(9, 3),
+            out.cell_style(3, 1),
             resolve_style(&Theme::default_theme(), Some("selected"))
         );
     }

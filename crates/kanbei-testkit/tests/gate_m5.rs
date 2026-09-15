@@ -12,6 +12,7 @@ use kanbei_core::id::Id128;
 use kanbei_modules::package::{ModuleOrigin, PackageManifest};
 use kanbei_session::{FaultPoint, Session, SessionConfig};
 use kanbei_testkit::{child_acked, spawn_m5_crash_child, verify_m5_recovery};
+use serde_json::json;
 use kanbei_ui::terminal::{TestTerminal, TermiosTerminal, is_raw_mode, openpty};
 
 /// NO_EPOCH engine: fuel/epoch are session-safety bounds; the workbench
@@ -45,8 +46,15 @@ fn tempdir(tag: &str) -> PathBuf {
     dir
 }
 
+/// The composer row: the LAST tree row carrying the shell prompt (`❯`). The
+/// kernel no longer pins the input to the bottom row, so the test tracks the
+/// tree-laid-out input.
 fn input_row(frame: &kanbei_ui::RenderOutput) -> String {
-    frame.row_text(frame.rows() - 1)
+    (0..frame.rows())
+        .map(|r| frame.row_text(r))
+        .filter(|t| t.contains('❯'))
+        .last()
+        .unwrap_or_default()
 }
 
 fn open(tag: &str) -> (PathBuf, Session) {
@@ -84,6 +92,11 @@ fn builtin_ui_end_to_end() {
         .expect("ui mount contribution in composition");
     let ui = session.ui().expect("ui host bound");
     assert_eq!(ui.component, kanbei_ui::BUILTIN_UI_COMPONENT);
+    assert_eq!(
+        ui.mounts[0].module_id,
+        Some(kanbei_session::builtin_ui_module_id()),
+        "the activated generation carries the source-derived module id"
+    );
     let _ = mount;
 
     // Type "hello": each char reduces in the module.
@@ -93,7 +106,7 @@ fn builtin_ui_end_to_end() {
     }
     session.ui_render_frame().unwrap();
     let frame = session.ui().unwrap().last_frame().unwrap().clone();
-    assert_eq!(input_row(&frame), "> hello");
+    assert_eq!(input_row(&frame), "❯ hello");
 
     // Enter submits: canonical user_message + responder trigger.
     let outcome = session.ui_handle_input(b"\n").unwrap();
@@ -110,7 +123,7 @@ fn builtin_ui_end_to_end() {
     // The module cleared its draft; the refresh fact lands in the log view.
     session.ui_render_frame().unwrap();
     let frame = session.ui().unwrap().last_frame().unwrap().clone();
-    assert_eq!(input_row(&frame), ">", "draft cleared after submit");
+    assert_eq!(input_row(&frame), "❯", "draft cleared after submit");
     session.ui_refresh("user message committed").unwrap();
     session.ui_render_frame().unwrap();
     let frame = session.ui().unwrap().last_frame().unwrap().clone();
@@ -136,7 +149,7 @@ fn focus_and_reserved_keys() {
     session.ui_handle_input(b"b").unwrap();
     session.ui_render_frame().unwrap();
     let frame = session.ui().unwrap().last_frame().unwrap().clone();
-    assert_eq!(input_row(&frame), "> ab", "nav/reserved keys must not reach the module");
+    assert_eq!(input_row(&frame), "❯ ab", "nav/reserved keys must not reach the module");
 
     // Tab moves focus onto the input node (kernel focus model).
     session.ui_handle_input(b"\x09").unwrap();
@@ -221,6 +234,93 @@ fn capability_intersection_denies_ui_intents() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Key ownership (decision 8): a parked approval is decided by the SAME
+/// keymap path as every key. The built-in config layer's modal `y` -> approve
+/// binding is routed through `ui_handle_input`; there is no ad-hoc Rust key
+/// map.
+#[test]
+fn approval_keys_route_through_the_keymap() {
+    let dir = tempdir("approval-keys");
+    let session_id = Id128::generate();
+    let mut broker = kanbei_capabilities::Broker::new();
+    broker
+        .add_template(PolicyTemplate {
+            trust_class: TrustClass::Builtin,
+            allow: vec![
+                Capability::new("fs.read".into(), vec!["call".into()]),
+                Capability::new("fs.write".into(), vec!["call".into()]),
+            ],
+            deny: vec![],
+            require_approval: vec![Capability::new("fs.write".into(), vec!["call".into()])],
+            version: 1,
+            monotonic: true,
+        })
+        .unwrap();
+    let mut grant = Grant {
+        grant_digest: Digest::new(b"m5-approval-key"),
+        principal: Principal {
+            session: session_id,
+            generation: 0,
+            run: None,
+        },
+        module_generation: 0,
+        capability: Capability::new("fs.write".into(), vec!["call".into()]),
+        scope: GrantScope::Session,
+        expiry: None,
+        budget: None,
+        purpose: Some("m5 approval-key routing".into()),
+        policy_version: 1,
+    };
+    grant.grant_digest = grant.derive_digest();
+    broker.add_grant(grant).unwrap();
+    let mut session = Session::open(SessionConfig {
+        dir: dir.clone(),
+        stream: "m5-approval-keys".into(),
+        broker,
+        session_id: Some(session_id),
+        engine: Some(engine()),
+        // Activate the built-in config layer so its modal approve/deny
+        // bindings are live.
+        config_layers: vec![kanbei_session::builtin_config_manifest()],
+        fs_root: dir.clone(),
+        ..Default::default()
+    })
+    .unwrap();
+    require_guest();
+    session.activate_builtin_ui().unwrap();
+
+    session.observe_trigger(kanbei_scheduler::Trigger {
+        kind: kanbei_scheduler::TriggerKind::NewCausalEvent,
+        referent: None,
+    });
+    let run = session.accept_wake().unwrap().unwrap();
+    session.run_start(run.run_id).unwrap();
+    let principal = Principal {
+        session: session_id,
+        generation: 0,
+        run: Some(0),
+    };
+    session
+        .tool_call(
+            run.run_id,
+            principal,
+            "fs.write",
+            json!({"path": "key.txt", "content": "approved"}),
+        )
+        .unwrap();
+    assert_eq!(session.pending_approvals().len(), 1, "the tool parked");
+
+    let outcome = session.ui_handle_input(b"y").unwrap();
+    assert!(outcome.repaint);
+    assert!(
+        session.pending_approvals().is_empty(),
+        "the modal approve binding resolved the parked approval"
+    );
+    assert!(dir.join("key.txt").exists(), "the approved write dispatched");
+    session.close().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A flaky UI module for the fault-class-2 test: errors on reduce for the
 /// char "x", works otherwise. Activated as a second root-scope mount so the
 /// host binds it.
@@ -257,7 +357,10 @@ function kb_hot(d)
       return { root = { id = "r", kind = "carousel" } }
     end
     return { root = { id = "root", kind = "stack", children = {
-      { id = "input", kind = "input", content = tostring(s.draft or "") },
+      { id = "composer", kind = "row", children = {
+        { id = "prompt", kind = "text", spans = { { text = "❯" } } },
+        { id = "input", kind = "input", content = tostring(s.draft or "") },
+      } },
     } } }
   end
   error("unknown entry")
@@ -291,7 +394,7 @@ fn runtime_component_fault_degrades() {
     session.ui_render_frame().unwrap();
     assert!(session.ui().unwrap().degraded, "invalid tree degrades the module");
     let frame = session.ui().unwrap().last_frame().unwrap().clone();
-    let body: String = (1..frame.rows() - 2)
+    let body: String = (0..frame.rows())
         .map(|r| frame.row_text(r))
         .collect::<Vec<_>>()
         .join("|");
@@ -303,7 +406,7 @@ fn runtime_component_fault_degrades() {
     session.ui_render_frame().unwrap();
     assert!(!session.ui().unwrap().degraded, "successful render clears degradation");
     let frame = session.ui().unwrap().last_frame().unwrap().clone();
-    assert_eq!(input_row(&frame), ">");
+    assert_eq!(input_row(&frame), "❯");
 
     // Trap fault: 'x' errors inside the guest → the wasm instance dies
     // (M2 documented); the module stays degraded with the placeholder.

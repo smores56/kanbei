@@ -63,10 +63,10 @@ end
     }
 }
 
-/// The visible body text of the last rendered frame.
+/// The visible text of the last rendered frame (the tree owns every row).
 fn body(session: &Session) -> String {
     let frame = session.ui().unwrap().last_frame().unwrap().clone();
-    (0..frame.rows() - 2)
+    (0..frame.rows())
         .map(|r| frame.row_text(r))
         .collect::<Vec<_>>()
         .join("|")

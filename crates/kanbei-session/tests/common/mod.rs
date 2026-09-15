@@ -107,7 +107,10 @@ function kb_hot(d)
     return { root = { id = "root", kind = "stack", children = {
       { id = "title", kind = "text", spans = { { text = "panel {NAME}" } } },
       { id = "events", kind = "list", items = items },
-      { id = "{NAME}_input", kind = "input", content = tostring(s.draft or "") },
+      { id = "{NAME}_composer", kind = "row", children = {
+        { id = "{NAME}_prompt", kind = "text", spans = { { text = "❯" } } },
+        { id = "{NAME}_input", kind = "input", content = tostring(s.draft or "") },
+      } },
       { id = "{NAME}_btn", kind = "button", label = "{NAME} button" },
     } } }
   end
@@ -177,7 +180,21 @@ pub fn has_user_message(dir: &PathBuf, text: &str) -> bool {
     found
 }
 
-/// The visible text of one frame row (test helper).
+/// The visible text of every frame row joined by '|' (test helper).
+pub fn frame_text(frame: &kanbei_ui::RenderOutput) -> String {
+    (0..frame.rows())
+        .map(|r| frame.row_text(r))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// The composer row: the LAST tree row carrying the shell prompt (`❯`). A
+/// single-mount shell places the composer after the transcript, so the last
+/// prompt row is the live input (the kernel no longer pins it to the bottom).
 pub fn input_row(frame: &kanbei_ui::RenderOutput) -> String {
-    frame.row_text(frame.rows() - 1)
+    (0..frame.rows())
+        .map(|r| frame.row_text(r))
+        .filter(|t| t.contains('❯'))
+        .last()
+        .unwrap_or_default()
 }
