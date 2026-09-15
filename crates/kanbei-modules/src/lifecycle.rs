@@ -27,7 +27,7 @@
 //! fact shape) is always false in M2 — the routine drop IS the force, and it
 //! cannot fail.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -403,6 +403,18 @@ impl ModuleManager {
     /// fresh generation id (= vm token), instantiates, registers, and runs the
     /// activation entry. On any failure nothing is registered (fail-closed).
     pub fn activate(&mut self, manifest: &PackageManifest) -> Result<Generation, ModuleError> {
+        self.activate_with_supersede(manifest, &HashSet::new())
+    }
+
+    /// As [`Self::activate`], with a precedence-driven supersede set: the
+    /// generation is allowed to take over `supersede`'s service keys from a
+    /// DIFFERENT, lower-precedence active config layer (decision 28). Callers
+    /// that do not resolve precedence pass the empty set.
+    pub fn activate_with_supersede(
+        &mut self,
+        manifest: &PackageManifest,
+        supersede: &HashSet<ServiceKey>,
+    ) -> Result<Generation, ModuleError> {
         // R-07/C-F1: validate the declared state schema against the existing
         // head BEFORE any side effect, so an incompatible generation is rejected
         // atomically and the old head (and object store) stay untouched.
@@ -428,6 +440,7 @@ impl ModuleManager {
             deps: manifest.deps.clone(),
             state_key: manifest.state_key.clone(),
             state_schema: manifest.state_schema,
+            supersede: supersede.clone(),
         };
         self.tokens.write().expect("tokens lock poisoned").insert(generation, info);
         self.instances

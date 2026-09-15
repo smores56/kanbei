@@ -51,6 +51,7 @@ use kanbei_services::{
 };
 use kanbei_vm::Host;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 use crate::runtime::{ActorError, GenerationRuntime, Scope, REPLY_TIMEOUT};
 use crate::state::{StateStore, StateUpdate};
@@ -84,6 +85,13 @@ pub(crate) struct TokenInfo {
     /// later reject at activation.
     pub state_key: Option<String>,
     pub state_schema: Option<u32>,
+    /// Service keys this generation may take over from a LOWER-precedence active
+    /// config layer (decision 28 precedence-driven implicit replacement). The
+    /// session computes this at activation time from `active_config_layers`; the
+    /// host allows `service_publish` to displace a DIFFERENT module's holder only
+    /// for keys in this set. Empty for every non-config activation, preserving
+    /// the plain `Conflict`.
+    pub supersede: HashSet<ServiceKey>,
 }
 
 /// The kernel host: split shared fields (no `Arc<Mutex<ModuleManager>>` — a
@@ -521,6 +529,17 @@ impl ModuleHost {
                 };
                 reg.replace_publish(key, provider, &intent)
             }
+            // Decision 28: a higher-precedence config layer takes over a key
+            // held by a strictly lower-precedence active config layer. The
+            // session scoped this generation's `supersede` set to exactly those
+            // keys, so any other cross-module conflict still fails below.
+            Some(current) if info.supersede.contains(&key) => {
+                let intent = ReplaceIntent {
+                    current,
+                    proposed: provider.clone(),
+                };
+                reg.replace_publish(key, provider, &intent)
+            }
             Some(current) => Err(ServiceError::Conflict {
                 key,
                 holder: current,
@@ -765,6 +784,7 @@ mod tests {
                 deps: Vec::new(),
                 state_key: None,
                 state_schema: None,
+                supersede: HashSet::new(),
             },
         );
         let currency: Arc<dyn Fn(u64) -> bool + Send + Sync> = {
@@ -799,6 +819,7 @@ mod tests {
             deps: Vec::new(),
             state_key: None,
             state_schema: None,
+            supersede: HashSet::new(),
         }
     }
 

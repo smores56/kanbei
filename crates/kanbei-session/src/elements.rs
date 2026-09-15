@@ -277,11 +277,35 @@ impl Session {
         // OCC: capture the current epoch before the (potentially long)
         // activation so a stale staged set can never publish.
         let staged = self.composition.stage(Vec::new());
+        // Decision 28 service precedence: this layer may take over the service
+        // keys held by the currently-active config layers whose origin ranks
+        // strictly lower. Compute them BEFORE activation so the guest's
+        // `kb_on_activate` publications are allowed to displace those holders
+        // instead of tripping the conflict trap.
+        let my_rank = manifest.origin.precedence_rank();
+        // Capture both the allowed keys and the displaced holders so the
+        // displaced provider can flow into the `OverridePlan` below (the shared
+        // registry holder changes during activation, so it can no longer be
+        // re-derived from a post-activation snapshot).
+        let mut supersede: HashSet<ServiceKey> = HashSet::new();
+        let mut superseded: Vec<(ServiceKey, ServiceProvider)> = Vec::new();
+        {
+            let reg = self.services.lock().expect("services lock poisoned");
+            for (key, provider, _) in reg.snapshot() {
+                let lower = self.active_config_layers.iter().any(|(rank, _, generation)| {
+                    *rank < my_rank && *generation == provider.generation
+                });
+                if lower {
+                    supersede.insert(key.clone());
+                    superseded.push((key, provider));
+                }
+            }
+        }
         let Some(manager) = self.modules.as_mut() else {
             return Err(SessionError::ModulesDisabled);
         };
         // 4 — activate; kb_on_activate publishes into the shared registry.
-        let generation = manager.activate(&manifest)?;
+        let generation = manager.activate_with_supersede(&manifest, &supersede)?;
         // The delta: every service this generation published.
         let delta: Vec<(ServiceKey, ServiceProvider)> = self
             .services
@@ -343,7 +367,6 @@ impl Session {
         };
         // Precedence-driven implicit replacement: a higher-origin layer takes
         // over the identity keys held by lower-precedence active layers.
-        let my_rank = manifest.origin.precedence_rank();
         let staged_keys: HashSet<(kanbei_services::ScopePath, String)> = staged
             .contributions
             .iter()
@@ -381,6 +404,25 @@ impl Session {
                 if contribution_override_key(&c).is_some_and(|k| staged_keys.contains(&k)) {
                     plan.removed.push(c);
                 }
+            }
+        }
+        // The captured displaced holders: a takeover already re-pointed the
+        // shared registry, so those lower providers can no longer be re-derived
+        // from the post-activation snapshot above. Add them to the plan (when the
+        // staged set actually occupies their key) so `apply_planned`'s
+        // force-remove-then-publish ordering displaces the old holder and
+        // publishes exactly the staged replacement.
+        for (key, provider) in &superseded {
+            let c = Contribution {
+                scope: key.scope.clone(),
+                kind: ContributionKind::Service(ServiceContribution {
+                    key: key.clone(),
+                    provider: provider.clone(),
+                    deps: manifest.deps.clone(),
+                }),
+            };
+            if contribution_override_key(&c).is_some_and(|k| staged_keys.contains(&k)) {
+                plan.removed.push(c);
             }
         }
         // 6+7 — validate, epoch-check, and apply atomically (removals + the

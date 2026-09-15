@@ -1050,6 +1050,113 @@ fn project_layer_overrides_user_ui_mount() {
     session.close().unwrap();
 }
 
+/// Decision 28 extends to `ContributionKind::Service`: a higher-precedence
+/// config layer implicitly takes over a service key held by a strictly
+/// lower-precedence active layer, instead of tripping the conflict trap and
+/// dropping the whole non-builtin stack to safe mode. Exactly the higher
+/// provider reaches the registry and the composition.
+#[test]
+fn workspace_layer_supersedes_user_service_key() {
+    require_guest();
+    let dir = TempDir::new("service-override");
+    let user = manifest(Id128::generate(), PUBLISHER, vec![]);
+    let user_id = user.module_id;
+    let mut project = manifest(Id128::generate(), REPLACER, vec![]);
+    project.origin = ModuleOrigin::WorkspaceConfig;
+    project.trust_class = TrustClass::Workspace;
+    let project_id = project.module_id;
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest(), user, project],
+        ..Default::default()
+    })
+    .unwrap();
+    // the workspace layer's v2 provider is the one that resolves
+    let provider = session
+        .modules()
+        .unwrap()
+        .services()
+        .lock()
+        .unwrap()
+        .resolve(&svc_key("greeter"), 2, &root())
+        .unwrap()
+        .clone();
+    assert_eq!(provider.module_id, project_id);
+    assert_ne!(provider.module_id, user_id);
+    assert_eq!(provider.generation, 3, "builtin=1, user=2, workspace=3");
+    // the composition holds exactly the higher provider
+    let providers: Vec<ServiceProvider> = session
+        .composition()
+        .contributions
+        .iter()
+        .filter_map(|c| match &c.kind {
+            kanbei_scopes::contrib::ContributionKind::Service(s) => Some(s.provider.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0].module_id, project_id);
+    session.close().unwrap();
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert!(
+        !envs.iter().any(|e| e.kind == "safe_mode_activated"),
+        "the takeover is a legitimate override, not an activation failure"
+    );
+}
+
+/// Negative: a service conflict from an EQUAL-precedence layer is NOT
+/// superseded. The activation still fails and the session drops to safe mode
+/// with the surviving built-in state intact.
+#[test]
+fn same_rank_service_conflict_falls_to_safe_mode() {
+    require_guest();
+    let dir = TempDir::new("service-conflict-safe");
+    let user_a = manifest(Id128::generate(), PUBLISHER, vec![]);
+    let user_b = manifest(Id128::generate(), REPLACER, vec![]);
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest(), user_a, user_b],
+        ..Default::default()
+    })
+    .unwrap();
+    // only the built-in generation survives
+    let snapshot = session.modules().unwrap().snapshot();
+    assert_eq!(snapshot.len(), 1, "only the built-in survives");
+    assert_eq!(snapshot[0].0, builtin_config_manifest().module_id);
+    // neither user layer's greeter publication remains
+    assert!(
+        session
+            .modules()
+            .unwrap()
+            .services()
+            .lock()
+            .unwrap()
+            .resolve(&svc_key("greeter"), 1, &root())
+            .is_err(),
+        "the dropped user layers' services are gone"
+    );
+    // built-in settings survive
+    assert_eq!(
+        session
+            .host_settings()
+            .provider
+            .as_ref()
+            .and_then(|p| p.protocol.as_deref()),
+        Some("openai"),
+        "built-in provider default survives"
+    );
+    session.close().unwrap();
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert_eq!(
+        envs.iter()
+            .filter(|e| e.kind == "safe_mode_activated")
+            .count(),
+        1
+    );
+}
+
 /// Decision 28 safe-mode residue (A2a): an already-activated user layer that
 /// published settings must not leave its merged overlay behind when a later
 /// project layer fails. `host_settings` shows only the built-in defaults.
