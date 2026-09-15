@@ -419,8 +419,15 @@ impl ContributionRegistry {
                     next.hooks.remove(&(c.scope.clone(), h.hook, h.name.clone()));
                 }
                 ContributionKind::Keymap(km) => {
-                    next.keymaps
-                        .retain(|(s, e)| !(s == &c.scope && e.key == km.key && e.context == km.context));
+                    // Removal must include the origin: same-key/context layers
+                    // published by OTHER origins in the same scope must survive
+                    // a displaced generation's removal (decision 29).
+                    next.keymaps.retain(|(s, e)| {
+                        !(s == &c.scope
+                            && e.key == km.key
+                            && e.context == km.context
+                            && e.origin == km.origin)
+                    });
                 }
                 ContributionKind::Settings(_) => {
                     // Intended asymmetry (F11): settings are a merge-only
@@ -785,8 +792,15 @@ impl ContributionRegistry {
                     next.hooks.remove(&(c.scope.clone(), h.hook, h.name.clone()));
                 }
                 ContributionKind::Keymap(km) => {
-                    next.keymaps
-                        .retain(|(s, e)| !(s == &c.scope && e.key == km.key && e.context == km.context));
+                    // Removal must include the origin: same-key/context layers
+                    // published by OTHER origins in the same scope must survive
+                    // a displaced generation's removal (decision 29).
+                    next.keymaps.retain(|(s, e)| {
+                        !(s == &c.scope
+                            && e.key == km.key
+                            && e.context == km.context
+                            && e.origin == km.origin)
+                    });
                 }
                 ContributionKind::Settings(_) => {
                     // One merged entry per scope: removing the scope's
@@ -1721,6 +1735,67 @@ mod tests {
         assert!(registry
             .keymap_for(&s, "missing", KeyContext::default())
             .is_none());
+    }
+
+    /// A kernel-stamped origin must survive a serde round-trip (it is no
+    /// longer `#[serde(skip)]`): a downgrade to `Builtin` would silently
+    /// re-tier a user-config binding.
+    #[test]
+    fn keybinding_origin_survives_serde_round_trip() {
+        let kb = Keybinding {
+            key: "k".into(),
+            context: ContextPredicate::Modal,
+            action: "a".into(),
+            origin: KeymapOrigin::UserConfig,
+        };
+        let json = serde_json::to_string(&kb).unwrap();
+        let back: Keybinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, kb);
+    }
+
+    /// Decision 29: keymap removal keys on `(scope, key, context, origin)`, so
+    /// dropping one origin's layer never deletes another origin's same-key
+    /// layer in the same scope.
+    #[test]
+    fn keymap_removal_is_origin_scoped() {
+        let s = scope("app");
+        let mut registry = ContributionRegistry::new(Arc::new(Mutex::new(ServiceRegistry::new())));
+        let kb = |origin: KeymapOrigin, action: &str| Contribution {
+            scope: s.clone(),
+            kind: ContributionKind::Keymap(Keybinding {
+                key: "k".into(),
+                context: ContextPredicate::Always,
+                action: action.into(),
+                origin,
+            }),
+        };
+        registry
+            .apply(&s, &[kb(KeymapOrigin::Builtin, "builtin"), kb(KeymapOrigin::UserConfig, "user")])
+            .unwrap();
+        let count = |r: &ContributionRegistry| {
+            r.snapshot()
+                .into_iter()
+                .filter(|c| matches!(c.kind, ContributionKind::Keymap(_)))
+                .count()
+        };
+
+        // remove_contributions drops only the matching origin's layer.
+        registry
+            .remove_contributions(&[kb(KeymapOrigin::Builtin, "builtin")])
+            .unwrap();
+        assert_eq!(count(&registry), 1);
+        assert_eq!(winner(&registry, &s, "k", KeyContext::default()).as_deref(), Some("user"));
+
+        // apply_planned's plan.removed path is origin-scoped too.
+        registry
+            .apply(&s, &[kb(KeymapOrigin::Builtin, "builtin2")])
+            .unwrap();
+        let plan = OverridePlan {
+            removed: vec![kb(KeymapOrigin::Builtin, "builtin2")],
+        };
+        registry.apply_planned(&s, &[], &plan).unwrap();
+        assert_eq!(count(&registry), 1, "the user layer survives the removal");
+        assert_eq!(winner(&registry, &s, "k", KeyContext::default()).as_deref(), Some("user"));
     }
 
     /// Decision 29: dispatch ranks context first (`Always < Overlay < Modal`),

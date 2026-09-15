@@ -173,9 +173,10 @@ pub struct Keybinding {
     pub context: ContextPredicate,
     pub action: String,
     /// Kernel-stamped from the publishing generation's origin; never
-    /// module-supplied. Skipped by serde: origin is kernel provenance, not
-    /// module content, so it stays out of the composition digest.
-    #[serde(skip)]
+    /// module-supplied. Serialized so a registry snapshot round-trip
+    /// preserves the dispatch tier (a skipped field would deserialize to the
+    /// `Builtin` default, a silent precedence downgrade).
+    #[serde(default)]
     pub origin: KeymapOrigin,
 }
 

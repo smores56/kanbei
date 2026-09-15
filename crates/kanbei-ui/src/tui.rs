@@ -144,7 +144,7 @@ pub fn transcript_paragraph<'a>(rows: &'a [StyledRow], theme: &'a Theme) -> Para
 
 /// Map a decoded terminal key event to the closed `InputEvent` set (input
 /// sanitization contract: only mapped events survive; everything else is
-/// dropped). Control combinations follow the reserved table (Ctrl-C/L/X);
+/// dropped). Control combinations follow the reserved table (Ctrl-C/L/X/Z);
 /// `Ctrl-Q` quits (UI level) and lone `Escape` returns to input focus (UI
 /// level) — both are UI events, not kernel-reserved.
 pub fn key_to_input(k: &crossterm::event::KeyEvent) -> Option<InputEvent> {
@@ -158,6 +158,7 @@ pub fn key_to_input(k: &crossterm::event::KeyEvent) -> Option<InputEvent> {
             'c' => InputEvent::CtrlC,
             'l' => InputEvent::CtrlL,
             'x' => InputEvent::CtrlX,
+            'z' => InputEvent::CtrlZ,
             'q' => InputEvent::CtrlQ,
             _ => InputEvent::Drop,
         }),
@@ -240,7 +241,7 @@ mod tests {
         assert_eq!(key_to_input(&ctrl(KeyCode::Char('l'))), Some(InputEvent::CtrlL));
         assert_eq!(key_to_input(&ctrl(KeyCode::Char('x'))), Some(InputEvent::CtrlX));
         assert_eq!(key_to_input(&ctrl(KeyCode::Char('q'))), Some(InputEvent::CtrlQ));
-        assert_eq!(key_to_input(&ctrl(KeyCode::Char('z'))), Some(InputEvent::Drop));
+        assert_eq!(key_to_input(&ctrl(KeyCode::Char('z'))), Some(InputEvent::CtrlZ));
         assert_eq!(key_to_input(&key(KeyCode::Char('h'))), Some(InputEvent::Char('h')));
         assert_eq!(key_to_input(&key(KeyCode::Enter)), Some(InputEvent::Enter));
         assert_eq!(key_to_input(&key(KeyCode::Esc)), Some(InputEvent::Escape));

@@ -10,8 +10,10 @@
 //!
 //! ABI (internal/unstable, M5):
 //! - `{"entry":"ui_reduce","state":<json|null>,"event":{"kind":
-//!   "char"|"backspace"|"enter"|"activate"|"refresh", ...}}` →
-//!   `{"state":<json>,"intents":[{"kind":"submit_text","text":...}]}`
+//!   "char"|"backspace"|"enter"|"activate"|"command"|"refresh", ...}}` →
+//!   `{"state":<json>,"intents":[{"kind":"submit_text","text":...}]}`. A
+//!   `command` event carries the `action` id of the winning keybinding
+//!   (decision 29); a `refresh` event carries kernel facts.
 //! - `{"entry":"ui_render","state":<json>}` → the semantic tree wire shape
 //!   (see `crate::tree`).
 

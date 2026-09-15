@@ -168,8 +168,8 @@ impl Default for Theme {
 }
 
 impl Theme {
-    /// The built-in default theme: header/status/input/list_item/selected/
-    /// error/banner named styles over a default foreground.
+    /// The built-in default theme: header/status/input/selected/error/banner
+    /// named styles over a default foreground.
     pub fn default_theme() -> Self {
         let mut styles = HashMap::new();
         styles.insert(DEFAULT_STYLE.to_string(), Style::default());
@@ -190,13 +190,6 @@ impl Theme {
         );
         styles.insert(
             "input".to_string(),
-            Style {
-                fg: Color::Default,
-                ..Style::default()
-            },
-        );
-        styles.insert(
-            "list_item".to_string(),
             Style {
                 fg: Color::Default,
                 ..Style::default()

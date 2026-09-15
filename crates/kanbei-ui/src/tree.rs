@@ -8,6 +8,8 @@
 //! wants (a response bubble is a `stack` of styled `text` spans) instead of
 //! asking the kernel for named semantic rows.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -15,6 +17,11 @@ use serde_json::{Map, Value};
 pub const MAX_TREE_DEPTH: usize = 32;
 /// Maximum node count of a module-authored tree (kernel bound).
 pub const MAX_TREE_NODES: usize = 4096;
+/// Maximum length (in chars) of any single module-authored string: span/item
+/// text, input content, button label. Structural bounds alone do not cap
+/// allocation (one `text` node with a huge span is under the node bound but
+/// forces a huge render-time allocation).
+pub const MAX_TEXT_LEN: usize = 4096;
 
 /// The primitive node kinds understood by the kernel renderer. Unknown kinds
 /// are rejected at parse time (fail-closed, R-27).
@@ -372,6 +379,8 @@ pub enum TreeError {
     TooDeep { id: String },
     #[error("tree exceeds the maximum node count {MAX_TREE_NODES}")]
     TooManyNodes,
+    #[error("node id {id:?} appears more than once; ids must be unique")]
+    DuplicateId { id: String },
 }
 
 impl SemanticTree {
@@ -386,14 +395,20 @@ impl SemanticTree {
         let obj = v.as_object().ok_or(TreeError::NotAnObject)?;
         let root_value = obj.get("root").ok_or(TreeError::NotAnObject)?;
         let mut count = 0;
-        let root = Self::parse_node(root_value, 0, &mut count)?;
+        let mut ids = HashSet::new();
+        let root = Self::parse_node(root_value, 0, &mut count, &mut ids)?;
         if root.kind() != NodeKind::Stack {
             return Err(TreeError::BadRootKind(root.kind().as_str().to_string()));
         }
         Ok(SemanticTree { root })
     }
 
-    fn parse_node(v: &Value, depth: usize, count: &mut usize) -> Result<Node, TreeError> {
+    fn parse_node(
+        v: &Value,
+        depth: usize,
+        count: &mut usize,
+        ids: &mut HashSet<String>,
+    ) -> Result<Node, TreeError> {
         if depth > MAX_TREE_DEPTH {
             return Err(TreeError::TooDeep {
                 id: v.get("id").and_then(Value::as_str).unwrap_or("?").to_string(),
@@ -403,11 +418,17 @@ impl SemanticTree {
         if *count > MAX_TREE_NODES {
             return Err(TreeError::TooManyNodes);
         }
-        let id = v
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        // A node id is the kernel's handle for focus containment and
+        // accessibility; a missing/blank id or a duplicate would let a second
+        // node shadow the first (focus would resolve to the wrong subtree), so
+        // both are parse faults (fail-closed).
+        let id = match v.get("id").and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return Err(bad_props("?", "id", "every node needs a non-empty string \"id\"")),
+        };
+        if !ids.insert(id.clone()) {
+            return Err(TreeError::DuplicateId { id });
+        }
         let kind_str = v
             .get("kind")
             .and_then(Value::as_str)
@@ -419,7 +440,7 @@ impl SemanticTree {
             id: id.clone(),
             kind: kind_str.to_string(),
         })?;
-        let props = Self::parse_props(kind, v, &id)?;
+        let props = Self::parse_props(kind, v, &id, count)?;
         let disabled = match v.get("disabled") {
             None => false,
             Some(Value::Bool(b)) => *b,
@@ -435,13 +456,18 @@ impl SemanticTree {
             let children = lua_array(children)
                 .ok_or_else(|| bad_props(&node.id, "children", "expected an array"))?;
             for child in children {
-                node.children.push(Self::parse_node(child, depth + 1, count)?);
+                node.children.push(Self::parse_node(child, depth + 1, count, ids)?);
             }
         }
         Ok(node)
     }
 
-    fn parse_props(kind: NodeKind, v: &Value, id: &str) -> Result<NodeProps, TreeError> {
+    fn parse_props(
+        kind: NodeKind,
+        v: &Value,
+        id: &str,
+        count: &mut usize,
+    ) -> Result<NodeProps, TreeError> {
         Ok(match kind {
             NodeKind::Stack => NodeProps::Stack {
                 z: parse_i32(v, "z", id)?,
@@ -449,16 +475,16 @@ impl SemanticTree {
             NodeKind::Row => NodeProps::Row,
             NodeKind::Col => NodeProps::Col,
             NodeKind::Text => NodeProps::Text {
-                spans: parse_spans(v, id)?,
+                spans: parse_spans(v, id, count)?,
             },
             NodeKind::Code => NodeProps::Code {
-                spans: parse_spans(v, id)?,
+                spans: parse_spans(v, id, count)?,
             },
             NodeKind::Input => NodeProps::Input {
                 content: parse_string(v, "content", id)?.unwrap_or_default(),
             },
             NodeKind::List => NodeProps::List {
-                items: parse_items(v, id)?,
+                items: parse_items(v, id, count)?,
             },
             NodeKind::Button => NodeProps::Button {
                 label: parse_string(v, "label", id)?.unwrap_or_default(),
@@ -631,18 +657,30 @@ fn parse_i32(v: &Value, key: &str, id: &str) -> Result<i32, TreeError> {
 fn parse_string(v: &Value, key: &str, id: &str) -> Result<Option<String>, TreeError> {
     match v.get(key) {
         None => Ok(None),
+        Some(Value::String(s)) if s.chars().count() > MAX_TEXT_LEN => Err(bad_props(
+            id,
+            "content",
+            format!("{key} exceeds the maximum length {MAX_TEXT_LEN}"),
+        )),
         Some(Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err(bad_props(id, "content", "expected a string")),
     }
 }
 
-fn parse_spans(v: &Value, id: &str) -> Result<Vec<Span>, TreeError> {
+fn parse_spans(v: &Value, id: &str, count: &mut usize) -> Result<Vec<Span>, TreeError> {
     let arr = v
         .get("spans")
         .and_then(lua_array)
         .ok_or_else(|| bad_props(id, "spans", "expected an array"))?;
     arr.iter()
         .map(|s| {
+            // Spans are render-time allocation units: charge each against the
+            // node bound and cap its text, or one node with a huge span
+            // bypasses the structural bounds.
+            *count += 1;
+            if *count > MAX_TREE_NODES {
+                return Err(TreeError::TooManyNodes);
+            }
             let obj = s
                 .as_object()
                 .ok_or_else(|| bad_props(id, "spans", "each span must be an object"))?;
@@ -650,6 +688,13 @@ fn parse_spans(v: &Value, id: &str) -> Result<Vec<Span>, TreeError> {
                 .get("text")
                 .and_then(Value::as_str)
                 .ok_or_else(|| bad_props(id, "spans", "each span needs a string \"text\""))?;
+            if text.chars().count() > MAX_TEXT_LEN {
+                return Err(bad_props(
+                    id,
+                    "spans",
+                    format!("span text exceeds the maximum length {MAX_TEXT_LEN}"),
+                ));
+            }
             let style = match obj.get("style") {
                 None => None,
                 Some(Value::String(s)) => Some(s.clone()),
@@ -663,13 +708,18 @@ fn parse_spans(v: &Value, id: &str) -> Result<Vec<Span>, TreeError> {
         .collect()
 }
 
-fn parse_items(v: &Value, id: &str) -> Result<Vec<ListItem>, TreeError> {
+fn parse_items(v: &Value, id: &str, count: &mut usize) -> Result<Vec<ListItem>, TreeError> {
     let arr = v
         .get("items")
         .and_then(lua_array)
         .ok_or_else(|| bad_props(id, "items", "expected an array"))?;
     arr.iter()
         .map(|i| {
+            // Items render as rows: charge each against the node bound.
+            *count += 1;
+            if *count > MAX_TREE_NODES {
+                return Err(TreeError::TooManyNodes);
+            }
             let obj = i
                 .as_object()
                 .ok_or_else(|| bad_props(id, "items", "each item must be an object"))?;
@@ -681,6 +731,13 @@ fn parse_items(v: &Value, id: &str) -> Result<Vec<ListItem>, TreeError> {
                 .get("label")
                 .and_then(Value::as_str)
                 .ok_or_else(|| bad_props(id, "items", "each item needs a string \"label\""))?;
+            if label.chars().count() > MAX_TEXT_LEN {
+                return Err(bad_props(
+                    id,
+                    "items",
+                    format!("item label exceeds the maximum length {MAX_TEXT_LEN}"),
+                ));
+            }
             let selectable = match obj.get("selectable") {
                 None => false,
                 Some(Value::Bool(b)) => *b,
@@ -849,8 +906,8 @@ mod tests {
     #[test]
     fn rejects_oversized_tree() {
         let mut node = json!({"id": "leaf", "kind": "text", "spans": [{"text": "x"}]});
-        for _ in 0..MAX_TREE_DEPTH + 1 {
-            node = json!({"id": "n", "kind": "stack", "children": [node]});
+        for i in 0..MAX_TREE_DEPTH + 1 {
+            node = json!({"id": format!("n{i}"), "kind": "stack", "children": [node]});
         }
         let err = SemanticTree::from_json(&json!({"root": node})).unwrap_err();
         assert!(matches!(err, TreeError::TooDeep { .. }));
@@ -867,6 +924,77 @@ mod tests {
         }))
         .unwrap_err();
         assert!(matches!(err, TreeError::TooManyNodes));
+    }
+
+    #[test]
+    fn rejects_duplicate_and_missing_node_ids() {
+        // Duplicate ids would make focus containment resolve to the first
+        // preorder match, i.e. outside the intended subtree — reject at parse.
+        let err = SemanticTree::from_json(&json!({
+            "root": {"id": "r", "kind": "stack", "children": [
+                {"id": "dup", "kind": "text", "spans": [{"text": "a"}]},
+                {"id": "dup", "kind": "text", "spans": [{"text": "b"}]}
+            ]}
+        }))
+        .unwrap_err();
+        assert!(matches!(err, TreeError::DuplicateId { id } if id == "dup"));
+
+        // A missing or non-string/blank id is a fault, never silently "".
+        let missing = SemanticTree::from_json(&json!({
+            "root": {"id": "r", "kind": "stack", "children": [{"kind": "text", "spans": []}]}
+        }))
+        .unwrap_err();
+        assert!(matches!(missing, TreeError::BadProps { prop: "id", .. }));
+        let blank = SemanticTree::from_json(&json!({
+            "root": {"id": "", "kind": "stack"}
+        }))
+        .unwrap_err();
+        assert!(matches!(blank, TreeError::BadProps { prop: "id", .. }));
+    }
+
+    #[test]
+    fn spans_and_items_count_against_the_node_bound() {
+        let spans: Vec<Value> = (0..MAX_TREE_NODES)
+            .map(|i| json!({"text": format!("s{i}")}))
+            .collect();
+        let err = SemanticTree::from_json(&json!({
+            "root": {"id": "r", "kind": "stack", "children": [
+                {"id": "t", "kind": "text", "spans": spans}
+            ]}
+        }))
+        .unwrap_err();
+        assert!(matches!(err, TreeError::TooManyNodes), "spans charged");
+
+        let items: Vec<Value> = (0..MAX_TREE_NODES)
+            .map(|i| json!({"id": format!("i{i}"), "label": "x"}))
+            .collect();
+        let err = SemanticTree::from_json(&json!({
+            "root": {"id": "r", "kind": "stack", "children": [
+                {"id": "l", "kind": "list", "items": items}
+            ]}
+        }))
+        .unwrap_err();
+        assert!(matches!(err, TreeError::TooManyNodes), "items charged");
+    }
+
+    #[test]
+    fn rejects_oversized_span_and_item_text() {
+        let long = "x".repeat(MAX_TEXT_LEN + 1);
+        let err = SemanticTree::from_json(&json!({
+            "root": {"id": "r", "kind": "stack", "children": [
+                {"id": "t", "kind": "text", "spans": [{"text": long}]}
+            ]}
+        }))
+        .unwrap_err();
+        assert!(matches!(err, TreeError::BadProps { prop: "spans", .. }));
+
+        let err = SemanticTree::from_json(&json!({
+            "root": {"id": "r", "kind": "stack", "children": [
+                {"id": "l", "kind": "list", "items": [{"id": "i", "label": long}]}
+            ]}
+        }))
+        .unwrap_err();
+        assert!(matches!(err, TreeError::BadProps { prop: "items", .. }));
     }
 
     #[test]

@@ -19,12 +19,20 @@ use kanbei_services::ScopePath;
 /// `kb_on_activate(ctx)` (the guest contract) that publishes the default
 /// settings contribution. Top-level code is pure (runs twice).
 pub const BUILTIN_CONFIG_SOURCE: &str = r#"-- kanbei built-in config defaults (decision 28).
--- Lowest-precedence desired-state layer: publishes default settings only.
+-- Lowest-precedence desired-state layer: publishes default settings and the
+-- built-in keybinding layer (decision 29).
 function kb_on_activate(ctx)
   ctx.contribution_publish(
     '{"kind":"settings",' ..
     '"provider":{"protocol":"openai"},' ..
     '"approval":{"auto_approve":false,"yolo":false}}')
+  -- Decision 29: the built-in layer ships the kernel's default bindings so
+  -- making Ctrl-C/Ctrl-L remappable does not drop run cancellation out of the
+  -- box. Origin is kernel-stamped as `builtin` (lowest dispatch tier).
+  ctx.contribution_publish(
+    '{"kind":"keymap","bindings":[' ..
+    '{"key":"ctrl-c","context":"always","action":"cancel_run"},' ..
+    '{"key":"ctrl-l","context":"always","action":"repaint"}]}')
 end
 
 function kb_hot(dispatch)
@@ -120,5 +128,7 @@ mod tests {
         assert!(m.source.contains("kb_on_activate"));
         assert!(m.source.contains("kb_hot"));
         assert!(m.source.contains(r#""kind":"settings""#));
+        assert!(m.source.contains(r#""kind":"keymap""#), "built-in defaults ship bindings");
+        assert!(m.source.contains(r#""action":"cancel_run""#));
     }
 }

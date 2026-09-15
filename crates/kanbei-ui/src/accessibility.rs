@@ -49,12 +49,30 @@ fn walk(node: &crate::Node, disabled_ancestor: bool, issues: &mut Vec<Issue>) {
         issues.push(Issue::error(&node.id, "node has an empty id"));
     }
     // Focusability is intrinsic to the interactive kinds; an input may be
-    // empty (an empty prompt), the others need a label to be interactive.
-    if node.is_interactive() && node.kind() != NodeKind::Input && node.label().is_empty() {
+    // empty (an empty prompt), the others need a label to be interactive. A
+    // list's labels are validated per selectable item below.
+    if node.is_interactive()
+        && node.kind() != NodeKind::Input
+        && node.kind() != NodeKind::List
+        && node.label().is_empty()
+    {
         issues.push(Issue::error(&node.id, "focusable node has no label/content"));
     }
     if node.is_interactive() && disabled {
         issues.push(Issue::error(&node.id, "focusable node is inside a disabled subtree"));
+    }
+    // A selectable list item with no label is unreachable for a screen reader
+    // even when a sibling item is labeled (an `any`-labeled list passes the
+    // node-level check); require every selectable item to be labeled.
+    if node.kind() == NodeKind::List {
+        for item in node.items() {
+            if item.selectable && item.label.is_empty() {
+                issues.push(Issue::error(
+                    &node.id,
+                    "selectable list item has an empty label",
+                ));
+            }
+        }
     }
     // A modal layer with no focusable descendant is unusable: the kernel
     // cannot place focus inside it (inescapable modal).
@@ -116,6 +134,31 @@ mod tests {
         let issues = issues_for(&t, "l");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn every_selectable_item_must_be_labeled() {
+        // One labeled selectable item must not mask an unlabeled sibling.
+        let t = SemanticTree::new(Node::stack("root").child(Node::list(
+            "l",
+            vec![
+                ListItem::new("a", "ok").selectable(),
+                ListItem::new("b", "").selectable(),
+            ],
+        )));
+        assert!(!is_valid(&t));
+        assert!(issues_for(&t, "l")
+            .iter()
+            .any(|i| i.severity == Severity::Error));
+        // All selectable items labeled: valid.
+        let ok = SemanticTree::new(Node::stack("root").child(Node::list(
+            "l",
+            vec![
+                ListItem::new("a", "ok").selectable(),
+                ListItem::new("b", "also ok").selectable(),
+            ],
+        )));
+        assert!(is_valid(&ok));
     }
 
     #[test]

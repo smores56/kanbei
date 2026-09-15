@@ -230,13 +230,50 @@ pub fn render(ctx: &RenderContext) -> Result<RenderOutput, RenderError> {
 }
 
 /// Depth-first body lines. Layout kinds recurse (siblings in ascending z
-/// order, so a higher z paints later and occludes); `input` nodes are
-/// kernel-rendered on the bottom row and skipped here.
+/// order, so a higher z paints later and occludes); a `row`'s children share
+/// each band horizontally; `input` nodes are kernel-rendered on the bottom row
+/// and skipped here.
 pub(crate) fn collect_lines<'a>(node: &'a Node, out: &mut Vec<BodyLine<'a>>) {
     match node.kind() {
-        NodeKind::Stack | NodeKind::Row | NodeKind::Col | NodeKind::Layer => {
+        NodeKind::Stack | NodeKind::Col | NodeKind::Layer => {
             for child in sorted_children(node) {
                 collect_lines(child, out);
+            }
+        }
+        NodeKind::Row => {
+            // Horizontal layout: each child's lines are laid out side by side,
+            // band-by-band, joined with a one-cell gutter. Intrinsic-width
+            // scheme (not equal split): a child contributes its natural width
+            // and `render` wraps the merged line to the viewport, so the result
+            // is deterministic and total-width-safe. The band's anchor node is
+            // its first contributing child, keeping focus/viewport lookup
+            // meaningful for the leading column.
+            let columns: Vec<Vec<BodyLine<'a>>> = sorted_children(node)
+                .into_iter()
+                .map(|child| {
+                    let mut lines = Vec::new();
+                    collect_lines(child, &mut lines);
+                    lines
+                })
+                .collect();
+            let bands = columns.iter().map(Vec::len).max().unwrap_or(0);
+            for band in 0..bands {
+                let mut spans: Vec<(String, String)> = Vec::new();
+                let mut anchor: Option<&'a Node> = None;
+                for lines in &columns {
+                    if let Some(line) = lines.get(band) {
+                        if anchor.is_none() {
+                            anchor = Some(line.node);
+                        }
+                        if !spans.is_empty() {
+                            spans.push((String::from(" "), DEFAULT_STYLE.to_string()));
+                        }
+                        spans.extend(line.spans.iter().cloned());
+                    }
+                }
+                if let Some(anchor) = anchor {
+                    out.push(BodyLine { node: anchor, spans });
+                }
             }
         }
         NodeKind::List => {
@@ -463,6 +500,33 @@ mod tests {
         assert_eq!(out.frame.cell(0, 0).style, "user");
         assert_eq!(out.frame.cell(0, 1).style, "user");
         assert_eq!(out.frame.cell(0, 2).style, DEFAULT_STYLE);
+    }
+
+    #[test]
+    fn row_places_children_on_the_same_line() {
+        let t = SemanticTree::new(
+            Node::stack("root").child(
+                Node::row("r")
+                    .child(Node::text("a", "left"))
+                    .child(Node::text("b", "right")),
+            ),
+        );
+        let f = FocusModel::new();
+        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
+        assert_eq!(out.frame.row_text(0), "left right");
+        assert_eq!(out.frame.row_text(1), "", "row consumes a single band");
+
+        // `col` stays vertical (the old row==col aliasing is gone).
+        let t = SemanticTree::new(
+            Node::stack("root").child(
+                Node::col("c")
+                    .child(Node::text("a", "left"))
+                    .child(Node::text("b", "right")),
+            ),
+        );
+        let out = render(&ctx(&t, &f, "idle", &Theme::default_theme())).unwrap();
+        assert_eq!(out.frame.row_text(0), "left");
+        assert_eq!(out.frame.row_text(1), "right");
     }
 
     #[test]

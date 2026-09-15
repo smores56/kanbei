@@ -34,7 +34,7 @@ use kanbei_capabilities::{Capability, Principal};
 use kanbei_core::id::Id128;
 use kanbei_modules::package::{ModuleOrigin, PackageManifest};
 use kanbei_modules::ModuleManager;
-use kanbei_scopes::contrib::KeyContext;
+use kanbei_scopes::contrib::{Keybinding, KeyContext, KeymapOrigin};
 use kanbei_ui::accessibility;
 use kanbei_ui::fallback;
 use kanbei_ui::focus::{FocusDirection, InputClass, KeyClassifier, ReservedAction};
@@ -86,6 +86,10 @@ impl UiIntent {
 /// mount's slot as a `target` hint).
 #[derive(Debug)]
 pub struct BoundMount {
+    /// The scope the mount's contribution was published in (root scope for a
+    /// bound mount); a keymap binding is "owned" by a degraded mount when its
+    /// origin scope matches.
+    pub scope: kanbei_services::ScopePath,
     /// The composite region this mount renders into (canonical slots:
     /// `main`, `status`, `header`, `composer`, `aux`; `None` is the default
     /// `main` and is normalized by the registry at publish).
@@ -115,8 +119,15 @@ pub struct BoundMount {
 }
 
 impl BoundMount {
-    fn new(slot: String, name: String, component: String, generation: u64) -> Self {
+    fn new(
+        scope: kanbei_services::ScopePath,
+        slot: String,
+        name: String,
+        component: String,
+        generation: u64,
+    ) -> Self {
         BoundMount {
+            scope,
             slot,
             name,
             component,
@@ -339,7 +350,7 @@ impl Session {
             return Ok(());
         };
         let root = kanbei_services::ScopePath(vec!["root".into()]);
-        let mut mounts: Vec<(String, String, String)> = self
+        let mut mounts: Vec<(String, String, String, kanbei_services::ScopePath)> = self
             .registry
             .snapshot()
             .into_iter()
@@ -348,6 +359,7 @@ impl Session {
                     m.slot.unwrap_or_else(|| "main".to_string()),
                     m.name,
                     m.component,
+                    c.scope,
                 )),
                 _ => None,
             })
@@ -359,14 +371,14 @@ impl Session {
         });
         let mut bound: Vec<BoundMount> = Vec::new();
         let mut theme = Theme::default_theme();
-        for (slot, name, component) in mounts {
+        for (slot, name, component, scope) in mounts {
             let Some(generation) = manager.ui_generation(&component) else {
                 continue;
             };
             if let Some(overlay) = self.registry.theme_overlay(&root, &name) {
                 let _ = theme.apply_overlay(&overlay.overlay);
             }
-            bound.push(BoundMount::new(slot, name, component, generation));
+            bound.push(BoundMount::new(scope, slot, name, component, generation));
         }
         self.ui_host = if bound.is_empty() {
             None
@@ -478,9 +490,27 @@ impl Session {
                     // id as a typed command intent through the normal reduce
                     // path; only unbound keys fall through to raw forwarding.
                     if let Some(action) = self.ui_binding_action(&event) {
-                        self.ui_reduce(UiEvent::user(UiEventKind::Command(action)))?;
-                        let applied = self.apply_ui_intents()?;
-                        outcome.intents_applied += applied;
+                        match action.as_str() {
+                            // The built-in layer's default bindings restore the
+                            // pre-T10 kernel behaviors: `cancel_run` cancels the
+                            // active run, `repaint` forces a full repaint. Both
+                            // stay remappable (a binding can target other ids).
+                            "cancel_run" => {
+                                if self.scheduler.active_run().is_some() {
+                                    let _ = self.cancel_active_run()?;
+                                }
+                                outcome.repaint = true;
+                            }
+                            "repaint" => outcome.repaint = true,
+                            _ => {
+                                // Deliver only to the focused (target) mount: a
+                                // command id is that module's namespace, so a
+                                // victim reducer must not act on it.
+                                self.ui_reduce_command(&action)?;
+                                let applied = self.apply_ui_intents()?;
+                                outcome.intents_applied += applied;
+                            }
+                        }
                     } else {
                         self.ui_forward(&event, &mut outcome)?;
                     }
@@ -518,7 +548,9 @@ impl Session {
 
     /// The winning binding's action for `event` under the current UI context,
     /// if any binding matches (decision 29). Reserved keys are classified
-    /// before this and never consult the binding table.
+    /// before this and never consult the binding table. Bindings owned by a
+    /// degraded mount are skipped so a bound key falls through to forwarding
+    /// instead of being silently swallowed by a dead reducer.
     fn ui_binding_action(&self, event: &InputEvent) -> Option<String> {
         let key = event.key_name()?;
         let host = self.ui_host.as_ref()?;
@@ -529,9 +561,11 @@ impl Session {
                 .as_ref()
                 .is_some_and(|t| t.overlay_present()),
         };
-        self.registry
-            .keymap_winner(&key, ctx)
-            .map(|(_, binding)| binding.action.clone())
+        let (scope, binding) = self.registry.keymap_winner(&key, ctx)?;
+        if binding_is_degraded(binding, scope, host) {
+            return None;
+        }
+        Some(binding.action.clone())
     }
 
     /// Forward one non-reserved event: navigation stays kernel-side; text
@@ -658,31 +692,39 @@ impl Session {
     /// mount (placeholder subtree); the others keep working.
     fn ui_reduce(&mut self, event: UiEvent) -> Result<(), SessionError> {
         self.fault(FaultPoint::BeforeUiReduce);
-        self.ui_reduce_inner(event);
+        self.ui_reduce_inner(event, false);
         self.fault(FaultPoint::AfterUiReduce);
         Ok(())
     }
 
-    fn ui_reduce_inner(&mut self, event: UiEvent) {
+    /// Deliver a binding's command ONLY to the focused mount: the action id is
+    /// the target module's namespace, so a victim reducer must not act on it.
+    fn ui_reduce_command(&mut self, action: &str) -> Result<(), SessionError> {
+        self.fault(FaultPoint::BeforeUiReduce);
+        self.ui_reduce_inner(UiEvent::user(UiEventKind::Command(action.to_string())), true);
+        self.fault(FaultPoint::AfterUiReduce);
+        Ok(())
+    }
+
+    fn ui_reduce_inner(&mut self, event: UiEvent, target_only: bool) {
         let Some(host) = self.ui_host.as_mut() else {
             return;
         };
         let Some(manager) = self.modules.as_ref() else {
             return;
         };
-        // The target hint: the focused mount's slot (None when nothing is
-        // focused). Single-mount ids are unprefixed (M5 byte-identical
-        // trees), so an unresolvable id means the one bound mount.
-        let target = host
+        // The target: the focused mount's index/slot (None when nothing is
+        // focused). Single-mount ids are unprefixed (M5 byte-identical trees),
+        // so an unresolvable id means the one bound mount.
+        let target_index = host
             .focus
             .focused
             .as_deref()
             .and_then(SemanticTree::split_composite_id)
-            .and_then(|(i, _)| host.mounts.get(i))
-            .map(|m| m.slot.clone())
-            .or_else(|| {
-                (host.mounts.len() == 1).then(|| host.mounts[0].slot.clone())
-            });
+            .map(|(i, _)| i)
+            .filter(|i| *i < host.mounts.len())
+            .or_else(|| (host.mounts.len() == 1).then_some(0));
+        let target = target_index.map(|i| host.mounts[i].slot.clone());
         // Activation ids are composite ids; each mount receives its own
         // original id back.
         let event_kind = match &event.kind {
@@ -705,7 +747,10 @@ impl Session {
         if let Some(target) = target {
             event_value["target"] = json!(target);
         }
-        for mount in host.mounts.iter_mut() {
+        for (i, mount) in host.mounts.iter_mut().enumerate() {
+            if target_only && Some(i) != target_index {
+                continue;
+            }
             let payload = json!({
                 "entry": "ui_reduce",
                 "state": mount.reducer_state,
@@ -1057,4 +1102,18 @@ impl Session {
         }
         Ok(())
     }
+}
+
+/// Whether a winning binding is owned by a degraded mount. Built-in defaults
+/// are kernel-owned and never skipped; a module/config binding is skipped when
+/// a degraded mount publishes in the same scope, so a bound key falls through
+/// to forwarding instead of being swallowed by a dead reducer (the keymap
+/// stays in the registry after the placeholder swap).
+fn binding_is_degraded(
+    binding: &Keybinding,
+    scope: &kanbei_services::ScopePath,
+    host: &UiHost,
+) -> bool {
+    binding.origin != KeymapOrigin::Builtin
+        && host.mounts.iter().any(|m| m.degraded && &m.scope == scope)
 }

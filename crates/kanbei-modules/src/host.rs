@@ -726,35 +726,63 @@ impl ModuleHost {
                         "contribution_publish: keymap must carry a non-empty \"bindings\" array"
                             .to_string()
                     })?;
+                if bindings.len() > MAX_KEYBINDINGS {
+                    return Err(format!(
+                        "contribution_publish: keymap exceeds the maximum of {MAX_KEYBINDINGS} bindings"
+                    ));
+                }
+                let trusted = info.origin.is_trusted();
                 let origin = keymap_origin(info.origin);
                 let mut staged = Vec::with_capacity(bindings.len());
                 for b in bindings {
                     let key = b
                         .get("key")
                         .and_then(Value::as_str)
-                        .filter(|k| !k.is_empty())
+                        .filter(|k| !k.is_empty() && k.chars().count() <= MAX_KEY_LEN)
                         .ok_or_else(|| {
-                            "contribution_publish: keymap binding must carry a non-empty \"key\""
-                                .to_string()
+                            format!(
+                                "contribution_publish: keymap binding needs a non-empty \"key\" of at most {MAX_KEY_LEN} chars"
+                            )
                         })?;
                     let action = b
                         .get("action")
                         .and_then(Value::as_str)
-                        .filter(|a| !a.is_empty())
+                        .filter(|a| !a.is_empty() && a.chars().count() <= MAX_ACTION_LEN)
                         .ok_or_else(|| {
-                            "contribution_publish: keymap binding must carry a non-empty \"action\""
-                                .to_string()
+                            format!(
+                                "contribution_publish: keymap binding needs a non-empty \"action\" of at most {MAX_ACTION_LEN} chars"
+                            )
                         })?;
-                    let context = match b.get("context").and_then(Value::as_str) {
-                        None | Some("always") => ContextPredicate::Always,
-                        Some("modal") => ContextPredicate::Modal,
-                        Some("overlay") => ContextPredicate::Overlay,
+                    // Strict: a non-string `context` must error, not silently
+                    // default to `Always`.
+                    let context = match b.get("context") {
+                        None => ContextPredicate::Always,
+                        Some(Value::String(s)) => match s.as_str() {
+                            "always" => ContextPredicate::Always,
+                            "modal" => ContextPredicate::Modal,
+                            "overlay" => ContextPredicate::Overlay,
+                            other => {
+                                return Err(format!(
+                                    "contribution_publish: unknown keymap context {other:?}"
+                                ));
+                            }
+                        },
                         Some(other) => {
                             return Err(format!(
-                                "contribution_publish: unknown keymap context {other:?}"
+                                "contribution_publish: keymap context must be a string, got {other}"
                             ));
                         }
                     };
+                    // Context rank outranks origin rank, and the context is
+                    // module-chosen (a module renders the modal/overlay layer),
+                    // so an untrusted origin must not publish Modal/Overlay
+                    // bindings: it could eclipse a trusted binding. Reject the
+                    // whole payload fail-closed.
+                    if !trusted && context != ContextPredicate::Always {
+                        return Err(format!(
+                            "contribution_publish: untrusted origin cannot publish context-scoped keymap bindings ({context:?})"
+                        ));
+                    }
                     staged.push(Contribution {
                         scope: info.scope.clone(),
                         kind: ContributionKind::Keymap(Keybinding {
@@ -829,11 +857,21 @@ impl ModuleHost {
     }
 }
 
+/// Maximum bindings accepted in one `keymap` publish (mirrors the tree's
+/// structural-bound style); keys/actions are length-capped too, so a single
+/// publish cannot force unbounded registry work (`apply` is O(n^2) per publish).
+const MAX_KEYBINDINGS: usize = 256;
+/// Maximum char length of a binding key.
+const MAX_KEY_LEN: usize = 64;
+/// Maximum char length of a binding action id.
+const MAX_ACTION_LEN: usize = 128;
+
 /// Map the publishing generation's origin to its keymap dispatch tier
 /// (decision 29): built-in defaults rank lowest; runtime-added modules
 /// (`Agent`, `UserInstalled`) rank as plugins; user/project config ranks
 /// highest. Workspace config is config, not a plugin, so it ranks with user
-/// config.
+/// config — but note it is UNTRUSTED for the Modal/Overlay gate above (see
+/// [`ModuleOrigin::is_trusted`]).
 fn keymap_origin(origin: ModuleOrigin) -> KeymapOrigin {
     match origin {
         ModuleOrigin::Builtin => KeymapOrigin::Builtin,
@@ -1217,6 +1255,86 @@ mod tests {
             2,
             "malformed payloads stage nothing"
         );
+        drop(host);
+        teardown(dir, queue);
+    }
+
+    /// Decision 29 (amended): context rank outranks origin rank and the
+    /// context is module-chosen, so only a trusted origin may publish
+    /// `Modal`/`Overlay` bindings; the whole payload is rejected otherwise.
+    #[test]
+    fn keymap_rejects_untrusted_context_scoped_bindings() {
+        let (dir, queue, host) = host_with_generation("keymap-trust");
+        let mut untrusted = info();
+        untrusted.origin = ModuleOrigin::WorkspaceConfig;
+        let err = host
+            .op_contribution_publish(
+                &untrusted,
+                r#"{"kind":"keymap","bindings":[{"key":"k","context":"modal","action":"a"}]}"#,
+            )
+            .unwrap_err();
+        assert!(err.contains("untrusted origin"), "{err}");
+        assert!(
+            host.published_contributions(1).is_empty(),
+            "the whole payload is rejected, not just the scoped binding"
+        );
+        let err = host
+            .op_contribution_publish(
+                &untrusted,
+                r#"{"kind":"keymap","bindings":[{"key":"k","context":"overlay","action":"a"}]}"#,
+            )
+            .unwrap_err();
+        assert!(err.contains("untrusted origin"), "{err}");
+        // `Always` bindings from an untrusted origin are still accepted.
+        host.op_contribution_publish(
+            &untrusted,
+            r#"{"kind":"keymap","bindings":[{"key":"k","context":"always","action":"a"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(host.published_contributions(1).len(), 1);
+        drop(host);
+        teardown(dir, queue);
+    }
+
+    /// A `keymap` publish is bounded (count + key/action length) and the
+    /// context parse is strict (a non-string never defaults to `Always`).
+    #[test]
+    fn keymap_publish_is_bounded_and_context_is_strict() {
+        let (dir, queue, host) = host_with_generation("keymap-bounds");
+        let i = info();
+        let bindings: Vec<String> = (0..MAX_KEYBINDINGS + 1)
+            .map(|n| format!(r#"{{"key":"k{n}","action":"a"}}"#))
+            .collect();
+        let payload = format!(r#"{{"kind":"keymap","bindings":[{}]}}"#, bindings.join(","));
+        let err = host.op_contribution_publish(&i, &payload).unwrap_err();
+        assert!(err.contains("maximum"), "{err}");
+
+        let long_key = "x".repeat(MAX_KEY_LEN + 1);
+        let err = host
+            .op_contribution_publish(
+                &i,
+                &format!(r#"{{"kind":"keymap","bindings":[{{"key":"{long_key}","action":"a"}}]}}"#),
+            )
+            .unwrap_err();
+        assert!(err.contains("at most"), "{err}");
+
+        let long_action = "a".repeat(MAX_ACTION_LEN + 1);
+        let err = host
+            .op_contribution_publish(
+                &i,
+                &format!(r#"{{"kind":"keymap","bindings":[{{"key":"k","action":"{long_action}"}}]}}"#),
+            )
+            .unwrap_err();
+        assert!(err.contains("at most"), "{err}");
+
+        for bad in [
+            r#"{"kind":"keymap","bindings":[{"key":"k","context":5,"action":"a"}]}"#,
+            r#"{"kind":"keymap","bindings":[{"key":"k","context":true,"action":"a"}]}"#,
+        ] {
+            let err = host.op_contribution_publish(&i, bad).unwrap_err();
+            assert!(err.contains("must be a string"), "strict context for {bad}: {err}");
+        }
+        assert!(host.published_contributions(1).is_empty());
         drop(host);
         teardown(dir, queue);
     }
