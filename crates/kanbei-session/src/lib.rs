@@ -88,7 +88,7 @@ mod layout;
 mod recovery;
 mod switch;
 mod transcript;
-use layout::{resolve_and_migrate, write_manifest};
+use layout::{ResolvedSession, resolve_and_migrate, write_manifest};
 use recovery::{decode_record, recover_or_fresh, shutdown_queue};
 pub use builtin_config::{
     BUILTIN_CONFIG_SOURCE, builtin_config_manifest, builtin_config_module_id, root_scope,
@@ -266,11 +266,13 @@ pub struct SessionConfig {
     /// presentation.
     pub present_hook: Option<PresentHook>,
     // --- M4 memory substrate + context projection ---
-    /// Memory substrate root (canonical XDG state). None = cfg.dir.join("memory").
+    /// Memory substrate root (canonical XDG state). None = under a layout its
+    /// `memory/`, else `cfg.dir.join("memory")`.
     pub memory_root: Option<PathBuf>,
     /// XDG state layout (decision 33/T14); None = the legacy cwd-relative
-    /// layout under `dir`. Step 1 only exposes the resolver: nothing in `open`
-    /// consults this yet, so existing paths are unchanged.
+    /// layout under `dir`. With one, `open` derives the session dir, log,
+    /// manifest, memory root and projection from it and treats `dir` as the
+    /// legacy source a migration reads.
     pub layout: Option<kanbei_core::StateLayout>,
     /// ProjectId (pro_ brand) binding; None = no project memory scope.
     pub project: Option<Id128>,
@@ -753,30 +755,40 @@ impl Session {
     /// After the M1 flow the M2 subsystems are built: the shared service
     /// registry, the scope tree, the contribution registry, the composition
     /// store, the retention gate, and (when the guest wasm loads) the module
-    /// manager with its own object-store handle over `<dir>/objects` and the
-    /// state store over `<dir>/state`. The `cfg.config_layers` generations are
-    /// then activated atomically LOW→HIGH; a failing non-builtin layer drops
-    /// the non-builtin generations, keeps the built-in one active, and commits
+    /// manager with its own object-store handle over the session dir's
+    /// `objects/` and the state store over its `state/`. The
+    /// `cfg.config_layers` generations are then activated atomically LOW→HIGH;
+    /// a failing non-builtin layer drops the non-builtin generations, keeps the
+    /// built-in one active, and commits
     /// a canonical `safe_mode_activated` event — the session remains usable
     /// (R-01/C-02, decision 28).
     pub fn open(mut cfg: SessionConfig) -> Result<Self, SessionError> {
         // Storage root (decision 33): without a layout `cfg.dir` is the session
         // root exactly as before; with one the session dir is derived from the
         // layout and `cfg.dir` is only the legacy source a migration reads.
+        // The identity is resolved before any path is derived, so the id stops
+        // being a post-hoc recovery from the log markers.
         let session_layout = cfg.layout.clone();
-        let (session_dir, session_id) = match &session_layout {
-            None => {
-                let id = cfg.session_id.unwrap_or_else(Id128::generate);
-                (cfg.dir.clone(), id)
-            }
+        let resolved = match &session_layout {
+            None => ResolvedSession {
+                id: cfg.session_id.unwrap_or_else(Id128::generate),
+                project: None,
+            },
             Some(layout) => {
                 let memory_root = cfg
                     .memory_root
                     .clone()
                     .unwrap_or_else(|| layout.memory_root());
-                let id = resolve_and_migrate(layout, cfg.session_id, &cfg.dir, &memory_root)?;
-                (layout.session_dir(id), id)
+                resolve_and_migrate(layout, cfg.session_id, &cfg.dir, &memory_root)?
             }
+        };
+        let session_id = resolved.id;
+        // The caller's binding wins; otherwise a resumed session re-binds the
+        // project its manifest persisted.
+        let project_id = cfg.project.or(resolved.project);
+        let session_dir = match &session_layout {
+            None => cfg.dir.clone(),
+            Some(layout) => layout.session_dir(session_id),
         };
         std::fs::create_dir_all(&session_dir)?;
         let log_path = match &session_layout {
@@ -798,7 +810,7 @@ impl Session {
         // Persist the identity as `session.json` (decision 33), after the log
         // opens so a resolver never sees a manifest whose log is not durable.
         if let Some(layout) = &session_layout
-            && let Err(e) = write_manifest(layout, session_id)
+            && let Err(e) = write_manifest(layout, session_id, project_id)
         {
             drop(log);
             shutdown_queue(queue);
@@ -909,7 +921,6 @@ impl Session {
         });
         std::fs::create_dir_all(&memory_root)?;
         let memory_fault = cfg.memory_fault.clone();
-        let project_id = cfg.project;
         let child_provider = cfg.child_provider.take();
         let mut memory_lifetime = kanbei_memory::MemoryRootActor::open(
             &memory_root,
@@ -1715,7 +1726,11 @@ impl Session {
         // only known once the first frame exists, which for a fresh session is
         // after open wrote the initial manifest.
         if let Some(layout) = &self.cfg.layout {
-            write_manifest(layout, self.session_id)?;
+            write_manifest(
+                layout,
+                self.session_id,
+                self.project_entry.as_ref().map(|entry| entry.project_id),
+            )?;
         }
         let Session {
             log,

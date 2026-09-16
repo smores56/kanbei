@@ -61,9 +61,9 @@ fn base_root(xdg: Option<&OsStr>, home_rel: &Path, home: Option<&OsStr>) -> Opti
 }
 
 /// The kanbei state layout (decision 33): pure path derivations under one state
-/// root. Holds no handles and performs no filesystem I/O — step 2 wires these
-/// paths into session/memory/projection storage, which is why nothing consumes
-/// them yet.
+/// root. Holds no handles and performs no filesystem I/O — `Session::open`
+/// derives the session dir/log/manifest, memory root and projection from it
+/// when a layout is configured.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateLayout {
     root: PathBuf,

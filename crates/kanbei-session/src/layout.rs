@@ -5,7 +5,12 @@
 //! persisted `session.json` manifest; the module resolves which session to
 //! open, creates a fresh one when none exists, and migrates a legacy
 //! cwd-relative dir (`log.zst`) into the layout. With no layout every path is
-//! derived from `SessionConfig::dir` as before — this module is never reached.
+//! derived from `SessionConfig::dir` as before — this module is never reached,
+//! so an explicit-dir session is never inspected, migrated or manifested.
+//!
+//! Exactly one case migrates: a layout open whose legacy source dir (the
+//! session's `SessionConfig::dir`) carries a `log.zst`. The source is copied,
+//! never moved, so a failed or repeated migration cannot lose it.
 
 use std::io;
 use std::path::Path;
@@ -14,7 +19,7 @@ use kanbei_core::id::Id128;
 use kanbei_core::StateLayout;
 use serde::{Deserialize, Serialize};
 
-use crate::recovery::recover_session_id;
+use crate::recovery::{recover_bound_project, recover_session_id};
 use crate::SessionError;
 
 /// The manifest schema this build reads and writes.
@@ -40,6 +45,18 @@ pub(crate) struct SessionManifest {
     pub log: String,
     #[serde(default)]
     pub created_us: u64,
+    /// The bound project (the `project_bound` fact's subject), so a resume
+    /// re-binds it without the caller naming it again. `None` = unbound, and
+    /// a caller-supplied `SessionConfig::project` always wins over this.
+    #[serde(default)]
+    pub project: Option<Id128>,
+}
+
+/// The session a layout open resolved: its identity, plus the project its
+/// manifest persisted (the caller's own binding takes precedence).
+pub(crate) struct ResolvedSession {
+    pub id: Id128,
+    pub project: Option<Id128>,
 }
 
 /// Resolves which session a layout open targets.
@@ -51,67 +68,97 @@ pub(crate) struct SessionManifest {
 /// 3. Otherwise the most recently created session — greatest manifest
 ///    `created_us`, ties broken by the greatest id text — is resumed;
 ///    with no session present a fresh id is generated.
+///
+/// The project each branch reports is the manifest's: a caller-supplied
+/// `SessionConfig::project` overrides it in `Session::open`.
 pub(crate) fn resolve_and_migrate(
     layout: &StateLayout,
     requested: Option<Id128>,
     legacy_dir: &Path,
     memory_root: &Path,
-) -> Result<Id128, SessionError> {
+) -> Result<ResolvedSession, SessionError> {
     if legacy_dir.join(LEGACY_LOG_NAME).is_file() {
-        return migrate_legacy(layout, legacy_dir, memory_root);
+        let id = migrate_legacy(layout, legacy_dir, memory_root)?;
+        return Ok(ResolvedSession {
+            id,
+            project: manifest_project(layout, id)?,
+        });
     }
     if let Some(id) = requested {
-        return Ok(id);
+        return Ok(ResolvedSession {
+            id,
+            project: manifest_project(layout, id)?,
+        });
     }
-    Ok(scan_sessions(layout)?.unwrap_or_else(Id128::generate))
+    Ok(scan_sessions(layout)?.unwrap_or(ResolvedSession {
+        id: Id128::generate(),
+        project: None,
+    }))
+}
+
+/// The project a session's manifest persisted, if any.
+fn manifest_project(layout: &StateLayout, session: Id128) -> Result<Option<Id128>, SessionError> {
+    Ok(read_manifest(&layout.session_manifest(session))?.and_then(|m| m.project))
 }
 
 /// Picks the most recently created session, if any. A session dir without a
 /// manifest is a migration still in flight: it is skipped, never opened half
-/// written. A manifest that exists but does not decode is corruption and fails
-/// loud rather than resurrecting or silently dropping a session.
-fn scan_sessions(layout: &StateLayout) -> Result<Option<Id128>, SessionError> {
+/// written.
+fn scan_sessions(layout: &StateLayout) -> Result<Option<ResolvedSession>, SessionError> {
     let sessions = layout.root().join("sessions");
     let entries = match std::fs::read_dir(&sessions) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let mut best: Option<(u64, String, Id128)> = None;
+    let mut best: Option<(u64, String, ResolvedSession)> = None;
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let manifest_path = entry.path().join(MANIFEST_NAME);
-        let text = match std::fs::read_to_string(&manifest_path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
+        let Some(manifest) = read_manifest(&entry.path().join(MANIFEST_NAME))? else {
+            continue;
         };
-        let manifest: SessionManifest = serde_json::from_str(&text).map_err(|e| {
-            SessionError::CorruptRecord(format!(
-                "session manifest {}: {e}",
-                manifest_path.display()
-            ))
-        })?;
-        if manifest.schema != SESSION_MANIFEST_SCHEMA {
-            return Err(SessionError::CorruptRecord(format!(
-                "session manifest {}: unsupported schema {}",
-                manifest_path.display(),
-                manifest.schema
-            )));
-        }
         let candidate = (manifest.created_us, manifest.session.to_string());
         let better = match &best {
             None => true,
             Some((created, text, _)) => candidate > (*created, text.clone()),
         };
         if better {
-            best = Some((candidate.0, candidate.1, manifest.session));
+            best = Some((
+                candidate.0,
+                candidate.1,
+                ResolvedSession {
+                    id: manifest.session,
+                    project: manifest.project,
+                },
+            ));
         }
     }
-    Ok(best.map(|(_, _, id)| id))
+    Ok(best.map(|(_, _, resolved)| resolved))
+}
+
+/// Reads a session manifest. Absent is `None`. A manifest that exists but does
+/// not decode, or carries an unknown schema, is corruption and fails loud
+/// rather than resurrecting or silently dropping a session.
+fn read_manifest(path: &Path) -> Result<Option<SessionManifest>, SessionError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let manifest: SessionManifest = serde_json::from_str(&text).map_err(|e| {
+        SessionError::CorruptRecord(format!("session manifest {}: {e}", path.display()))
+    })?;
+    if manifest.schema != SESSION_MANIFEST_SCHEMA {
+        return Err(SessionError::CorruptRecord(format!(
+            "session manifest {}: unsupported schema {}",
+            path.display(),
+            manifest.schema
+        )));
+    }
+    Ok(Some(manifest))
 }
 
 /// Migrates a legacy dir into the layout. Idempotent by the target manifest:
@@ -150,18 +197,25 @@ fn migrate_legacy(
     if src_memory.is_dir() {
         copy_dir_all(&src_memory, memory_root).map_err(|e| copy_error(&src_memory, e))?;
     }
-    write_manifest(layout, id)?;
+    // The source's project binding survives the move (the marker the import
+    // path recovers from too), so a resume re-binds it.
+    write_manifest(layout, id, recover_bound_project(source)?)?;
     Ok(id)
 }
 
 /// Writes (atomically, via a temp file + rename) the manifest for `session`.
-pub(crate) fn write_manifest(layout: &StateLayout, session: Id128) -> Result<(), SessionError> {
+pub(crate) fn write_manifest(
+    layout: &StateLayout,
+    session: Id128,
+    project: Option<Id128>,
+) -> Result<(), SessionError> {
     let log = layout.session_log(session);
     let manifest = SessionManifest {
         schema: SESSION_MANIFEST_SCHEMA,
         session,
         log: SESSION_LOG_NAME.to_string(),
         created_us: first_frame_us(&log)?.unwrap_or(0),
+        project,
     };
     let path = layout.session_manifest(session);
     let tmp = path.with_extension("json.tmp");

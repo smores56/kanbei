@@ -2,16 +2,21 @@
 //!
 //! Usage: `kanbei [DIR]`
 //!
-//! DIR defaults to `$KANBEI_DIR`, then `.` (the session dir). The session dir
-//! is also the project-config root: `discover_config_layers` activates the
-//! built-in defaults, then `$XDG_CONFIG_HOME/kanbei/init.lua` (or
+//! DIR defaults to `$KANBEI_DIR`, then `.` (the project-config root and fs
+//! sandbox). Session storage follows decision 33: with an explicit DIR the
+//! session keeps the legacy layout under it, and without one it lives under the
+//! XDG state layout (`$XDG_STATE_HOME/kanbei/sessions/<SessionId>/`, falling
+//! back to `$HOME/.local/state/kanbei`). The root is the project-config root
+//! too: `discover_config_layers` activates the built-in defaults, then
+//! `$XDG_CONFIG_HOME/kanbei/init.lua` (or
 //! `$HOME/.config/kanbei/init.lua`), then `<DIR>/.kanbei/init.lua`. The
 //! provider and approval wiring — engine, base URL, model, protocol, key
 //! reference, auto-approval, yolo — comes from the merged config layers
 //! through [`CliSettings`] (decision 28), not argv.
 //!
 //! Bootstrap env surface (all other `KANBEI_*` env was retired by decision 28):
-//! - `KANBEI_DIR` — the session/layout root when no positional DIR is given.
+//! - `KANBEI_DIR` — the project root when no positional DIR is given; naming it
+//!   keeps the legacy session layout.
 //! - `KANBEI_PROVIDER_URL` / `KANBEI_PROVIDER_KEY` — read only as fallbacks
 //!   when config does not supply a base URL/key; config wins.
 //!
@@ -44,6 +49,7 @@ use kanbei_capabilities::{
 };
 use kanbei_core::digest::Digest;
 use kanbei_core::id::Id128;
+use kanbei_core::StateLayout;
 use kanbei_driver::{Driver, Turn};
 use kanbei_modules::PackageManifest;
 use kanbei_provider::{
@@ -68,20 +74,39 @@ use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 const USAGE: &str = "usage: kanbei [DIR]";
 
 /// Bootstrap-only CLI options (decision 28): argv/env no longer carry provider
-/// or approval wiring — that lives in the config layers. `dir` is the session
-/// layout root and the project-config root.
-#[derive(Debug)]
+/// or approval wiring — that lives in the config layers. `dir` is the
+/// project-config root (and the fs sandbox), and — because decision 33 keys the
+/// XDG layout off an *explicit* root — naming it also selects the legacy
+/// session layout.
+#[derive(Debug, Default)]
 struct Options {
-    dir: PathBuf,
+    /// None = neither argv nor `KANBEI_DIR` named a root.
+    dir: Option<PathBuf>,
 }
 
 impl Options {
     fn from_env() -> Self {
+        // An empty value counts as unset (the XDG rule), never as `""`.
         Self {
-            dir: std::env::var("KANBEI_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(".")),
+            dir: std::env::var_os("KANBEI_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
         }
+    }
+
+    /// The project root: the explicit dir, else the cwd (the pre-decision-33
+    /// default).
+    fn root(&self) -> &Path {
+        self.dir.as_deref().unwrap_or(Path::new("."))
+    }
+
+    /// The state layout this run opens its session with (decision 33): the XDG
+    /// layout only when the user named no root, so an explicit `DIR`/
+    /// `KANBEI_DIR` keeps the legacy layout. `env_layout` is the layout the
+    /// process environment resolves to; `None` (no `$XDG_STATE_HOME`/`$HOME`)
+    /// degrades to the legacy layout rather than failing open.
+    fn session_layout(&self, env_layout: Option<StateLayout>) -> Option<StateLayout> {
+        if self.dir.is_some() { None } else { env_layout }
     }
 }
 
@@ -98,7 +123,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         positional = Some(arg.clone());
     }
     if let Some(dir) = positional {
-        opts.dir = PathBuf::from(dir);
+        opts.dir = Some(PathBuf::from(dir));
     }
     Ok(opts)
 }
@@ -483,12 +508,14 @@ fn discover_config_layers_or_default(dir: &Path) -> (Vec<PackageManifest>, Optio
 /// Piped-stdin path: the plain line REPL.
 fn run_repl(opts: Options) {
     let interactive: ApprovalResolver = Arc::new(interactive_approve);
-    let (config_layers, config_discovery_error) = discover_config_layers_or_default(&opts.dir);
+    let root = opts.root();
+    let (config_layers, config_discovery_error) = discover_config_layers_or_default(root);
     let session = match Session::open(SessionConfig {
-        dir: opts.dir.clone(),
+        dir: root.to_path_buf(),
+        layout: opts.session_layout(StateLayout::from_env()),
         stream: "cli".into(),
         engine: Some(cli_engine()),
-        fs_root: opts.dir.clone(),
+        fs_root: root.to_path_buf(),
         config_layers,
         config_discovery_error,
         settings: Some(Arc::new(CliSettings {
@@ -583,12 +610,14 @@ fn run_tui(opts: Options) -> i32 {
         reply_rx.recv().unwrap_or(false)
     });
     let cancel_cfg = cancel_flag.clone();
-    let (config_layers, config_discovery_error) = discover_config_layers_or_default(&opts.dir);
+    let root = opts.root();
+    let (config_layers, config_discovery_error) = discover_config_layers_or_default(root);
     let cfg = SessionConfig {
-        dir: opts.dir.clone(),
+        dir: root.to_path_buf(),
+        layout: opts.session_layout(StateLayout::from_env()),
         stream: "cli".into(),
         engine: Some(cli_engine()),
-        fs_root: opts.dir.clone(),
+        fs_root: root.to_path_buf(),
         config_layers,
         config_discovery_error,
         settings: Some(Arc::new(CliSettings {
@@ -872,7 +901,31 @@ mod tests {
     #[test]
     fn parse_positional_dir() {
         let opts = parse_args(&["/tmp/x".into()]).unwrap();
-        assert_eq!(opts.dir, PathBuf::from("/tmp/x"));
+        assert_eq!(opts.dir, Some(PathBuf::from("/tmp/x")));
+    }
+
+    /// Decision 33: an explicit root (argv/`KANBEI_DIR`) keeps the legacy
+    /// session layout; the unnamed root falls back to the cwd and opts into the
+    /// XDG state layout.
+    #[test]
+    fn explicit_dir_keeps_the_legacy_layout() {
+        let opts = Options {
+            dir: Some(PathBuf::from("/tmp/x")),
+        };
+        assert_eq!(opts.root(), Path::new("/tmp/x"));
+        assert!(opts.session_layout(Some(StateLayout::new("/state"))).is_none());
+    }
+
+    #[test]
+    fn unnamed_dir_uses_the_xdg_layout() {
+        let opts = Options::default();
+        assert_eq!(opts.root(), Path::new("."));
+        let layout = opts
+            .session_layout(Some(StateLayout::new("/state")))
+            .expect("the unnamed root opens under the XDG layout");
+        assert_eq!(layout.root(), Path::new("/state"));
+        // An unresolvable state root degrades to the legacy layout.
+        assert!(opts.session_layout(None).is_none());
     }
 
     /// Decision 28: the provider/approval flags are gone — argv is

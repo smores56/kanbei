@@ -91,6 +91,7 @@ fn session_lands_under_the_layout_with_a_manifest() {
     assert_eq!(manifest["schema"], 1);
     assert_eq!(manifest["session"], id.to_string());
     assert_eq!(manifest["log"], "events.jsonl.zst");
+    assert!(manifest["project"].is_null(), "unbound session: {manifest}");
     session.close().unwrap();
 }
 
@@ -229,6 +230,43 @@ fn default_path_is_unchanged() {
     assert!(dir.path().join("memory").is_dir());
     session.close().unwrap();
     assert!(!dir.path().join("session.json").exists());
+}
+
+/// (f) The manifest persists the bound project; a resume that names no project
+/// re-binds the persisted one (decision 33: the identity precedes the log).
+#[test]
+fn manifest_persists_the_bound_project() {
+    let root = TempDir::new("g-root");
+    let legacy = TempDir::new("g-legacy");
+    let layout = StateLayout::new(root.path());
+    let project = Id128::generate();
+    let id = {
+        let session = Session::open(SessionConfig {
+            dir: legacy.path().to_path_buf(),
+            layout: Some(layout.clone()),
+            project: Some(project),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(session.project_entry().unwrap().project_id, project);
+        let id = session.session_id();
+        session.close().unwrap();
+        id
+    };
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(layout.session_manifest(id)).unwrap())
+            .unwrap();
+    assert_eq!(manifest["project"], project.to_string());
+
+    let session = open_under(&layout, legacy.path());
+    assert_eq!(session.session_id(), id);
+    assert_eq!(
+        session.project_entry().map(|entry| entry.project_id),
+        Some(project),
+        "resume re-binds the persisted project"
+    );
+    session.close().unwrap();
 }
 
 /// An ambiguous legacy dir (a `log.zst` with no recoverable identity) fails
