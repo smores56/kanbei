@@ -957,9 +957,18 @@ impl Session {
         memory_lifetime.set_fault(memory_fault.clone());
         let (memory_project, project_entry) = match project_id {
             Some(project_id) => {
-                let mut registry =
-                    kanbei_memory::ProjectRegistry::open(&memory_root.join("projects.jsonl"))
-                        .map_err(SessionError::Memory)?;
+                // Under a layout the registry is the canonical append log at
+                // the layout path (migrating the legacy JSONL once); without
+                // one it stays the plain explicit-path JSONL.
+                let mut registry = match &session_layout {
+                    Some(layout) => {
+                        kanbei_memory::ProjectRegistry::open_under(layout, &memory_root)
+                    }
+                    None => {
+                        kanbei_memory::ProjectRegistry::open(&memory_root.join("projects.jsonl"))
+                    }
+                }
+                .map_err(SessionError::Memory)?;
                 let entry = match registry.lookup(project_id).map_err(SessionError::Memory)? {
                     Some(entry) => entry,
                     None => {

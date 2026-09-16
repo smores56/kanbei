@@ -16,7 +16,10 @@
 //!
 //! ```text
 //! <memory_root>/
-//! ├── projects.jsonl                  (ProjectRegistry, append-only JSONL)
+//! ├── projects/events.jsonl.zst       (ProjectRegistry under a layout:
+//! │                                    AppendLog, stream "project-registry")
+//! ├── projects.jsonl                  (ProjectRegistry without one: plain
+//! │                                    JSONL — the pre-layout form)
 //! ├── lifetime/
 //! │   ├── transitions.jsonl.zst       (AppendLog, stream "memory-transitions")
 //! │   ├── head.json                   (atomic convenience pointer)
@@ -34,7 +37,9 @@ pub mod types;
 
 pub use actor::{MemoryFaultInjector, MemoryFaultPoint, MemoryRootActor, TransitionOutcome};
 pub use error::MemoryError;
-pub use registry::{PROJECT_ENTRY_SCHEMA, ProjectEntry, ProjectRegistry};
+pub use registry::{
+    PROJECT_ENTRY_SCHEMA, PROJECTS_STREAM, ProjectEntry, ProjectRegistry, entry_of_record,
+};
 pub use types::{
     Claim, ClaimEdge, ClaimProvenance, EdgeKind, IdempotencyKey, MEMORY_CLAIM_SCHEMA,
     MEMORY_EDGE_SCHEMA, MEMORY_ROOT_SCHEMA, MEMORY_TRANSITION_SCHEMA, MemoryFollowPolicy,

@@ -9,6 +9,7 @@ use kanbei_core::envelope::Envelope;
 use kanbei_core::id::Id128;
 use kanbei_core::StateLayout;
 use kanbei_log::for_each_frame;
+use kanbei_memory::ProjectRegistry;
 use kanbei_modules::{ModuleOrigin, PACKAGE_SCHEMA, PackageManifest};
 use kanbei_session::{NewEvent, Session, SessionConfig};
 use kanbei_services::ScopePath;
@@ -153,6 +154,13 @@ fn legacy_dir_migrates_and_resumes() {
     assert_eq!(session.session_id(), id, "migration preserves identity");
     assert_eq!(session.log_path(), layout.session_log(id));
     assert!(layout.session_manifest(id).is_file());
+
+    // The migrated registry JSONL became the canonical append-log stream,
+    // keeping the marker's `created_session`.
+    let registry = ProjectRegistry::open_under(&layout, &layout.memory_root()).unwrap();
+    let entry = registry.lookup(project).unwrap().expect("migrated registration");
+    assert_eq!(entry.created_session, id);
+    assert!(layout.projects_log().is_file());
 
     let before = session.next_seq();
     session
@@ -476,4 +484,37 @@ fn explicit_dir_keeps_the_legacy_package_store() {
     assert!(session.store().exists(&digest));
     assert!(dir.path().join("objects").join(digest.to_string()).is_file());
     session.close().unwrap();
+}
+
+/// (j) With a layout the project registry IS the canonical append-log stream
+/// at the layout path: the registration lands there (never in the legacy
+/// `projects.jsonl`) carrying the opening session as its `created_session`.
+#[test]
+fn project_registry_lands_in_the_layout_stream() {
+    let root = TempDir::new("j-root");
+    let legacy = TempDir::new("j-legacy");
+    let layout = StateLayout::new(root.path());
+    let project = Id128::generate();
+
+    let session = Session::open(SessionConfig {
+        dir: legacy.path().to_path_buf(),
+        layout: Some(layout.clone()),
+        project: Some(project),
+        ..Default::default()
+    })
+    .unwrap();
+    let id = session.session_id();
+    session.close().unwrap();
+
+    let log_path = layout.projects_log();
+    assert!(log_path.is_file(), "registry stream at {}", log_path.display());
+    assert!(
+        !layout.memory_root().join("projects.jsonl").exists(),
+        "under a layout the JSONL form is never written"
+    );
+    let registry = ProjectRegistry::open_under(&layout, &layout.memory_root()).unwrap();
+    let entry = registry.lookup(project).unwrap().expect("registered");
+    assert_eq!(entry.created_session, id, "the opening session is the marker");
+    assert_eq!(entry.name, "default");
+    assert_eq!(entry.dir, format!("projects/{project}"));
 }

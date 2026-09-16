@@ -197,6 +197,19 @@ impl Session {
             if registry.exists() {
                 std::fs::copy(&registry, target_memory_root.join("projects.jsonl"))?;
             }
+            // Under a layout the source's registry stream is the append log
+            // (the JSONL copy above only covers a legacy source); copy it so
+            // the fork inherits the locator and its original `created_session`.
+            if let (Some(source), Some(target)) = (&self.cfg.layout, &options.config.layout) {
+                let source_log = source.projects_log();
+                if source_log.is_file() {
+                    let target_log = target.projects_log();
+                    if let Some(parent) = target_log.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::copy(&source_log, target_log)?;
+                }
+            }
             if let Some(project_root) = facts.project_memory_root {
                 let scope_dir = kanbei_memory::MemoryScope::Project(project_id).dir_name();
                 copy_dir_all(

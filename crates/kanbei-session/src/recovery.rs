@@ -64,9 +64,10 @@ pub(crate) fn shutdown_queue(queue: Arc<DurabilityQueue>) {
 /// The session id an imported dir carries, if any: the first canonical
 /// identity marker, in order — a `memory_proposal` owner principal on the
 /// session log, a memory transition's `origin_session`, or the project
-/// registry's `created_session`. None = the dir carries no session identity
-/// (import then opens with a fresh id). The session id is not part of the
-/// layout; these are the markers a session leaves behind.
+/// registry's `created_session` (in whichever form the registry has: the
+/// append-log stream, else the plain JSONL). None = the dir carries no session
+/// identity (import then opens with a fresh id). The session id is not part of
+/// the layout; these are the markers a session leaves behind.
 pub(crate) fn recover_session_id(source_dir: &Path) -> Result<Option<Id128>, SessionError> {
     let mut found: Option<Id128> = None;
     let log_path = source_dir.join("log.zst");
@@ -152,6 +153,27 @@ pub(crate) fn recover_session_id(source_dir: &Path) -> Result<Option<Id128>, Ses
         }
     }
     if found.is_none() {
+        let registry_log = source_dir
+            .join("memory")
+            .join("projects")
+            .join("events.jsonl.zst");
+        if registry_log.is_file() {
+            kanbei_log::for_each_frame(&registry_log, |info| {
+                if found.is_some() {
+                    return;
+                }
+                for line in &info.events {
+                    if let Some(id) = kanbei_memory::entry_of_record(line)
+                        .map(|entry| entry.created_session)
+                    {
+                        found = Some(id);
+                        return;
+                    }
+                }
+            })?;
+        }
+    }
+    if found.is_none() {
         let registry = source_dir.join("memory").join("projects.jsonl");
         if let Ok(text) = std::fs::read_to_string(&registry) {
             for line in text.lines() {
@@ -198,6 +220,8 @@ pub(crate) fn recover_bound_project(source_dir: &Path) -> Result<Option<Id128>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kanbei_core::queue::DurabilityQueue;
+    use kanbei_log::{AppendLog, Profile};
 
     #[test]
     fn malformed_load_bearing_envelope_fails_loud() {
@@ -218,5 +242,72 @@ mod tests {
     fn well_formed_other_kind_is_none() {
         let line = r#"{"env":1,"seq":1,"evt":"e","kind":"tool_outcome","schema":1,"payload":{},"refs":[],"snapshot":null}"#;
         assert!(decode_record(line, &["breaker_tripped"]).unwrap().is_none());
+    }
+
+    /// Writes `envelope` as a single frame at `path`, creating its parents.
+    fn write_one_frame(path: &Path, stream: &str, envelope: Envelope) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let queue = Arc::new(DurabilityQueue::start("test-recovery-frame"));
+        {
+            let mut log = AppendLog::open(path, stream, Arc::clone(&queue)).unwrap();
+            log.append(&[envelope], Profile::Strict).unwrap();
+        }
+        Arc::try_unwrap(queue)
+            .ok()
+            .expect("the test holds the only queue handle")
+            .shutdown()
+            .unwrap();
+    }
+
+    fn envelope(seq: u64, kind: &str, payload: serde_json::Value) -> Envelope {
+        Envelope {
+            env: 1,
+            seq,
+            evt: format!("{kind}:{seq}"),
+            kind: kind.into(),
+            payload_schema: 1,
+            payload,
+            refs: Vec::new(),
+            snapshot: None,
+        }
+    }
+
+    /// (e) The registry's `created_session` is still a recovery marker when the
+    /// registry is the append-log stream.
+    #[test]
+    fn registry_stream_yields_created_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "kb-recovery-registry-{}-{}",
+            std::process::id(),
+            Id128::generate()
+        ));
+        let session = Id128::generate();
+        let project = Id128::generate();
+        let entry = kanbei_memory::ProjectEntry {
+            schema: kanbei_memory::PROJECT_ENTRY_SCHEMA,
+            project_id: project,
+            name: "default".into(),
+            dir: format!("projects/{project}"),
+            created_session: session,
+            created_event: 1,
+        };
+        // The source is a legacy-rooted dir: its log carries no identity
+        // marker, so recovery falls through to the registry stream.
+        write_one_frame(
+            &dir.join("log.zst"),
+            "session",
+            envelope(1, "probe", serde_json::json!({})),
+        );
+        write_one_frame(
+            &dir.join("memory").join("projects").join("events.jsonl.zst"),
+            kanbei_memory::PROJECTS_STREAM,
+            envelope(
+                1,
+                "project_registered",
+                serde_json::to_value(entry).unwrap(),
+            ),
+        );
+        assert_eq!(recover_session_id(&dir).unwrap(), Some(session));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
