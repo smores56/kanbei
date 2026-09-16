@@ -9,6 +9,7 @@ mod common;
 use kanbei_capabilities::TrustClass;
 use kanbei_core::id::Id128;
 use kanbei_modules::package::{ModuleOrigin, PackageManifest};
+use kanbei_scopes::contrib::ContributionKind;
 use kanbei_session::Session;
 
 use common::{input_row, open, require_guest};
@@ -99,6 +100,45 @@ fn builtin_shell_renders_transcript_rows() {
     let text = body(&session);
     assert!(text.contains("❯ hello shell"), "user turn row: {text}");
     assert!(text.contains("… working"), "live working indicator: {text}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `activate_builtin_ui` activates the builtin shell as a NON-config module:
+/// it contributes its mount/theme and commits its canonical composition event,
+/// but must NOT pollute the config identity (`config_layers`/`config_digest`)
+/// with a non-config module.
+#[test]
+fn builtin_ui_activation_leaves_config_identity_untouched() {
+    let (dir, mut session) = open("ui-config-identity");
+    require_guest();
+    let layers_before = session.config_layer_digests();
+    let digest_before = session.config_digest();
+    session.activate_builtin_ui().unwrap();
+
+    assert_eq!(
+        session.config_layer_digests(),
+        layers_before,
+        "the builtin UI is not a config layer"
+    );
+    assert_eq!(session.config_digest(), digest_before, "config digest untouched");
+    // Its contributions and canonical event are preserved.
+    assert!(session.ui().is_some(), "UI host bound");
+    assert!(
+        session
+            .composition()
+            .contributions
+            .iter()
+            .any(|c| matches!(c.kind, ContributionKind::UiMount(_))),
+        "ui mount contribution in the composition"
+    );
+    assert!(
+        session
+            .composition()
+            .contributions
+            .iter()
+            .any(|c| matches!(c.kind, ContributionKind::Theme(_))),
+        "theme contribution in the composition"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -55,6 +55,13 @@ use crate::{FaultPoint, NewEvent, Session, SessionError};
 /// run).
 pub const UI_INTENT_RESOURCE: &str = "session";
 
+/// Upper bound on the number of UI mounts the host binds (structural DoS
+/// budget: a single module can publish arbitrarily many distinct mount names,
+/// and `UiHost::mounts` must not grow without bound). Mounts past the budget,
+/// in deterministic (slot, scope path, name) order, are dropped and the host
+/// faults through the composition-failure staleness path.
+const MAX_UI_MOUNTS: usize = 64;
+
 /// A normalized intent emitted by the UI module (R-27: persist intents/facts,
 /// never gestures).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,7 +355,10 @@ impl Session {
             state_schema: None,
             state_key: None,
         };
-        let activation = self.activate_config(manifest)?;
+        // A non-config activation: the built-in shell is kernel-trusted but is
+        // NOT a desired-state config layer, so it must not pollute the config
+        // identity (`config_layers`/`config_digest`).
+        let activation = self.activate_module(manifest)?;
         self.rebind_ui(activation.generation)?;
         let generation = activation.generation;
         let epoch = activation.epoch;
@@ -437,8 +447,17 @@ impl Session {
         });
         let mut bound: Vec<BoundMount> = Vec::new();
         let mut theme = Theme::default_theme();
+        let mut overflow = false;
         for (slot, name, component, scope) in mounts {
-            let Some(generation) = manager.ui_generation(&component) else {
+            // Structural budget: a module can publish arbitrarily many UI
+            // mounts, so the bind set is capped. Excess mounts never bind and
+            // the host faults through the existing composition-failure path
+            // (staleness), rather than letting the mount vector grow unbounded.
+            if bound.len() >= MAX_UI_MOUNTS {
+                overflow = true;
+                break;
+            }
+            let Some(generation) = manager.ui_generation(&scope, &name) else {
                 continue;
             };
             if let Some(overlay) = self.registry.theme_overlay(&root, &name) {
@@ -463,6 +482,11 @@ impl Session {
         } else {
             Some(UiHost::bind(theme, bound))
         };
+        if overflow {
+            self.ui_mark_stale(&format!(
+                "ui mount budget exceeded (max {MAX_UI_MOUNTS}): excess mounts dropped"
+            ));
+        }
         Ok(())
     }
 
@@ -846,9 +870,12 @@ impl Session {
     }
 
     /// Deliver a binding's command to its OWNER mount (the module that
-    /// published the binding), else to the focused mount, else fan out — never
-    /// silently drop. The action id is the owner module's namespace, so a
-    /// victim reducer must not act on it.
+    /// published the binding). A binding with NO owner (a config/global
+    /// binding) falls back to the focused mount, else fans out. A binding whose
+    /// owner module owns no live mount is DROPPED: the action id is the owner
+    /// module's namespace, so a victim reducer must never act on it (the owner
+    /// generation may have been retired/replaced while its keymap contribution
+    /// — keymaps merge, they are never displaced by name — stayed live).
     fn ui_reduce_command(
         &mut self,
         action: &str,
@@ -856,14 +883,18 @@ impl Session {
     ) -> Result<(), SessionError> {
         let target = {
             let host = self.ui_host.as_ref();
-            // Prefer the binding's owner; a config/global binding with no
-            // mount of its own falls back to the focused mount.
-            let focus_index = host.and_then(Self::focused_mount_index);
-            let owner_index = owner.and_then(|mid| {
-                host.and_then(|h| h.mounts.iter().position(|m| m.module_id == Some(mid)))
-            });
-            match owner_index.or(focus_index) {
+            let resolved = match owner {
+                // Attributed binding: only its owner's live mount may act.
+                Some(mid) => host
+                    .and_then(|h| h.mounts.iter().position(|m| m.module_id == Some(mid))),
+                // Unattributed binding: the focused mount, else fan out.
+                None => host.and_then(Self::focused_mount_index),
+            };
+            match resolved {
                 Some(i) => ReduceTarget::Index(i),
+                // A retired owner's mount is gone: drop rather than deliver the
+                // owner's action id to an unrelated reducer.
+                None if owner.is_some() => return Ok(()),
                 None => ReduceTarget::Fanout,
             }
         };

@@ -370,6 +370,56 @@ fn builtin_layer_ctrl_c_dispatches_as_kernel_cancel() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// An owner module that publishes a `g -> cmd_g` binding but NO UI mount: its
+/// command has no owner mount to act on, so pressing `g` must be DROPPED — not
+/// delivered to whatever unrelated mount happens to hold focus.
+#[test]
+fn binding_owner_without_a_mount_is_not_routed_to_the_focused_mount() {
+    let (dir, mut session) = open("keymap-retired-owner");
+    require_guest();
+    session.activate_ui(binding_only_module()).unwrap();
+    session
+        .activate_ui(dispatch_module("b", "b_comp", "status", false, false))
+        .unwrap();
+    session.ui_render_frame().unwrap();
+    assert_eq!(session.ui().unwrap().mounts.len(), 1, "only b's mount is bound");
+    assert_eq!(session.ui().unwrap().mounts[0].component, "b_comp");
+
+    // Focus b's (the only) mount and press the key bound by the mount-less
+    // owner's keymap.
+    session.ui_mut().unwrap().focus.focused = Some("b_input".to_string());
+    session.ui_handle_input(b"g").unwrap();
+    assert!(
+        !saw_command(&session, 0, "cmd_g"),
+        "a mount-less owner's command must be dropped, not delivered to the focused victim mount"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A trusted module that publishes ONLY a keymap (no UI mount), so its
+/// binding's owner module owns no mount.
+fn binding_only_module() -> PackageManifest {
+    PackageManifest {
+        schema: kanbei_modules::PACKAGE_SCHEMA,
+        module_id: Id128::generate(),
+        origin: ModuleOrigin::UserConfig,
+        trust_class: TrustClass::Builtin,
+        scope: kanbei_services::ScopePath(vec!["root".into()]),
+        deps: Vec::new(),
+        capabilities: Vec::new(),
+        source: r#"
+function kb_on_activate(ctx)
+  ctx.contribution_publish('{"kind":"keymap","bindings":[{"key":"g","context":"always","action":"cmd_g"}]}')
+end
+function kb_hot(d) error("binding-only module has no entries") end
+"#
+        .to_string(),
+        state_schema: None,
+        state_key: None,
+    }
+}
+
 /// Whether the mount at `index` recorded the routed command `action`.
 fn saw_command(session: &Session, index: usize, action: &str) -> bool {
     state_contains(session, index, &format!("command:{action}"))

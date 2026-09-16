@@ -306,6 +306,95 @@ fn deactivation_unbinds_replaced_mount() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Two modules may publish the SAME component name under DIFFERENT mount names:
+/// they coexist, each mount resolves to its own publishing generation, and
+/// deactivating one leaves the other bound. (Regression: the host resolved
+/// component -> generation by component name alone, so the second publish
+/// clobbered the first resolution.)
+#[test]
+fn same_component_name_from_two_modules_coexists() {
+    let (dir, mut session) = open("component-collision");
+    require_guest();
+    let a = ui_module("a", "shared_comp", "main", TrustClass::Builtin, false);
+    let b = ui_module("b", "shared_comp", "status", TrustClass::Builtin, false);
+    session.activate_ui(a.clone()).unwrap();
+    session.activate_ui(b.clone()).unwrap();
+
+    let host = session.ui().unwrap();
+    assert_eq!(host.mounts.len(), 2, "both mounts bound");
+    assert_ne!(
+        host.mounts[0].generation, host.mounts[1].generation,
+        "each mount must resolve to its OWN publishing generation"
+    );
+
+    // Deactivating b (a plain module mounts nothing) leaves a bound.
+    let mut plain = plain_module();
+    plain.module_id = b.module_id;
+    session.replace_module(b.module_id, plain).unwrap();
+    let host = session.ui().unwrap();
+    assert_eq!(host.mounts.len(), 1, "a's mount survives b's deactivation");
+    assert_eq!(host.mounts[0].slot, "main");
+
+    session.ui_render_frame().unwrap();
+    assert!(body(&session).contains("panel a"), "a still renders");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A module whose `kb_on_activate` publishes `count` distinct UI mounts (all
+/// into `slot`), each with a distinct name/component: exercises the UI-mount
+/// budget.
+fn many_mounts_module(count: usize) -> PackageManifest {
+    let source = format!(
+        r#"
+function kb_on_activate(ctx)
+  for i = 1, {count} do
+    ctx.contribution_publish('{{"kind":"ui","name":"m' .. i .. '","component":"c' .. i .. '","slot":"main"}}')
+  end
+end
+function kb_hot(d)
+  if d.entry == "ui_reduce" then
+    return {{ state = d.state, intents = {{}} }}
+  elseif d.entry == "ui_render" then
+    return {{ root = {{ id = "root", kind = "stack", children = {{
+      {{ id = "t", kind = "text", spans = {{ {{ text = "many" }} }} }},
+    }} }} }}
+  end
+  error("unknown entry: " .. tostring(d.entry))
+end
+"#
+    );
+    PackageManifest {
+        schema: kanbei_modules::PACKAGE_SCHEMA,
+        module_id: Id128::generate(),
+        origin: ModuleOrigin::UserConfig,
+        trust_class: TrustClass::Builtin,
+        scope: kanbei_services::ScopePath(vec!["root".into()]),
+        deps: Vec::new(),
+        capabilities: Vec::new(),
+        source,
+        state_schema: None,
+        state_key: None,
+    }
+}
+
+/// The UI-mount count is capped: a module publishing more mounts than the
+/// budget has the excess dropped (they never enter `mounts`) and the host
+/// faults through the existing composition-failure path (staleness banner).
+#[test]
+fn ui_mount_count_is_capped() {
+    let (dir, mut session) = open("mount-cap");
+    require_guest();
+    session.activate_ui(many_mounts_module(65)).unwrap();
+    let host = session.ui().unwrap();
+    assert_eq!(host.mounts.len(), 64, "mounts past the cap do not bind");
+    assert!(
+        host.staleness.is_some(),
+        "overflowing the mount budget faults via the staleness path"
+    );
+    session.ui_render_frame().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Fault isolation: one mount's generation trapping degrades only that
 /// mount (placeholder subtree); the other mount still renders and applies
 /// intents.

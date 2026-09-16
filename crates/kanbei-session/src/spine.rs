@@ -1681,6 +1681,10 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
             };
             match outcome.map_err(SessionError::Memory)? {
                 TransitionOutcome::Committed { transition_id, .. } => {
+                    // R-08: the actor just advanced a memory root, so the
+                    // backlink is a state-changing commit — pin the post-state
+                    // manifest (its memory-root pin captures the new head) so
+                    // `current_snapshot` advances and a resume re-derives it.
                     self.commit(
                         vec![NewEvent {
                             kind: "memory_transition_backlink".into(),
@@ -1693,7 +1697,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                             objects: Vec::new(),
                             refs: Vec::new(),
                         }],
-                        None,
+                        Some(self.composition.current().digest),
                     )?;
                     return Ok(("approved".into(), Some(transition_id)));
                 }

@@ -123,9 +123,13 @@ pub struct ModuleHost {
     /// (M5 UI/theme mounts). Kept out of the live registry until the session
     /// stages + OCC-publishes them atomically (the activation delta).
     contributions: Mutex<HashMap<u64, Vec<Contribution>>>,
-    /// UI component name → generation that mounted it (stale generations are
-    /// removed on disposal, so a displaced mount cannot be resolved).
-    ui_components: Mutex<HashMap<String, u64>>,
+    /// UI mount `(scope, name)` → generation that mounted it (stale
+    /// generations are removed on disposal, so a displaced mount cannot be
+    /// resolved). Keyed by the registry's own mount identity `(scope, name)` —
+    /// NOT by component: two modules may export the same component name under
+    /// different mount names, and keying by component alone let one clobber the
+    /// other's resolution/teardown.
+    ui_components: Mutex<HashMap<(ScopePath, String), u64>>,
     /// Hook `(scope, kind, name)` → generation that declared it (mirrors
     /// `ui_components`; stale generations are pruned on disposal). Keyed by
     /// the full scope path so same-named hooks in different scopes never
@@ -590,6 +594,10 @@ impl ModuleHost {
         let staged: Vec<Contribution> = match kind {
             "ui" => {
                 let name = name()?;
+                // The registry's UiMount identity is (scope, name); resolve the
+                // mount by it so two modules sharing a component name never
+                // collide (nor unbind each other on teardown).
+                let mount_identity = (info.scope.clone(), name.clone());
                 let component = v
                     .get("component")
                     .and_then(Value::as_str)
@@ -606,7 +614,7 @@ impl ModuleHost {
                     .lock()
                     .expect("ui components lock poisoned");
                 self.ensure_current(info.generation)?;
-                ui_components.insert(component.clone(), info.generation);
+                ui_components.insert(mount_identity, info.generation);
                 vec![Contribution {
                     scope: info.scope.clone(),
                     kind: ContributionKind::UiMount(UiMountContribution {
@@ -839,13 +847,13 @@ impl ModuleHost {
             .unwrap_or_default()
     }
 
-    /// The generation that mounted a UI component (session UI host
-    /// resolution).
-    pub(crate) fn ui_generation(&self, component: &str) -> Option<u64> {
+    /// The generation that mounted the UI mount `(scope, name)` (session UI
+    /// host resolution).
+    pub(crate) fn ui_generation(&self, scope: &ScopePath, name: &str) -> Option<u64> {
         self.ui_components
             .lock()
             .expect("ui components lock poisoned")
-            .get(component)
+            .get(&(scope.clone(), name.to_string()))
             .copied()
     }
 

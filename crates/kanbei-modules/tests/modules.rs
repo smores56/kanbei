@@ -843,7 +843,7 @@ fn failed_activation_does_not_leak_services_or_contributions() {
         "a failed activation must not leave services published"
     );
     assert_eq!(
-        manager.ui_generation("panel_ui"),
+        manager.ui_generation(&root(), "panel"),
         None,
         "a failed activation must not leave UI mounts live"
     );
@@ -865,7 +865,7 @@ fn retire_unpublishes_generation_services_and_contributions() {
     let generation = g.generation;
     assert_eq!(manager.services().lock().unwrap().snapshot().len(), 1);
     assert_eq!(manager.published_contributions(generation).len(), 1);
-    assert_eq!(manager.ui_generation("panel_ui"), Some(generation));
+    assert_eq!(manager.ui_generation(&root(), "panel"), Some(generation));
 
     manager.host().retire(generation, "test: forced retirement");
 
@@ -877,7 +877,7 @@ fn retire_unpublishes_generation_services_and_contributions() {
         manager.published_contributions(generation).is_empty(),
         "a retired generation's contributions must be dropped"
     );
-    assert_eq!(manager.ui_generation("panel_ui"), None);
+    assert_eq!(manager.ui_generation(&root(), "panel"), None);
     drop(g);
     drop(manager);
     cleanup(dir, queue);
@@ -900,7 +900,7 @@ fn dispose_unpublishes_generation_services_and_contributions() {
     assert_eq!(rec.generation, generation);
     assert!(manager.services().lock().unwrap().snapshot().is_empty());
     assert!(manager.published_contributions(generation).is_empty());
-    assert_eq!(manager.ui_generation("panel_ui"), None);
+    assert_eq!(manager.ui_generation(&root(), "panel"), None);
     drop(manager);
     cleanup(dir, queue);
 }

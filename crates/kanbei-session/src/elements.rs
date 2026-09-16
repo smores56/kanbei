@@ -383,7 +383,7 @@ impl Session {
     /// divergence: the log is the authority at restart.
     /// Mark the UI stale (R-27 fault class 1: composition failure → the
     /// last-valid UI with a staleness banner). No-op without a bound UI.
-    fn ui_mark_stale(&mut self, reason: &str) {
+    pub(crate) fn ui_mark_stale(&mut self, reason: &str) {
         if let Some(host) = self.ui_host.as_mut() {
             host.staleness = Some(reason.to_string());
         }
@@ -646,6 +646,85 @@ impl Session {
         self.rebind_hooks();
         Ok(ConfigActivation {
             module_id,
+            generation: generation.generation,
+            epoch,
+            event_seq: receipt.unwrap().last_seq,
+        })
+    }
+
+    /// Activate a NON-config module generation: same atomic contract as
+    /// [`Self::activate_config`] (validate → OCC publish → canonical
+    /// `composition_changed` + post-state manifest pin) but it is NOT recorded
+    /// in `config_layers`/`config_digest`/`config_manifest` and its canonical
+    /// event carries `initiator: "module"` (so the config-layer replay in
+    /// [`ConfigChoice`](crate::branch) never mistakes it for a config layer).
+    /// Used by the built-in UI, which is kernel-trusted but not a desired-state
+    /// config layer.
+    pub(crate) fn activate_module(
+        &mut self,
+        manifest: PackageManifest,
+    ) -> Result<ConfigActivation, SessionError> {
+        let staged = self.composition.stage(Vec::new());
+        let Some(manager) = self.modules.as_mut() else {
+            return Err(SessionError::ModulesDisabled);
+        };
+        // No precedence supersede: a non-config module never takes over a
+        // config layer's service keys.
+        let generation = manager.activate(&manifest)?;
+        let mut published = manager.published_contributions(generation.generation);
+        gate_published_contributions(manifest.origin, &mut published);
+        let mut staged = staged;
+        staged.contributions = published;
+        let plan = OverridePlan { removed: Vec::new() };
+        if let Err(e) = self
+            .composition
+            .publish_planned(&staged, &mut self.registry, &plan)
+        {
+            let reason = e.to_string();
+            let _ = manager.deactivate(manifest.module_id);
+            self.ui_mark_stale(&reason);
+            return Err(e.into());
+        }
+        let epoch = self.composition.current().epoch;
+        let package = generation.package;
+        let composition_digest = self.composition.current().digest;
+        let comp_bytes = self.composition.current().to_canonical_bytes();
+        self.store.install(&comp_bytes)?;
+        let receipt = self.commit(
+            vec![NewEvent {
+                kind: "composition_changed".into(),
+                payload_schema: 1,
+                payload: json!({
+                    "epoch": epoch,
+                    "delta": {
+                        "added": [{
+                            "module_id": manifest.module_id.to_string(),
+                            "generation": generation.generation,
+                            "package": package.to_string(),
+                        }],
+                        "removed": [],
+                    },
+                    "scope": manifest.scope.to_string(),
+                    "initiator": "module",
+                }),
+                objects: Vec::new(),
+                refs: vec![package, composition_digest],
+            }],
+            // R-08: the theme/UI-visible contribution change is a state change;
+            // pin the post-state manifest so a resume re-derives it.
+            Some(composition_digest),
+        );
+        if let Err(e) = receipt {
+            if let Some(m) = self.modules.as_mut() {
+                let _ = m.deactivate(manifest.module_id);
+            }
+            self.ui_mark_stale(&e.to_string());
+            return Err(e);
+        }
+        self.reset_hook_recovery();
+        self.rebind_hooks();
+        Ok(ConfigActivation {
+            module_id: manifest.module_id,
             generation: generation.generation,
             epoch,
             event_seq: receipt.unwrap().last_seq,

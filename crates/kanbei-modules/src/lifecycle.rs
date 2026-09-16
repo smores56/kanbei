@@ -764,9 +764,9 @@ impl ModuleManager {
         self.host.published_contributions(generation)
     }
 
-    /// The live generation that mounted a UI component, if any.
-    pub fn ui_generation(&self, component: &str) -> Option<u64> {
-        self.host.ui_generation(component)
+    /// The live generation that mounted the UI mount `(scope, name)`, if any.
+    pub fn ui_generation(&self, scope: &ScopePath, name: &str) -> Option<u64> {
+        self.host.ui_generation(scope, name)
     }
 
     /// The stable module id of a live generation, if any (UI keybinding
