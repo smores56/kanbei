@@ -751,10 +751,10 @@ impl Session {
     /// Opens `<dir>/log.zst` + `<dir>/objects/` + `<dir>/state/`. Runs
     /// [`kanbei_log::recover`] first — REQUIRED before open so a torn tail is
     /// truncated before the writer resumes. A fresh log pins the kernel
-    /// bootstrap snapshot as the genesis manifest (R-08); a resumed log does
-    /// NOT re-pin — M1 sessions resume without manifest state (current_snapshot
-    /// is None; the audit reconstruction is the authority, not the resumed
-    /// session).
+    /// bootstrap snapshot as the genesis manifest (R-08); a resumed log
+    /// re-derives `current_snapshot` from the last manifest the committed log
+    /// references (decision 16) — it never emits `snapshot: null`, so
+    /// post-resume events reference the last pinned manifest.
     ///
     /// After the M1 flow the M2 subsystems are built: the shared service
     /// registry, the scope tree, the contribution registry, the composition
@@ -865,7 +865,21 @@ impl Session {
                 }
             }
         } else {
-            None
+            // Decision 16: resume re-derives `current_snapshot` from the last
+            // pinned manifest the replayed log references. The derivation is
+            // digest-only — the log is the authority (hash-chained, verified by
+            // `recover`), and every manifest an envelope references was
+            // installed before that envelope's frame (R-10) and is a GC live
+            // root, so the digest resolves.
+            match crate::recovery::last_pinned_snapshot(&log_path) {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    drop(log);
+                    drop(store);
+                    shutdown_queue(queue);
+                    return Err(e);
+                }
+            }
         };
 
         // ---- M2 wiring ----

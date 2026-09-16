@@ -136,7 +136,11 @@ impl Session {
     }
 
     /// Commit the run-start record. Run genesis pins a manifest (R-08: run
-    /// genesis is a state-changing transition).
+    /// genesis is a state-changing transition): the manifest captures the
+    /// environment the run executes under — module generations, memory roots,
+    /// tool registry, provider/policy pins — which private updates advanced
+    /// without pinning. The pin is content-addressed, so an unchanged
+    /// environment dedups to the manifest already pinned.
     pub fn run_start(&mut self, run_id: RunId) -> Result<RunStart, SessionError> {
         self.fault(crate::FaultPoint::BeforeRunStart);
         let start = self.scheduler.run_start(run_id)?;
@@ -151,7 +155,7 @@ impl Session {
                 objects: Vec::new(),
                 refs: Vec::new(),
             }],
-            None,
+            Some(self.composition.current().digest),
         )?;
         self.fault(crate::FaultPoint::AfterRunStart);
         Ok(start)

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use kanbei_capabilities::{
     Broker, Capability, Grant, GrantScope, PolicyTemplate, Principal, TrustClass,
 };
+use kanbei_core::digest::Digest;
 use kanbei_core::id::Id128;
 use kanbei_provider::{
     CompletionResponse, FakeEngine, FinishReason, KeySource, ProviderConfig, Usage,
@@ -23,6 +24,7 @@ use kanbei_scheduler::{
     TerminalOutcome, Trigger, TriggerKind,
 };
 use kanbei_session::{FaultPoint, Session, SessionConfig};
+use kanbei_snapshot::ExecutionManifest;
 use kanbei_testkit::{child_acked, collect_envelopes, spawn_m3_crash_child, verify_m3_recovery};
 use kanbei_tools::OutcomeClassification;
 use serde_json::json;
@@ -220,8 +222,46 @@ fn spine_commits_canonical_run_records() {
     );
 }
 
-// --- acceptance: crash injection at the M3 seams (633) ----------------------
+// --- decision 16: run genesis pins a manifest -------------------------------
 
+/// R-08/decision 16: run genesis pins a manifest. The run's records reference
+/// it (the pre-event snapshot of every later event); only the pre-run events
+/// reference the kernel bootstrap pin.
+#[test]
+fn run_genesis_pins_a_manifest() {
+    let dir = fresh_session_dir("run-genesis-pin");
+    let _guard = DirGuard(dir.clone());
+    let (mut session, _id) = spine_session(&dir, vec![]);
+    let bootstrap = Digest::new(&ExecutionManifest::bootstrap().to_bytes());
+    assert_eq!(
+        session.current_snapshot(),
+        Some(bootstrap),
+        "a fresh session only pins the bootstrap manifest"
+    );
+
+    let outcome = run_spine(
+        &mut session,
+        vec![StepCommand::Finish(TerminalOutcome::CompletedGoal)],
+    );
+    assert_eq!(outcome, TerminalOutcome::CompletedGoal);
+
+    let evs = envelopes(&dir);
+    let start = evs.iter().position(|e| e.kind == "run_start").unwrap();
+    let end = evs.iter().position(|e| e.kind == "run_outcome").unwrap();
+    assert_eq!(evs[start].snapshot, Some(bootstrap), "run_start pins its pre-event snapshot");
+    // the run FSM's records reference the manifest run genesis pinned
+    let pinned = evs[end].snapshot.expect("post-run records reference the run-genesis manifest");
+    assert_ne!(pinned, bootstrap, "run genesis pins an environment manifest of its own");
+    assert_eq!(session.current_snapshot(), Some(pinned));
+    let manifest: ExecutionManifest =
+        serde_json::from_slice(&session.store().get(&pinned).unwrap()).unwrap();
+    assert!(manifest.state_head.is_some(), "the run manifest pins the state head");
+    assert!(manifest.composition.is_some(), "the run manifest pins the composition");
+    assert!(manifest.tool_registry.is_some(), "the run manifest pins the tool registry");
+    session.close().unwrap();
+}
+
+// --- acceptance: crash injection at the M3 seams (633) ----------------------
 #[test]
 fn acceptance_crash_m3_points() {
     const POINTS: [FaultPoint; 14] = [

@@ -333,6 +333,10 @@ impl Session {
     }
 
     /// Commits the canonical `safe_mode_activated` fact with the failure reason.
+    /// Safe mode is an authority/policy change — the dropped generations'
+    /// contributions and capabilities leave force — so it pins a manifest
+    /// (R-08/decision 16): later events reference the post-safe-mode
+    /// environment instead of the pre-drop one.
     pub(crate) fn commit_safe_mode(&mut self, reason: &str) -> Result<(), SessionError> {
         self.safe_mode_committed = true;
         self.commit(
@@ -343,7 +347,7 @@ impl Session {
                 objects: Vec::new(),
                 refs: Vec::new(),
             }],
-            None,
+            Some(self.composition.current().digest),
         )?;
         Ok(())
     }

@@ -130,10 +130,15 @@ fn commit_recovery_roundtrip() {
     // the log holds exactly 3 events
     let recovered = kanbei_log::recover(&dir.path().join("log.zst")).unwrap();
     assert_eq!(recovered.events, 3);
-    // reopen: seq continues, objects survive, manifest state is not resumed
+    // reopen: seq continues, objects survive, and the manifest is re-derived
+    // from the log (decision 16: never `snapshot: null`)
     let session = open(dir.path());
     assert_eq!(session.next_seq(), 4);
-    assert_eq!(session.current_snapshot(), None, "M1 resumes without manifest state");
+    assert_eq!(
+        session.current_snapshot(),
+        Some(Digest::new(&kanbei_snapshot::ExecutionManifest::bootstrap().to_bytes())),
+        "resume re-derives the last pinned manifest"
+    );
     for bytes in &objects {
         let digest = Digest::new(bytes);
         assert_eq!(session.store().get(&digest).unwrap().as_slice(), bytes.as_slice());
@@ -249,10 +254,67 @@ fn state_change_pins_manifest() {
     assert!(session.store().exists(&post), "pinned manifest is stored");
     assert!(session.store().get(&post).is_ok(), "pinned manifest reads back");
     // a pure commit references the pinned manifest and pins nothing new
+    let objects_before = session.store().scan().unwrap().len();
     let receipt2 = session.commit(vec![event("pure", json!({"s": 2}))], None).unwrap();
     assert_eq!(receipt2.pre_snapshot, Some(post));
     assert_eq!(receipt2.post_snapshot, None);
     assert_eq!(session.current_snapshot(), Some(post), "pure commit leaves the manifest unchanged");
+    // no manifest materialized: the store is byte-identical (manifests
+    // materialize only at commit, never per private update — R-08)
+    assert_eq!(session.store().scan().unwrap().len(), objects_before);
+    assert_eq!(envelopes(session.log_path())[1].snapshot, Some(post), "the pure event references it");
+    session.close().unwrap();
+}
+
+#[test]
+fn resume_re_derives_current_snapshot() {
+    let dir = TempDir::new("resume-snapshot");
+    // A state change pins a manifest; the pure event after it references that
+    // manifest — the last pinned one in the log.
+    let pinned = {
+        let mut session = open(dir.path());
+        let receipt = session.commit(vec![event("change", json!({"s": 1}))], Some(Digest::new(b"state-1"))).unwrap();
+        let pinned = receipt.post_snapshot.expect("state change pins a manifest");
+        session.commit(vec![event("pure", json!({"s": 2}))], None).unwrap();
+        session.close().unwrap();
+        pinned
+    };
+
+    let mut session = open(dir.path());
+    assert_eq!(session.current_snapshot(), Some(pinned), "resume re-derives the pinned manifest");
+    // post-resume events carry the re-derived manifest instead of null
+    let receipt = session.commit(vec![event("post_resume", json!({"s": 3}))], None).unwrap();
+    assert_eq!(receipt.pre_snapshot, Some(pinned));
+    assert_eq!(receipt.post_snapshot, None, "a pure event re-pins nothing");
+    let envs = envelopes(session.log_path());
+    assert_eq!(envs.last().unwrap().snapshot, Some(pinned), "post-resume event carries it");
+    session.close().unwrap();
+}
+
+#[test]
+fn authority_change_pins_manifest() {
+    // A discovery-degraded open degrades authority (safe mode) with no
+    // composition change at all: the `safe_mode_activated` fact must pin the
+    // environment manifest so later events reference it (R-08/decision 16).
+    let dir = TempDir::new("authority-pin");
+    let mut session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        config_discovery_error: Some("unreadable config file".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let genesis = Digest::new(&kanbei_snapshot::ExecutionManifest::bootstrap().to_bytes());
+    let envs = envelopes(session.log_path());
+    assert_eq!(envs[0].kind, "safe_mode_activated");
+    assert_eq!(envs[0].snapshot, Some(genesis), "pre-event snapshot is the genesis pin");
+    let pinned = session.current_snapshot().expect("the authority change pins a manifest");
+    assert_ne!(pinned, genesis, "the authority change pins its own manifest");
+    assert!(session.store().exists(&pinned));
+    // the next event references it rather than re-pinning
+    let receipt = session.commit(vec![event("probe", json!({}))], None).unwrap();
+    assert_eq!(receipt.pre_snapshot, Some(pinned));
+    assert_eq!(receipt.post_snapshot, None);
+    assert_eq!(envelopes(session.log_path())[1].snapshot, Some(pinned));
     session.close().unwrap();
 }
 

@@ -3,6 +3,7 @@
 use crate::{SessionError};
 use std::path::{Path};
 use std::sync::Arc;
+use kanbei_core::digest::Digest;
 use kanbei_core::envelope::Envelope;
 use kanbei_core::id::Id128;
 use kanbei_core::queue::DurabilityQueue;
@@ -21,6 +22,33 @@ pub(crate) fn recover_or_fresh(log_path: &Path) -> Result<Recovered, SessionErro
         kanbei_kernel::recovery::RecoveryError::Log(e) => SessionError::Log(e),
         kanbei_kernel::recovery::RecoveryError::Io(e) => SessionError::Io(e),
     })
+}
+
+/// The last execution-snapshot manifest the committed log references: the
+/// newest non-null `snapshot` field across its decodable envelopes (R-08:
+/// every canonical event references its pre-event commit-snapshot digest).
+/// Resume re-derives `current_snapshot` from it, so post-resume events
+/// reference the last pinned manifest instead of `snapshot: null`
+/// (decision 16). A trailing state-changing commit's post-manifest is pinned
+/// after its own frame, so no envelope references it yet (R-08 materializes it
+/// at that commit; the next commit supersedes or re-pins it by content
+/// addressing) — the derivation therefore lands on the newest manifest the log
+/// actually references. Undecodable lines are skipped exactly like
+/// [`Session::envelope_at`](crate::Session::envelope_at): the log's
+/// hash-chain is already verified by `recover`, and `snapshot` is an optional
+/// envelope field, so a line that does not decode cannot be load-bearing here.
+pub(crate) fn last_pinned_snapshot(log_path: &Path) -> Result<Option<Digest>, SessionError> {
+    let mut found: Option<Digest> = None;
+    kanbei_log::for_each_frame(log_path, |info| {
+        for line in &info.events {
+            if let Ok(env) = Envelope::from_line(line)
+                && env.snapshot.is_some()
+            {
+                found = env.snapshot;
+            }
+        }
+    })?;
+    Ok(found)
 }
 
 /// Decode one canonical log line for a load-bearing recovery scan. `Ok(None)`

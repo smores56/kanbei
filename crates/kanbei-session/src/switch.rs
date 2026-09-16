@@ -329,8 +329,10 @@ impl Session {
     /// `source_session` is this session (else `InvalidInput` naming both
     /// ids), and the fork must have committed events past that fact — a head
     /// to adopt (else `InvalidInput` "fork has no outcome"). The fork's head
-    /// snapshot (its `current_snapshot`, falling back to the last envelope's
-    /// pre-event snapshot for a resumed fork) must parse as a manifest and
+    /// snapshot (its `current_snapshot` — the pre-event snapshot of its last
+    /// envelope, or the resumed re-derivation; the last envelope's field is
+    /// the fallback for a log whose envelopes all carry a null snapshot) must
+    /// parse as a manifest and
     /// every closure digest must resolve in the fork's session or memory
     /// stores (a post-fork memory root legitimately lives only in the memory
     /// actor's store).
@@ -425,8 +427,8 @@ impl Session {
         // --- reconcile domain state: the fork's HEAD snapshot + closure
         // The head snapshot is the fork's current_snapshot (the pre-event
         // snapshot of its last envelope; advanced by a state-changing last
-        // commit); a resumed fork loses the in-memory pin, so fall back to
-        // the last envelope's snapshot field.
+        // commit, re-derived by a resume — decision 16); the last envelope's
+        // field remains the fallback for an all-null-snapshot log.
         let head_snapshot = fork
             .current_snapshot()
             .or_else(|| fork.envelope_at(head_seq).ok().and_then(|env| env.snapshot))
