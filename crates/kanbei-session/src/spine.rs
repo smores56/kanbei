@@ -14,6 +14,7 @@ use kanbei_context::{
     TrajectoryView, TriggerFragment, lower, sensitivity_rank,
 };
 use kanbei_core::digest::Digest;
+use kanbei_core::envelope::Envelope;
 use kanbei_core::id::Id128;
 use kanbei_memory::{
     Claim, ClaimEdge, ClaimProvenance, EdgeKind, IdempotencyKey, MEMORY_CLAIM_SCHEMA,
@@ -61,7 +62,13 @@ fn truncate_utf8(s: &mut String, max: usize) {
 fn consequential_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "fs.write" | "fs.patch" | "process.exec" | "child.spawn" | "memory.propose"
+        "fs.write"
+            | "fs.patch"
+            | "process.exec"
+            | "child.spawn"
+            | "memory.propose"
+            | "memory.review"
+            | "memory.promote"
     )
 }
 
@@ -186,6 +193,9 @@ impl Session {
         reason: Option<String>,
     ) -> Result<Option<kanbei_scheduler::BreakerTrip>, SessionError> {
         self.fault(crate::FaultPoint::BeforeRunOutcome);
+        // A completed goal resolves the run's open loops (layer-2, R-12):
+        // the promises the user made are addressed; failures leave them open.
+        let completed_goal = outcome == TerminalOutcome::CompletedGoal;
         let (record, trip) = self.scheduler.record_outcome_reason(
             run_id,
             outcome,
@@ -212,6 +222,9 @@ impl Session {
             });
         }
         self.commit(events, None)?;
+        if completed_goal {
+            self.open_loops.clear();
+        }
         #[cfg(feature = "otel")]
         self.telemetry_close_run(outcome, usage);
         #[cfg(feature = "otel")]
@@ -928,6 +941,8 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
         match intent.tool.as_str() {
             "memory.query" => return self.dispatch_memory_query(run_id, intent, principal),
             "memory.propose" => return self.dispatch_memory_propose(run_id, intent, principal),
+            "memory.review" => return self.dispatch_memory_review(run_id, intent, principal),
+            "memory.promote" => return self.dispatch_memory_promote(run_id, intent, principal),
             "child.spawn" => return self.dispatch_child_spawn(run_id, intent, principal),
             _ => {}
         }
@@ -1209,8 +1224,11 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                 &SalienceInput {
                     frozen_seq,
                     recent_causal,
-                    open_loops: Vec::new(),
-                    pins: Vec::new(),
+                    // R-12/F-S5 layer-2: the canonical pins/open loops derived
+                    // from committed facts make the goals/pins salience
+                    // components live instead of permanently zero.
+                    open_loops: self.open_loops.clone(),
+                    pins: self.active_pins.clone(),
                     fold: salience_fold.clone(),
                     top_n: 32,
                 },
@@ -1568,6 +1586,13 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
             "fts_used": result.fts_used,
             "expanded": result.expanded,
         });
+        // The returned claims are this run's activated memories: they pin for
+        // the next model-call boundary's salience scoring (R-12/F-S5).
+        self.active_pins = claims
+            .iter()
+            .filter_map(|c| c.get("digest").and_then(|d| d.as_str()))
+            .filter_map(|d| d.parse::<Digest>().ok())
+            .collect();
         Ok(ToolOutcome {
             call_id: intent.call_id.clone(),
             tool: intent.tool.clone(),
@@ -1581,18 +1606,21 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
         })
     }
 
-    /// One approval-anchored root transition: commits the
-    /// `memory_root_approved` origin event, then proposes with a ≤3-attempt
-    /// CAS rebase (stale expected roots rebase onto the actor's actual head;
-    /// idempotency is keyed on the approval event). On exhaustion the
-    /// deferred facts are committed and `("deferred", None)` returned. The
-    /// session-side manifest mirrors the actor's internal construction
-    /// byte-for-byte (same schema/parent/scope/order fields; the actor
-    /// derives `retracted` from Supersedes edges itself).
+    /// One approval-anchored root transition on `scope`: commits the
+    /// `origin_kind` origin event (a typed root-approval/promotion fact), then
+    /// proposes with a ≤3-attempt CAS rebase (stale expected roots rebase onto
+    /// the actor's actual head; idempotency is keyed on the approval event).
+    /// On exhaustion the deferred facts are committed and `("deferred", None)`
+    /// returned. The session-side manifest mirrors the actor's internal
+    /// construction byte-for-byte (same schema/parent/scope/order fields; the
+    /// actor derives `retracted` from Supersedes edges itself).
     #[allow(clippy::too_many_arguments)]
-    fn approve_transition(
+    fn propose_transition(
         &mut self,
-        project_id: Id128,
+        scope: MemoryScope,
+        kind: TransitionKind,
+        origin_kind: &str,
+        origin_payload: Value,
         principal: &Principal,
         decision_digest: Digest,
         added_claims: &[Digest],
@@ -1603,14 +1631,9 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
     ) -> Result<(String, Option<Id128>), SessionError> {
         let receipt = self.commit(
             vec![NewEvent {
-                kind: "memory_root_approved".into(),
+                kind: origin_kind.into(),
                 payload_schema: 1,
-                payload: json!({
-                    "claim_digest": added_claims.first().map(|d| d.to_string()),
-                    "edge_digest": added_edges.first().map(|d| d.to_string()),
-                    "decision_digest": decision_digest.to_string(),
-                    "expected_root": expected_root.map(|d| d.to_string()),
-                }),
+                payload: origin_payload,
                 objects: Vec::new(),
                 refs: Vec::new(),
             }],
@@ -1620,11 +1643,16 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
         let mut expected = expected_root;
         for attempt in 0..3u32 {
             let outcome = {
-                let project = self.memory_project.as_mut().expect("project bound");
+                let actor = match &scope {
+                    MemoryScope::Lifetime => &mut self.memory_lifetime,
+                    MemoryScope::Project(_) => {
+                        self.memory_project.as_mut().expect("project bound")
+                    }
+                };
                 let manifest = RootManifest {
                     schema: MEMORY_ROOT_SCHEMA,
                     parent: expected,
-                    scope: MemoryScope::Project(project_id),
+                    scope: scope.clone(),
                     added_claims: added_claims.to_vec(),
                     added_edges: added_edges.to_vec(),
                     retracted: retracted.to_vec(),
@@ -1634,13 +1662,13 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                 let transition = MemoryTransition {
                     schema: MEMORY_TRANSITION_SCHEMA,
                     transition_id: manifest.transition_id,
-                    scope: MemoryScope::Project(project_id),
-                    kind: TransitionKind::RootApproval,
+                    scope: scope.clone(),
+                    kind: kind.clone(),
                     expected_old_root: expected,
                     accepted_new_root: manifest_digest,
                     origin_session: self.session_id,
                     origin_event: approval_event,
-                    origin_kind: "memory_root_approved".into(),
+                    origin_kind: origin_kind.into(),
                     decision_principal: principal.clone(),
                     decision_digest,
                     idempotency_key: IdempotencyKey {
@@ -1649,7 +1677,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                         decision: decision_digest,
                     },
                 };
-                project.propose(transition, added_claims, added_edges)
+                actor.propose(transition, added_claims, added_edges)
             };
             match outcome.map_err(SessionError::Memory)? {
                 TransitionOutcome::Committed { transition_id, .. } => {
@@ -1659,7 +1687,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                             payload_schema: 1,
                             payload: json!({
                                 "transition_id": transition_id.to_string(),
-                                "scope": serde_json::to_value(MemoryScope::Project(project_id))
+                                "scope": serde_json::to_value(scope.clone())
                                     .expect("scope serialization cannot fail"),
                             }),
                             objects: Vec::new(),
@@ -1689,7 +1717,7 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                                 kind: "memory_orphans_expected".into(),
                                 payload_schema: 1,
                                 payload: json!({
-                                    "scope": serde_json::to_value(MemoryScope::Project(project_id))
+                                    "scope": serde_json::to_value(scope.clone())
                                         .expect("scope serialization cannot fail"),
                                     "digests": installed
                                         .iter()
@@ -1868,8 +1896,15 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
             let project = self.memory_project.as_ref().expect("project bound");
             project.head()
         };
-        let (status, transition_id) = self.approve_transition(
-            project_id,
+        let (status, transition_id) = self.propose_transition(
+            MemoryScope::Project(project_id),
+            TransitionKind::RootApproval,
+            "memory_root_approved",
+            json!({
+                "claim_digest": claim_digest.to_string(),
+                "decision_digest": approval_digest.to_string(),
+                "expected_root": expected.map(|d| d.to_string()),
+            }),
             &principal,
             approval_digest,
             &[claim_digest],
@@ -1889,8 +1924,16 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
                 let project = self.memory_project.as_ref().expect("project bound");
                 project.head()
             };
-            let (s, t) = self.approve_transition(
-                project_id,
+            let (s, t) = self.propose_transition(
+                MemoryScope::Project(project_id),
+                TransitionKind::RootApproval,
+                "memory_root_approved",
+                json!({
+                    "claim_digest": claim_digest.to_string(),
+                    "edge_digest": edge_digest.to_string(),
+                    "decision_digest": approval_digest.to_string(),
+                    "expected_root": expected.map(|d| d.to_string()),
+                }),
                 &principal,
                 approval_digest,
                 &[],
@@ -1923,6 +1966,338 @@ fn resolve_parked_via_driver(&mut self) -> Result<Option<ToolOutcome>, SessionEr
         })
     }
 
+    /// Resolves a proposed claim's digest from the committed `memory_proposal`
+    /// facts: a proposal is committed (and its object installed) but, until
+    /// approved, is absent from the scope fold. The most recent matching
+    /// proposal wins.
+    fn proposed_claim_digest(&self, claim_id: Id128) -> Result<Option<Digest>, SessionError> {
+        let log_path = self.log_path.clone();
+        let mut found: Option<Digest> = None;
+        kanbei_log::for_each_frame(&log_path, |info| {
+            for line in &info.events {
+                let Ok(env) = Envelope::from_line(line) else {
+                    continue;
+                };
+                if env.kind != "memory_proposal" {
+                    continue;
+                }
+                let payload = self.resolved_payload(&env);
+                let matches = payload
+                    .get("claim_id")
+                    .and_then(|c| c.as_str())
+                    .and_then(|s| s.parse::<Id128>().ok())
+                    == Some(claim_id);
+                if matches
+                    && let Some(d) = payload
+                        .get("claim_digest")
+                        .and_then(|d| d.as_str())
+                        .and_then(|s| s.parse::<Digest>().ok())
+                {
+                    found = Some(d);
+                }
+            }
+        })?;
+        Ok(found)
+    }
+
+    /// memory.review: the root agent's decision on a proposed project claim
+    /// (R-11). `approve` commits the root transition under the broker approval
+    /// (the same write path as an approval-gated propose); `reject` and
+    /// `request_evidence` commit canonical decision facts only — they never
+    /// touch the claim DAG, but they are the recorded review outcome the
+    /// design requires ("accepts, rejects, requests evidence, or leaves them
+    /// unresolved").
+    fn dispatch_memory_review(
+        &mut self,
+        run_id: RunId,
+        intent: &ToolIntent,
+        principal: Principal,
+    ) -> Result<ToolOutcome, SessionError> {
+        if let Err(e) = self.scheduler.record_usage(
+            run_id,
+            RunUsage {
+                tokens: 0,
+                tools: 1,
+                children: 0,
+                started_at_secs: 0,
+            },
+        ) {
+            match e {
+                kanbei_scheduler::SchedulerError::NotActiveRun(_) => {}
+                other => return Err(other.into()),
+            }
+        }
+        if self.memory_project.is_none() {
+            return Ok(self.memory_outcome_error(intent, "no project bound".into()));
+        }
+        let Some(claim_id) = intent
+            .args
+            .get("claim_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Id128>().ok())
+        else {
+            return Ok(self.memory_outcome_error(intent, "memory.review requires a claim_id".into()));
+        };
+        let Some(decision) = intent.args.get("decision").and_then(|v| v.as_str()) else {
+            return Ok(
+                self.memory_outcome_error(intent, "memory.review requires a decision".into())
+            );
+        };
+        // An active fold claim is already approved; a proposal resolves
+        // through its committed `memory_proposal` fact.
+        let active = {
+            let project = self.memory_project.as_ref().expect("project bound");
+            let fold = project.fold(project.head()).map_err(SessionError::Memory)?;
+            fold.claims
+                .iter()
+                .find(|(_, c)| c.claim_id == claim_id)
+                .map(|(d, _)| *d)
+        };
+        match decision {
+            "approve" => {
+                if active.is_some() {
+                    return Ok(
+                        self.memory_outcome_error(intent, "claim is already active".into())
+                    );
+                }
+                let Some(claim_digest) = self.proposed_claim_digest(claim_id)? else {
+                    return Ok(
+                        self.memory_outcome_error(intent, "no matching memory proposal".into())
+                    );
+                };
+                let Some(approval_digest) = intent.approval else {
+                    return Ok(
+                        self.memory_outcome_error(intent, "approve requires user approval".into())
+                    );
+                };
+                let scope = self.project_scope();
+                let expected = self.memory_project.as_ref().expect("project bound").head();
+                let (status, transition_id) = self.propose_transition(
+                    scope,
+                    TransitionKind::RootApproval,
+                    "memory_root_approved",
+                    json!({
+                        "claim_digest": claim_digest.to_string(),
+                        "decision_digest": approval_digest.to_string(),
+                        "expected_root": expected.map(|d| d.to_string()),
+                    }),
+                    &principal,
+                    approval_digest,
+                    &[claim_digest],
+                    &[],
+                    &[],
+                    claim_digest,
+                    expected,
+                )?;
+                Ok(ToolOutcome {
+                    call_id: intent.call_id.clone(),
+                    tool: intent.tool.clone(),
+                    result: json!({
+                        "claim_id": claim_id.to_string(),
+                        "claim_digest": claim_digest.to_string(),
+                        "decision": decision,
+                        "status": status,
+                        "transition_id": transition_id.map(|t| t.to_string()),
+                    }),
+                    error: None,
+                    classification: OutcomeClassification::Normal,
+                    origin_snapshot: intent.origin_snapshot,
+                    commit_snapshot: self.current_snapshot,
+                    retained: None,
+                    hook_denied: None,
+                })
+            }
+            "reject" | "request_evidence" => {
+                let Some(claim_digest) = active.or(self.proposed_claim_digest(claim_id)?) else {
+                    return Ok(
+                        self.memory_outcome_error(intent, "no matching memory proposal".into())
+                    );
+                };
+                let reason = intent
+                    .args
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let kind = if decision == "reject" {
+                    "memory_proposal_rejected"
+                } else {
+                    "memory_evidence_requested"
+                };
+                self.commit(
+                    vec![NewEvent {
+                        kind: kind.into(),
+                        payload_schema: 1,
+                        payload: json!({
+                            "claim_id": claim_id.to_string(),
+                            "claim_digest": claim_digest.to_string(),
+                            "reason": reason,
+                            "decision_principal": principal,
+                        }),
+                        objects: Vec::new(),
+                        refs: Vec::new(),
+                    }],
+                    None,
+                )?;
+                Ok(ToolOutcome {
+                    call_id: intent.call_id.clone(),
+                    tool: intent.tool.clone(),
+                    result: json!({
+                        "claim_id": claim_id.to_string(),
+                        "claim_digest": claim_digest.to_string(),
+                        "decision": decision,
+                        "status": decision,
+                    }),
+                    error: None,
+                    classification: OutcomeClassification::Normal,
+                    origin_snapshot: intent.origin_snapshot,
+                    commit_snapshot: self.current_snapshot,
+                    retained: None,
+                    hook_denied: None,
+                })
+            }
+            other => Ok(self.memory_outcome_error(
+                intent,
+                format!("unknown memory.review decision {other:?}"),
+            )),
+        }
+    }
+
+    /// memory.promote: promote an ACTIVE project claim into the lifetime
+    /// scope (R-11/E-F4). Promotion is user-gated — the origin fact carries
+    /// the broker approval digest. The destination claim is a NEW
+    /// lifetime-scoped claim whose provenance carries the source claim digest
+    /// and a bounded evidence excerpt; a `promoted_from` edge links
+    /// destination → source (the source lives in the project DAG, so the edge
+    /// target is cross-scope). The lifetime scope transition commits first;
+    /// the session then records the accepted TransitionId as a backlink.
+    fn dispatch_memory_promote(
+        &mut self,
+        run_id: RunId,
+        intent: &ToolIntent,
+        principal: Principal,
+    ) -> Result<ToolOutcome, SessionError> {
+        if let Err(e) = self.scheduler.record_usage(
+            run_id,
+            RunUsage {
+                tokens: 0,
+                tools: 1,
+                children: 0,
+                started_at_secs: 0,
+            },
+        ) {
+            match e {
+                kanbei_scheduler::SchedulerError::NotActiveRun(_) => {}
+                other => return Err(other.into()),
+            }
+        }
+        if self.memory_project.is_none() {
+            return Ok(self.memory_outcome_error(intent, "no project bound".into()));
+        }
+        let Some(source_claim_id) = intent
+            .args
+            .get("claim_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Id128>().ok())
+        else {
+            return Ok(
+                self.memory_outcome_error(intent, "memory.promote requires a claim_id".into())
+            );
+        };
+        let evidence = intent
+            .args
+            .get("evidence")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let source = {
+            let project = self.memory_project.as_ref().expect("project bound");
+            let fold = project.fold(project.head()).map_err(SessionError::Memory)?;
+            fold.claims
+                .iter()
+                .find(|(_, c)| c.claim_id == source_claim_id)
+                .cloned()
+        };
+        let Some((source_digest, source_claim)) = source else {
+            return Ok(self.memory_outcome_error(
+                intent,
+                "promote source is not an active project claim".into(),
+            ));
+        };
+        let Some(approval_digest) = intent.approval else {
+            return Ok(
+                self.memory_outcome_error(intent, "promotion requires user approval".into())
+            );
+        };
+        let provenance = ClaimProvenance::new_promotion(
+            self.session_id,
+            intent.intent_event.unwrap_or(0),
+            vec![source_digest],
+            evidence,
+        )
+        .map_err(SessionError::Memory)?;
+        let dest = Claim {
+            schema: MEMORY_CLAIM_SCHEMA,
+            claim_id: Id128::generate(),
+            kind: source_claim.kind.clone(),
+            content: source_claim.content.clone(),
+            owner: principal.clone(),
+            visibility_scope: MemoryScope::Lifetime,
+            provenance: provenance.clone(),
+            observed_at: source_claim.observed_at,
+            valid_from: source_claim.valid_from,
+            sensitivity: source_claim.sensitivity.clone(),
+        };
+        let dest_digest = self.memory_install(&MemoryScope::Lifetime, &dest.to_canonical_bytes())?;
+        let edge = ClaimEdge::new(
+            dest.claim_id,
+            Some(source_claim_id),
+            EdgeKind::PromotedFrom,
+            Vec::new(),
+            provenance,
+        )
+        .map_err(SessionError::Memory)?;
+        let edge_digest = self.memory_install(&MemoryScope::Lifetime, &edge.to_canonical_bytes())?;
+
+        let expected = self.memory_lifetime.head();
+        let (status, transition_id) = self.propose_transition(
+            MemoryScope::Lifetime,
+            TransitionKind::Promotion,
+            "memory_promotion_approved",
+            json!({
+                "claim_digest": dest_digest.to_string(),
+                "edge_digest": edge_digest.to_string(),
+                "source_claim_id": source_claim_id.to_string(),
+                "source_digest": source_digest.to_string(),
+                "decision_digest": approval_digest.to_string(),
+                "expected_root": expected.map(|d| d.to_string()),
+            }),
+            &principal,
+            approval_digest,
+            &[dest_digest],
+            &[edge_digest],
+            &[],
+            dest_digest,
+            expected,
+        )?;
+        Ok(ToolOutcome {
+            call_id: intent.call_id.clone(),
+            tool: intent.tool.clone(),
+            result: json!({
+                "claim_id": dest.claim_id.to_string(),
+                "claim_digest": dest_digest.to_string(),
+                "source_claim_id": source_claim_id.to_string(),
+                "source_digest": source_digest.to_string(),
+                "status": status,
+                "transition_id": transition_id.map(|t| t.to_string()),
+            }),
+            error: None,
+            classification: OutcomeClassification::Normal,
+            origin_snapshot: intent.origin_snapshot,
+            commit_snapshot: self.current_snapshot,
+            retained: None,
+            hook_denied: None,
+        })
+    }
     /// child.spawn: spawn a bounded child run under the active parent,
     /// drive it through the cognition loop with a fresh provider from the
     /// configured factory (the child's render closure attenuates via

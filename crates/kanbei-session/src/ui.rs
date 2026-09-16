@@ -32,6 +32,7 @@
 use std::io;
 
 use kanbei_capabilities::{Capability, Principal};
+use kanbei_context::OpenLoop;
 use kanbei_core::id::Id128;
 use kanbei_modules::package::{ModuleOrigin, PackageManifest};
 use kanbei_modules::ModuleManager;
@@ -514,6 +515,15 @@ impl Session {
             }],
             None,
         )?;
+        // Layer-2: a user message is an open loop until a run completes the
+        // goal it expresses (R-12/F-S5). Bounded: the loop list is cleared at
+        // each CompletedGoal.
+        self.open_loops.push(OpenLoop {
+            id: receipt.last_seq.to_string(),
+            text: text.to_string(),
+            created_event: receipt.last_seq,
+            sensitivity: "internal".into(),
+        });
         self.scheduler.observe(kanbei_scheduler::Trigger {
             kind: kanbei_scheduler::TriggerKind::UserMessage,
             referent: None,

@@ -52,6 +52,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use kanbei_context::OpenLoop;
 use kanbei_core::digest::Digest;
 use kanbei_core::envelope::{Envelope, EnvelopeError};
 use kanbei_core::id::{BranchId, Id128};
@@ -700,6 +701,13 @@ pub struct Session {
     /// Bounded recent-event ring (seq, kind, payload) — the trajectory
     /// render source, capped at [`RECENT_RING`] entries.
     recent_events: std::collections::VecDeque<(u64, String, serde_json::Value)>,
+    /// Layer-2 active-memory pins: the claim digests the most recent
+    /// `memory.query` outcome activated (R-12/F-S5). Derived from the
+    /// canonical tool outcome; the scores themselves stay disposable.
+    active_pins: Vec<Digest>,
+    /// Layer-2 open loops: user messages with no completed run outcome since.
+    /// Derived from canonical facts, never invented.
+    open_loops: Vec<OpenLoop>,
     /// Covered compaction ranges (R-18/E-06) recovered from the log.
     compacted: Vec<CompactedRange>,
     // --- M6 historical correction ---
@@ -1268,6 +1276,8 @@ impl Session {
             last_opaque: None,
             last_cache: None,
             recent_events: std::collections::VecDeque::new(),
+            active_pins: Vec::new(),
+            open_loops: Vec::new(),
             compacted,
             branch,
             branch_records,
@@ -1694,6 +1704,18 @@ impl Session {
     /// The memory roots pinned by the current follow policy (`None` =
     /// FollowHead): the checkpoint/fork roots the projection folds instead
     /// of the live actor heads.
+    /// The layer-2 active-memory pins (R-12/F-S5): claim digests activated by
+    /// the most recent `memory.query` outcome.
+    pub fn active_pins(&self) -> &[Digest] {
+        &self.active_pins
+    }
+
+    /// The layer-2 open loops (R-12/F-S5): canonical user messages not yet
+    /// resolved by a completed run outcome.
+    pub fn open_loops(&self) -> &[OpenLoop] {
+        &self.open_loops
+    }
+
     pub fn pinned_roots(&self) -> Option<&PinnedRoots> {
         self.pinned_roots.as_ref()
     }

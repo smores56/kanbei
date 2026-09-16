@@ -340,9 +340,29 @@ impl MemoryRootActor {
         for (d, c) in &added_claims {
             added_ids.insert(c.claim_id, *d);
         }
+        // Claims whose provenance records a source-claim digest (promotion
+        // destinations). Used to qualify cross-scope `PromotedFrom` targets.
+        let mut carries_source: HashMap<Id128, bool> = HashMap::new();
+        for (_, c) in fold
+            .claims
+            .iter()
+            .chain(fold.retracted.iter())
+            .chain(added_claims.iter())
+        {
+            carries_source.insert(c.claim_id, !c.provenance.source_claims.is_empty());
+        }
         for (_, edge) in &added_edges {
+            // A `PromotedFrom` target is the source claim, which lives in a
+            // DIFFERENT scope's DAG by definition (promotion changes scope).
+            // The local-fold check cannot apply, so the edge is admissible
+            // only when its origin claim carries the source digest in its
+            // provenance — the cross-scope link is then verifiable from the
+            // committed bytes even though the target object is not reachable
+            // here. Every other edge keeps refs-to-committed.
             if let Some(to) = edge.to
                 && !committed.contains_key(&to)
+                && (edge.kind != EdgeKind::PromotedFrom
+                    || !carries_source.get(&edge.from).copied().unwrap_or(false))
             {
                 return Err(MemoryError::AcyclicViolation(format!(
                     "edge {} -> {to}: target claim is not committed in the fold",
@@ -1557,6 +1577,63 @@ mod tests {
             recorded.lock().unwrap().is_empty(),
             "no fault point may fire on a rejected proposal"
         );
+        drop(actor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A promotion transition commits a destination-scoped claim plus a
+    /// `promoted_from` edge whose target is the SOURCE claim in another scope
+    /// (never in this fold): the acyclicity check must exempt cross-scope
+    /// promotion targets.
+    #[test]
+    fn promotion_transition_commits_cross_scope_promoted_from_edge() {
+        let root = tmp_root("promotion");
+        let scope = MemoryScope::Lifetime;
+        let mut actor = MemoryRootActor::open(&root, scope.clone()).unwrap();
+        let session = Id128::generate();
+
+        // The source claim lives in the project scope's DAG: only its
+        // ClaimId/digest are referenced here.
+        let source_id = Id128::generate();
+        let source_digest = Digest::new(b"project-source-claim");
+        let mut dest = make_claim(&scope, session, "promoted decision");
+        dest.provenance = ClaimProvenance::new_promotion(
+            session,
+            7,
+            vec![source_digest],
+            "the project scope held the evidence",
+        )
+        .unwrap();
+        let edge = make_edge(dest.claim_id, Some(source_id), EdgeKind::PromotedFrom, session);
+
+        let dest_digest = dest.digest();
+        let edge_digest = edge.digest();
+        install_objects(
+            &actor.dir.join("objects"),
+            &[dest.to_canonical_bytes(), edge.to_canonical_bytes()],
+        );
+        let transition = make_transition(
+            &actor,
+            Id128::generate(),
+            std::slice::from_ref(&dest),
+            std::slice::from_ref(&edge),
+            session,
+            7,
+            TransitionKind::Promotion,
+        );
+        let new_root = match actor
+            .propose(transition, &[dest_digest], &[edge_digest])
+            .expect("promotion proposes")
+        {
+            TransitionOutcome::Committed { new_root, .. } => new_root,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+
+        let fold = actor.fold(Some(new_root)).unwrap();
+        assert!(fold.claims.iter().any(|(d, c)| *d == dest_digest && c.claim_id == dest.claim_id));
+        assert!(fold.edges.iter().any(|(d, e)| *d == edge_digest
+            && e.kind == EdgeKind::PromotedFrom
+            && e.to == Some(source_id)));
         drop(actor);
         let _ = std::fs::remove_dir_all(&root);
     }

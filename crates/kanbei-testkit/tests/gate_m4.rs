@@ -19,7 +19,7 @@ use kanbei_core::digest::Digest;
 use kanbei_core::id::Id128;
 use kanbei_core::queue::DurabilityQueue;
 use kanbei_memory::{
-    Claim, ClaimProvenance, IdempotencyKey, MEMORY_CLAIM_SCHEMA, MEMORY_ROOT_SCHEMA,
+    Claim, ClaimProvenance, EdgeKind, IdempotencyKey, MEMORY_CLAIM_SCHEMA, MEMORY_ROOT_SCHEMA,
     MEMORY_TRANSITION_SCHEMA, MemoryRootActor, MemoryScope, MemoryTransition, RootManifest,
     TransitionKind, TransitionOutcome,
 };
@@ -1325,4 +1325,376 @@ fn backlink_idempotent_after_crash() {
         s.close().unwrap();
     }
     assert_eq!(backlinks(&dir2), 1);
+}
+
+// --- 10. T16: promotion write path, root review, layer-2 active view --------
+
+/// A broker granting exactly `allow`, requiring approval for exactly
+/// `require` — the T16 tools are not in the M4 baseline broker.
+fn tool_broker(session_id: Id128, allow: &[&str], require: &[&str]) -> Broker {
+    let call = |t: &str| Capability::new(t.into(), vec!["call".into()]);
+    let mut broker = Broker::new();
+    broker
+        .add_template(PolicyTemplate {
+            trust_class: TrustClass::Builtin,
+            allow: allow.iter().map(|t| call(t)).collect(),
+            deny: vec![],
+            require_approval: require.iter().map(|t| call(t)).collect(),
+            version: 1,
+            monotonic: true,
+        })
+        .unwrap();
+    for resource in allow {
+        let mut grant = Grant {
+            grant_digest: Digest::new(b"placeholder"),
+            principal: Principal {
+                session: session_id,
+                generation: 0,
+                run: None,
+            },
+            module_generation: 0,
+            capability: call(resource),
+            scope: GrantScope::Session,
+            expiry: None,
+            budget: None,
+            purpose: Some("gate".into()),
+            policy_version: 1,
+        };
+        grant.grant_digest = grant.derive_digest();
+        broker.add_grant(grant).unwrap();
+    }
+    broker
+}
+
+/// One memory.review round trip; the harness resolves a park.
+fn review_claim(
+    session: &mut Session,
+    run_id: kanbei_scheduler::RunId,
+    session_id: Id128,
+    claim_id: &str,
+    decision: &str,
+) -> kanbei_tools::ToolOutcome {
+    let principal = Principal {
+        session: session_id,
+        generation: 0,
+        run: Some(0),
+    };
+    let outcome = session
+        .tool_call(
+            run_id,
+            principal,
+            "memory.review",
+            json!({ "claim_id": claim_id, "decision": decision, "reason": "root review" }),
+        )
+        .unwrap();
+    if outcome.awaiting_approval() {
+        let digest = *session
+            .pending_approvals()
+            .last()
+            .expect("a parked review approval");
+        return session
+            .resolve_approval(&digest, true)
+            .unwrap()
+            .expect("review approval resolves");
+    }
+    session.commit_tool_outcome(&outcome).unwrap();
+    outcome
+}
+
+/// One memory.promote round trip; the harness resolves a park.
+fn promote_claim(
+    session: &mut Session,
+    run_id: kanbei_scheduler::RunId,
+    session_id: Id128,
+    claim_id: &str,
+    evidence: &str,
+) -> kanbei_tools::ToolOutcome {
+    let principal = Principal {
+        session: session_id,
+        generation: 0,
+        run: Some(0),
+    };
+    let outcome = session
+        .tool_call(
+            run_id,
+            principal,
+            "memory.promote",
+            json!({ "claim_id": claim_id, "evidence": evidence }),
+        )
+        .unwrap();
+    if outcome.awaiting_approval() {
+        let digest = *session
+            .pending_approvals()
+            .last()
+            .expect("a parked promotion approval");
+        return session
+            .resolve_approval(&digest, true)
+            .unwrap()
+            .expect("promotion approval resolves");
+    }
+    session.commit_tool_outcome(&outcome).unwrap();
+    outcome
+}
+
+/// E-F4: promotion is a real write path — a `Promotion` transition on the
+/// LIFETIME scope, a `promoted_from` edge whose target is the project source,
+/// the destination claim's provenance carrying the source digest, and the
+/// session backlink naming the lifetime scope.
+#[test]
+fn promotion_write_path_lifetime_root_and_promoted_from_edge() {
+    let root = fresh_session_dir("promotion");
+    let _guard = DirGuard(root.clone());
+    let project_id = Id128::generate();
+    let sid = Id128::generate();
+    let mut session = Session::open(SessionConfig {
+        dir: root.clone(),
+        memory_root: Some(root.join("memory")),
+        project: Some(project_id),
+        broker: tool_broker(
+            sid,
+            &["memory.propose", "memory.query", "memory.promote"],
+            &["memory.propose", "memory.promote"],
+        ),
+        session_id: Some(sid),
+        ..Default::default()
+    })
+    .unwrap();
+    let (run, _) = setup_run(&mut session);
+    let proposed = propose_claim(
+        &mut session,
+        run,
+        sid,
+        json!({"kind": "decision", "content": "the widget is canonical"}),
+    );
+    assert_eq!(proposed.result["status"], "approved");
+    let source_id = proposed.result["claim_id"].as_str().unwrap().to_string();
+    let source_digest = proposed.result["claim_digest"].as_str().unwrap().to_string();
+
+    let promoted = promote_claim(
+        &mut session,
+        run,
+        sid,
+        &source_id,
+        "the project held the evidence",
+    );
+    assert_eq!(promoted.result["status"], "approved", "{promoted:?}");
+    assert_eq!(promoted.result["source_claim_id"], source_id);
+    assert_eq!(promoted.result["source_digest"], source_digest);
+    assert!(
+        promoted.result["transition_id"].is_string(),
+        "a lifetime transition commits"
+    );
+
+    // Lifetime root updated: one Promotion transition, its fold carries the
+    // destination claim and the promoted_from edge to the project source id.
+    let actor = session.memory_lifetime();
+    assert_eq!(actor.transition_count(), 1);
+    let fold = actor.fold(actor.head()).unwrap();
+    assert_eq!(fold.claims.len(), 1);
+    let (_, dest) = &fold.claims[0];
+    assert_eq!(dest.visibility_scope, MemoryScope::Lifetime);
+    assert_eq!(dest.provenance.source_claims.len(), 1);
+    assert_eq!(dest.provenance.source_claims[0].to_string(), source_digest);
+    assert_eq!(dest.content, "the widget is canonical");
+    assert_eq!(fold.edges.len(), 1);
+    let (_, edge) = &fold.edges[0];
+    assert_eq!(edge.kind, EdgeKind::PromotedFrom);
+    assert_eq!(edge.from, dest.claim_id);
+    assert_eq!(edge.to.unwrap().to_string(), source_id);
+
+    let evs = envelopes(&root);
+    assert!(
+        evs.iter().any(|e| e.kind == "memory_promotion_approved"),
+        "the promotion origin fact is canonical"
+    );
+    let backlink = evs
+        .iter()
+        .find(|e| {
+            e.kind == "memory_transition_backlink"
+                && e.payload.get("scope").and_then(|s| s.as_str()) == Some("Lifetime")
+        })
+        .expect("a lifetime backlink is recorded");
+    assert!(backlink.payload["transition_id"].is_string());
+    session.close().unwrap();
+}
+
+/// E-F4 root-agent review: reject and request_evidence are canonical decision
+/// facts that leave the fold untouched; approve commits the root transition
+/// under the user approval and the claim becomes active.
+#[test]
+fn root_agent_review_reject_request_evidence_approve() {
+    let root = fresh_session_dir("review");
+    let _guard = DirGuard(root.clone());
+    let project_id = Id128::generate();
+    let sid = Id128::generate();
+    let mut session = Session::open(SessionConfig {
+        dir: root.clone(),
+        memory_root: Some(root.join("memory")),
+        project: Some(project_id),
+        broker: tool_broker(
+            sid,
+            &["memory.propose", "memory.review"],
+            &["memory.review"],
+        ),
+        session_id: Some(sid),
+        ..Default::default()
+    })
+    .unwrap();
+    let (run, _) = setup_run(&mut session);
+
+    // No approval requirement on propose (the broker requires it for review
+    // only): the claim stays proposed.
+    let first = propose_claim(
+        &mut session,
+        run,
+        sid,
+        json!({"kind": "decision", "content": "rejected widget"}),
+    );
+    assert_eq!(first.result["status"], "proposed");
+    let rejected_id = first.result["claim_id"].as_str().unwrap().to_string();
+    let rejected = review_claim(&mut session, run, sid, &rejected_id, "reject");
+    assert_eq!(rejected.result["decision"], "reject");
+    assert_eq!(session.memory_project().unwrap().transition_count(), 0);
+    assert!(
+        session
+            .memory_project()
+            .unwrap()
+            .fold(None)
+            .unwrap()
+            .claims
+            .is_empty(),
+        "a rejected proposal never enters the fold"
+    );
+
+    let second = propose_claim(
+        &mut session,
+        run,
+        sid,
+        json!({"kind": "decision", "content": "needs evidence"}),
+    );
+    let needs_id = second.result["claim_id"].as_str().unwrap().to_string();
+    let evidence = review_claim(&mut session, run, sid, &needs_id, "request_evidence");
+    assert_eq!(evidence.result["decision"], "request_evidence");
+    assert_eq!(session.memory_project().unwrap().transition_count(), 0);
+
+    let third = propose_claim(
+        &mut session,
+        run,
+        sid,
+        json!({"kind": "decision", "content": "approved widget"}),
+    );
+    let approved_id = third.result["claim_id"].as_str().unwrap().to_string();
+    let approved = review_claim(&mut session, run, sid, &approved_id, "approve");
+    assert_eq!(approved.result["status"], "approved");
+    assert!(approved.result["transition_id"].is_string());
+    assert_eq!(session.memory_project().unwrap().transition_count(), 1);
+    let fold = session
+        .memory_project()
+        .unwrap()
+        .fold(session.memory_project().unwrap().head())
+        .unwrap();
+    assert_eq!(fold.claims.len(), 1, "only the approved claim is active");
+    assert_eq!(fold.claims[0].1.content, "approved widget");
+
+    let evs = envelopes(&root);
+    assert!(evs.iter().any(|e| e.kind == "memory_proposal_rejected"));
+    assert!(evs.iter().any(|e| e.kind == "memory_evidence_requested"));
+    session.close().unwrap();
+}
+
+/// E-F8: the layer-2 active view is derived from canonical facts and reaches
+/// the model-call projection — a queried claim pins, a user message opens a
+/// loop, and both render in the active-memory fragment so the salience
+/// goals/pins components are live rather than permanently zero.
+#[test]
+fn layer2_pins_and_open_loops_reach_the_model_call_boundary() {
+    let root = fresh_session_dir("layer2");
+    let _guard = DirGuard(root.clone());
+    let project_id = Id128::generate();
+    let sid = Id128::generate();
+    let mut session = Session::open(SessionConfig {
+        dir: root.clone(),
+        memory_root: Some(root.join("memory")),
+        project: Some(project_id),
+        broker: tool_broker(
+            sid,
+            &["memory.propose", "memory.query"],
+            &["memory.propose"],
+        ),
+        session_id: Some(sid),
+        ..Default::default()
+    })
+    .unwrap();
+    let (run, trigger) = setup_run(&mut session);
+    let proposed = propose_claim(
+        &mut session,
+        run,
+        sid,
+        json!({"kind": "decision", "content": "the widget is canonical"}),
+    );
+    let digest = proposed.result["claim_digest"].as_str().unwrap().to_string();
+
+    let q = query_memory(&mut session, run, sid, "widget");
+    assert_eq!(q.result["claims"].as_array().unwrap().len(), 1);
+    assert_eq!(session.active_pins().len(), 1, "the query pins its claims");
+    assert_eq!(session.active_pins()[0].to_string(), digest);
+
+    session
+        .append_user_message("please fix the widget")
+        .unwrap();
+    assert_eq!(session.open_loops().len(), 1);
+    assert_eq!(session.open_loops()[0].text, "please fix the widget");
+
+    let ctx = session.project_context(run, &trigger).unwrap();
+    assert!(
+        ctx.rendered.contains(&format!("pin: {digest}")),
+        "the pinned claim renders in the active fragment: {}",
+        ctx.rendered
+    );
+    assert!(
+        ctx.rendered.contains("open_loop:") && ctx.rendered.contains("please fix the widget"),
+        "the open loop renders in the active fragment: {}",
+        ctx.rendered
+    );
+
+    // A completed run resolves the loop; the pin survives (it is query state).
+    session
+        .run_outcome(
+            run,
+            TerminalOutcome::CompletedGoal,
+            session.scheduler_usage(run),
+            &[],
+        )
+        .unwrap();
+    assert!(
+        session.open_loops().is_empty(),
+        "CompletedGoal resolves loops"
+    );
+    assert_eq!(session.active_pins().len(), 1);
+    session.close().unwrap();
+
+    // Layer-2 is per-run disposable (R-12/F-S5): a reopened session starts
+    // with an empty active view and re-derives it from the new run's facts.
+    let mut reopened = Session::open(SessionConfig {
+        dir: root.clone(),
+        memory_root: Some(root.join("memory")),
+        project: Some(project_id),
+        broker: tool_broker(
+            sid,
+            &["memory.propose", "memory.query"],
+            &["memory.propose"],
+        ),
+        session_id: Some(sid),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(
+        reopened.active_pins().is_empty(),
+        "the previous run's pins are not carried into the new run"
+    );
+    assert!(reopened.open_loops().is_empty());
+    // A later message opens a fresh loop after resume.
+    reopened.append_user_message("and then verify it").unwrap();
+    assert_eq!(reopened.open_loops().len(), 1);
+    reopened.close().unwrap();
 }

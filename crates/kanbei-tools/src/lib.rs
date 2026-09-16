@@ -136,6 +136,18 @@ pub fn builtin_tool_schemas() -> Vec<ToolSchema> {
             json!({"type": "object", "required": ["claim"], "properties": {"claim": {"type": "object"}}}),
             json!({"type": "object"}),
         ),
+        ToolSchema::new(
+            "memory.review",
+            "Root-agent review of a proposed claim: approve (user-gated), reject, or request_evidence.",
+            json!({"type": "object", "required": ["claim_id", "decision"], "properties": {"claim_id": {"type": "string"}, "decision": {"type": "string"}, "reason": {"type": "string"}}}),
+            json!({"type": "object"}),
+        ),
+        ToolSchema::new(
+            "memory.promote",
+            "Promote an active project claim into the lifetime scope (user-gated).",
+            json!({"type": "object", "required": ["claim_id"], "properties": {"claim_id": {"type": "string"}, "evidence": {"type": "string"}}}),
+            json!({"type": "object"}),
+        ),
     ];
     v.sort_by(|a, b| a.name.cmp(&b.name));
     v
@@ -613,10 +625,12 @@ pub fn execute_tool(
             "child.spawn".into(),
             "child spawn dispatch is wired by the session scheduler".into(),
         )),
-        "memory.query" | "memory.propose" => Err(ToolError::Unavailable(
-            name.into(),
-            "memory substrate lands in M4".into(),
-        )),
+        "memory.query" | "memory.propose" | "memory.review" | "memory.promote" => {
+            Err(ToolError::Unavailable(
+                name.into(),
+                "memory substrate lands in M4".into(),
+            ))
+        }
         _ => Err(ToolError::UnknownTool(name.into())),
     }
 }
