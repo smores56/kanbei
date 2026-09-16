@@ -46,14 +46,12 @@ fsyncs object *data* before the referencing frame became durable, commit
 paths no longer swallow `PolicyError`, and the epoch-digest / store-closure
 duplication collects into shared primitives.
 
-**Biggest things left unfixed (all dispositioned, none silent):** the
-module-lifecycle majors (activation-time state-schema validation,
-rollback leakage of registry publications, non-transactional service apply,
-post-swap `RestartFailed`, disposal facts discarded) are recorded with
+**Biggest things left unfixed (all dispositioned, none silent):** three
+module-lifecycle majors (non-transactional service apply, post-swap
+`RestartFailed`, disposal facts discarded — C-F3/F4/F6) are recorded with
 candidate fixes but not landed — they need their own milestone-sized waves;
-the epoch counter embedded in the composition digest defeats content-address
-dedup (R-01); `Session/open `/recovery` decodes bypass the versioned-record
-registry (17 sites); the M-14 claim-authority invariant is unenforced — and
+`Session::open`/`recovery` decodes bypass the versioned-record
+registry (17 sites, D-F-Q); the M-14 claim-authority invariant is unenforced — and
 built-in `mem.*` fragments render memory claims in the *system* prefix,
 which needs a design-ledger clarification before code follows (see §Design
 conflicts). The session remains a 12.8k-LOC monolith with a concrete
@@ -163,7 +161,7 @@ each lane's clean list is in the lane records.
 | D-F-L | major | fid | No-progress counter never resets on causal events ("ever-progressed" semantics vs arch:120). | **Fixed** (`683fb55`): the streak restarts on a causal event since the previous outcome (the old guard evaluated to always-true and was removed). |
 | D-F-M | minor | fid | Egress sensitivity classes hardcoded (`vec!["call"]`). | **Deferred** (fold real fragment classes). |
 | D-F-N | minor | fid | Compaction selection has enforcement, no kernel API; "causal-closed" is fragment-id containment, not a causal-parent check. | **Wontfix** (deferred milestone-shaped; enforcement half exists and tests drive the kind manually). |
-| D-F-O | major | fid | SessionId never persisted; default lifetime memory is per-session (`<dir>/memory` vs the XDG shared `memory/lifetime`); no `sessions/<SessionId>/` layout; import reverse-engineers the id from markers. | **Deferred (layout)** / **partial**: identity persistence (session.json at open, import reads it) is the bounded slice that kills the T3 fragility — recorded as the pick; full XDG layout conformance is a storage-model wave. |
+| D-F-O | major | fid | SessionId never persisted; default lifetime memory is per-session (`<dir>/memory` vs the XDG shared `memory/lifetime`); no `sessions/<SessionId>/` layout; import reverse-engineers the id from markers. | **Fixed in the pivot (T14, `255c008`/`352284c`/`8ddaec2`)**: identity persists as `session.json` at open, after the log opens (`session/src/lib.rs:828`, `write_manifest`); the XDG layout lives in `kanbei-core::paths` (`sessions/<SessionId>/events.jsonl.zst`, shared `<state>/memory` root; decision 33); discovery and import read the manifest instead of reverse-engineering the id from markers. |
 | D-F-P | minor | fid | `after_secs` discarded; `pending` unbounded without a timer wheel. | **Deferred** (small). |
 | D-F-Q | major | craft | The versioned-record registry/upcasters bypassed on all reconstruction paths (17 raw decodes; `payload_schema: 1` hardcoded; projection *counts* upcasts but does not consume them; `follow` silently falls back to `FollowHead` on schema drift). | **Deferred**: route the load-bearing group (follow/quiesce/config_choice) through `Registry::upcast`; fail loud on drift. Milestone-shaped but high-value. |
 | D-F-R | major | craft | Silent `Envelope::from_line` skips (21+ sites); `resolved_payload` returns the raw `$object` marker on store miss (a swept GC object drops a promoted intent from classification); GC skips unreadable manifests. | **Deferred**: `Result<Value, MissingObject>` + classify-as-interrupted; GC records sweep exceptions. |
@@ -182,11 +180,11 @@ each lane's clean list is in the lane records.
 | E-F1 | major | eff | reconcile wiped edges/roots per scope (empirically reproduced). | **Fixed** (`b2f97d4`). |
 | E-F2 | major | eff | Dedup adjacency-based (empirically reproduced). | **Fixed** (`b2f97d4`). |
 | E-F3 | major | fid | Children projected the lifetime memory fragment (m4-report claimed otherwise). | **Fixed** (`c16ad63`). |
-| E-F4 | major | fid | Promotion is vocabulary-only: no `Promotion` transition writer, no `PromotedFrom` edges, lifetime claims have no write path (`dispatch_memory_propose` hardcodes Project). | **Deferred**: the largest single memory-layer gap vs arch:456-468; promotion needs its milestone (approve/reject/request-evidence UX is unratified). Recorded with the reuse candidate (`approve_transition` w/ `TransitionKind::Promotion`). |
+| E-F4 | major | fid | Promotion is vocabulary-only: no `Promotion` transition writer, no `PromotedFrom` edges, lifetime claims have no write path (`dispatch_memory_propose` hardcodes Project). | **Fixed in the pivot (T15, `8e23a50`)**: `dispatch_memory_promote` (`session/src/spine.rs:2178`) installs a lifetime claim with promotion provenance, the cross-scope `promoted_from` edge (admissible only when the origin claim carries a source-claim digest) and the `Promotion` transition on the lifetime actor; `dispatch_memory_propose` is generalized to target the project or lifetime actor, and root review gains reject/request-evidence (`memory_proposal_rejected`/`memory_evidence_requested`). The unratified triage UX therefore stayed out of scope, but the write path and canonical facts landed (gate_m4). |
 | E-F5 | major | fid | M-14/R-13 unenforced — and built-in `mem.*` fragments (`MemoryClaim` sources, `ScopeStable`, cache-eligible) render in the SYSTEM prefix. | **Design conflict** — untrusted claim content occupies system-authority position in every model call; but arch's conceptual ordering (145-146: stable project/lifetime memory near the front) and M-14 pull opposite ways. Proposed amendment in §Amendments; code follows the amendment, not the other way. |
 | E-F6 | minor | fid | `applies_to` typed entity keys are dead vocabulary (content-derived entity projection half is implemented). | **Deferred** (wire an extractor or cut the field from MVP — decision recorded with the design). |
 | E-F7 | minor | fid | Structural event/tool extractors (modified-file, failed-with edges) absent. | **Deferred** (explicitly listed as a design gap, not silently). |
-| E-F8 | minor | fid | pins/open-loops never populated — the canonical layer-2 record is absent; salience weights for goals/pins permanently 0. | **Deferred**: either wire the `model_call` pin facts or zero+document the inert weights; needs an instrument decision. |
+| E-F8 | minor | fid | pins/open-loops never populated — the canonical layer-2 record is absent; salience weights for goals/pins permanently 0. | **Fixed in the pivot (T15, `8e23a50`)**: the session carries layer-2 `active_pins`/`open_loops` (`session/src/lib.rs:709-715`); query outcomes set pins, a user message opens a loop and `CompletedGoal` resolves it, and both feed salience at the model-call boundary. They stay per-run disposable (not restored on reopen, by design). |
 | E-F9 | minor | eff | Chronology check ignored `CompactionRange` refs. | **Fixed** (`c16ad63`). |
 | E-F10 | minor | craft | ProjectRegistry: no fsync, torn line bricks the registry, read-then-append race. | **Fixed** (`c16ad63`): `sync_data` before ack + torn-tail tolerance; the duplicate-suffix race remains accepted (documented; last-wins lookup). |
 | E-F11 | minor | fid | `PinnedAt` carries root digests, not a `TransitionId` (M-17's ratified shape). | **Deferred** (equivalent identity via one-transition-one-root; rename-vs-migrate is the decision). |
@@ -200,7 +198,7 @@ each lane's clean list is in the lane records.
 |---|---|---|---|---|
 | F-F1 | blocker | eff | GC root capture omitted workspace blobs. | **Fixed** (`c7c2162`). |
 | F-F2 | major | eff | InputDecoder pending unbounded + O(n) rescan per feed on unterminated CSI-numeric. | **Deferred** (cap + reset — 5 lines + tests). |
-| F-F3 | major | craft | Hot path: `Cell.style: String` (1920 allocs/frame), one `write()` per cell edit in `apply`/`paint_full`. Measured input-ACK p99 (1.38 ms) passes; paint cost is unbudgeted. | **Deferred** with reasoning: no violated budget today; style interning + run coalescing is the recorded pick when S16 becomes load-bearing. |
+| F-F3 | major | craft | Hot path: `Cell.style: String` (1920 allocs/frame), one `write()` per cell edit in `apply`/`paint_full`. Measured input-ACK p99 (1.38 ms) passes; paint cost is unbudgeted. | **Superseded in the pivot (T12, `d335a6f`)**: the custom cell grid (`diff.rs`, `apply`/`paint_full`, `Cell.style: String`) was deleted for the single ratatui render path (`frame.rs`), so the finding's subject no longer exists. |
 | F-F4 | major | fid | Grace clock never refreshed on re-quarantine. | **Fixed** (`c16ad63`). |
 | F-F5 | major | eff | Gauges double-scan + per-file stat per run outcome; spine `?` fails `run_outcome` after commit on io error. | **Fixed** (single pass). The `?` demotion is **deferred** (one line). |
 | F-F6 | minor | fid | Theme overlay bind swallows the apply error (partial application, silent). | **Deferred** (small). |
@@ -298,8 +296,8 @@ the fidelity rule (cite both passages; amend; never silently reconcile).
 
 1. ~~R-24 host-import timeout wrappers + per-generation wall-clock budget
    (B-F2/F3)~~ — landed in the pivot (T6).
-2. State-schema wire-up + `module reset-state` + rollback leak (C-F1/C-F2)
-   and the epoch-digest de-mixing (C-F5).
+2. ~~State-schema wire-up + `module reset-state` + rollback leak (C-F1/C-F2)
+   and the epoch-digest de-mixing (C-F5)~~ — landed in the pivot (T7).
 3. Registry-bypass decode boundary (D-F-Q) + `resolved_payload` Result
    (D-F-R).
 4. Session recovery single-scan + module split (D-F-S/T7).
@@ -307,7 +305,7 @@ the fidelity rule (cite both passages; amend; never silently reconcile).
    (D-F-K/L/J).
 6. B-05 classification coverage + intent-pairing validation (D-B-F/D-F-I).
 7. M8/M9 crash modes + budget instrumentation (G-F4/G-F3).
-8. Trust-class intersection (B-F5), digest binding (B-F8), promotion (E-F4).
+8. Trust-class intersection (B-F5), digest binding (B-F8).
 
 ## Gates
 

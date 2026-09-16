@@ -116,7 +116,7 @@ Greenfield is required. Maki moves toward the desired design but inherits global
 - Rust enforces pause/shutdown, user-initiated cancellation, deadlines, global/per-run concurrency, token/cost/tool/time budgets, stale-generation rejection, bounded queues/timers, and circuit breakers.
 - Canonical scheduler surface (R-09/E-09): canonical records are the wake-acceptance decision (coalesced triggers referenced as digest lists inside it), denials/circuit-breaks with the responsible constraint, run start, and terminal outcome; raw observed triggers and expected-utility scores are policy-private module state or ephemeral.
 - Wake = Run (R-09/E-10): every accepted wake creates exactly one RunId with a kind discriminator (`CognitionStep | ResponderTurn | Child`) and typed trigger provenance; wake/outcome pairing is the run FSM lifecycle.
-- Single-owner-at-a-time: the session actor runs one command at a time. A wake arriving during an active run is denied `ConcurrencyLimit` and its trigger queued — it never preempts the running command. Cancellation is user-initiated (Ctrl-C): the cancel flag is checked at stream boundaries inside an in-flight model call and between host commands, classifying the run `Failed(UserCancelled)`; committed intents are never rolled back.
+- Single-owner-at-a-time: each session's actor runs one command at a time. A wake arriving during an active run is denied `ConcurrencyLimit` and its trigger queued — it never preempts the running command. Cancellation is user-initiated (Ctrl-C): the cancel flag is checked at stream boundaries inside an in-flight model call and between host commands, classifying the run `Failed(UserCancelled)`; committed intents are never rolled back.
 - Circuit breakers (R-17/E-02): kernel-owned breakers on canonical counters — consecutive `Failed`; consecutive `NoProgress`/`Waiting` without new causal events; N identical action digests within a window; spend per wall-clock window; kernel enforces minimum floors, policy tunes only above floors; a trip appends canonical `BreakerTripped` (responsible counter) and pauses cognition until explicit user resume.
 - Reactive-only scheduling remains possible as a policy even though perpetual cognition is the experiment.
 
@@ -306,13 +306,13 @@ end)
 
 - UI is a semantic component tree with module reducers and typed intents.
 - Modules may replace the complete visible layout and interaction map.
-- Rust owns terminal initialization/restoration, input decoding/sanitization, focus/modal invariants, render diffing, accessibility validation, effect dispatch, and crash fallback UI.
+- Rust owns terminal initialization/restoration, input decoding/sanitization, focus/modal invariants, rendering, accessibility validation, effect dispatch, and crash fallback UI. The ratatui substrate amendment makes ratatui the one render path: `kanbei-ui` composes the kernel contract (`SemanticTree + Theme` plus reserved keys) into a ratatui buffer and paints through a kernel-fd-aware backend. The old custom cell grid is deleted; the kernel still owns the buffer and the terminal, and a module never draws cells.
 - Conceptual model:
 
 ```text
 UiState + UiEvent -> UiState + [DomainIntent]
 UiState -> SemanticTree
-SemanticTree + Theme -> TerminalFrame
+SemanticTree + Theme -> ratatui Buffer
 ```
 
 - Hot paths consume immutable Rust snapshots; Luau/Wasm does not draw terminal cells directly.
@@ -320,9 +320,9 @@ SemanticTree + Theme -> TerminalFrame
 - Persist normalized domain intents/facts, not gestures such as key presses, focus, scroll, hover, animation, or modal closure.
 - Drafts and presentation state may live in memory or disposable SQLite.
 - UI reducer state is always ephemeral; durable drafts persist only via module-state heads (R-27).
-- Three fault classes (R-27): composition-validation failure → last-valid/core UI with a staleness banner; runtime component fault → component-level placeholder with the module marked degraded; kernel render fault → kernel fallback UI.
+- Three fault classes (R-27), as shipped by the session UI host (`kanbei-session/src/ui.rs`): (1) composition-validation failure → `ui_mark_stale` records the reason and the kernel overlays a staleness banner on the retained last-valid/core UI; (2) runtime component fault → the faulting mount degrades to a kernel-authored placeholder subtree while the other mounts keep working (`degraded`, per mount since M8); (3) kernel render fault → the kernel `FallbackUi` tree with module input dropped (`safe_mode`).
 - The kernel assigns input provenance on every `UiEvent` (`User` or `Module(gen)`); module-emitted intents are subject to the standard capability intersection (R-27).
-- The kernel reserves a minimal interaction set (focus/modal escape, core navigation, safe-mode entry) that modules cannot rebind (R-27).
+- The kernel reserves a minimal interaction set that modules cannot rebind (R-27): process suspend (Ctrl-Z), the kernel safe-mode chord (Ctrl-X Ctrl-S), and Escape while a modal boundary is active. Cancel/repaint are remappable bindings, not reserved.
 
 ### Identity model
 
@@ -595,7 +595,7 @@ The first runnable milestone is a perpetual-cognition vertical slice intended to
 In scope:
 
 - branded Base58 UUIDv7 IDs, including SessionId, ProjectId, BranchId, RunId, EventId, ToolCallId, ClaimId, ModuleId, and GenerationId (message identity is its committing event — R-19/A-S4);
-- one Rust session actor, typed FSMs, canonical Zstd-framed JSONL audit, per-session immutable objects, execution snapshots, and disposable SQLite reconstruction;
+- one Rust session actor per session, typed FSMs, canonical Zstd-framed JSONL audit, per-session immutable objects, execution snapshots, and disposable SQLite reconstruction; the mutable state shared across sessions is the XDG project/lifetime memory root and its per-scope transition actors, never the session actor;
 - kernel bootstrap meta-schema, one provider engine/provider, normalized provider lifecycle, and cache-aware typed context projection;
 - interactive responder plus perpetual root cognition, configurable scheduler under Rust bounds, and Rust-supervised bounded child agents;
 - Luaur inside per-generation Wasmtime instances;
@@ -604,7 +604,7 @@ In scope:
 - no-effect classification/redaction/retention with two-phase streaming handling, shipped as a Rust built-in default policy (store-all or simple pattern redaction) with the module seam defined; the replaceable no-effect policy runtime is deferred (R-20);
 - immutable experience DAG, deterministic active-memory projection, root-approved project claims, SQLite exact-entity + FTS5/BM25 fusion, temporal/supersession filtering, and deterministic one-hop graph expansion (dense retrieval deferred — R-20);
 - per-project memory DAG/root transition actor and ProjectId locator registry;
-- composed semantic UI: kernel terminal/fallback boundary plus one built-in UI authored as an immutable module generation through the standard contribution contract, with composition-failure fallback; multi-module slots/reducers/atomic composition deferred post-MVP (R-20/R-27);
+- composed semantic UI: kernel terminal/fallback boundary plus module-authored UI generations through the standard contribution contract — the built-in shell (M5) and M8 multi-module composition (all root-scope mounts bind in deterministic `(slot, scope, name)` order into one synthetic root, per-mount capability-checked reducers, atomic OCC composition publish) — with composition-failure fallback (R-20/R-27);
 - `continue_from(checkpoint)` only for initial branching;
 - crash recovery to explicit interrupted/ambiguous outcomes;
 - separate optional OpenTelemetry-compatible telemetry (OTel correlation and storage reporting deferred — R-20; a manual usage check before the dogfooding gate (M7) compensates deferred GC growth).
@@ -730,17 +730,17 @@ How might we build a fast local Rust agent workbench whose perpetual cognition i
 
 ### Recommended direction
 
-Build a minimal Rust enforcement kernel around typed domain FSMs, one session actor, canonical append-only audit events, immutable content-addressed objects/snapshots, capability enforcement, Wasmtime/Luaur hosting, and terminal safety. Put product behavior into unified immutable Luau module generations with Cordis-style service dependencies, lifecycle-owned effects, transactional dynamic scopes, and atomic composition. One replaceable cognition-step service runs per accepted perpetual wake; domain operations remain in their own typed services and FSMs.
+Build a minimal Rust enforcement kernel around typed domain FSMs, one session actor per session (with a shared XDG project/lifetime memory root and a disposable SQLite projection outside it), canonical append-only audit events, immutable content-addressed objects/snapshots, capability enforcement, Wasmtime/Luaur hosting, and terminal safety. Put product behavior into unified immutable Luau module generations with Cordis-style service dependencies, lifecycle-owned effects, transactional dynamic scopes, and atomic composition. One replaceable cognition-step service runs per accepted perpetual wake; domain operations remain in their own typed services and FSMs.
 
 Store causal session history as checksummed/hash-chained Zstd JSONL frames, query disposable SQLite projections, and pin every state-changing event to an immutable execution snapshot (pure events reference the last-pinned manifest — P9 clarified, R-08). Separate memory into immutable experience, disposable per-run activation, and immutable project/lifetime claim DAGs whose roots are serialized through narrow per-scope transition logs. Use a typed cache-aware context pipeline and hybrid source-backed retrieval. Agent-authored Luau executes in per-generation Wasmtime instances; ordinary native developer tools remain subprocesses governed by capability policy and the user's optional outer sandbox.
 
 ### Key assumptions to validate
 
 - Wasm-hosted Luaur has acceptable startup, callback, async-host-call, and diagnostic behavior for live modules.
-- One session actor is sufficient for all expected root/child/event throughput.
+- One session actor per session is sufficient for all expected root/child/event throughput; cross-session mutable state is confined to the XDG memory roots and their per-scope transition actors.
 - Independent Zstd frames plus a local hash chain provide acceptable append latency, compression, recovery, and verification.
 - Execution-snapshot closure remains understandable and does not become a dependency-management bottleneck.
-- Composed semantic UI (one built-in UI module generation plus kernel fallback) can remain safe, low-latency, and versionable; multi-module composition is post-MVP (R-20).
+- Composed semantic UI (the built-in UI shell plus kernel fallback) can remain safe, low-latency, and versionable; M8 multi-module composition shipped within the flat mount list (R-20).
 - Exact-entity + FTS5/BM25 + one-hop memory retrieval is good enough for useful perpetual cognition; dense retrieval re-enters only via the memory benchmark plan (R-20).
 - Root-reviewed project memory avoids both pollution and excessive review burden.
 - Perpetual cognition provides enough subjective continuity/value to justify spend and lifecycle complexity.

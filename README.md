@@ -14,15 +14,21 @@ the cognition driver (`crates/kanbei-driver`) over a durable session
 (`crates/kanbei-session`):
 
 ```
-cargo run -p kanbei-cli --bin kanbei -- [DIR] [--model M] [--fake] [--auto-approve]
+cargo run -p kanbei-cli --bin kanbei -- [DIR]
 ```
 
-- `DIR` (or `$KANBEI_DIR`, default `.`) — the session dir: canonical log,
-  content-addressed objects, snapshots, and memory roots. Reopening the same
-  dir resumes the same session.
-- Provider: `$KANBEI_PROVIDER_URL` / `$KANBEI_PROVIDER_KEY` /
-  `$KANBEI_PROVIDER_MODEL` (an OpenAI-compatible chat-completions endpoint;
-  `--model` overrides the env), or `--fake` for a scripted smoke run.
+- `DIR` (or `$KANBEI_DIR`, default `.`) — the project root and fs sandbox. An
+  explicit root keeps the legacy session layout under it; without one, session
+  storage follows the XDG state layout (`$XDG_STATE_HOME/kanbei/sessions/<SessionId>/`,
+  falling back to `$HOME/.local/state/kanbei`; decision 33). Reopening the same
+  session dir resumes the same session.
+- Provider and approval wiring come from the merged config layers (built-in
+  defaults, then `$XDG_CONFIG_HOME/kanbei/init.lua`, then
+  `<DIR>/.kanbei/init.lua`) — `provider.base_url`/`provider.model`/`provider.fake`
+  and `approval.auto_approve`/`approval.yolo` (decision 28). The argv flags and
+  most `KANBEI_*` env vars were retired: only `$KANBEI_DIR`,
+  `$KANBEI_PROVIDER_URL` and `$KANBEI_PROVIDER_KEY` remain, the latter two read
+  solely as fallbacks when config supplies no base URL or key (config wins).
 
 On a TTY the CLI runs a full-screen TUI; piped stdin falls back to the plain
 REPL.
@@ -47,7 +53,8 @@ any turn by clicking its summary or selecting it (arrows/`j`/`k`) and pressing
 **REPL (piped stdin).** One user message per line; the resulting wakes are
 driven to quiescence and the model's final answer is printed to stdout.
 Intermediate tool round-trips are canonical facts (inspect with `/history`).
-Gated tools prompt interactively unless `--auto-approve` is set. Commands:
+Gated tools prompt interactively unless auto-approval is enabled
+(`approval.auto_approve` / `approval.yolo` in the config layers). Commands:
 `/status`, `/history [N]`, `/export DIR`, `/resume` (after a breaker pause),
 `/exit`.
 
