@@ -513,6 +513,9 @@ fn run_repl(opts: Options) {
     let session = match Session::open(SessionConfig {
         dir: root.to_path_buf(),
         layout: opts.session_layout(StateLayout::from_env()),
+        // Migration is opt-in (decision 34): only an explicitly named root
+        // (argv/`KANBEI_DIR`) may be a legacy source; the implicit cwd is not.
+        legacy_dir: opts.dir.clone(),
         stream: "cli".into(),
         engine: Some(cli_engine()),
         fs_root: root.to_path_buf(),
@@ -615,6 +618,9 @@ fn run_tui(opts: Options) -> i32 {
     let cfg = SessionConfig {
         dir: root.to_path_buf(),
         layout: opts.session_layout(StateLayout::from_env()),
+        // Migration is opt-in (decision 34): only an explicitly named root
+        // (argv/`KANBEI_DIR`) may be a legacy source; the implicit cwd is not.
+        legacy_dir: opts.dir.clone(),
         stream: "cli".into(),
         engine: Some(cli_engine()),
         fs_root: root.to_path_buf(),

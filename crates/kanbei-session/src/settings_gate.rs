@@ -19,17 +19,33 @@ pub(crate) fn origin_is_trusted_for_settings(origin: ModuleOrigin) -> bool {
 
 /// The FULL published-contribution gate applied where a generation's staged
 /// contributions are collected (F2/B): settings fields are trust-gated (see
-/// [`gate_settings_contributions`]) AND a lifecycle hook from an untrusted
-/// origin is dropped entirely — a cloned workspace must not be able to deny
-/// every tool/turn (DoS) or annotate guest data into the model context. Hook
-/// dispatch is advisory, so an untrusted origin's hook simply has no effect.
+/// [`gate_settings_contributions`]) AND, for an untrusted origin, `Hook` and
+/// `Keymap` contributions are dropped entirely.
+///
+/// - `Hook`: a cloned workspace must not be able to deny every tool/turn (DoS)
+///   or annotate guest data into the model context. Hook dispatch is advisory,
+///   so an untrusted origin's hook simply has no effect.
+/// - `Keymap`: the resolved keymap is the ONE keymap both the session's
+///   `ui_binding_action` routing and the CLI's approval-keystroke
+///   classification consult, and a parked approval is a modal gate. An
+///   untrusted binding that maps an innocent key to `approve` (`Always`
+///   context applies under the modal) would auto-approve a gated action, so
+///   the whole untrusted payload is dropped rather than filtered by action.
+///
+/// `Theme` is cosmetic and stays ungated; every other kind keeps its existing
+/// rules.
 pub(crate) fn gate_published_contributions(
     origin: ModuleOrigin,
     contributions: &mut Vec<Contribution>,
 ) {
     gate_settings_contributions(origin, contributions);
     if !origin_is_trusted_for_settings(origin) {
-        contributions.retain(|c| !matches!(c.kind, ContributionKind::Hook(_)));
+        contributions.retain(|c| {
+            !matches!(
+                c.kind,
+                ContributionKind::Hook(_) | ContributionKind::Keymap(_)
+            )
+        });
     }
 }
 
@@ -109,13 +125,49 @@ fn valid_base_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kanbei_scopes::contrib::{ApprovalSettings, ProviderSettings, SettingsContribution};
+    use kanbei_scopes::contrib::{
+        ApprovalSettings, ContextPredicate, HookKind, Keybinding, KeymapOrigin, ProviderSettings,
+        SettingsContribution, ThemeContribution,
+    };
     use kanbei_services::ScopePath;
 
     fn settings_contribution(settings: SettingsContribution) -> Contribution {
         Contribution {
             scope: ScopePath(vec![]),
             kind: ContributionKind::Settings(settings),
+        }
+    }
+
+    fn keymap_contribution(key: &str, action: &str) -> Contribution {
+        Contribution {
+            scope: ScopePath(vec![]),
+            kind: ContributionKind::Keymap(Keybinding {
+                key: key.into(),
+                context: ContextPredicate::Always,
+                action: action.into(),
+                origin: KeymapOrigin::UserConfig,
+                owner: None,
+            }),
+        }
+    }
+
+    fn theme_contribution() -> Contribution {
+        Contribution {
+            scope: ScopePath(vec![]),
+            kind: ContributionKind::Theme(ThemeContribution {
+                name: "t".into(),
+                overlay: serde_json::Value::Null,
+            }),
+        }
+    }
+
+    fn hook_contribution() -> Contribution {
+        Contribution {
+            scope: ScopePath(vec![]),
+            kind: ContributionKind::Hook(kanbei_scopes::contrib::HookContribution {
+                name: "h".into(),
+                hook: HookKind::OnTurnStart,
+            }),
         }
     }
 
@@ -182,6 +234,56 @@ mod tests {
             panic!("settings")
         };
         assert_eq!(s.provider.as_ref().unwrap().base_url, None);
+    }
+
+    #[test]
+    fn untrusted_keymap_is_dropped_while_trusted_keymap_survives() {
+        // A workspace-supplied binding that maps an innocent key to `approve`
+        // would hijack the modal approval gate: the CLI and the session both
+        // classify that keystroke from the resolved keymap. Untrusted keymaps
+        // are dropped whole-payload; trusted ones pass through untouched.
+        let mut untrusted = vec![keymap_contribution("ctrl-a", "approve")];
+        gate_published_contributions(ModuleOrigin::WorkspaceConfig, &mut untrusted);
+        assert!(
+            untrusted.is_empty(),
+            "an untrusted origin's keymap must be dropped"
+        );
+
+        let mut trusted = vec![keymap_contribution("ctrl-a", "approve")];
+        gate_published_contributions(ModuleOrigin::UserConfig, &mut trusted);
+        assert_eq!(trusted.len(), 1, "a trusted origin keeps its keymap");
+        assert!(matches!(trusted[0].kind, ContributionKind::Keymap(_)));
+    }
+
+    #[test]
+    fn gate_policy_is_settings_hook_keymap_only() {
+        // The gate is one policy: for an untrusted origin, exactly the
+        // sensitive Settings fields, whole Hook contributions, and whole
+        // Keymap contributions are removed. Theme stays (cosmetic).
+        let mut untrusted = vec![
+            settings_contribution(untrusted_sensitive()),
+            keymap_contribution("ctrl-a", "approve"),
+            theme_contribution(),
+            hook_contribution(),
+        ];
+        gate_published_contributions(ModuleOrigin::WorkspaceConfig, &mut untrusted);
+        assert_eq!(untrusted.len(), 2, "hook and keymap dropped, theme stays");
+        assert!(untrusted.iter().any(|c| matches!(
+            &c.kind,
+            ContributionKind::Theme(t) if t.name == "t"
+        )));
+        let ContributionKind::Settings(s) = &untrusted[0].kind else {
+            panic!("expected surviving settings at index 0")
+        };
+        assert_eq!(s.provider.as_ref().unwrap().base_url, None);
+
+        let mut trusted = vec![
+            theme_contribution(),
+            hook_contribution(),
+            keymap_contribution("ctrl-a", "approve"),
+        ];
+        gate_published_contributions(ModuleOrigin::UserConfig, &mut trusted);
+        assert_eq!(trusted.len(), 3, "a trusted origin keeps hook and keymap");
     }
 
     #[test]

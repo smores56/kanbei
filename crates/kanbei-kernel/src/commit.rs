@@ -50,10 +50,20 @@ pub struct PostManifest {
 
 /// The tier-1 commit path over the append log, object store, and writer-pin
 /// set. A tier-2 composition root owns the state and drives it.
+/// Read-only secondary source for a ref check: the caller's storage may place
+/// a legitimate explicit ref outside the writer store (the XDG layout keeps
+/// the config/module packages in a global store), while the writer store still
+/// owns the log's own objects. Consulted only after the writer store misses, so
+/// a corrupt primary object stays corrupt rather than being masked.
+pub trait RefSource {
+    fn has(&self, digest: &Digest) -> bool;
+}
+
 pub struct CommitPath<'a> {
     log: &'a mut AppendLog,
     store: &'a mut ObjectStore,
     gc_pins: &'a Mutex<HashSet<Digest>>,
+    refs: Option<&'a dyn RefSource>,
 }
 
 impl<'a> CommitPath<'a> {
@@ -66,7 +76,15 @@ impl<'a> CommitPath<'a> {
             log,
             store,
             gc_pins,
+            refs: None,
         }
+    }
+
+    /// Attaches a secondary ref source consulted when the writer store lacks an
+    /// explicit ref (see [`RefSource`]).
+    pub fn with_ref_source(mut self, refs: &'a dyn RefSource) -> Self {
+        self.refs = Some(refs);
+        self
     }
 
     /// Steps 2–4: objects-first install (R-10), reference verification, payload
@@ -100,9 +118,10 @@ impl<'a> CommitPath<'a> {
                 objects.push(digest);
             }
             // explicit refs must already exist — never commit a newly created
-            // dangling reference (R-10)
+            // dangling reference (R-10); an out-of-store ref is accepted only
+            // when the caller's secondary source resolves it.
             for r in &ev.refs {
-                if !self.store.exists(r) {
+                if !self.store.exists(r) && !self.refs.is_some_and(|s| s.has(r)) {
                     return Err(CommitError::MissingObject { digest: *r });
                 }
             }

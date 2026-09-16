@@ -1032,3 +1032,54 @@ fn fork_after_continue_and_replace_restores_exact_live_stack() {
     receipt.session.close().unwrap();
     source.close().unwrap();
 }
+
+/// DEFECT 2 (decision 34): fork under the XDG layout is unsupported. It fails
+/// typed BEFORE any destructive write, so the shared global memory log is not
+/// self-copied or truncated and no target dir is seeded.
+#[test]
+fn fork_under_a_layout_is_rejected_without_touching_shared_memory() {
+    use kanbei_core::StateLayout;
+
+    let dir = TempDir::new("layout-unsupported");
+    let source_id = Id128::generate();
+    let _lifetime_root = seed_claim(
+        &dir.path().join("memory"),
+        MemoryScope::Lifetime,
+        source_id,
+        "fork seed",
+    );
+    let mut source = open_source(dir.path(), source_id);
+    let cp = source.create_checkpoint(Some("fork point".into())).unwrap();
+
+    // The layout's shared memory root pre-exists with a sentinel transition
+    // log: a destructive fork would self-copy + truncate it.
+    let state = TempDir::new("layout-unsupported-state");
+    let layout = StateLayout::new(state.path());
+    let lifetime_log = layout
+        .memory_root()
+        .join(MemoryScope::Lifetime.dir_name())
+        .join("transitions.jsonl.zst");
+    std::fs::create_dir_all(lifetime_log.parent().unwrap()).unwrap();
+    let sentinel = b"untouched shared memory".to_vec();
+    std::fs::write(&lifetime_log, &sentinel).unwrap();
+
+    let target = dir.path().join("fork");
+    let mut options = fork_options(&target);
+    options.config.layout = Some(layout);
+    let err = match source.fork(&cp, options) {
+        Ok(_) => panic!("fork under a layout must be rejected"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, SessionError::InvalidInput(_)),
+        "typed InvalidInput, got {err:?}"
+    );
+
+    assert!(!target.exists(), "no target dir was seeded");
+    assert_eq!(
+        std::fs::read(&lifetime_log).unwrap(),
+        sentinel,
+        "the shared memory log is byte-identical"
+    );
+    source.close().unwrap();
+}

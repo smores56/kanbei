@@ -67,6 +67,18 @@ impl Session {
     ) -> Result<ForkReceipt, SessionError> {
         let facts = self.validate_checkpoint(checkpoint)?;
         let target_dir = options.target_dir.clone();
+        // Decision 34: fork is UNSUPPORTED under the XDG layout. The target's
+        // memory root IS the source's shared global memory root, so the
+        // checkpoint-truncated memory seeding below would self-copy the shared
+        // scope dirs and truncate the LIVE shared logs. It requires an explicit
+        // session dir, which the shared-memory layout cannot express.
+        if options.config.layout.is_some() {
+            return Err(SessionError::InvalidInput(
+                "fork is unsupported under the XDG state layout: it requires an explicit session \
+                 dir because the shared-memory layout cannot express checkpoint-truncated memory"
+                    .into(),
+            ));
+        }
         match std::fs::metadata(&target_dir) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Ok(m) if m.is_dir() => {

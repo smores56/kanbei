@@ -272,9 +272,13 @@ pub struct SessionConfig {
     pub memory_root: Option<PathBuf>,
     /// XDG state layout (decision 33/T14); None = the legacy cwd-relative
     /// layout under `dir`. With one, `open` derives the session dir, log,
-    /// manifest, memory root and projection from it and treats `dir` as the
-    /// legacy source a migration reads.
+    /// manifest, memory root and projection from it.
     pub layout: Option<kanbei_core::StateLayout>,
+    /// The legacy session dir a layout open migrates from, opt-in (decision
+    /// 34): migration happens ONLY for `Some(dir)` carrying `log.zst`, never
+    /// for the implicit `dir` root, so a cloned repo's `log.zst` cannot
+    /// auto-import into the global memory root. None = no migration.
+    pub legacy_dir: Option<PathBuf>,
     /// ProjectId (pro_ brand) binding; None = no project memory scope.
     pub project: Option<Id128>,
     /// Kernel fault injector for the memory actors (transition/head points).
@@ -331,6 +335,7 @@ impl Default for SessionConfig {
             present_hook: None,
             memory_root: None,
             layout: None,
+            legacy_dir: None,
             project: None,
             memory_fault: None,
             child_provider: None,
@@ -792,7 +797,7 @@ impl Session {
                     .memory_root
                     .clone()
                     .unwrap_or_else(|| layout.memory_root());
-                resolve_and_migrate(layout, cfg.session_id, &cfg.dir, &memory_root)?
+                resolve_and_migrate(layout, cfg.session_id, cfg.legacy_dir.as_deref(), &memory_root)?
             }
         };
         let session_id = resolved.id;
@@ -1478,12 +1483,12 @@ impl Session {
                 identity_pins.insert(pin);
             }
             for d in closure {
-                if self.store.exists(&d) {
-                    let bytes = self.store.get(&d)?;
-                    std::fs::write(dir.join("objects").join(format!("{d}.bin")), &bytes)?;
-                    exported_objects.insert(d);
-                } else {
-                    missing.push(d);
+                match self.resolve_closure_object(&d)? {
+                    Some(bytes) => {
+                        std::fs::write(dir.join("objects").join(format!("{d}.bin")), &bytes)?;
+                        exported_objects.insert(d);
+                    }
+                    None => missing.push(d),
                 }
             }
         }
@@ -1505,6 +1510,21 @@ impl Session {
             serde_json::to_vec_pretty(&report).expect("export report serialization cannot fail"),
         )?;
         Ok(report)
+    }
+
+    /// The bytes of a closure object, resolved through the layered package
+    /// store (decision 33/T14): the global `<state>/modules` store primary
+    /// with the session `objects/` fallback under a layout, the session's own
+    /// store without one. Config-layer PACKAGE digests live in the global
+    /// store, so an export must read them through this store, not the
+    /// session store (which would report them `missing`). `None` = absent
+    /// from every layer.
+    fn resolve_closure_object(&self, d: &Digest) -> Result<Option<Vec<u8>>, SessionError> {
+        if self.packages.exists(d) {
+            Ok(Some(self.packages.get(d)?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Scan the committed log for intent-kind events without their
@@ -1920,3 +1940,75 @@ mod gc;
 // M9 wave 4: content-addressed working-tree snapshots and restore over
 // kanbei-workspace (workspace.rs).
 mod workspace;
+
+#[cfg(test)]
+mod export_closure_tests {
+    use super::*;
+    use kanbei_snapshot::{ExecutionManifest, ModulePin};
+
+    /// DEFECT 1: under a layout a config-layer PACKAGE digest lives in the
+    /// GLOBAL `<state>/modules` store, not the session `objects/` store. The
+    /// export closure walk must read it through the layered package store, so
+    /// it is exported and `verified` holds instead of being reported `missing`.
+    #[test]
+    fn export_resolves_closure_objects_through_the_global_module_store() {
+        let root = std::env::temp_dir().join(format!(
+            "kb-session-export-layout-{}-{}",
+            std::process::id(),
+            Id128::generate()
+        ));
+        let legacy = root.join("legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let layout = kanbei_core::StateLayout::new(root.join("state"));
+
+        let mut session = Session::open(SessionConfig {
+            dir: legacy,
+            layout: Some(layout.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // A package installed in the GLOBAL module store only, exactly as a
+        // config-layer install writes it.
+        let package_bytes = b"global-only package bytes".to_vec();
+        let package = Digest::new(&package_bytes);
+        std::fs::create_dir_all(layout.module_root()).unwrap();
+        std::fs::write(layout.module_root().join(package.to_string()), &package_bytes).unwrap();
+        assert!(
+            !session.store.exists(&package),
+            "the package is absent from the session objects store"
+        );
+
+        // A manifest pinning that package, stored as a session object (a
+        // manifest is never a package object) and made the live snapshot so
+        // the export walks its closure.
+        let mut manifest = ExecutionManifest::bootstrap();
+        manifest.modules = vec![ModulePin {
+            module_id: Id128::generate(),
+            generation: 1,
+            package,
+            scope: "/".into(),
+        }];
+        let manifest_digest = session.store.install(&manifest.to_bytes()).unwrap();
+        session.current_snapshot = Some(manifest_digest);
+
+        let export_dir = root.join("export");
+        let report = session.export_bundle(&export_dir).unwrap();
+        assert!(
+            report.missing.is_empty(),
+            "the global module store satisfies the closure: {:?}",
+            report.missing
+        );
+        assert!(report.verified, "nothing missing => verified");
+        assert!(
+            export_dir
+                .join("objects")
+                .join(format!("{package}.bin"))
+                .is_file(),
+            "the global package is exported"
+        );
+
+        session.close().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

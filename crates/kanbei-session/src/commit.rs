@@ -5,6 +5,18 @@ use kanbei_core::digest::Digest;
 use kanbei_core::envelope::Envelope;
 use kanbei_snapshot::ExecutionManifest;
 
+/// Bridges the session's layered package store (global XDG modules + this
+/// session's `objects/`) to the kernel's ref check: under the XDG layout a
+/// config/module package lives only in the global store, yet the session's
+/// canonical events legitimately reference it (R-10).
+struct PackageRefs<'a>(&'a kanbei_modules::PackageStore);
+
+impl kanbei_kernel::commit::RefSource for PackageRefs<'_> {
+    fn has(&self, digest: &Digest) -> bool {
+        self.0.exists(digest)
+    }
+}
+
 impl Session {
     /// Serialized single-writer commit path: install objects (R-10), verify
     /// explicit refs, classify payloads (§7), build envelopes against the
@@ -49,11 +61,13 @@ impl Session {
         // and its own bookkeeping below.
         let fault = self.cfg.fault.clone();
         let outcome = {
+            let refs = PackageRefs(&self.packages);
             let mut path = kanbei_kernel::commit::CommitPath::new(
                 &mut self.log,
                 &mut self.store,
                 &self.gc_pins,
-            );
+            )
+            .with_ref_source(&refs);
             path.commit(
                 &mut events,
                 kanbei_kernel::commit::CommitParams {

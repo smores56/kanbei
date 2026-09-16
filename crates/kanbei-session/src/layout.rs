@@ -66,8 +66,10 @@ pub(crate) struct ResolvedSession {
 /// Resolves which session a layout open targets.
 ///
 /// Rule, in order:
-/// 1. A legacy dir carrying `log.zst` is the source of truth: it is migrated
-///    (idempotently) and its recovered id wins.
+/// 1. A legacy dir the caller opted into (`Some(dir)` carrying `log.zst`) is
+///    the source of truth: it is migrated (idempotently) and its recovered id
+///    wins. Migration is opt-in (decision 34): `None`, or a `dir` without
+///    `log.zst`, never migrates — the implicit cwd is never a legacy source.
 /// 2. An explicit `requested` id wins.
 /// 3. Otherwise the most recently created session — greatest manifest
 ///    `created_us`, ties broken by the greatest id text — is resumed;
@@ -78,11 +80,13 @@ pub(crate) struct ResolvedSession {
 pub(crate) fn resolve_and_migrate(
     layout: &StateLayout,
     requested: Option<Id128>,
-    legacy_dir: &Path,
+    legacy_dir: Option<&Path>,
     memory_root: &Path,
 ) -> Result<ResolvedSession, SessionError> {
-    if legacy_dir.join(LEGACY_LOG_NAME).is_file() {
-        let id = migrate_legacy(layout, legacy_dir, memory_root)?;
+    if let Some(dir) = legacy_dir
+        && dir.join(LEGACY_LOG_NAME).is_file()
+    {
+        let id = migrate_legacy(layout, dir, memory_root)?;
         return Ok(ResolvedSession {
             id,
             project: manifest_project(layout, id)?,
@@ -365,6 +369,7 @@ mod tests {
         let session = Session::open(SessionConfig {
             dir: legacy.clone(),
             layout: Some(layout.clone()),
+            legacy_dir: Some(legacy.clone()),
             ..Default::default()
         })
         .unwrap();

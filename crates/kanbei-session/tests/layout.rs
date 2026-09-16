@@ -61,12 +61,14 @@ fn envelopes(log_path: &Path) -> Vec<Envelope> {
     out
 }
 
-/// Opens under `layout`, using `legacy` only as the (typically empty) migration
-/// source so resolution falls through to the manifest scan/new id.
+/// Opens under `layout`, opting `legacy` in as the migration source (decision
+/// 34) so a `log.zst` there migrates; an empty legacy dir simply falls through
+/// to manifest resolution.
 fn open_under(layout: &StateLayout, legacy: &Path) -> Session {
     Session::open(SessionConfig {
         dir: legacy.to_path_buf(),
         layout: Some(layout.clone()),
+        legacy_dir: Some(legacy.to_path_buf()),
         ..Default::default()
     })
     .unwrap()
@@ -304,6 +306,7 @@ fn ambiguous_legacy_dir_fails_loud() {
     let err = match Session::open(SessionConfig {
         dir: legacy.path().to_path_buf(),
         layout: Some(layout),
+        legacy_dir: Some(legacy.path().to_path_buf()),
         ..Default::default()
     }) {
         Ok(_) => panic!("ambiguous legacy migration must fail"),
@@ -375,7 +378,7 @@ fn package_installs_into_the_global_module_store() {
     let config = config_package("global-greeter");
     let digest = package_digest(&config);
 
-    let mut session = Session::open(SessionConfig {
+    let session = Session::open(SessionConfig {
         dir: legacy.path().to_path_buf(),
         layout: Some(layout.clone()),
         config_layers: vec![config],
@@ -517,4 +520,126 @@ fn project_registry_lands_in_the_layout_stream() {
     assert_eq!(entry.created_session, id, "the opening session is the marker");
     assert_eq!(entry.name, "default");
     assert_eq!(entry.dir, format!("projects/{project}"));
+}
+
+/// (m) DEFECT 3: migration is opt-in (decision 34). A layout open whose
+/// `legacy_dir` is None never reads a `log.zst` at the fs root, so a cloned
+/// repo's log cannot auto-import into the global memory root.
+#[test]
+fn cwd_log_is_not_auto_migrated_without_opt_in() {
+    let legacy = TempDir::new("m-legacy");
+    let id = Id128::generate();
+    {
+        let mut session = Session::open(SessionConfig {
+            dir: legacy.path().to_path_buf(),
+            session_id: Some(id),
+            ..Default::default()
+        })
+        .unwrap();
+        session
+            .commit(vec![event("legacy_probe", json!({"n": 7}))], None)
+            .unwrap();
+        session.close().unwrap();
+    }
+    assert!(legacy.path().join("log.zst").is_file());
+
+    let root = TempDir::new("m-root");
+    let layout = StateLayout::new(root.path());
+    // `dir` is the implicit cwd-equivalent carrying the untrusted `log.zst`,
+    // but with no explicit `legacy_dir` it is never migrated.
+    let session = Session::open(SessionConfig {
+        dir: legacy.path().to_path_buf(),
+        layout: Some(layout.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_ne!(session.session_id(), id, "the cwd log is ignored");
+    assert!(
+        !layout.session_manifest(id).exists(),
+        "no session dir was created for the legacy id"
+    );
+    assert!(
+        !layout.memory_root().join("projects.jsonl").exists(),
+        "the global memory root was not seeded by an implicit migration"
+    );
+    session.close().unwrap();
+}
+
+/// (n) DEFECT 3: the same `log.zst` DOES migrate when the caller opts in by
+/// naming the legacy dir explicitly.
+#[test]
+fn explicit_legacy_dir_migrates() {
+    let legacy = TempDir::new("n-legacy");
+    let id = Id128::generate();
+    {
+        // A bound project records `created_session` in the registry — the
+        // identity marker migration recovers.
+        let mut session = Session::open(SessionConfig {
+            dir: legacy.path().to_path_buf(),
+            session_id: Some(id),
+            project: Some(Id128::generate()),
+            ..Default::default()
+        })
+        .unwrap();
+        session
+            .commit(vec![event("legacy_probe", json!({"n": 7}))], None)
+            .unwrap();
+        session.close().unwrap();
+    }
+    assert!(legacy.path().join("log.zst").is_file());
+
+    let root = TempDir::new("n-root");
+    let layout = StateLayout::new(root.path());
+    let session = Session::open(SessionConfig {
+        dir: legacy.path().to_path_buf(),
+        layout: Some(layout.clone()),
+        legacy_dir: Some(legacy.path().to_path_buf()),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(session.session_id(), id, "the opted-in legacy dir migrates");
+    assert!(layout.session_manifest(id).is_file());
+    session.close().unwrap();
+}
+
+/// (k) DEFECT: under a layout the config-layer package lives only in the GLOBAL
+/// module store, yet the `composition_changed` event legitimately references it
+/// (R-10). The kernel's ref check must resolve it through the session's layered
+/// package store, so the non-builtin layer stays active instead of the commit
+/// failing and degrading the session to safe mode.
+#[test]
+fn config_activation_commits_under_a_layout() {
+    require_guest();
+    let root = TempDir::new("k-root");
+    let legacy = TempDir::new("k-legacy");
+    let layout = StateLayout::new(root.path());
+    let config = config_package("layout-greeter");
+    let digest = package_digest(&config);
+    let module_id = config.module_id;
+
+    let mut session = Session::open(SessionConfig {
+        dir: legacy.path().to_path_buf(),
+        layout: Some(layout.clone()),
+        config_layers: vec![config],
+        engine: Some(no_epoch()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert!(
+        session.config_layer_digests().contains(&digest),
+        "the global-store package ref commits: the non-builtin layer stays active"
+    );
+    let live: Vec<Id128> = session
+        .modules()
+        .expect("engine")
+        .snapshot()
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    assert!(
+        live.contains(&module_id),
+        "the layer's module is mounted, not dropped to safe mode"
+    );
+    session.close().unwrap();
 }
