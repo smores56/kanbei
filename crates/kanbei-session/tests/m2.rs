@@ -1051,13 +1051,16 @@ fn builtin_settings_survive_failed_user_layer() {
     session.close().unwrap();
 }
 
-/// Decision 28: a higher-precedence layer implicitly replaces a lower layer's
-/// UI mount of the same `(scope, name)`; exactly one holder (the highest
-/// layer's) remains in the composition.
+/// C trust check: a UI mount takeover requires more than precedence — an
+/// UNTRUSTED `WorkspaceConfig` layer may NOT supersede a TRUSTED `UserConfig`
+/// holder's `UiMount` by rank alone. The activation conflicts and the session
+/// drops to safe mode exactly like any other disallowed conflict, closing the
+/// cloned-workspace phishing hazard (a `.kanbei/init.lua` cannot replace the
+/// user's mounted UI to fake the approval prompt).
 #[test]
-fn project_layer_overrides_user_ui_mount() {
+fn workspace_layer_cannot_supersede_user_ui_mount() {
     require_guest();
-    let dir = TempDir::new("ui-override");
+    let dir = TempDir::new("ui-override-blocked");
     let user = settings_manifest(
         Id128::generate(),
         ModuleOrigin::UserConfig,
@@ -1077,6 +1080,66 @@ fn project_layer_overrides_user_ui_mount() {
         ..Default::default()
     })
     .unwrap();
+    // Only the built-in generation survives: the untrusted workspace layer
+    // could not displace the trusted user mount, so its activation conflicted
+    // and safe mode dropped both non-builtin layers.
+    let snapshot = session.modules().unwrap().snapshot();
+    assert_eq!(snapshot.len(), 1, "only the built-in survives");
+    assert_eq!(snapshot[0].0, builtin_config_manifest().module_id);
+    let mounts: Vec<String> = session
+        .composition()
+        .contributions
+        .iter()
+        .filter_map(|c| match &c.kind {
+            kanbei_scopes::contrib::ContributionKind::UiMount(u) => Some(u.component.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        mounts.is_empty(),
+        "neither contender's UI mount remains: {mounts:?}"
+    );
+    // The disallowed takeover is an explicit conflict, recorded canonically.
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert_eq!(
+        envs.iter()
+            .filter(|e| e.kind == "safe_mode_activated")
+            .count(),
+        1,
+        "the blocked takeover records one safe-mode fact"
+    );
+    session.close().unwrap();
+}
+
+/// C trust check, positive direction: a TRUSTED `UserConfig` layer may
+/// supersede an UNTRUSTED `WorkspaceConfig` holder of the same UI mount key
+/// regardless of rank, so the user can always reclaim a mount a cloned
+/// workspace published first.
+#[test]
+fn user_layer_supersedes_workspace_ui_mount() {
+    require_guest();
+    let dir = TempDir::new("ui-override-user");
+    // The workspace layer activates FIRST (rank 2) and mounts; the user layer
+    // activates second (rank 1) and reclaims the key despite its lower rank.
+    let project = settings_manifest(
+        Id128::generate(),
+        ModuleOrigin::WorkspaceConfig,
+        TrustClass::Workspace,
+        r#"{"kind":"ui","name":"chat","component":"ProjectChat"}"#,
+    );
+    let user = settings_manifest(
+        Id128::generate(),
+        ModuleOrigin::UserConfig,
+        TrustClass::User,
+        r#"{"kind":"ui","name":"chat","component":"UserChat"}"#,
+    );
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        engine: Some(no_epoch()),
+        config_layers: vec![builtin_config_manifest(), project, user],
+        ..Default::default()
+    })
+    .unwrap();
     let mounts: Vec<String> = session
         .composition()
         .contributions
@@ -1088,8 +1151,13 @@ fn project_layer_overrides_user_ui_mount() {
         .collect();
     assert_eq!(
         mounts,
-        vec!["ProjectChat".to_string()],
-        "the workspace layer's mount replaced the user layer's"
+        vec!["UserChat".to_string()],
+        "the trusted user layer reclaimed the mount from the workspace holder"
+    );
+    let envs = envelopes(&dir.path().join("log.zst"));
+    assert!(
+        !envs.iter().any(|e| e.kind == "safe_mode_activated"),
+        "the trust-allowed takeover is a legitimate override"
     );
     session.close().unwrap();
 }

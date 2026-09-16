@@ -497,20 +497,30 @@ impl Session {
                 })
                 .collect(),
         };
-        // Precedence-driven implicit replacement: a higher-origin layer takes
-        // over the identity keys held by lower-precedence active layers.
+        // Precedence-driven implicit replacement: a layer takes over the
+        // identity keys held by the active layers it may supersede. Trust
+        // gates this exactly like the service path above: an UNTRUSTED
+        // challenger may never displace a TRUSTED holder, while a TRUSTED
+        // challenger may always reclaim from an untrusted holder regardless of
+        // rank; same trust class falls back to strictly-higher rank. A layer
+        // that `settings_supersede_allowed` rejects is deliberately LEFT OUT of
+        // the plan, so `publish_planned`'s validation raises the conflict (and
+        // the non-builtin layers drop to safe mode) instead of the disallowed
+        // takeover silently winning — the R-27 phishing hazard.
         let staged_keys: HashSet<(kanbei_services::ScopePath, String)> = staged
             .contributions
             .iter()
             .filter_map(contribution_override_key)
             .collect();
-        let lower_generations: Vec<u64> = self
+        let superseding: Vec<u64> = self
             .config_layers
             .iter()
-            .filter(|l| l.rank < my_rank)
+            .filter(|l| {
+                settings_supersede_allowed(manifest.origin, my_rank, l.manifest.origin, l.rank)
+            })
             .map(|l| l.generation)
             .collect();
-        for lower_generation in lower_generations {
+        for lower_generation in superseding {
             for c in manager.published_contributions(lower_generation) {
                 if contribution_override_key(&c).is_some_and(|k| staged_keys.contains(&k)) {
                     plan.removed.push(c);
