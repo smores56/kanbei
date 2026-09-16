@@ -422,11 +422,12 @@ impl Session {
     }
 
     /// The module id a config-layer package digest names, read from the package
-    /// manifest object. Falls back to the digest string when the package is
-    /// absent from the store or unreadable — the fork then fails loud on the
-    /// missing layer rather than keying against a stale digest.
+    /// manifest object (the module store, with the session store as the legacy
+    /// fallback). Falls back to the digest string when the package is absent
+    /// from both or unreadable — the fork then fails loud on the missing layer
+    /// rather than keying against a stale digest.
     fn config_layer_module_key(&self, digest: Digest) -> String {
-        self.store
+        self.packages
             .get(&digest)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<kanbei_modules::PackageManifest>(&bytes).ok())

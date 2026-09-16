@@ -14,9 +14,13 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use kanbei_core::id::Id128;
+use kanbei_core::queue::DurabilityQueue;
 use kanbei_core::StateLayout;
+use kanbei_modules::PackageStore;
+use kanbei_objects::ObjectStore;
 use serde::{Deserialize, Serialize};
 
 use crate::recovery::{recover_bound_project, recover_session_id};
@@ -257,10 +261,130 @@ pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Opens the store module packages resolve through (decision 33/T14).
+///
+/// Under a layout the primary store is the GLOBAL `<state>/modules` store, so
+/// a package digest is shared by every session and survives session deletion,
+/// with the session's own `objects/` as the read-only fallback for packages
+/// installed before the global store existed; without a layout the primary IS
+/// the session `objects/` store and there is no fallback — an explicit-dir
+/// session keeps the legacy behavior byte-identically. The session store is
+/// therefore always resolvable through the returned store, whichever
+/// configuration applies.
+pub(crate) fn open_package_store(
+    layout: Option<&StateLayout>,
+    session_dir: &Path,
+    queue: &Arc<DurabilityQueue>,
+) -> Result<PackageStore, SessionError> {
+    let objects = ObjectStore::open(&session_dir.join("objects"), Arc::clone(queue))?;
+    Ok(match layout {
+        None => PackageStore::from(objects),
+        Some(layout) => PackageStore::with_fallback(
+            ObjectStore::open(&layout.module_root(), Arc::clone(queue))?,
+            objects,
+        ),
+    })
+}
+
 /// Names the source path in a copy failure (the bare `io::Error` does not).
 fn copy_error(src: &Path, e: io::Error) -> SessionError {
     SessionError::Io(io::Error::new(
         e.kind(),
         format!("copy {}: {e}", src.display()),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{NewEvent, Session, SessionConfig};
+    use kanbei_core::Digest;
+    use kanbei_modules::{PACKAGE_SCHEMA, PackageManifest};
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kb-layout-pkg-{tag}-{}-{}",
+            std::process::id(),
+            Id128::generate()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// (d) A session whose packages live in its legacy `objects/` store keeps
+    /// resolving them once a layout is in play: the migration carries the store
+    /// in place and the package store's fallback layer reads it, while the
+    /// global store stays untouched.
+    #[test]
+    fn legacy_package_resolves_under_the_layout() {
+        let legacy = tmp_dir("legacy");
+        let state = tmp_dir("state");
+        let id = Id128::generate();
+        let project = Id128::generate();
+        {
+            let mut session = Session::open(SessionConfig {
+                dir: legacy.clone(),
+                session_id: Some(id),
+                project: Some(project),
+                ..Default::default()
+            })
+            .unwrap();
+            session
+                .commit(
+                    vec![NewEvent {
+                        kind: "legacy_probe".into(),
+                        payload_schema: 1,
+                        payload: serde_json::json!({}),
+                        objects: Vec::new(),
+                        refs: Vec::new(),
+                    }],
+                    None,
+                )
+                .unwrap();
+            session.close().unwrap();
+        }
+        let manifest = PackageManifest {
+            schema: PACKAGE_SCHEMA,
+            module_id: Id128::generate(),
+            origin: kanbei_modules::ModuleOrigin::UserConfig,
+            trust_class: kanbei_capabilities::TrustClass::User,
+            scope: kanbei_services::ScopePath(vec![]),
+            deps: vec![],
+            capabilities: vec![],
+            source: "function kb_hot(x) return x end".into(),
+            state_schema: None,
+            state_key: None,
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let digest = Digest::new(&bytes);
+        // The pre-global-store layout: the package object sits in the session's
+        // own `objects/` store, content-addressed exactly as install wrote it.
+        std::fs::write(legacy.join("objects").join(digest.to_string()), &bytes).unwrap();
+
+        let layout = StateLayout::new(state.clone());
+        let session = Session::open(SessionConfig {
+            dir: legacy.clone(),
+            layout: Some(layout.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(session.session_id(), id, "migration preserves identity");
+        // No config layer is activated, so nothing re-installed the package:
+        // the global store does not hold it...
+        assert!(!layout.module_root().join(digest.to_string()).exists());
+        // ...the migration carried the legacy copy into the session dir, and
+        // the package store's fallback resolves it there.
+        assert!(
+            layout
+                .session_dir(id)
+                .join("objects")
+                .join(digest.to_string())
+                .is_file()
+        );
+        assert_eq!(session.packages.get(&digest).unwrap(), bytes);
+        session.close().unwrap();
+
+        let _ = std::fs::remove_dir_all(&legacy);
+        let _ = std::fs::remove_dir_all(&state);
+    }
 }

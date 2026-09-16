@@ -22,7 +22,6 @@ use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::digest::Digest;
 use crate::id::Id128;
 
 /// The application directory name appended to every XDG base.
@@ -121,11 +120,14 @@ impl StateLayout {
         self.root.join("projection.sqlite")
     }
 
-    /// `<state>/modules/<digest>` — the content-addressed module store; the
-    /// digest uses its canonical `alg:hex` text form so stored generations are
-    /// addressed by algorithm as well as bytes.
-    pub fn module_dir(&self, digest: &Digest) -> PathBuf {
-        self.root.join("modules").join(digest.to_string())
+    /// `<state>/modules` — the global content-addressed module store
+    /// (decision 33/T14). Module packages install flat under it as
+    /// `modules/<digest alg:hex>`, one file per digest — the same on-disk
+    /// form as the session object store — so a package digest is shared by
+    /// every session under the state root and survives session deletion;
+    /// `docs/architecture.md`'s `modules/<package-digest>` names that file.
+    pub fn module_root(&self) -> PathBuf {
+        self.root.join("modules")
     }
 
     /// `<state>/memory/projects/events.jsonl.zst` — the project locator stream.
@@ -257,12 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn layout_module_dir_is_content_addressed() {
-        let layout = StateLayout::new("/s");
-        let digest = Digest::new(b"package");
+    fn layout_module_root_holds_the_shared_store() {
         assert_eq!(
-            layout.module_dir(&digest),
-            PathBuf::from(format!("/s/modules/{digest}"))
+            StateLayout::new("/s").module_root(),
+            PathBuf::from("/s/modules")
         );
     }
 }

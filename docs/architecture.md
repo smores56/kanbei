@@ -804,9 +804,14 @@ XDG state
 ├── memory/lifetime/{transitions.jsonl.zst,head.json,objects/}
 ├── memory/projects/<ProjectId>/{transitions.jsonl.zst,head.json,objects/}
 ├── projects/events.jsonl.zst
-├── modules/<package-digest>/...
+├── modules/<package-digest>          (flat CAS file, shared by every session)
 └── projection.sqlite
 ```
+
+Under `modules/` a package is one content-addressed file named by its digest
+(`modules/<package-digest>`, the same flat `<digest>` form the session object
+store uses) — the `<package-digest>` in the tree above names that file, not a
+per-digest directory.
 
 ## Design principle
 

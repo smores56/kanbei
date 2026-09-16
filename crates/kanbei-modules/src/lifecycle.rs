@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use kanbei_capabilities::BrokerError;
 use kanbei_core::id::Id128;
 use kanbei_core::Digest;
-use kanbei_objects::{ObjectError, ObjectStore};
+use kanbei_objects::ObjectError;
 use kanbei_scopes::contrib::HookKind;
 use kanbei_services::{
     replacement, ReplaceIntent, ScopePath, ServiceDependency, ServiceError, ServiceKey,
@@ -46,7 +46,7 @@ use kanbei_vm::{GuestError, Vm};
 use thiserror::Error;
 
 use crate::host::{ModuleHost, TokenInfo};
-use crate::package::{install_package, ModuleOrigin, PackageManifest};
+use crate::package::{install_package, ModuleOrigin, PackageManifest, PackageStore};
 use crate::runtime::{DRAIN_DEADLINE, GenerationRuntime, REPLY_TIMEOUT, Scope};
 use crate::state::{StateError, StateStore};
 
@@ -338,7 +338,7 @@ impl std::fmt::Debug for ReplacementOutcome {
 /// the kernel [`ModuleHost`]. Single-threaded (the session actor).
 pub struct ModuleManager {
     vm: Vm,
-    store: ObjectStore,
+    packages: PackageStore,
     state: Arc<Mutex<StateStore>>,
     services: Arc<Mutex<ServiceRegistry>>,
     host: Arc<ModuleHost>,
@@ -355,7 +355,7 @@ pub struct ModuleManager {
 impl ModuleManager {
     pub fn new(
         vm: Vm,
-        store: ObjectStore,
+        packages: PackageStore,
         state: StateStore,
         services: Arc<Mutex<ServiceRegistry>>,
     ) -> Result<Self, ModuleError> {
@@ -392,7 +392,7 @@ impl ModuleManager {
         ));
         Ok(Self {
             vm,
-            store,
+            packages,
             state,
             services,
             host,
@@ -512,7 +512,7 @@ impl ModuleManager {
         // head BEFORE any side effect, so an incompatible generation is rejected
         // atomically and the old head (and object store) stay untouched.
         Self::validate_state_schema(&self.state, manifest)?;
-        let (package, _deduped) = install_package(&mut self.store, manifest)?;
+        let (package, _deduped) = install_package(&mut self.packages, manifest)?;
         // D: fresh per-generation hook secret, embedded into the compiled
         // multiplexer so only this generation's VM and the kernel know it.
         let hook_nonce = Id128::generate().to_string();
@@ -892,7 +892,7 @@ impl ModuleManager {
                     "respawn: no package recorded for generation {generation}"
                 ))
             })?;
-        let bytes = self.store.get(&package)?;
+        let bytes = self.packages.get(&package)?;
         let manifest: PackageManifest = serde_json::from_slice(&bytes).map_err(|e| {
             ModuleError::InvalidInput(format!("respawn: stored package is not a manifest: {e}"))
         })?;

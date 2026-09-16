@@ -212,11 +212,70 @@ fn deserialize_capability_vec<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<Ca
         .collect())
 }
 
+/// The content-addressed store module packages live in (decision 33/T14).
+///
+/// The primary store is where installs land: the global `<state>/modules`
+/// store when the session runs under a layout, else the session's own
+/// `objects/`. The optional fallback is READ-ONLY resolution for packages that
+/// predate the global store — a layout session whose packages were installed
+/// into its session store (a legacy dir a migration copied in place) keeps
+/// resolving them instead of failing as missing. Reads hash-verify, so a
+/// fallback hit is byte-identical to a primary hit; a write never touches the
+/// fallback.
+pub struct PackageStore {
+    primary: ObjectStore,
+    fallback: Option<ObjectStore>,
+}
+
+impl PackageStore {
+    /// A layered store: installs go to `primary`, reads fall back to
+    /// `fallback` when the primary is missing the digest.
+    pub fn with_fallback(primary: ObjectStore, fallback: ObjectStore) -> Self {
+        Self {
+            primary,
+            fallback: Some(fallback),
+        }
+    }
+
+    /// The bytes of `want` — the primary store, else the fallback. Verified
+    /// either way; only `Missing` falls through, so a corrupt primary object
+    /// stays a corruption error instead of being masked by a fallback copy.
+    pub fn get(&self, want: &Digest) -> Result<Vec<u8>, ObjectError> {
+        match self.primary.get(want) {
+            Err(ObjectError::Missing { .. }) => match &self.fallback {
+                Some(fallback) => fallback.get(want),
+                None => Err(ObjectError::Missing { digest: *want }),
+            },
+            other => other,
+        }
+    }
+
+    /// Whether `digest` resolves in either layer.
+    pub fn exists(&self, digest: &Digest) -> bool {
+        self.primary.exists(digest) || self.fallback.as_ref().is_some_and(|f| f.exists(digest))
+    }
+
+    /// Installs into the primary store (content-deduped there).
+    pub fn install(&mut self, bytes: &[u8]) -> io::Result<Digest> {
+        self.primary.install(bytes)
+    }
+}
+
+impl From<ObjectStore> for PackageStore {
+    fn from(primary: ObjectStore) -> Self {
+        Self {
+            primary,
+            fallback: None,
+        }
+    }
+}
+
 /// Installs the manifest's canonical JSON as a package object (content-deduped).
-/// Returns `(package digest, deduped)` where `deduped` = the object already
-/// existed.
+/// Returns `(package digest, deduped)` where `deduped` = the package already
+/// resolved (a fallback hit counts — the same bytes are already readable); the
+/// primary store is materialized either way.
 pub fn install_package(
-    store: &mut ObjectStore,
+    store: &mut PackageStore,
     manifest: &PackageManifest,
 ) -> Result<(Digest, bool), PackageError> {
     if manifest.schema != PACKAGE_SCHEMA {
@@ -248,6 +307,83 @@ pub enum PackageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kanbei_core::queue::DurabilityQueue;
+    use std::sync::Arc;
+
+    /// A raw primary/fallback store to layer (the bytes go in verbatim).
+    fn store(tag: &str) -> (std::path::PathBuf, ObjectStore, Arc<DurabilityQueue>) {
+        let dir = std::env::temp_dir().join(format!(
+            "kb-package-store-{tag}-{}-{}",
+            std::process::id(),
+            Id128::generate()
+        ));
+        let queue = Arc::new(DurabilityQueue::start(&format!("test-package-{tag}")));
+        let store = ObjectStore::open(&dir, Arc::clone(&queue)).unwrap();
+        (dir, store, queue)
+    }
+
+    fn cleanup(dir: std::path::PathBuf, queue: Arc<DurabilityQueue>) {
+        let _ = std::fs::remove_dir_all(dir);
+        if let Ok(queue) = Arc::try_unwrap(queue) {
+            let _ = queue.shutdown();
+        }
+    }
+
+    /// A layered store writes to the primary and resolves a fallback-only
+    /// digest (decision 33/T14): the legacy session-store copy of a package
+    /// installed before the global store existed stays readable.
+    #[test]
+    fn layered_store_installs_to_primary_and_reads_the_fallback() {
+        let (primary_dir, primary, primary_queue) = store("layered-primary");
+        let (fallback_dir, mut fallback, fallback_queue) = store("layered-fallback");
+        let legacy = fallback.install(b"{\"legacy package\":1}").unwrap();
+        let mut layered = PackageStore::with_fallback(primary, fallback);
+        assert!(layered.exists(&legacy), "the fallback digest resolves");
+        assert_eq!(layered.get(&legacy).unwrap(), b"{\"legacy package\":1}");
+
+        let fresh = layered.install(b"{\"fresh package\":1}").unwrap();
+        assert!(primary_dir.join(fresh.to_string()).is_file());
+        assert!(
+            !fallback_dir.join(fresh.to_string()).exists(),
+            "an install never writes through to the fallback"
+        );
+        cleanup(primary_dir, primary_queue);
+        cleanup(fallback_dir, fallback_queue);
+    }
+
+    /// A corrupt primary object is a corruption error, never masked by a
+    /// healthy fallback copy (the digest identity is the contract).
+    #[test]
+    fn corrupt_primary_is_not_masked_by_the_fallback() {
+        let (primary_dir, mut primary, primary_queue) = store("corrupt-primary");
+        let (fallback_dir, mut fallback, fallback_queue) = store("corrupt-fallback");
+        let bytes = b"{\"package\":1}";
+        let digest = primary.install(bytes).unwrap();
+        fallback.install(bytes).unwrap();
+        std::fs::write(primary_dir.join(digest.to_string()), b"garbage").unwrap();
+        let layered = PackageStore::with_fallback(primary, fallback);
+        assert!(matches!(
+            layered.get(&digest),
+            Err(ObjectError::Corruption { .. })
+        ));
+        cleanup(primary_dir, primary_queue);
+        cleanup(fallback_dir, fallback_queue);
+    }
+
+    /// A missing digest in both layers is `Missing`, not an empty read.
+    #[test]
+    fn missing_in_both_layers_is_missing() {
+        let (primary_dir, primary, primary_queue) = store("missing-primary");
+        let (fallback_dir, fallback, fallback_queue) = store("missing-fallback");
+        let layered = PackageStore::with_fallback(primary, fallback);
+        let want = Digest::new(b"never installed");
+        assert!(matches!(
+            layered.get(&want),
+            Err(ObjectError::Missing { digest }) if digest == want
+        ));
+        cleanup(primary_dir, primary_queue);
+        cleanup(fallback_dir, fallback_queue);
+    }
 
     #[test]
     fn wire_names_roundtrip() {

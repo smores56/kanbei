@@ -8,7 +8,7 @@ use std::io;
 use kanbei_core::digest::Digest;
 use kanbei_core::envelope::Envelope;
 use kanbei_core::id::Id128;
-use kanbei_modules::PackageManifest;
+use kanbei_modules::{PackageManifest, PackageStore};
 use kanbei_objects::ObjectError;
 use kanbei_snapshot::ExecutionManifest;
 use serde_json::json;
@@ -219,7 +219,7 @@ impl Session {
         // re-serialized) so the restored identity is byte-identical.
         let layer_digests: Vec<Digest> =
             self.config_choice_at(checkpoint.seq)?.unwrap_or_default();
-        let config_layers = load_config_layers(&self.store, &layer_digests)?;
+        let config_layers = load_config_layers(&self.packages, &layer_digests)?;
         let loaded_digests: Vec<Digest> = layer_digests.clone();
         let config_digest = layer_digests.last().copied();
 
@@ -776,13 +776,15 @@ fn truncate_log_at(log_path: &Path, root: Digest) -> Result<(), SessionError> {
 // ---------- M9 wave 5b helpers (adopt + import) ----------
 
 
-/// Resolves `digest` in the fork's session store, falling back to its
+/// Resolves `digest` through the fork's package store — which covers the
+/// session store in every configuration (the primary store under an explicit
+/// dir, the legacy fallback under a layout) — falling back to its
 /// lifetime/project memory stores (a post-fork memory root manifest
 /// legitimately exists only in the actor's store — the session store carries
 /// root manifests only as checkpoint event objects). `get` hash-verifies, so
 /// a resolved object is trusted. Typed `Snapshot` errors name the digest.
 fn resolve_fork_object(fork: &Session, digest: &Digest) -> Result<Vec<u8>, SessionError> {
-    match fork.store.get(digest) {
+    match fork.packages.get(digest) {
         Ok(bytes) => return Ok(bytes),
         Err(ObjectError::Missing { .. }) => {}
         Err(e) => {
@@ -805,22 +807,22 @@ fn resolve_fork_object(fork: &Session, digest: &Digest) -> Result<Vec<u8>, Sessi
         }
     }
     Err(SessionError::Snapshot(format!(
-        "fork object {digest} is missing from the fork session and memory stores"
+        "fork object {digest} is missing from the fork package and memory stores"
     )))
 }
 
 /// Loads the ordered config-layer manifests a fork will re-activate, reusing
 /// the recorded package digests verbatim (never re-serialized, so the restored
-/// identity is byte-identical). A digest whose package is absent from the store
-/// is a typed `MissingConfigLayer` error (B): the restored stack must fail loud
-/// rather than silently change.
+/// identity is byte-identical). A digest whose package is absent from the
+/// module and session stores is a typed `MissingConfigLayer` error (B): the
+/// restored stack must fail loud rather than silently change.
 fn load_config_layers(
-    store: &kanbei_objects::ObjectStore,
+    packages: &PackageStore,
     digests: &[Digest],
 ) -> Result<Vec<PackageManifest>, SessionError> {
     let mut layers = Vec::with_capacity(digests.len());
     for digest in digests {
-        let bytes = store
+        let bytes = packages
             .get(digest)
             .map_err(|_| SessionError::MissingConfigLayer { digest: *digest })?;
         let manifest: PackageManifest = serde_json::from_slice(&bytes).map_err(|e| {
@@ -836,10 +838,11 @@ fn load_config_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kanbei_modules::PackageStore;
     use kanbei_objects::ObjectStore;
     use std::sync::Arc;
 
-    fn store(tag: &str) -> (std::path::PathBuf, ObjectStore) {
+    fn open(tag: &str) -> (std::path::PathBuf, ObjectStore) {
         let dir = std::env::temp_dir().join(format!(
             "kb-session-load-layers-{tag}-{}-{}",
             std::process::id(),
@@ -851,6 +854,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let queue = Arc::new(kanbei_core::queue::DurabilityQueue::start("kb-load-layers-test"));
         (dir.clone(), ObjectStore::open(&dir, queue).unwrap())
+    }
+
+    fn store(tag: &str) -> (std::path::PathBuf, PackageStore) {
+        let (dir, store) = open(tag);
+        (dir, PackageStore::from(store))
     }
 
     fn manifest(id: Id128) -> PackageManifest {
@@ -882,6 +890,31 @@ mod tests {
             "the original digest round-trips"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A package that only the legacy session store holds (decision 33/T14:
+    /// a layout session's pre-global-store package) still loads, through the
+    /// package store's fallback layer, with its recorded digest reused
+    /// verbatim.
+    #[test]
+    fn loads_layers_through_the_legacy_fallback_store() {
+        let (primary_dir, primary) = open("fallback-global");
+        let (fallback_dir, mut fallback) = open("fallback-session");
+        let bytes = serde_json::to_vec(&manifest(Id128::generate())).unwrap();
+        let digest = fallback.install(&bytes).unwrap();
+        let packages = PackageStore::with_fallback(primary, fallback);
+        let layers = load_config_layers(&packages, &[digest]).unwrap();
+        assert_eq!(
+            Digest::new(&serde_json::to_vec(&layers[0]).unwrap()),
+            digest,
+            "the original digest round-trips from the fallback"
+        );
+        assert!(
+            !primary_dir.join(digest.to_string()).exists(),
+            "the fallback supplies the bytes, not the primary store"
+        );
+        let _ = std::fs::remove_dir_all(primary_dir);
+        let _ = std::fs::remove_dir_all(fallback_dir);
     }
 
     /// A missing package is a typed error, never a silent drop.

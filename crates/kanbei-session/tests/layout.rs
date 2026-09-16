@@ -4,11 +4,15 @@
 
 use std::path::{Path, PathBuf};
 
+use kanbei_core::Digest;
 use kanbei_core::envelope::Envelope;
 use kanbei_core::id::Id128;
 use kanbei_core::StateLayout;
 use kanbei_log::for_each_frame;
+use kanbei_modules::{ModuleOrigin, PACKAGE_SCHEMA, PackageManifest};
 use kanbei_session::{NewEvent, Session, SessionConfig};
+use kanbei_services::ScopePath;
+use kanbei_vm::{GuestError, Vm, VmConfig};
 use serde_json::json;
 
 struct TempDir(PathBuf);
@@ -305,4 +309,171 @@ fn ambiguous_legacy_dir_fails_loud() {
         ),
         "expected a loud ambiguous-migration error, got {err:?}"
     );
+}
+
+// --- global module store (decision 33/T14) ---------------------------------
+
+/// Module activation needs the guest wasm; a missing guest is a hard failure
+/// (the module-install assertions must not pass by omission).
+fn require_guest() {
+    match Vm::load(no_epoch()) {
+        Ok(_) => {}
+        Err(GuestError::NotBuilt) => {
+            panic!("guest wasm not built: run `cargo xtask build-guest` from the workspace root")
+        }
+        Err(e) => panic!("Vm::load failed: {e}"),
+    }
+}
+
+fn no_epoch() -> VmConfig {
+    VmConfig {
+        fuel_per_call: u64::MAX,
+        epoch_deadline: u64::MAX,
+        ..Default::default()
+    }
+}
+
+fn config_package(name: &str) -> PackageManifest {
+    PackageManifest {
+        schema: PACKAGE_SCHEMA,
+        module_id: Id128::generate(),
+        origin: ModuleOrigin::UserConfig,
+        trust_class: kanbei_capabilities::TrustClass::User,
+        scope: ScopePath(vec![]),
+        deps: vec![],
+        capabilities: vec![],
+        source: format!(
+            "function kb_on_activate(ctx) ctx.service_publish('{{\"scope\":[],\"name\":\"{name}\"}}', 1, '[]') end\nfunction kb_hot(x) return x end"
+        ),
+        state_schema: None,
+        state_key: None,
+    }
+}
+
+/// The canonical package digest (`install_package` hashes the canonical JSON).
+fn package_digest(manifest: &PackageManifest) -> Digest {
+    Digest::new(&serde_json::to_vec(manifest).unwrap())
+}
+
+/// (g) With a layout the package installs into the GLOBAL module store
+/// (`<state>/modules/<digest>`) and not into the session dir, which keeps only
+/// the session's own objects (the genesis snapshot).
+#[test]
+fn package_installs_into_the_global_module_store() {
+    require_guest();
+    let root = TempDir::new("g-root");
+    let legacy = TempDir::new("g-legacy");
+    let layout = StateLayout::new(root.path());
+    let config = config_package("global-greeter");
+    let digest = package_digest(&config);
+
+    let mut session = Session::open(SessionConfig {
+        dir: legacy.path().to_path_buf(),
+        layout: Some(layout.clone()),
+        config_layers: vec![config],
+        engine: Some(no_epoch()),
+        ..Default::default()
+    })
+    .unwrap();
+    let id = session.session_id();
+    let genesis = session.current_snapshot().expect("genesis snapshot");
+    assert!(session.store().exists(&genesis), "session objects stay per-session");
+    session.close().unwrap();
+
+    assert!(
+        layout.module_root().join(digest.to_string()).is_file(),
+        "the package lands in the global module store"
+    );
+    let session_objects = layout.session_dir(id).join("objects");
+    assert!(session_objects.join(genesis.to_string()).is_file());
+    assert!(
+        !session_objects.join(digest.to_string()).exists(),
+        "the package is not copied into the session dir"
+    );
+}
+
+/// (h) The same digest is reused across two sessions under one layout: the
+/// second activation finds the package in the global store (no rewrite), and
+/// neither session dir holds a copy.
+#[test]
+fn the_global_module_store_is_shared_across_sessions() {
+    require_guest();
+    let root = TempDir::new("h-root");
+    let legacy = TempDir::new("h-legacy");
+    let layout = StateLayout::new(root.path());
+    let config = config_package("shared-greeter");
+    let digest = package_digest(&config);
+
+    let open = |session_id: Option<Id128>| {
+        Session::open(SessionConfig {
+            dir: legacy.path().to_path_buf(),
+            layout: Some(layout.clone()),
+            session_id,
+            config_layers: vec![config.clone()],
+            engine: Some(no_epoch()),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let first = open(Some(Id128::generate()));
+    let first_id = first.session_id();
+    first.close().unwrap();
+
+    let path = layout.module_root().join(digest.to_string());
+    let installed_at = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    let second = open(Some(Id128::generate()));
+    let second_id = second.session_id();
+    second.close().unwrap();
+
+    assert_ne!(first_id, second_id);
+    let names: Vec<String> = std::fs::read_dir(layout.module_root())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        names.contains(&digest.to_string()),
+        "the shared package is one entry of the store: {names:?}"
+    );
+    assert!(
+        names.iter().all(|n| Digest::from_hex(n).is_ok()),
+        "flat content-addressed <digest> files, never per-digest dirs: {names:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        installed_at,
+        "the second session deduped instead of rewriting the package"
+    );
+    for id in [first_id, second_id] {
+        assert!(
+            !layout
+                .session_dir(id)
+                .join("objects")
+                .join(digest.to_string())
+                .exists()
+        );
+    }
+}
+
+/// (i) An explicit dir keeps the legacy package store byte-identically: the
+/// package lands in `<dir>/objects/` and the session stays on `log.zst`.
+#[test]
+fn explicit_dir_keeps_the_legacy_package_store() {
+    require_guest();
+    let dir = TempDir::new("i-legacy");
+    let config = config_package("legacy-greeter");
+    let digest = package_digest(&config);
+
+    let session = Session::open(SessionConfig {
+        dir: dir.path().to_path_buf(),
+        config_layers: vec![config],
+        engine: Some(no_epoch()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    assert_eq!(session.log_path(), dir.path().join("log.zst"));
+    assert!(session.store().exists(&digest));
+    assert!(dir.path().join("objects").join(digest.to_string()).is_file());
+    session.close().unwrap();
 }

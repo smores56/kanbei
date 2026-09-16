@@ -14,7 +14,7 @@ use kanbei_core::queue::DurabilityQueue;
 use kanbei_core::{Digest, Id128};
 use kanbei_modules::{
     install_package, ActorError, HeadFile, HookError, ModuleError, ModuleManager, ModuleOrigin,
-    PackageError, PackageManifest, StateError, StateStore, StateUpdate, HOOK_WAIT,
+    PackageError, PackageManifest, PackageStore, StateError, StateStore, StateUpdate, HOOK_WAIT,
 };
 use kanbei_objects::ObjectStore;
 use kanbei_scopes::contrib::{ContributionKind, HookKind};
@@ -87,7 +87,7 @@ fn manager_setup(tag: &str, vm: Vm) -> (PathBuf, ModuleManager, Arc<DurabilityQu
     let store = ObjectStore::open(&dir.join("objects"), Arc::clone(&queue)).unwrap();
     let state = StateStore::open(&dir, Arc::clone(&queue), Arc::new(|_| true));
     let services = Arc::new(Mutex::new(ServiceRegistry::new()));
-    let manager = ModuleManager::new(vm, store, state, services).unwrap();
+    let manager = ModuleManager::new(vm, PackageStore::from(store), state, services).unwrap();
     (dir, manager, queue)
 }
 
@@ -214,7 +214,8 @@ function kb_hot(x) return x end
 fn install_package_roundtrip_and_dedup() {
     let dir = tmp_dir("pkg");
     let queue = Arc::new(DurabilityQueue::start("test-modules-pkg"));
-    let mut store = ObjectStore::open(&dir.join("objects"), Arc::clone(&queue)).unwrap();
+    let store = ObjectStore::open(&dir.join("objects"), Arc::clone(&queue)).unwrap();
+    let mut store = PackageStore::from(store);
     let m = manifest(Id128::generate(), TRIVIAL_HOT, vec![]);
     let (d1, dedup1) = install_package(&mut store, &m).unwrap();
     assert!(!dedup1);

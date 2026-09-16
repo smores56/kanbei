@@ -57,7 +57,7 @@ use kanbei_core::envelope::{Envelope, EnvelopeError};
 use kanbei_core::id::{BranchId, Id128};
 use kanbei_core::queue::DurabilityQueue;
 use kanbei_log::{AppendLog, Profile};
-use kanbei_modules::{HeadFile, ModuleError, ModuleManager, PackageManifest};
+use kanbei_modules::{HeadFile, ModuleError, ModuleManager, PackageManifest, PackageStore};
 use kanbei_objects::{ObjectError, ObjectStore};
 use kanbei_policy::builtins::StoreAllPolicy;
 use kanbei_policy::{PolicyPlugin, RetentionGate};
@@ -616,6 +616,10 @@ struct ConfigLayer {
 pub struct Session {
     log: AppendLog,
     store: ObjectStore,
+    /// The store packages resolve through (decision 33/T14): the global
+    /// `<state>/modules` store with this session's `objects/` as the legacy
+    /// fallback under a layout, else this session's own `objects/`.
+    packages: PackageStore,
     queue: Arc<DurabilityQueue>,
     next_seq: u64,
     current_snapshot: Option<Digest>,
@@ -755,8 +759,9 @@ impl Session {
     /// After the M1 flow the M2 subsystems are built: the shared service
     /// registry, the scope tree, the contribution registry, the composition
     /// store, the retention gate, and (when the guest wasm loads) the module
-    /// manager with its own object-store handle over the session dir's
-    /// `objects/` and the state store over its `state/`. The
+    /// manager with its own package-store handle — the global `<state>/modules`
+    /// store under a layout, the session dir's `objects/` without one (decision
+    /// 33/T14) — plus the state store over its `state/`. The
     /// `cfg.config_layers` generations are then activated atomically LOW→HIGH;
     /// a failing non-builtin layer drops the non-builtin generations, keeps the
     /// built-in one active, and commits
@@ -825,6 +830,22 @@ impl Session {
                 return Err(e.into());
             }
         };
+        // Decision 33/T14: packages resolve through the global
+        // `<state>/modules` store under a layout, else through this session's
+        // own `objects/` — the same store the session body uses.
+        let packages = match crate::layout::open_package_store(
+            session_layout.as_ref(),
+            &session_dir,
+            &queue,
+        ) {
+            Ok(packages) => packages,
+            Err(e) => {
+                drop(log);
+                drop(store);
+                shutdown_queue(queue);
+                return Err(e);
+            }
+        };
         let next_seq = if recovered.events == 0 {
             1
         } else {
@@ -869,7 +890,13 @@ impl Session {
                 state.set_max_state_bytes(cfg.max_state_bytes);
                 let manager = ModuleManager::new(
                     vm,
-                    ObjectStore::open(&objects_dir, Arc::clone(&queue))?,
+                    // A second handle over the same package store dirs (the
+                    // manager installs; the session resolves reads).
+                    crate::layout::open_package_store(
+                        session_layout.as_ref(),
+                        &session_dir,
+                        &queue,
+                    )?,
                     state,
                     Arc::clone(&services),
                 )?;
@@ -1171,6 +1198,7 @@ impl Session {
         let mut session = Self {
             log,
             store,
+            packages,
             queue,
             next_seq,
             current_snapshot,
@@ -1735,6 +1763,7 @@ impl Session {
         let Session {
             log,
             store,
+            packages,
             queue,
             modules,
             memory_lifetime,
@@ -1751,6 +1780,7 @@ impl Session {
         }
         drop(log);
         drop(store);
+        drop(packages);
         drop(modules);
         drop(memory_lifetime);
         drop(memory_project);
