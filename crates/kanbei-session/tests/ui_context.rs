@@ -159,6 +159,70 @@ fn builtin_shell_renders_empty_transcript() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A module that publishes a UI mount and a theme overlay overriding the
+/// `header` style (the shell's header row style name) to red — a value the
+/// default theme never uses, so a cell carrying it proves the module's overlay
+/// reached the rendered frame rather than a kernel hardcode.
+fn theme_override_module() -> PackageManifest {
+    PackageManifest {
+        schema: kanbei_modules::PACKAGE_SCHEMA,
+        module_id: Id128::generate(),
+        origin: ModuleOrigin::UserConfig,
+        trust_class: TrustClass::Builtin,
+        scope: kanbei_services::ScopePath(vec!["root".into()]),
+        deps: Vec::new(),
+        capabilities: Vec::new(),
+        source: r#"
+function kb_on_activate(ctx)
+  ctx.contribution_publish('{"kind":"ui","name":"theme_ui","component":"theme_comp","slot":"status"}')
+  ctx.contribution_publish('{"kind":"theme","name":"theme_ui","overlay":{"header":{"fg":"red"}}}')
+end
+function kb_hot(d)
+  if d.entry == "ui_reduce" then
+    return { state = d.state, intents = {} }
+  elseif d.entry == "ui_render" then
+    return { root = { id = "theme_root", kind = "text", spans = { { text = "theme" } } } }
+  end
+  error("unknown entry: " .. tostring(d.entry))
+end
+"#
+        .to_string(),
+        state_schema: None,
+        state_key: None,
+    }
+}
+
+/// A module-contributed theme overlay reaches the rendered frame: after the
+/// overlay retints the shell header style red, the presented header cell's
+/// foreground is red (the default is bright-black), so the module's theme drove
+/// the screen, not the kernel's default theme.
+#[test]
+fn module_theme_overlay_reaches_the_rendered_frame() {
+    let (dir, mut session) = open("ui-theme-frame");
+    require_guest();
+    session.activate_builtin_ui().unwrap();
+    session.activate_ui(theme_override_module()).unwrap();
+    session.ui_render_frame().unwrap();
+    let frame = session.ui().unwrap().last_frame().unwrap().clone();
+    let row = (0..frame.rows())
+        .find(|&r| frame.row_text(r).contains("kanbei · idle"))
+        .expect("the shell header row renders");
+    let col = frame
+        .row_text(row)
+        .find("kanbei")
+        .expect("header text at a known column") as u16;
+    let dbg = format!("{:?}", frame.cell_style(row, col)).to_lowercase();
+    assert!(
+        dbg.contains("red"),
+        "the module theme's red header reached the cell: {dbg}"
+    );
+    assert!(
+        !dbg.contains("brightblack") && !dbg.contains("gray"),
+        "the overlay replaced the default header, not merely coexisted: {dbg}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Session-local collapse overrides are applied kernel-side when the context
 /// transcript is built (decision 9/32): a settled turn collapses to a header
 /// and re-opens when the override is set, without re-entering the projection.
