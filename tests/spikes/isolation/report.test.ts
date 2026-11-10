@@ -44,7 +44,7 @@ const sampleResult = (): SpikeResultType => {
     recommendation: {
       decision: "DG-4",
       status: "recommend",
-      selected: "process-cgroup",
+      recommended: "process-cgroup",
       rule: "rule",
       targetConcurrency: 16,
       eligible: ["process-cgroup"],

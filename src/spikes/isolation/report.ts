@@ -75,7 +75,7 @@ const armSection = (arm: ArmResult): ReadonlyArray<string> => {
 
 export const renderReport = (result: SpikeResult): string => {
   const arms = result.arms
-  const selected = result.recommendation.selected
+  const selected = result.recommendation.recommended
   const host = result.host
 
   const lines: ReadonlyArray<string> = [

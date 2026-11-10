@@ -127,7 +127,7 @@ export type IneligibleArm = typeof IneligibleArm.Type
 export const Recommendation = Schema.Struct({
   decision: Schema.Literal("DG-4"),
   status: Schema.Literals(["recommend", "no-selection"]),
-  selected: Schema.optional(ArmId),
+  recommended: Schema.optional(ArmId),
   rule: Schema.String,
   targetConcurrency: Schema.Number,
   eligible: Schema.Array(Schema.String),

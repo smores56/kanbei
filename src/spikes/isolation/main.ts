@@ -44,6 +44,6 @@ for (const arm of decoded.arms) {
     if (check.status === "fail") say(`  fail ${check.id}: ${check.detail}`)
   }
 }
-say(`DG-4: ${decoded.recommendation.status} ${decoded.recommendation.selected ?? ""}`.trimEnd())
+say(`DG-4: ${decoded.recommendation.status} ${decoded.recommendation.recommended ?? ""}`.trimEnd())
 for (const line of decoded.recommendation.rationale) say(`  ${line}`)
 say(`wrote ${spikeDirectory}/result.json and ${spikeDirectory}/REPORT.md`)

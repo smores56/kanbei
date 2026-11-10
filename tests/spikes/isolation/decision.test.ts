@@ -16,7 +16,7 @@ Deno.test("blocked arm reports its blocking reason and is never selected", () =>
   const blocked = arm("microvm", { status: "blocked", blockedReason: "no runtime on PATH" })
   assertEquals(eligibilityFailure(blocked), "status blocked: no runtime on PATH")
   const recommendation = recommend([arm("process-cgroup"), blocked])
-  assertEquals(recommendation.selected, "process-cgroup")
+  assertEquals(recommendation.recommended, "process-cgroup")
   assertEquals(recommendation.ineligible, [{
     arm: "microvm",
     reason: "status blocked: no runtime on PATH",
@@ -83,7 +83,7 @@ Deno.test("among eligible arms the lowest p95 cold start wins, then RSS, then IP
   const slow = arm("process-cgroup")
   const recommendation = recommend([slow, fast])
   assertEquals(recommendation.status, "recommend")
-  assertEquals(recommendation.selected, "wasm-instance")
+  assertEquals(recommendation.recommended, "wasm-instance")
   assertEquals(recommendation.eligible, ["process-cgroup", "wasm-instance"])
 })
 
@@ -93,7 +93,7 @@ Deno.test("no eligible arm yields no selection so the gate stays open", () => {
     arm("wasm-instance", { checks: checks({ "hosts-agent-workload": "fail" }) }),
   ])
   assertEquals(recommendation.status, "no-selection")
-  assertEquals(recommendation.selected, undefined)
+  assertEquals(recommendation.recommended, undefined)
   assertEquals(recommendation.eligible, [])
   assertEquals(recommendation.rationale.length, 3)
 })

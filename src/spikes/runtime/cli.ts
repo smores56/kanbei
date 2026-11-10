@@ -140,7 +140,11 @@ const program = Effect.gen(function* () {
   }
 
   const version = yield* fixtureVersion(repoRoot)
-  const outcome = outcomeOf(bakeOff.outcome.decision.value, bakeOff.decisionBlocks)
+  const outcome = outcomeOf(
+    bakeOff.outcome.decision.value,
+    bakeOff.decisionBlocks,
+    bakeOff.unboundProbes,
+  )
   const envelope = yield* sealSpikeEvidence(base, appendFixtureReference(version), outcome)
   const document: SpikeResultDocument = Schema.decodeUnknownSync(SpikeResultDocument)({
     ...base,

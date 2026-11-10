@@ -258,6 +258,7 @@ Runtimes missing from `PATH` are resolved non-destructively from pinned nixpkgs 
 - Monty startup includes CPython process startup and pydantic-monty import; it is not an in-process sandbox-only number.
 - Progressive-disclosure rows report characters, not provider tokens; token measurement is blocked.
 - Model matrix cells remain blocked; this result contains no model-generated success, token, turn, or latency data.
+- `lang-v1` is a local task-suite fixture, not a §7.0 registered dataset; DG-1 stays blocked until the suite is bound to an allowed dataset or the human amends the registry.
 - Deno's node-compatibility shim on PATH is rejected by a version pattern; the Node arm uses nixpkgs Node, not the shim.
 - Local host-call probes use 50, 20, and 3 calls at 10, 100, and 1000 ms to bound wall time; the pre-registered model workload keeps the full task call counts.
 

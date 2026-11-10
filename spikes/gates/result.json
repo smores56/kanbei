@@ -12,26 +12,30 @@
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
         "frozen OS-sandbox profile",
-        "sealed security-v1"
+        "sealed security-v1",
+        "FI-01 runtime/interpreter versions",
+        "FI-06 hardware fingerprint, timeouts, resource ceilings",
+        "DG-2 signed: NODE-DENO-1 winner fixes the TypeScript evaluator variant",
+        "lang-v1 is not a §7.0 registered dataset"
       ]
     },
     {
       "gate": "DG-2",
       "status": "open",
       "recommended": "deno@2.9.2",
-      "condition": "conditional; re-run after ledger sequencer and worker model exist"
+      "condition": "conditional; re-run after ledger sequencer and worker model exist; S1 envelope is blocked"
     },
     {
       "gate": "DG-3",
       "status": "open",
-      "recommended": "variant-D-hybrid",
-      "condition": "dedicated-UID arm is unverified; no privilege in this run"
+      "recommended": "variant-D-hybrid-risk-based",
+      "condition": "no pre-registered DEP-1 decision rule; dedicated-UID arm is unverified; no privilege in this run"
     },
     {
       "gate": "DG-4",
       "status": "open",
       "recommended": "process-cgroup",
-      "condition": "requires systemd user cgroup delegation; no security property claimed"
+      "condition": "requires systemd user cgroup delegation; must be re-run under DG-3 supervisor identity; no security property claimed"
     }
   ],
   "decisionsClosed": [],
@@ -39,12 +43,14 @@
   "evidenceBindingGaps": [
     "security-v1 is not sealed; A1 security probes, A2, A3, and A4 security cells lack dataset-bound envelopes",
     "A4 issued no envelope because all model cells are blocked",
-    "A2 and A3 emitted measurement records rather than envelopes"
+    "A2 and A3 emitted measurement records rather than envelopes",
+    "A1 S1 envelope is blocked because cost-v1/security-v1 bindings are absent"
   ],
   "operatorEnvelopeSchema": "src/spikes/gates/operator-envelope.ts",
   "next": [
     "human signs or amends DG-2, DG-3, DG-4",
     "human resolves DG-1 model manifest and credentials or blocks F4",
     "human decides whether to seal and re-run security-v1 binding"
-  ]
+  ],
+  "crossGate": "DG-4 was measured under the deployment user manager; DG-3 variant D moves the supervisor to a dedicated UID, so S3 must be re-run under that identity before the two recommendations compose."
 }

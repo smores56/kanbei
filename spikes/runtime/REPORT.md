@@ -181,14 +181,14 @@ worker round-trip p95 0.165 vs 1.39 ms (node); `SIGTERM` shutdown 18.9 vs 14.7 m
 
 | ID                 | node  | deno  | Evidence                                            |
 | ------------------ | ----- | ----- | --------------------------------------------------- |
-| `HF-CORRECTNESS`   | clear | clear | 9 driver checks pass on both arms                   |
+| `HF-CORRECTNESS`   | clear | clear | 11 checks pass on both arms                         |
 | `HF-SINGLE-WRITER` | clear | clear | concurrent writer refused, not visible, recovery ok |
 | `HF-INTEGRITY`     | clear | clear | `integrity_check=ok` after 1000 appends             |
 | `HF-DATA-LOSS`     | clear | clear | 1000 issued, 1000 stored                            |
-| `HF-TAIL-LATENCY`  | clear | clear | p95 6.7 / 8.4 ms, threshold 250 ms                  |
-| `HF-APPEND-TAIL`   | clear | clear | p95 7.4 / 9.2 ms, threshold 100 ms                  |
+| `HF-TAIL-LATENCY`  | clear | clear | p95 6.41 / 8.10 ms, threshold 250 ms                |
+| `HF-APPEND-TAIL`   | clear | clear | p95 7.16 / 8.64 ms, threshold 100 ms                |
 | `HF-ISOLATION`     | clear | clear | crash observed, parent survived, heartbeat ran      |
-| `HF-SIGNAL`        | clear | clear | handler invoked, 23.6 / 7.2 ms, exit 0              |
+| `HF-SIGNAL`        | clear | clear | handler invoked, 18.9 / 14.7 ms, exit 0             |
 | `HF-PERMISSION`    | clear | clear | no configured denial succeeded                      |
 
 Hazards recorded but not disqualifying (both arms): a synchronous SQLite busy handler parks the caller's own
@@ -213,7 +213,7 @@ weighted at 0.6 of the composite and do not offset the cold-start/RSS gap by the
 
 ## 7. Residual risks
 
-1. **The composite is inside the margin in every run (1.5–4.5 %).** The outcome rests on a pre-registered
+1. **The composite is inside the margin in every run (1.5–4.7 %).** The outcome rests on a pre-registered
    tie-breaker, not on a clear performance win. A future change in worker model, or a different filesystem,
    can flip the weighted composite.
 2. **One full workload run per arm per session.** Cold start has 11 samples per arm; append/read and event-loop

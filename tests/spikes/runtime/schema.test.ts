@@ -39,7 +39,9 @@ Deno.test("the published envelope outcome agrees with the published decision", (
   const published = Schema.decodeUnknownSync(SpikeResultDocument)(
     readJson("spikes/runtime/result.json"),
   )
-  if (published.decision.value === "inconclusive") {
+  if (published.unboundProbes.length > 0) {
+    assertEquals(published.envelope.outcome, "blocked")
+  } else if (published.decision.value === "inconclusive") {
     assertEquals(published.envelope.outcome, "inconclusive")
   } else if (published.blocked.some((entry) => entry.measurement === "arm-measurements")) {
     assertEquals(published.envelope.outcome, "blocked")

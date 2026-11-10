@@ -102,7 +102,7 @@ export const recommend = (arms: ReadonlyArray<ArmResult>): Recommendation => {
     : {
       decision: "DG-4",
       status: "recommend",
-      selected: selected.arm,
+      recommended: selected.arm,
       rule: DECISION_RULE,
       targetConcurrency: TARGET_CONCURRENCY,
       eligible: eligible.map((arm) => arm.arm),

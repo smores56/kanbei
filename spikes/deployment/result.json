@@ -125,7 +125,7 @@
       "method": "same-UID sibling opens /proc/<broker>/mem",
       "status": "pass",
       "observed": "same-UID sibling was denied /proc/<broker>/mem",
-      "evidence": "attacker mem {\"ok\":true,\"opened\":false,\"error\":\"PermissionDenied: Permission denied (os error 13): open '/proc/307638/mem'\"}; kernel.yama.ptrace_scope=1",
+      "evidence": "attacker mem {\"ok\":true,\"opened\":false,\"error\":\"PermissionDenied: Permission denied (os error 13): open '/proc/317883/mem'\"}; kernel.yama.ptrace_scope=1",
       "enforcement": {
         "pure": "kernel",
         "dedicated": "kernel"
@@ -143,7 +143,7 @@
       "method": "strace -p <broker> from a sibling; strace -f on an own child as control",
       "status": "pass",
       "observed": "PTRACE attach on a same-UID sibling denied; own child attach allowed=true",
-      "evidence": "sibling: exit=1 | /run/current-system/sw/bin/strace: attach: ptrace(PTRACE_SEIZE, 307654): Operation not permitted\n/run/current-system/sw/bin/strace: sysctl kernel.yama.ptrace_scope = 1 may be restricting this attach | own child: exit=0",
+      "evidence": "sibling: exit=1 | /run/current-system/sw/bin/strace: attach: ptrace(PTRACE_SEIZE, 317899): Operation not permitted\n/run/current-system/sw/bin/strace: sysctl kernel.yama.ptrace_scope = 1 may be restricting this attach | own child: exit=0",
       "enforcement": {
         "pure": "kernel",
         "dedicated": "kernel"
@@ -278,7 +278,7 @@
       "method": "start a transient user unit with hardening directives and read effective properties",
       "status": "pass",
       "observed": "20 hardening directives applied as requested",
-      "evidence": "exit=0 | Running as unit: kanbei-dep1-sd02.service; invocation ID: fca5a531f8c5489e9ebb363d74d8ea87 | effective {\"MemoryHigh\":\"50331648\",\"MemoryMax\":\"67108864\",\"TasksMax\":\"32\",\"RemoveIPC\":\"yes\",\"PrivateTmp\":\"yes\",\"PrivateDevices\":\"yes\",\"ProtectClock\":\"yes\",\"ProtectKernelTunables\":\"yes\",\"ProtectKernelModules\":\"yes\",\"ProtectControlGroups\":\"yes\",\"PrivateNetwork\":\"yes\",\"ProtectHome\":\"read-only\",\"ProtectSystem\":\"strict\",\"NoNewPrivileges\":\"yes\",\"LockPersonality\":\"yes\",\"RestrictAddressFamilies\":\"AF_INET AF_UNIX\",\"RestrictRealtime\":\"yes\",\"RestrictSUIDSGID\":\"yes\",\"RestrictNamespaces\":\"yes\",\"ProtectHostname\":\"yes\"}",
+      "evidence": "exit=0 | Running as unit: kanbei-dep1-sd02.service; invocation ID: 24a2cddb975b4bb387f50f577378e85b | effective {\"MemoryHigh\":\"50331648\",\"MemoryMax\":\"67108864\",\"TasksMax\":\"32\",\"RemoveIPC\":\"yes\",\"PrivateTmp\":\"yes\",\"PrivateDevices\":\"yes\",\"ProtectClock\":\"yes\",\"ProtectKernelTunables\":\"yes\",\"ProtectKernelModules\":\"yes\",\"ProtectControlGroups\":\"yes\",\"PrivateNetwork\":\"yes\",\"ProtectHome\":\"read-only\",\"ProtectSystem\":\"strict\",\"NoNewPrivileges\":\"yes\",\"LockPersonality\":\"yes\",\"RestrictAddressFamilies\":\"AF_INET AF_UNIX\",\"RestrictRealtime\":\"yes\",\"RestrictSUIDSGID\":\"yes\",\"RestrictNamespaces\":\"yes\",\"ProtectHostname\":\"yes\"}",
       "prerequisites": [
         "systemd-run",
         "systemctl",
@@ -326,8 +326,8 @@
       "arm": "pure-user-space",
       "method": "compare /tmp device:inode inside a PrivateTmp unit with the host",
       "status": "pass",
-      "observed": "/tmp is private (unit 30:324403, host 30:13)",
-      "evidence": "unit: exit=0 | 30:324403 | host: exit=0 | 30:13",
+      "observed": "/tmp is private (unit 30:325161, host 30:13)",
+      "evidence": "unit: exit=0 | 30:325161 | host: exit=0 | 30:13",
       "enforcement": {
         "pure": "kernel",
         "dedicated": "kernel"
@@ -409,7 +409,7 @@
       "method": "a same-UID process stops and reconfigures a sibling unit",
       "status": "fail",
       "observed": "same-UID process rewrote a sibling unit ceiling from 67108864 to 134217728 and can stop it",
-      "evidence": "unit start: exit=0 | Running as unit: kanbei-dep1-sd10.service; invocation ID: 1fcad93cebaa4c5cb2d1d602db6ec3a7 | cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/kanbei-dep1-sd10.service | memory.max 67108864 -> 134217728",
+      "evidence": "unit start: exit=0 | Running as unit: kanbei-dep1-sd10.service; invocation ID: 12a8bd74bfb949baac5993d9aaa4b70e | cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/kanbei-dep1-sd10.service | memory.max 67108864 -> 134217728",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -427,7 +427,7 @@
       "method": "unit with MemoryMax=64M allocates 400 MiB and is observed until it dies",
       "status": "pass",
       "observed": "unit result=oom-kill, MemoryPeak=67108864 bytes, ActiveState=failed",
-      "evidence": "systemd-run: exit=0 Running as unit: kanbei-dep1-lm01.service; invocation ID: 0e6694c3ee684115b8f54513dd9470dc | final state {\"activeState\":\"failed\",\"result\":\"oom-kill\",\"memoryPeak\":\"67108864\",\"restarts\":\"0\"}",
+      "evidence": "systemd-run: exit=0 Running as unit: kanbei-dep1-lm01.service; invocation ID: 59549a14eae440018f78e332aab53c72 | final state {\"activeState\":\"failed\",\"result\":\"oom-kill\",\"memoryPeak\":\"67108864\",\"restarts\":\"0\"}",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -445,8 +445,8 @@
       "arm": "pure-user-space",
       "method": "unit with MemoryHigh=32M allocates 400 MiB; read memory.events",
       "status": "pass",
-      "observed": "memory.events high count=888, unit ActiveState=active, result=success",
-      "evidence": "memory.events: low 0 high 888 max 0 oom 0 oom_kill 0 oom_group_kill 0 ",
+      "observed": "memory.events high count=915, unit ActiveState=active, result=success",
+      "evidence": "memory.events: low 0 high 915 max 0 oom 0 oom_kill 0 oom_group_kill 0 ",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -482,8 +482,8 @@
       "arm": "pure-user-space",
       "method": "unit with CPUQuota=10% runs a busy loop; read cpu.stat nr_throttled",
       "status": "pass",
-      "observed": "cpu.max=10000 100000, nr_throttled=21",
-      "evidence": "cpu.stat: usage_usec 217597 user_usec 212001 system_usec 5595 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 21 nr_throttled 21 throttled_usec 1812763 nr_bursts 0 burst_usec 0 ",
+      "observed": "cpu.max=10000 100000, nr_throttled=20",
+      "evidence": "cpu.stat: usage_usec 210971 user_usec 207078 system_usec 3892 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 20 nr_throttled 20 throttled_usec 1750082 nr_bursts 0 burst_usec 0 ",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -511,7 +511,7 @@
       "method": "unit with Restart=on-failure and StartLimitBurst=2 exits 7 repeatedly",
       "status": "pass",
       "observed": "NRestarts=2, Result=start-limit-hit, ExecMainStatus=7",
-      "evidence": "systemd-run: exit=0 Running as unit: kanbei-dep1-rc01.service; invocation ID: 808a64f82c2b4b48a266e0c922146af3",
+      "evidence": "systemd-run: exit=0 Running as unit: kanbei-dep1-rc01.service; invocation ID: b9ec710a91ab4d80ad9389ef96f686b6",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -529,8 +529,8 @@
       "arm": "pure-user-space",
       "method": "background child outlives its parent shell",
       "status": "fail",
-      "observed": "detached sandbox-shaped child 308013 survived its parent",
-      "evidence": "setsid sleep 30 & echo $! -> pid=308013 alive=true",
+      "observed": "detached sandbox-shaped child 318163 survived its parent",
+      "evidence": "setsid sleep 30 & echo $! -> pid=318163 alive=true",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -561,7 +561,7 @@
       "method": "kill a child after it records intent; classify the interrupted effect",
       "status": "pass",
       "observed": "intent recorded=true, completion recorded=false, classification=outcome_unknown",
-      "evidence": "kill -9 after intent; state dir /tmp/kanbei-dep1-fc24485423c03368/recovery/effect",
+      "evidence": "kill -9 after intent; state dir /tmp/kanbei-dep1-278d6c06b72d8a42/recovery/effect",
       "prerequisites": [
         "deno"
       ],
@@ -594,7 +594,7 @@
       "method": "bind 127.0.0.1, then connect via loopback and via the host's global IPv4 address",
       "status": "pass",
       "observed": "loopback connect=true, 10.77.0.2 connect=false",
-      "evidence": "port 42567; external error: ConnectionRefused: Connection refused (os error 111)",
+      "evidence": "port 34755; external error: ConnectionRefused: Connection refused (os error 111)",
       "enforcement": {
         "pure": "kernel",
         "dedicated": "kernel"
@@ -612,7 +612,7 @@
       "method": "bind 0.0.0.0 and connect through the host's global IPv4 address",
       "status": "fail",
       "observed": "wildcard listener reachable on 10.77.0.2=true",
-      "evidence": "port 34543; error ",
+      "evidence": "port 33309; error ",
       "prerequisites": [
         "deno",
         "ip"
@@ -639,7 +639,7 @@
       "method": "read a 0600 file from a 0700 directory as the same UID",
       "status": "fail",
       "observed": "0600 file in a 0700 directory is readable by the same UID (mode 0o100600)",
-      "evidence": "open /tmp/kanbei-dep1-fc24485423c03368/secrets/credential with mode 0o100600 -> readable=true",
+      "evidence": "open /tmp/kanbei-dep1-278d6c06b72d8a42/secrets/credential with mode 0o100600 -> readable=true",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -666,7 +666,7 @@
       "method": "create a 0444 audit sink in a user-owned tree, then truncate and unlink it as the same UID",
       "status": "fail",
       "observed": "same-UID truncate=false, unlink=true on a 0444 audit file",
-      "evidence": "/tmp/kanbei-dep1-fc24485423c03368/audit/audit.log mode 0444 owned by uid 1000",
+      "evidence": "/tmp/kanbei-dep1-278d6c06b72d8a42/audit/audit.log mode 0444 owned by uid 1000",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -705,8 +705,8 @@
       "arm": "both",
       "method": "unix socket with mode 0600; server reports SO_PEERCRED of a same-UID client",
       "status": "fail",
-      "observed": "SO_PEERCRED peer uid=1000 gid=100 pid=308077; socket mode=0600; deployment uid=1000",
-      "evidence": "perl SO_PEERCRED + nc -U -> {\"peerPid\":308077,\"peerUid\":1000,\"peerGid\":100,\"socketMode\":\"0600\"}",
+      "observed": "SO_PEERCRED peer uid=1000 gid=100 pid=318227; socket mode=0600; deployment uid=1000",
+      "evidence": "perl SO_PEERCRED + nc -U -> {\"peerPid\":318227,\"peerUid\":1000,\"peerGid\":100,\"socketMode\":\"0600\"}",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -779,7 +779,7 @@
       "method": "make the audit sink unwritable and confirm the guarded effect is denied",
       "status": "pass",
       "observed": "sink writable=true, writable after chmod 0444=false, guarded effect allowed=true, guarded effect after denial=false",
-      "evidence": "audit sink /tmp/kanbei-dep1-fc24485423c03368/fail-closed/gate/audit.log; effect marker exists=false",
+      "evidence": "audit sink /tmp/kanbei-dep1-278d6c06b72d8a42/fail-closed/gate/audit.log; effect marker exists=false",
       "prerequisites": [
         "deno"
       ],
@@ -817,7 +817,14 @@
         "SC-03",
         "BI-01"
       ],
-      "unverified": [],
+      "unverified": [
+        "RC-05",
+        "RC-06",
+        "NW-03",
+        "SC-05",
+        "BI-02",
+        "BI-04"
+      ],
       "secretIsolation": "none",
       "note": "measured secret-isolation failures: PR-01, PR-04, PR-05, SC-01, BI-01"
     },
@@ -833,15 +840,20 @@
         "PR-05",
         "LL-02",
         "LL-03",
+        "RC-05",
+        "RC-06",
         "NW-01",
+        "NW-03",
         "SC-01",
         "SC-03",
+        "SC-05",
         "BI-01",
         "BI-02",
-        "BI-03"
+        "BI-03",
+        "BI-04"
       ],
       "secretIsolation": "unverified",
-      "note": "secret isolation was not exercised for this arm: PR-01, PR-02, PR-03, PR-04, PR-05, SC-01, BI-01, BI-02, BI-03"
+      "note": "secret isolation was not exercised for this arm: PR-01, PR-02, PR-03, PR-04, PR-05, SC-01, SC-05, BI-01, BI-02, BI-03, BI-04"
     }
   ],
   "recommendation": {
@@ -851,7 +863,7 @@
       "Pure user-space cannot protect broker secrets: same-UID code read an open credential descriptor and 0600 files, and signalled sibling processes (conventional: LM-01, LM-02, LM-03, LM-04, RC-01, PR-01, PR-04, PR-05, SD-04, SD-10, RC-02, SC-01, SC-03, BI-01).",
       "The user manager is controllable by the deployment UID, so hard ceilings, restart discipline, and the watchdog are conventional rather than kernel-enforced for a pure user-space arm (SD-10, LM-01).",
       "Kernel-enforced pieces that remain available to the user-space core are Landlock filesystem and TCP rules, Yama-scoped memory denial, cgroup ceilings inside a unit, and loopback-only binding.",
-      "Dedicated-UID enforcement claims could not be exercised from an unprivileged run (PR-01, PR-02, PR-03, PR-04, PR-05, LL-02, LL-03, NW-01, SC-01, SC-03, BI-01, BI-02, BI-03), so they are recorded as unverified rather than assumed."
+      "Dedicated-UID enforcement claims could not be exercised from an unprivileged run (PR-01, PR-02, PR-03, PR-04, PR-05, LL-02, LL-03, RC-05, RC-06, NW-01, NW-03, SC-01, SC-03, SC-05, BI-01, BI-02, BI-03, BI-04), so they are recorded as unverified rather than assumed."
     ],
     "requiredConditions": [
       "Create kanbei-broker and kanbei-sandbox system users and run both as system units; the deployment user must not be able to signal, trace, or reconfigure them.",
@@ -903,7 +915,7 @@
       "BI-02",
       "BI-03"
     ],
-    "statement": "Variant D (hybrid) is the recommended deployment plane: the broker and sandbox supervisor as dedicated system users, core/agents/UI under the deployment user. This is a decision input, not a selection; DG-3 closes only with a human signature."
+    "statement": "Variant D (hybrid) is a risk-based proposal: the broker and sandbox supervisor as dedicated system users, core/agents/UI under the deployment user. DEP-1 had no pre-registered decision rule and the dedicated-UID arm is unverified, so this is not a rule-decided selection; DG-3 closes only with a human signature."
   },
   "residuals": [
     "PrivateUsers=yes started without changing the UID mapping",

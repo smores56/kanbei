@@ -1,5 +1,5 @@
 import { assertEquals } from "@std/assert"
-import { Schema } from "effect"
+import { Duration, Schema } from "effect"
 import { OperatorEnvelope } from "../../src/spikes/gates/operator-envelope.ts"
 
 const sample = {
@@ -15,13 +15,13 @@ const sample = {
   },
   defaultLoopBudget: {
     tokens: 1,
-    spendUsd: 1,
-    wallClockMs: 1,
-    modelCalls: 1,
-    effectCalls: 1,
-    decisionRequests: 1,
-    decisionsConsumed: 1,
-    maxOverrideMultiplier: 1,
+    spend_usd: 1,
+    wall_clock: Duration.seconds(1),
+    model_calls: 1,
+    effect_calls: 1,
+    decision_requests: 1,
+    decisions_consumed: 1,
+    max_override_multiplier: 1,
   },
 } as const
 

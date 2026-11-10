@@ -21,15 +21,25 @@
       "MI-CRED-ANTHROPIC",
       "MI-CRED-OPENAI",
       "MI-04 frozen sandbox profile",
-      "MI-06 security-v1 dataset"
+      "MI-06 security-v1 dataset",
+      "FI-01 runtime/interpreter versions",
+      "FI-06 hardware fingerprint, timeouts, resource ceilings",
+      "DG-2 signed: NODE-DENO-1 winner fixes the TypeScript evaluator variant",
+      "lang-v1 is not a §7.0 registered dataset"
     ],
     "rejectedAlternatives": [],
     "evidenceEnvelopes": [],
-    "evidenceArtifacts": ["spikes/language/result.json", "spikes/language/REPORT.md"],
+    "evidenceArtifacts": [
+      "spikes/language/result.json",
+      "spikes/language/REPORT.md"
+    ],
     "residuals": [
       "No model success, token, turn, tool-call, or latency comparison exists yet.",
       "No LANG-1 arm is selected or rejected on model evidence.",
       "Monty snapshot trust is based on a local dump/load_snapshot probe only."
+    ],
+    "blocks": [
+      "F4"
     ]
   },
   {
@@ -53,16 +63,27 @@
     "blockers": [
       "security-v1 is not sealed; permission and fail-closed probes are unbound.",
       "systemd integration and OpenTelemetry/tracing were not measured.",
-      "Node single-binary packaging is blocked in this environment."
+      "Node single-binary packaging is blocked in this environment.",
+      "S1 envelope is blocked: cost-v1 and security-v1 bindings are absent"
     ],
-    "rejectedAlternatives": ["node@24.21.0"],
-    "evidenceEnvelopes": ["spikes/runtime/result.json#envelope"],
-    "evidenceArtifacts": ["spikes/runtime/result.json", "spikes/runtime/REPORT.md"],
+    "rejectedAlternatives": [
+      "node@24.21.0"
+    ],
+    "evidenceEnvelopes": [
+      "spikes/runtime/result.json#envelope (outcome=blocked)"
+    ],
+    "evidenceArtifacts": [
+      "spikes/runtime/result.json",
+      "spikes/runtime/REPORT.md"
+    ],
     "residuals": [
       "The composite margin is 1.5-4.7% across runs; a different worker or filesystem can flip it.",
       "SQLite micro-versions differ: Node 3.53.3 and Deno 3.53.2.",
       "Deno node:sqlite lacks errcode/errstr on lock contention.",
       "Both arms park their own timer queue during a synchronous SQLite busy timeout."
+    ],
+    "blocks": [
+      "B1 onward"
     ]
   },
   {
@@ -71,7 +92,7 @@
     "owner": "human",
     "producingTask": "A2",
     "status": "open",
-    "recommended": "variant-D-hybrid",
+    "recommended": "variant-D-hybrid-risk-based",
     "recommendationRationale": [
       "Pure user-space measured secret isolation is none: same-UID code read broker credential bytes through an open descriptor, read 0600 files, and signalled sibling processes.",
       "The user manager is a per-user trust domain; same-UID code rewrote a sibling unit memory ceiling and could stop the unit.",
@@ -90,7 +111,9 @@
     "blockers": [
       "The dedicated-UID arm is unverified because this run had no privilege to create or enter a second UID.",
       "Post-reboot recovery, ledger/backup restore, and SCM_CREDENTIALS remain unmeasured.",
-      "security-v1 is not sealed, so no EvidenceEnvelope is issued."
+      "security-v1 is not sealed, so no EvidenceEnvelope is issued.",
+      "DEP-1 had no pre-registered decision rule; variant D is risk-based, not rule-decided",
+      "dedicated-UID arm is unverified; no privilege in this run"
     ],
     "rejectedAlternatives": [
       "pure-user-space home-manager unit",
@@ -98,13 +121,21 @@
       "all-dedicated system units"
     ],
     "evidenceEnvelopes": [],
-    "evidenceArtifacts": ["spikes/deployment/result.json", "spikes/deployment/REPORT.md"],
+    "evidenceArtifacts": [
+      "spikes/deployment/result.json",
+      "spikes/deployment/REPORT.md"
+    ],
     "residuals": [
       "Yama protection is ancestry-based; an agent that is an ancestor of the broker could attach.",
       "Landlock does not cover UDP or io_uring; io_uring is enabled on this host.",
       "A wildcard listener was externally reachable; every Kanbei listener must bind 127.0.0.1 explicitly.",
       "A same-UID process can still signal or reconfigure user units under the pure user-space arm.",
       "The dedicated-UID enforcement claim is unverified, not assumed."
+    ],
+    "blocks": [
+      "E1",
+      "E2",
+      "H7"
     ]
   },
   {
@@ -126,16 +157,28 @@
     ],
     "blockers": [
       "microVM runtime and sealed guest image are unavailable.",
-      "security-v1 is not sealed, so no EvidenceEnvelope is issued."
+      "security-v1 is not sealed, so no EvidenceEnvelope is issued.",
+      "DG-3 must fix which UID owns the delegated cgroup subtree; S3 must be re-run under that supervisor identity",
+      "SD-10: a same-UID agent can raise its own memory.max; containment holds only for non-hostile agents"
     ],
-    "rejectedAlternatives": ["wasm-instance", "microvm"],
+    "rejectedAlternatives": [
+      "wasm-instance",
+      "microvm"
+    ],
     "evidenceEnvelopes": [],
-    "evidenceArtifacts": ["spikes/isolation/result.json", "spikes/isolation/REPORT.md"],
+    "evidenceArtifacts": [
+      "spikes/isolation/result.json",
+      "spikes/isolation/REPORT.md"
+    ],
     "residuals": [
       "No security property is claimed; this is crash and resource containment only.",
       "Target concurrency 16 is a spike assumption; LIM-1 owns the real ceiling.",
       "WASM RSS is a process-level delta; per-instance memory is the declared linear-memory cap.",
-      "MicroVM containment and density are unmeasured."
+      "MicroVM containment and density are unmeasured.",
+      "DG-4 process-cgroup was measured under the deployment user user manager, not under DG-3 dedicated supervisor; S3 must be re-run under DG-3 identity."
+    ],
+    "blocks": [
+      "E1"
     ]
   }
 ]

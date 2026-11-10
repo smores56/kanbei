@@ -428,7 +428,6 @@
   "recommendation": {
     "decision": "DG-4",
     "status": "recommend",
-    "selected": "process-cgroup",
     "rule": "Eligible = status measured AND every containment check pass or not-applicable AND hosts-agent-workload pass AND density at target concurrency ok AND p95 cold start <= 500 ms AND per-agent RSS <= 64 MiB AND p95 IPC <= 25 ms AND no root requirement AND host dependencies <= 2. Among eligible arms, select the lowest p95 cold start, then the lowest per-agent RSS, then the lowest p95 IPC. No eligible arm means no selection; DG-4 stays open.",
     "targetConcurrency": 16,
     "eligible": [
@@ -448,7 +447,8 @@
       "process-cgroup is the only arm that satisfies every pre-registered gate",
       "wasm-instance: containment failed: resource-ceilings, hosts-agent-workload",
       "microvm: status blocked: no microVM runtime on PATH (firecracker, cloud-hypervisor, microvm all absent; general VMM found: none); /dev/kvm is accessible; no sealed guest kernel, initrd, or rootfs exists in the repository, and the host has no toolchain to build one"
-    ]
+    ],
+    "recommended": "process-cgroup"
   },
   "residuals": [
     "No security property is claimed for any arm. This record covers crash and resource containment only.",

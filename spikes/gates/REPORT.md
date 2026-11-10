@@ -4,12 +4,12 @@ Status: `input-ready-human-signature-required`. No decision gate is closed by th
 
 ## Inputs
 
-| Task | Protocol             | Result                          | Gate   | Recommendation                                    |
-| ---- | -------------------- | ------------------------------- | ------ | ------------------------------------------------- |
-| `A1` | `S1` / `NODE-DENO-1` | `spikes/runtime/result.json`    | `DG-2` | `deno@2.9.2`, conditional                         |
-| `A2` | `S2` / `DEP-1`       | `spikes/deployment/result.json` | `DG-3` | variant D, hybrid dedicated-UID broker/supervisor |
-| `A3` | `S3` / `ISO-1`       | `spikes/isolation/result.json`  | `DG-4` | `process-cgroup`                                  |
-| `A4` | `S1` / `LANG-1`      | `spikes/language/result.json`   | `DG-1` | none; model arm blocked                           |
+| Task | Protocol             | Result                          | Gate   | Recommendation                                      |
+| ---- | -------------------- | ------------------------------- | ------ | --------------------------------------------------- |
+| `A1` | `S1` / `NODE-DENO-1` | `spikes/runtime/result.json`    | `DG-2` | `deno@2.9.2`, conditional                           |
+| `A2` | `S2` / `DEP-1`       | `spikes/deployment/result.json` | `DG-3` | variant D, risk-based; no pre-registered DEP-1 rule |
+| `A3` | `S3` / `ISO-1`       | `spikes/isolation/result.json`  | `DG-4` | `process-cgroup`                                    |
+| `A4` | `S1` / `LANG-1`      | `spikes/language/result.json`   | `DG-1` | none; model arm blocked                             |
 
 ## Gate records
 
@@ -21,19 +21,19 @@ Status: **open**. Recommendation: **none**.
 
 All 600 model cells (18,000 planned trials) are blocked. The local matrix resolved Monty, Deno, Node, Lua 5.4, Luau, Bash, and CPython, and measured startup, RSS, host-call overhead, snapshot support, capability posture, and progressive disclosure. Those measurements are context only; they do not select a language.
 
-Blocking inputs: frozen model manifest, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, frozen OS-sandbox profile, and sealed `security-v1`.
+Blocking inputs: frozen model manifest, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, frozen OS-sandbox profile, sealed `security-v1`, `FI-01` runtime/interpreter versions, `FI-06` hardware fingerprint/timeouts/ceilings, a signed `DG-2` to fix the TypeScript evaluator variant, and a §7.0-registered dataset for the A4 task suite (`lang-v1` is not registered).
 
 ### `DG-2` — control-plane runtime
 
 Status: **open**. Recommendation: **Deno 2.9.2**, conditional.
 
-The pre-registered composite margin was 4.7%, inside the 10% margin, so the peak-RSS tie-break selected Deno. This is a near-tie: Node wins append throughput (+62%), event-loop p50, warm start, and worker startup. Deno wins cold start, peak RSS, shutdown, and single-binary packaging. The record must carry the conditions that canonical writes are serialized in the application, never by a SQLite busy handler, and that the protocol is re-run after the ledger sequencer and worker model exist.
+The pre-registered composite margin was 4.7%, inside the 10% margin, so the peak-RSS tie-break selected Deno. This is a near-tie: Node wins append throughput (+62%), event-loop p50, warm start, and worker startup. Deno wins cold start, peak RSS, and shutdown; its single-binary packaging was measured while Node packaging was blocked. The record must carry the conditions that canonical writes are serialized in the application, never by a SQLite busy handler, and that the protocol is re-run after the ledger sequencer and worker model exist.
 
 ### `DG-3` — deployment plane and broker identity
 
 Status: **open**. Recommendation: **variant D** — core, agents, and UI under the deployment user; broker and sandbox supervisor as dedicated system users in system units.
 
-Pure user-space measured **no secret isolation**: a same-UID sibling read broker credential bytes through an open descriptor and 0600 files, and could signal and reconfigure sibling units. Dedicated-UID enforcement is **unverified** because this run had no privilege to create or enter a second UID. The recommendation therefore relies on the kernel UID model plus review, not on a measured dedicated-UID arm.
+Pure user-space measured **no secret isolation**: a same-UID sibling read broker credential bytes through an open descriptor and 0600 files, and could signal and reconfigure sibling units. Dedicated-UID enforcement is **unverified** because this run had no privilege to create or enter a second UID. DEP-1 also had no pre-registered decision rule; variant D is a risk-based proposal, not a rule-decided selection. It therefore relies on the kernel UID model plus review, not on a measured dedicated-UID arm.
 
 Required conditions include dedicated system users, credentials outside the deployment user's writable paths, loopback-only binding, startup verification of effective systemd hardening, `LimitCORE=0`, removal from the `docker` group, and control-group kill on supervisor termination.
 
@@ -41,11 +41,11 @@ Required conditions include dedicated system users, credentials outside the depl
 
 Status: **open**. Recommendation: **process-cgroup**.
 
-`process-cgroup` is the only eligible arm. It passed crash, hang, OOM, fork-bomb, cleanup, orphan-reaping, IPC, resource-ceiling, and workload checks, with p95 cold start 429 ms, 15.8 MiB per agent at 16 agents, and IPC p95 0.35 ms. `wasm-instance` is excluded because it has no CPU/fuel ceiling and cannot host the LANG-1 workload. `microvm` is blocked because no runtime or sealed guest image exists on this host. **No security property is claimed** for any arm.
+`process-cgroup` is the only eligible arm. It passed crash, hang, OOM, fork-bomb, cleanup, orphan-reaping, IPC, resource-ceiling, and workload checks, with p95 cold start 429 ms, 15.8 MiB per agent at 16 agents, and IPC p95 0.35 ms. `wasm-instance` is excluded because it has no CPU/fuel ceiling and cannot host the LANG-1 workload. `microvm` is blocked because no runtime or sealed guest image exists on this host. **No security property is claimed** for any arm. DG-4 is also not closed: DG-3 must fix which UID owns the delegated cgroup subtree, and S3 must be re-run under that supervisor identity. SD-10 means a same-UID agent can raise its own `memory.max`, so the containment pass holds only for non-hostile agents.
 
 ## Operator envelope
 
-`src/spikes/gates/operator-envelope.ts` defines the provisional `HardCeilings`, `LoopBudget`, and `OperatorEnvelope` schemas from `07 §4.7.3`. No values are set here. `H4` measures the workload and proposes values; the human decides at `DG-6`.
+`src/spikes/gates/operator-envelope.ts` mirrors the `HardCeilings`, `LoopBudget`, `BudgetOverride`, and `OperatorEnvelope` shapes from `07 §4.7.3`, including `Duration` for `wall_clock`. No values are set here. `H4` measures the workload and proposes values; the human decides at `DG-6`.
 
 ## Baseline freeze
 
@@ -61,9 +61,13 @@ Not performed. A baseline cannot be frozen while `DG-1` through `DG-4` remain un
 - `security-v1` is not registered or sealed. A1’s permission probes, A2’s host probes, A3’s isolation probes, and A4’s security cells therefore lack a dataset-bound `EvidenceEnvelope`.
 - A4 issued no envelope because the model arm is blocked.
 - A2 and A3 emitted measurement records, not envelopes, for the same `security-v1` reason.
-- A1 emitted a valid envelope bound to `append-v1`, but its security probes remain unbound.
+- A1 emitted a measurement envelope bound to `append-v1`; it is now marked `blocked` because `cost-v1` and `security-v1` bindings are absent.
 
 These are recorded blockers, not waivers.
+
+## Cross-gate dependency
+
+`DG-3` and `DG-4` are operationally coupled. A3 measured `process-cgroup` under the deployment user systemd user manager. Variant D moves the sandbox supervisor to a dedicated system unit. Until DG-3 fixes which UID owns the delegated cgroup subtree, DG-4 cannot be treated as measured in the target posture. S3 must be re-run under that identity before the recommendations compose.
 
 ## Required human decisions
 

@@ -74,19 +74,19 @@ from this unprivileged run and is never converted into a pass.
 | SD-02 | systemd             | pass         | 20 hardening directives applied as requested                                                                                          |
 | SD-03 | systemd             | pass         | $HOME is read-only inside the unit and readable=true                                                                                  |
 | SD-04 | systemd             | fail         | state path was read-only under ProtectSystem=strict even though ReadWritePaths named it                                               |
-| SD-05 | systemd             | pass         | /tmp is private (unit 30:324403, host 30:13)                                                                                          |
+| SD-05 | systemd             | pass         | /tmp is private (unit 30:325161, host 30:13)                                                                                          |
 | SD-06 | network             | pass         | unit network namespace holds only lo; host has docker0,enp0s7,lo                                                                      |
 | SD-07 | systemd             | pass         | IPv4 bind=allowed, IPv6 bind=denied                                                                                                   |
 | SD-08 | systemd             | pass         | mount syscalls were denied inside the filtered unit                                                                                   |
 | SD-09 | fail-closed         | pass         | systemd rejects unknown properties and invalid values instead of degrading                                                            |
 | SD-10 | recovery            | fail         | same-UID process rewrote a sibling unit ceiling from 67108864 to 134217728 and can stop it                                            |
 | LM-01 | resource-limits     | pass         | unit result=oom-kill, MemoryPeak=67108864 bytes, ActiveState=failed                                                                   |
-| LM-02 | resource-limits     | pass         | memory.events high count=888, unit ActiveState=active, result=success                                                                 |
+| LM-02 | resource-limits     | pass         | memory.events high count=915, unit ActiveState=active, result=success                                                                 |
 | LM-03 | resource-limits     | pass         | fork was denied at the pid ceiling; pids.max is enforced by the kernel                                                                |
-| LM-04 | resource-limits     | pass         | cpu.max=10000 100000, nr_throttled=21                                                                                                 |
+| LM-04 | resource-limits     | pass         | cpu.max=10000 100000, nr_throttled=20                                                                                                 |
 | LM-05 | resource-limits     | pass         | delegated controllers=[cpu io memory pids], io.weight=default 100                                                                     |
 | RC-01 | recovery            | pass         | NRestarts=2, Result=start-limit-hit, ExecMainStatus=7                                                                                 |
-| RC-02 | recovery            | fail         | detached sandbox-shaped child 308013 survived its parent                                                                              |
+| RC-02 | recovery            | fail         | detached sandbox-shaped child 318163 survived its parent                                                                              |
 | RC-03 | recovery            | fail         | Linger=no                                                                                                                             |
 | RC-04 | fail-closed         | pass         | intent recorded=true, completion recorded=false, classification=outcome_unknown                                                       |
 | RC-05 | recovery            | blocked      | reboot is a destructive host action and was not performed                                                                             |
@@ -99,7 +99,7 @@ from this unprivileged run and is never converted into a pass.
 | SC-03 | fail-closed         | fail         | same-UID truncate=false, unlink=true on a 0444 audit file                                                                             |
 | SC-04 | secret-reachability | fail         | groups=[users wheel docker], /var/run/docker.sock mode=0o140660                                                                       |
 | SC-05 | secret-reachability | inconclusive | fs.suid_dumpable=2, core_pattern=\|/nix/store/b8zavc5rpmlcs0jjvz74b8v53zclqmww-systemd/lib/sys                                        |
-| BI-01 | broker-identity     | fail         | SO_PEERCRED peer uid=1000 gid=100 pid=308077; socket mode=0600; deployment uid=1000                                                   |
+| BI-01 | broker-identity     | fail         | SO_PEERCRED peer uid=1000 gid=100 pid=318227; socket mode=0600; deployment uid=1000                                                   |
 | BI-02 | broker-identity     | blocked      | cross-UID connect is untestable: effective capabilities=0000000000000000; a second UID cannot be created or entered without privilege |
 | BI-03 | broker-identity     | blocked      | uid=1000, effective capabilities=0000000000000000, existing kanbei service users=false                                                |
 | BI-04 | broker-identity     | inconclusive | kernel.yama.ptrace_scope=1; SCM_CREDENTIALS support was not exercised                                                                 |
@@ -122,7 +122,7 @@ The decisive question for `DEP-1` is what another process of the same UID can do
 | SC-02 | secret-reachability | pass         | no conventional secret material exists on this host                                                                                   |
 | SC-04 | secret-reachability | fail         | groups=[users wheel docker], /var/run/docker.sock mode=0o140660                                                                       |
 | SC-05 | secret-reachability | inconclusive | fs.suid_dumpable=2, core_pattern=\|/nix/store/b8zavc5rpmlcs0jjvz74b8v53zclqmww-systemd/lib/sys                                        |
-| BI-01 | broker-identity     | fail         | SO_PEERCRED peer uid=1000 gid=100 pid=308077; socket mode=0600; deployment uid=1000                                                   |
+| BI-01 | broker-identity     | fail         | SO_PEERCRED peer uid=1000 gid=100 pid=318227; socket mode=0600; deployment uid=1000                                                   |
 | BI-02 | broker-identity     | blocked      | cross-UID connect is untestable: effective capabilities=0000000000000000; a second UID cannot be created or entered without privilege |
 | BI-03 | broker-identity     | blocked      | uid=1000, effective capabilities=0000000000000000, existing kanbei service users=false                                                |
 | BI-04 | broker-identity     | inconclusive | kernel.yama.ptrace_scope=1; SCM_CREDENTIALS support was not exercised                                                                 |
@@ -166,14 +166,14 @@ Interpretation, limited to what was measured:
 - Secret isolation: **none** (measured secret-isolation failures: PR-01, PR-04, PR-05, SC-01, BI-01)
 - Kernel-enforced, measured: PR-02, PR-03, LL-02, LL-03, SD-03, SD-05, SD-06, SD-07, SD-08, NW-01
 - Conventional or measured-violating: LM-01, LM-02, LM-03, LM-04, RC-01, PR-01, PR-04, PR-05, SD-04, SD-10, RC-02, SC-01, SC-03, BI-01
-- Kernel claims left unverified: none
+- Kernel claims left unverified: RC-05, RC-06, NW-03, SC-05, BI-02, BI-04
 
 ### dedicated-uid
 
-- Secret isolation: **unverified** (secret isolation was not exercised for this arm: PR-01, PR-02, PR-03, PR-04, PR-05, SC-01, BI-01, BI-02, BI-03)
+- Secret isolation: **unverified** (secret isolation was not exercised for this arm: PR-01, PR-02, PR-03, PR-04, PR-05, SC-01, SC-05, BI-01, BI-02, BI-03, BI-04)
 - Kernel-enforced, measured: none
 - Conventional or measured-violating: none
-- Kernel claims left unverified: PR-01, PR-02, PR-03, PR-04, PR-05, LL-02, LL-03, NW-01, SC-01, SC-03, BI-01, BI-02, BI-03
+- Kernel claims left unverified: PR-01, PR-02, PR-03, PR-04, PR-05, LL-02, LL-03, RC-05, RC-06, NW-01, NW-03, SC-01, SC-03, SC-05, BI-01, BI-02, BI-03, BI-04
 
 ## Broker identity recommendation
 
@@ -184,7 +184,7 @@ Rationale:
 - Pure user-space cannot protect broker secrets: same-UID code read an open credential descriptor and 0600 files, and signalled sibling processes (conventional: LM-01, LM-02, LM-03, LM-04, RC-01, PR-01, PR-04, PR-05, SD-04, SD-10, RC-02, SC-01, SC-03, BI-01).
 - The user manager is controllable by the deployment UID, so hard ceilings, restart discipline, and the watchdog are conventional rather than kernel-enforced for a pure user-space arm (SD-10, LM-01).
 - Kernel-enforced pieces that remain available to the user-space core are Landlock filesystem and TCP rules, Yama-scoped memory denial, cgroup ceilings inside a unit, and loopback-only binding.
-- Dedicated-UID enforcement claims could not be exercised from an unprivileged run (PR-01, PR-02, PR-03, PR-04, PR-05, LL-02, LL-03, NW-01, SC-01, SC-03, BI-01, BI-02, BI-03), so they are recorded as unverified rather than assumed.
+- Dedicated-UID enforcement claims could not be exercised from an unprivileged run (PR-01, PR-02, PR-03, PR-04, PR-05, LL-02, LL-03, RC-05, RC-06, NW-01, NW-03, SC-01, SC-03, SC-05, BI-01, BI-02, BI-03, BI-04), so they are recorded as unverified rather than assumed.
 
 Required conditions:
 
@@ -258,7 +258,7 @@ Rejected alternatives:
 - gate: `DG-3` — status: `input-ready-human-signature-required`
 - dependent tasks: E1, E2, H7
 - evidence probes cited: NS-06, PR-01, PR-04, PR-05, LL-04, SD-04, SD-10, RC-02, RC-03, RC-05, RC-06, NW-02, SC-01, SC-03, SC-04, BI-01, BI-02, BI-03
-- Variant D (hybrid) is the recommended deployment plane: the broker and sandbox supervisor as dedicated system users, core/agents/UI under the deployment user. This is a decision input, not a selection; DG-3 closes only with a human signature.
+- Variant D (hybrid) is a risk-based proposal: the broker and sandbox supervisor as dedicated system users, core/agents/UI under the deployment user. DEP-1 had no pre-registered decision rule and the dedicated-UID arm is unverified, so this is not a rule-decided selection; DG-3 closes only with a human signature.
 
 `DG-3` remains open. This report is the pre-registered evidence input; it does not select a
 deployment plane by itself, and the unverified dedicated-UID claims stay unverified until a

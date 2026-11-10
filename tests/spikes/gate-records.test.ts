@@ -10,4 +10,5 @@ Deno.test("all pre-registered A5 gate records are valid and open", async () => {
   assertEquals(records.map((record) => record.gate), ["DG-1", "DG-2", "DG-3", "DG-4"])
   assertEquals(records.every((record) => record.status === "open"), true)
   assertEquals(records.every((record) => record.signedBy === undefined), true)
+  assertEquals(records.find((record) => record.gate === "DG-3")?.blocks, ["E1", "E2", "H7"])
 })

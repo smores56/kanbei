@@ -152,6 +152,7 @@ Deno.test("an inconclusive decision produces an inconclusive envelope, not a pas
 
 Deno.test("a blocked decision produces a blocked envelope", () => {
   assertEquals(outcomeOf("deno", ["node: no measurements"]), "blocked")
+  assertEquals(outcomeOf("deno", [], ["security-v1: unbound"]), "blocked")
   assertEquals(outcomeOf("inconclusive", []), "inconclusive")
   assertEquals(outcomeOf("node", []), "pass")
 })

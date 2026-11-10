@@ -54,8 +54,10 @@ export const assessArm = (
     .map((probe) => probe.id)
   const unverified = relevant
     .filter((probe) =>
+      probe.status === "blocked" ||
+      probe.status === "inconclusive" ||
       enforcementFor(probe, arm) === "kernel" &&
-      !(appliesToArm(probe, arm) && (probe.status === "pass" || probe.status === "fail"))
+        !(appliesToArm(probe, arm) && (probe.status === "pass" || probe.status === "fail"))
     )
     .map((probe) => probe.id)
 
@@ -71,8 +73,9 @@ export const assessArm = (
     .filter(
       (probe) =>
         SECRET_CATEGORIES.has(probe.category) &&
-        enforcementFor(probe, arm) === "kernel" &&
-        !measuredForArm(probe, arm),
+        (probe.status === "blocked" ||
+          probe.status === "inconclusive" ||
+          enforcementFor(probe, arm) === "kernel" && !measuredForArm(probe, arm)),
     )
     .map((probe) => probe.id)
 

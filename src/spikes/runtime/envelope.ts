@@ -19,8 +19,9 @@ export const appendFixtureReference = (version: string): FixtureReference => ({
 export const outcomeOf = (
   decision: SpikeResultDocument["decision"]["value"],
   blocked: ReadonlyArray<string>,
+  bindingGaps: ReadonlyArray<string> = [],
 ): Outcome => {
-  if (blocked.length > 0) return "blocked"
+  if (blocked.length > 0 || bindingGaps.length > 0) return "blocked"
   if (decision === "inconclusive") return "inconclusive"
   return "pass"
 }

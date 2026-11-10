@@ -717,7 +717,7 @@
     "artifacts": [
       "sha256:77b08cc52e2d895fc3cf9a0a6302dabdab93fba99604ec90c25152742d7083bf"
     ],
-    "outcome": "pass",
+    "outcome": "blocked",
     "metrics": {
       "compositeNode": 1.2933,
       "compositeDeno": 1.2358,
@@ -749,6 +749,10 @@
       "deno.shutdown": 14.743,
       "node.runtimeBinary": 74.617,
       "deno.runtimeBinary": 135.985
-    }
+    },
+    "acceptedResiduals": [
+      "security-v1 is not sealed; permission and fail-closed probes are unbound",
+      "cost-v1 is not consumed by the runtime arm; LANG-1 owns that workload"
+    ]
   }
 }

@@ -101,7 +101,7 @@ const decisionGate = (probes: ReadonlyArray<ProbeResult>): DecisionGateInput => 
     .filter((probe) => probe.status === "fail" || probe.status === "blocked")
     .map((probe) => probe.id),
   statement:
-    "Variant D (hybrid) is the recommended deployment plane: the broker and sandbox supervisor as dedicated system users, core/agents/UI under the deployment user. This is a decision input, not a selection; DG-3 closes only with a human signature.",
+    "Variant D (hybrid) is a risk-based proposal: the broker and sandbox supervisor as dedicated system users, core/agents/UI under the deployment user. DEP-1 had no pre-registered decision rule and the dedicated-UID arm is unverified, so this is not a rule-decided selection; DG-3 closes only with a human signature.",
 })
 
 export const buildSpikeResult = (
