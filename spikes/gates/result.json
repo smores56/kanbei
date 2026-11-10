@@ -28,8 +28,8 @@
     {
       "gate": "DG-3",
       "status": "open",
-      "recommended": "variant-D-hybrid-risk-based",
-      "condition": "no pre-registered DEP-1 decision rule; dedicated-UID arm is unverified; no privilege in this run"
+      "recommended": "variant-E-rootless-sandbox-candidate",
+      "condition": "A2b passed; human choice E vs D pending; cgroups and security-v1 remain open"
     },
     {
       "gate": "DG-4",
@@ -52,5 +52,10 @@
     "human resolves DG-1 model manifest and credentials or blocks F4",
     "human decides whether to seal and re-run security-v1 binding"
   ],
-  "crossGate": "DG-4 was measured under the deployment user manager; DG-3 variant D moves the supervisor to a dedicated UID, so S3 must be re-run under that identity before the two recommendations compose."
+  "crossGate": "DG-4 was measured under the deployment user manager; DG-3 variant D moves the supervisor to a dedicated UID, so S3 must be re-run under that identity before the two recommendations compose.",
+  "a2b": {
+    "status": "pass",
+    "artifact": "spikes/deployment/rootless-result.json",
+    "report": "spikes/deployment/A2B-ROOTLESS-SANDBOX.md"
+  }
 }

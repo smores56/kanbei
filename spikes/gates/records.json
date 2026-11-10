@@ -92,28 +92,23 @@
     "owner": "human",
     "producingTask": "A2",
     "status": "open",
-    "recommended": "variant-D-hybrid-risk-based",
+    "recommended": "variant-E-rootless-sandbox-candidate",
     "recommendationRationale": [
-      "Pure user-space measured secret isolation is none: same-UID code read broker credential bytes through an open descriptor, read 0600 files, and signalled sibling processes.",
-      "The user manager is a per-user trust domain; same-UID code rewrote a sibling unit memory ceiling and could stop the unit.",
-      "Variant D keeps core, agents, and UI under the deployment user while moving the broker and sandbox supervisor to dedicated system users and system units."
+      "A2b demonstrated a rootless user+PID+mount namespace plus chroot and Landlock ABI 7: allowed reads/writes pass, denied paths fail with EACCES, broker fd and signals are blocked, systemctl --user is blocked, and /proc/self/root cannot escape to the host.",
+      "The broker socket remains reachable, so the same-UID broker can stay outside the sandbox with memory-only credentials.",
+      "Variant D remains the fallback where unprivileged user namespaces or a compatible Landlock ABI are unavailable."
     ],
     "conditions": [
-      "Create kanbei-broker and kanbei-sandbox system users and run both as system units.",
-      "Keep broker credentials outside ~/.local/state/kanbei and outside deployment-user-writable paths.",
-      "Bind the UI to 127.0.0.1 and expose it only through Cloudflare Tunnel and Access.",
-      "Apply Landlock filesystem and TCP rules before exec and keep kernel.yama.ptrace_scope >= 1.",
-      "Verify effective systemd hardening at startup and refuse to start when a declared directive is ineffective.",
-      "Set LimitCORE=0 on broker units.",
-      "Remove the deployment user from the docker group.",
-      "Use system units for watchdog and alerting; enable control-group kill on supervisor termination."
+      "Require unprivileged user namespaces and a compatible Landlock ABI; refuse to start otherwise.",
+      "Mount a minimal root with only runtime, /etc, /proc, allowed project roots, scratch, and the broker socket.",
+      "Keep credentials memory-only in the broker and outside every agent-visible mount.",
+      "Disable or restrict io_uring; add a seccomp policy.",
+      "Re-run S3 under this rootless supervisor identity before DG-4 can compose with DG-3."
     ],
     "blockers": [
-      "The dedicated-UID arm is unverified because this run had no privilege to create or enter a second UID.",
-      "Post-reboot recovery, ledger/backup restore, and SCM_CREDENTIALS remain unmeasured.",
-      "security-v1 is not sealed, so no EvidenceEnvelope is issued.",
-      "DEP-1 had no pre-registered decision rule; variant D is risk-based, not rule-decided",
-      "dedicated-UID arm is unverified; no privilege in this run"
+      "Human decision between E and D is pending.",
+      "A2b did not exercise cgroup delegation, real capabilities, backup/restore, or reboot.",
+      "security-v1 is not sealed, so no EvidenceEnvelope is issued."
     ],
     "rejectedAlternatives": [
       "pure-user-space home-manager unit",
@@ -123,14 +118,20 @@
     "evidenceEnvelopes": [],
     "evidenceArtifacts": [
       "spikes/deployment/result.json",
-      "spikes/deployment/REPORT.md"
+      "spikes/deployment/REPORT.md",
+      "spikes/deployment/A2B-ROOTLESS-SANDBOX.md",
+      "spikes/deployment/rootless-result.json"
     ],
     "residuals": [
       "Yama protection is ancestry-based; an agent that is an ancestor of the broker could attach.",
       "Landlock does not cover UDP or io_uring; io_uring is enabled on this host.",
       "A wildcard listener was externally reachable; every Kanbei listener must bind 127.0.0.1 explicitly.",
       "A same-UID process can still signal or reconfigure user units under the pure user-space arm.",
-      "The dedicated-UID enforcement claim is unverified, not assumed."
+      "The dedicated-UID enforcement claim is unverified, not assumed.",
+      "Rootless sandbox requires unprivileged user namespaces and Landlock; hosts without them must use D or refuse to start.",
+      "io_uring remains enabled; kernel exploit surface remains.",
+      "/etc and /nix/store are visible read-only; no secrets may live there.",
+      "Same-UID broker socket authentication is request authorization, not peer identity."
     ],
     "blocks": [
       "E1",

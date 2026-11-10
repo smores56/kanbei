@@ -4,12 +4,13 @@ Status: `input-ready-human-signature-required`. No decision gate is closed by th
 
 ## Inputs
 
-| Task | Protocol             | Result                          | Gate   | Recommendation                                      |
-| ---- | -------------------- | ------------------------------- | ------ | --------------------------------------------------- |
-| `A1` | `S1` / `NODE-DENO-1` | `spikes/runtime/result.json`    | `DG-2` | `deno@2.9.2`, conditional                           |
-| `A2` | `S2` / `DEP-1`       | `spikes/deployment/result.json` | `DG-3` | variant D, risk-based; no pre-registered DEP-1 rule |
-| `A3` | `S3` / `ISO-1`       | `spikes/isolation/result.json`  | `DG-4` | `process-cgroup`                                    |
-| `A4` | `S1` / `LANG-1`      | `spikes/language/result.json`   | `DG-1` | none; model arm blocked                             |
+| Task  | Protocol             | Result                                   | Gate   | Recommendation                                      |
+| ----- | -------------------- | ---------------------------------------- | ------ | --------------------------------------------------- |
+| `A1`  | `S1` / `NODE-DENO-1` | `spikes/runtime/result.json`             | `DG-2` | `deno@2.9.2`, conditional                           |
+| `A2`  | `S2` / `DEP-1`       | `spikes/deployment/result.json`          | `DG-3` | variant D, risk-based; no pre-registered DEP-1 rule |
+| `A2b` | `S2` extension       | `spikes/deployment/rootless-result.json` | `DG-3` | variant E rootless sandbox candidate                |
+| `A3`  | `S3` / `ISO-1`       | `spikes/isolation/result.json`           | `DG-4` | `process-cgroup`                                    |
+| `A4`  | `S1` / `LANG-1`      | `spikes/language/result.json`            | `DG-1` | none; model arm blocked                             |
 
 ## Gate records
 
@@ -31,11 +32,11 @@ The pre-registered composite margin was 4.7%, inside the 10% margin, so the peak
 
 ### `DG-3` — deployment plane and broker identity
 
-Status: **open**. Recommendation: **variant D** — core, agents, and UI under the deployment user; broker and sandbox supervisor as dedicated system users in system units.
+Status: **open**. Recommendation: **variant E candidate** — rootless user/PID/mount namespace + chroot + Landlock, broker outside the sandbox with memory-only credentials. Variant D is the fallback.
 
-Pure user-space measured **no secret isolation**: a same-UID sibling read broker credential bytes through an open descriptor and 0600 files, and could signal and reconfigure sibling units. Dedicated-UID enforcement is **unverified** because this run had no privilege to create or enter a second UID. DEP-1 also had no pre-registered decision rule; variant D is a risk-based proposal, not a rule-decided selection. It therefore relies on the kernel UID model plus review, not on a measured dedicated-UID arm.
+Pure user-space measured **no secret isolation**: a same-UID sibling read broker credential bytes through an open descriptor and 0600 files, and could signal and reconfigure sibling units. A2b then tested the composed rootless sandbox: a private user+PID+mount namespace, a minimal chroot root, and a Landlock allowlist. All checks passed: allowed reads/writes, denied-path `EACCES`, broker fd and signal isolation, `systemctl --user` denial, `/proc/self/root` host-escape denial, and broker socket reachability. The broker stays outside the sandbox and keeps credentials memory-only. This is option E. Variant D remains the fallback where user namespaces or a compatible Landlock ABI are unavailable.
 
-Required conditions include dedicated system users, credentials outside the deployment user's writable paths, loopback-only binding, startup verification of effective systemd hardening, `LimitCORE=0`, removal from the `docker` group, and control-group kill on supervisor termination.
+Required conditions for option E: unprivileged user namespaces and a compatible Landlock ABI; a minimal root containing only runtime, `/etc`, `/proc`, allowed project roots, scratch, and the broker socket; memory-only broker credentials; io_uring/seccomp hardening; and S3 re-run under the chosen supervisor identity. Variant D conditions remain the existing dedicated system-user, loopback, `LimitCORE=0`, `docker`-group removal, and control-group kill requirements.
 
 ### `DG-4` — inter-agent isolation
 
@@ -61,18 +62,19 @@ Not performed. A baseline cannot be frozen while `DG-1` through `DG-4` remain un
 - `security-v1` is not registered or sealed. A1’s permission probes, A2’s host probes, A3’s isolation probes, and A4’s security cells therefore lack a dataset-bound `EvidenceEnvelope`.
 - A4 issued no envelope because the model arm is blocked.
 - A2 and A3 emitted measurement records, not envelopes, for the same `security-v1` reason.
+- A2b is a measurement record; it is not an `EvidenceEnvelope` and does not close `DG-3`.
 - A1 emitted a measurement envelope bound to `append-v1`; it is now marked `blocked` because `cost-v1` and `security-v1` bindings are absent.
 
 These are recorded blockers, not waivers.
 
 ## Cross-gate dependency
 
-`DG-3` and `DG-4` are operationally coupled. A3 measured `process-cgroup` under the deployment user systemd user manager. Variant D moves the sandbox supervisor to a dedicated system unit. Until DG-3 fixes which UID owns the delegated cgroup subtree, DG-4 cannot be treated as measured in the target posture. S3 must be re-run under that identity before the recommendations compose.
+`DG-3` and `DG-4` are operationally coupled. A3 measured `process-cgroup` under the deployment user systemd user manager. Variant E keeps the supervisor outside the rootless sandbox but still under the deployment user; variant D moves it to a dedicated system unit. Until DG-3 chooses E or D and fixes which identity owns the delegated cgroup subtree, DG-4 cannot be treated as measured in the target posture. S3 must be re-run under that identity before the recommendations compose.
 
 ## Required human decisions
 
 1. Accept, reject, or amend the `DG-2` Deno recommendation and its conditions.
-2. Accept, reject, or amend the `DG-3` hybrid dedicated-UID deployment.
+2. Choose `DG-3` option E (rootless sandbox, recommended) or option D (dedicated system users), and accept or amend its residuals.
 3. Accept, reject, or amend the `DG-4` process+cgroup recommendation.
 4. For `DG-1`, either provide the model manifest and credentials for a live `LANG-1` run, or explicitly accept that no language is selected and block dependent `F4`.
 5. Decide whether to seal a real `security-v1` fixture and re-run S1–S3 binding, or accept the current evidence as input with the gap recorded.

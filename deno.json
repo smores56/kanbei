@@ -64,6 +64,7 @@
     "fixtures:seal": "deno run -A scripts/seal-fixtures.ts",
     "evidence:dry-run": "deno run -A src/cli/evidence.ts dry-run",
     "evidence:determinism": "deno run -A src/cli/evidence.ts determinism",
-    "evidence:failure": "deno run -A src/cli/evidence.ts failure"
+    "evidence:failure": "deno run -A src/cli/evidence.ts failure",
+    "rootless:probe": "deno run -A src/spikes/deployment/rootless/main.ts"
   }
 }
