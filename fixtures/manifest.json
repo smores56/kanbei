@@ -25,6 +25,12 @@
       "files": {
         "questions.json": "sha256:61b3ab517fcb4f147078dbb1bf93d558f6b6cb4f04fa42d4aa34a015e1ca944b"
       }
+    },
+    "security-v1@1.0.0": {
+      "treeHash": "sha256:d5dd0ed90f029a1e72fb567f1f87b37c2598566359fa9240d23593ebd0f3c709",
+      "files": {
+        "cases.json": "sha256:7ca6cfe54ed9da7bf27dfc5e1744fb96d9554451ae0eab3e230f32049b6d69ba"
+      }
     }
   }
 }
