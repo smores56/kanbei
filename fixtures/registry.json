@@ -10,6 +10,16 @@
       "id": "append-v1",
       "version": "1.0.0",
       "path": "fixtures/append-v1"
+    },
+    {
+      "id": "cost-v1",
+      "version": "1.0.0",
+      "path": "fixtures/cost-v1"
+    },
+    {
+      "id": "ui-v1",
+      "version": "1.0.0",
+      "path": "fixtures/ui-v1"
     }
   ]
 }

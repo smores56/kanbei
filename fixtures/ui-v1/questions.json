@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "dataset": "ui-v1",
+  "version": "1.0.0",
+  "baseline": "raw-ledger-transcript",
+  "questions": [
+    {
+      "id": "UQ-01",
+      "target": "contested",
+      "prompt": "Which claim is currently working, and which alternatives remain contested?"
+    },
+    {
+      "id": "UQ-02",
+      "target": "retracted",
+      "prompt": "Which claim was retracted, and what remains inspectable?"
+    },
+    {
+      "id": "UQ-03",
+      "target": "suspect",
+      "prompt": "Which claims are suspect but not yet rebuilt?"
+    },
+    {
+      "id": "UQ-04",
+      "target": "stale",
+      "prompt": "Is this view current, stale, or outside coverage?"
+    },
+    {
+      "id": "UQ-05",
+      "target": "approval",
+      "prompt": "What exact evidence, scope, hashes, tier, and constraints will this approval bind?"
+    },
+    {
+      "id": "UQ-06",
+      "target": "current",
+      "prompt": "Which external commit changed state, and what speculative branch was preserved?"
+    },
+    {
+      "id": "UQ-07",
+      "target": "current",
+      "prompt": "What capability and dependency changes does this candidate add or remove?"
+    },
+    {
+      "id": "UQ-08",
+      "target": "current",
+      "prompt": "What checkpoint does this undo fork from, and which descendants remain?"
+    },
+    {
+      "id": "UQ-09",
+      "target": "approval",
+      "prompt": "Which decisions are grouped by intent and deadline, and which evidence is shared?"
+    },
+    {
+      "id": "UQ-10",
+      "target": "current",
+      "prompt": "Can every critical graph state be recovered from the accessibility tree or text fallback?"
+    }
+  ]
+}

@@ -14,8 +14,10 @@ export type TestClass = typeof TestClass.Type
 export const Outcome = Schema.Literals(["pass", "fail", "inconclusive", "blocked"])
 export type Outcome = typeof Outcome.Type
 
+const Digest = Schema.String.pipe(Schema.check(Schema.isPattern(/^sha256:[0-9a-f]{64}$/u)))
+
 export const EnvironmentFingerprint = Schema.Struct({
-  hostFingerprint: Schema.String,
+  hostFingerprint: Digest,
   kernel: Schema.String,
   runtime: Schema.String,
   sandboxPosture: Schema.String,
@@ -25,7 +27,7 @@ export type EnvironmentFingerprint = typeof EnvironmentFingerprint.Type
 
 export const CanonicalHead = Schema.Struct({
   seq: Schema.Number,
-  hash: Schema.String,
+  hash: Digest,
 })
 export type CanonicalHead = typeof CanonicalHead.Type
 
@@ -37,8 +39,8 @@ export const EvidenceEnvelope = Schema.Struct({
   sequenceRange: Schema.Tuple([Schema.Number, Schema.Number]),
   environment: EnvironmentFingerprint,
   seeds: Schema.Array(Schema.Number),
-  modelRecordings: Schema.Array(Schema.String),
-  artifacts: Schema.Array(Schema.String),
+  modelRecordings: Schema.Array(Digest),
+  artifacts: Schema.Array(Digest),
   outcome: Outcome,
   failureClass: Schema.optional(Schema.String),
   metrics: Schema.optional(Schema.Record(Schema.String, Schema.Number)),

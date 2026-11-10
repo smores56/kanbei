@@ -1,0 +1,94 @@
+/**
+ * S3 process-arm agent.
+ *
+ * Entry point launched by the supervisor under a cgroup and rlimits. It speaks a
+ * line protocol on stdin/stdout. It deliberately reads no `/proc` or `/sys`: Deno
+ * denies even `/proc/self` under a narrow `--allow-read` grant, so all resource
+ * observation happens on the supervisor side. The agent therefore runs with the
+ * smallest useful permission set.
+ */
+const encoder = new TextEncoder()
+
+const stdout = (line: string): void => {
+  Deno.stdout.writeSync(encoder.encode(`${line}\n`))
+}
+
+const spin = (iterations: number): number => {
+  let accumulator = 0
+  for (let index = iterations; index > 0; index -= 1) {
+    accumulator = (accumulator + index) % 1_000_003
+  }
+  return accumulator
+}
+
+const hangForever = (): never => {
+  while (true) {
+    spin(1_000_000)
+  }
+}
+
+const holdAllocations = (mebibytes: number): number => {
+  const chunks: Uint8Array[] = []
+  for (let index = 0; index < mebibytes; index += 1) {
+    const chunk = new Uint8Array(1024 * 1024)
+    chunk.fill(1)
+    chunks.push(chunk)
+  }
+  return chunks.length
+}
+
+const decoder = new TextDecoder()
+
+stdout(`READY ${Deno.pid}`)
+
+const handle = (line: string): boolean => {
+  const [command = "", argument = "0"] = line.split(" ")
+  switch (command) {
+    case "PING":
+      stdout("PONG")
+      return true
+    case "CPU": {
+      const started = performance.now()
+      const checksum = spin(Number(argument))
+      stdout(`CPU ${checksum} ${(performance.now() - started).toFixed(2)}`)
+      return true
+    }
+    case "ALLOC": {
+      const held = holdAllocations(Number(argument))
+      stdout(`ALLOCATED ${held}`)
+      return true
+    }
+    case "SPAWN": {
+      const marker = Deno.env.get("KANBEI_ISO_MARKER") ?? "kanbei-iso-orphan"
+      const child = new Deno.Command("sh", {
+        args: ["-c", "sleep 300", marker],
+        stdout: "null",
+        stderr: "null",
+      }).spawn()
+      stdout(`SPAWNED ${child.pid}`)
+      return true
+    }
+    case "CRASH":
+      Deno.kill(Deno.pid, "SIGKILL")
+      return true
+    case "HANG":
+      return hangForever()
+    case "EXIT":
+      stdout("BYE")
+      return false
+    default:
+      stdout(`UNKNOWN ${command}`)
+      return true
+  }
+}
+
+for await (const chunk of Deno.stdin.readable) {
+  const lines = decoder.decode(chunk, { stream: true }).split("\n")
+  const stopped = lines.some((line) => {
+    const trimmed = line.trim()
+    return trimmed !== "" && !handle(trimmed)
+  })
+  if (stopped) break
+}
+
+export const AGENT_ENTRYPOINT = "kanbei/isolation/agent-process"

@@ -22,6 +22,10 @@ deno task typecheck       # strict TypeScript check
 deno task test            # test suite
 deno task verify          # all merge-blocking checks
 deno task verify:fix      # format and auto-fix, then verify
+deno task fixtures:seal   # regenerate the sealed fixture manifest
+deno task evidence:dry-run
+deno task evidence:determinism
+deno task evidence:failure
 ```
 
 The pre-commit hook runs `deno task verify`. CI runs the same command.

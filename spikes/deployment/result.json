@@ -1,0 +1,956 @@
+{
+  "schemaVersion": 1,
+  "protocol": "DEP-1",
+  "spike": "S2",
+  "dataset": "security-v1",
+  "host": {
+    "hostname": "agent-vm",
+    "kernel": "linux-6.18.39",
+    "user": "smores",
+    "uid": 1000,
+    "groups": [
+      "users",
+      "wheel",
+      "docker"
+    ],
+    "systemd": "systemd 261 (261)",
+    "cgroupVersion": "v2",
+    "yamaPtraceScope": "1",
+    "landlockAbi": "7",
+    "maxUserNamespaces": "31642",
+    "linger": "no",
+    "delegatedControllers": [
+      "cpu",
+      "io",
+      "memory",
+      "pids"
+    ],
+    "ambientCapabilities": "0000000000000000"
+  },
+  "probes": [
+    {
+      "id": "NS-01",
+      "category": "namespaces",
+      "arm": "both",
+      "method": "read /proc/sys/user/max_user_namespaces",
+      "status": "pass",
+      "observed": "user.max_user_namespaces=31642",
+      "evidence": "cat /proc/sys/user/max_user_namespaces"
+    },
+    {
+      "id": "NS-02",
+      "category": "namespaces",
+      "arm": "both",
+      "method": "unshare --user --map-root-user id -u",
+      "status": "pass",
+      "observed": "uid inside user namespace = 0",
+      "evidence": "unshare --user --map-root-user id -u -> exit=0 | 0",
+      "prerequisites": [
+        "unshare"
+      ]
+    },
+    {
+      "id": "NS-03",
+      "category": "namespaces",
+      "arm": "both",
+      "method": "unshare --user --map-root-user --net, enumerate interfaces",
+      "status": "pass",
+      "observed": "network namespace contains only loopback (host has docker0,enp0s7,lo)",
+      "evidence": "unshare -Urn cat /proc/net/dev -> Inter-|   Receive                                                |  Transmit  face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed     lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0",
+      "prerequisites": [
+        "unshare"
+      ]
+    },
+    {
+      "id": "NS-04",
+      "category": "namespaces",
+      "arm": "both",
+      "method": "unshare --user --map-root-user --pid --fork",
+      "status": "pass",
+      "observed": "pid namespace started",
+      "evidence": "unshare -Ur --pid --fork sh -c 'echo pid=$$' -> exit=0 | pid=1",
+      "prerequisites": [
+        "unshare"
+      ]
+    },
+    {
+      "id": "NS-05",
+      "category": "namespaces",
+      "arm": "both",
+      "method": "unshare --user --map-root-user --mount, mount tmpfs in scratch",
+      "status": "pass",
+      "observed": "private mount namespace accepted a tmpfs mount",
+      "evidence": "unshare -Urm mount -t tmpfs ... -> exit=0 | mount-ok",
+      "prerequisites": [
+        "unshare",
+        "mount"
+      ]
+    },
+    {
+      "id": "NS-06",
+      "category": "namespaces",
+      "arm": "both",
+      "method": "systemd-run --user -p PrivateUsers=yes id -u",
+      "status": "fail",
+      "observed": "uid inside namespaced user unit = 1000",
+      "evidence": "systemd-run --user -p PrivateUsers=yes id -u -> exit=0 | 1000",
+      "prerequisites": [
+        "systemd-run",
+        "systemctl"
+      ],
+      "residual": "PrivateUsers=yes started without changing the UID mapping"
+    },
+    {
+      "id": "PR-01",
+      "category": "same-uid-process",
+      "arm": "both",
+      "method": "same-UID sibling reads /proc/<broker>/cmdline, environ, maps, cgroup",
+      "status": "fail",
+      "observed": "same-UID sibling read broker cmdline, environ, maps, cgroup; canary value from environ visible",
+      "evidence": "attacker inspect {\"ok\":true,\"cmdlineReadable\":true,\"environReadable\":true,\"environHasCanary\":true,\"mapsReadable\":true,\"cgroupReadable\":true}",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "deno",
+        "a same-UID child process"
+      ],
+      "residual": "process metadata is world-readable within a UID; no secret may live in argv or environ"
+    },
+    {
+      "id": "PR-02",
+      "category": "same-uid-process",
+      "arm": "both",
+      "method": "same-UID sibling opens /proc/<broker>/mem",
+      "status": "pass",
+      "observed": "same-UID sibling was denied /proc/<broker>/mem",
+      "evidence": "attacker mem {\"ok\":true,\"opened\":false,\"error\":\"PermissionDenied: Permission denied (os error 13): open '/proc/307638/mem'\"}; kernel.yama.ptrace_scope=1",
+      "enforcement": {
+        "pure": "kernel",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "deno",
+        "kernel.yama.ptrace_scope >= 1"
+      ],
+      "residual": "protection is provided by Yama; verify the sysctl remains >= 1"
+    },
+    {
+      "id": "PR-03",
+      "category": "same-uid-process",
+      "arm": "both",
+      "method": "strace -p <broker> from a sibling; strace -f on an own child as control",
+      "status": "pass",
+      "observed": "PTRACE attach on a same-UID sibling denied; own child attach allowed=true",
+      "evidence": "sibling: exit=1 | /run/current-system/sw/bin/strace: attach: ptrace(PTRACE_SEIZE, 307654): Operation not permitted\n/run/current-system/sw/bin/strace: sysctl kernel.yama.ptrace_scope = 1 may be restricting this attach | own child: exit=0",
+      "enforcement": {
+        "pure": "kernel",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "strace",
+        "kernel.yama.ptrace_scope >= 1"
+      ],
+      "residual": "denial is ancestry-based; an agent that is an ancestor of the broker could attach"
+    },
+    {
+      "id": "PR-04",
+      "category": "same-uid-process",
+      "arm": "both",
+      "method": "same-UID sibling sends SIGTERM to the broker process",
+      "status": "fail",
+      "observed": "same-UID sibling delivered SIGTERM; broker liveness is not protected",
+      "evidence": "attacker signal {\"ok\":true,\"delivered\":true,\"error\":\"\"}",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "deno"
+      ]
+    },
+    {
+      "id": "PR-05",
+      "category": "secret-reachability",
+      "arm": "both",
+      "method": "same-UID sibling reads a secret file through /proc/<broker>/fd/<n>",
+      "status": "fail",
+      "observed": "same-UID sibling read broker credential bytes through the broker's open file descriptor",
+      "evidence": "attacker fd found=true contentMatchesCanary=true",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "deno",
+        "a broker holding a credential file open"
+      ],
+      "residual": "pure user-space cannot protect secrets a broker keeps open; closing descriptors immediately only shortens the window"
+    },
+    {
+      "id": "PR-06",
+      "category": "same-uid-process",
+      "arm": "both",
+      "method": "read kernel.yama.ptrace_scope and fs.suid_dumpable",
+      "status": "pass",
+      "observed": "kernel.yama.ptrace_scope=1, fs.suid_dumpable=2",
+      "evidence": "cat /proc/sys/kernel/yama/ptrace_scope; cat /proc/sys/fs/suid_dumpable",
+      "prerequisites": []
+    },
+    {
+      "id": "LL-01",
+      "category": "landlock",
+      "arm": "both",
+      "method": "landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION=1)",
+      "status": "pass",
+      "observed": "Landlock ABI=7 (network rules available)",
+      "evidence": "landlock_create_ruleset version query -> {\"abi\":7,\"mode\":\"fs\",\"created\":true,\"mask\":\"65535\",\"addRule\":-1,\"noNewPrivs\":0,\"restrict\":0,\"insideOpened\":false,\"outsideOpened\":false,\"insideContent\":\"\"}",
+      "prerequisites": [
+        "deno",
+        "--allow-ffi"
+      ]
+    },
+    {
+      "id": "LL-02",
+      "category": "landlock",
+      "arm": "both",
+      "method": "apply a path-beneath ruleset, then open an allowed and a denied path",
+      "status": "pass",
+      "observed": "Landlock allowed the granted path and denied an unlisted path",
+      "evidence": "landlock child {\"abi\":7,\"mode\":\"fs\",\"created\":true,\"mask\":\"65535\",\"addRule\":0,\"noNewPrivs\":0,\"restrict\":0,\"insideOpened\":true,\"outsideOpened\":false,\"insideContent\":\"allowed\"}",
+      "enforcement": {
+        "pure": "kernel",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "deno",
+        "--allow-ffi"
+      ],
+      "residual": "the ruleset only binds processes that call landlock_restrict_self; the sandbox supervisor must do so before exec"
+    },
+    {
+      "id": "LL-03",
+      "category": "landlock",
+      "arm": "both",
+      "method": "restrict LANDLOCK_ACCESS_NET_BIND_TCP, then Deno.listen on 127.0.0.1",
+      "status": "pass",
+      "observed": "TCP bind after Landlock net rule = denied",
+      "evidence": "landlock child net {\"abi\":7,\"mode\":\"net\",\"created\":true,\"noNewPrivs\":0,\"restrict\":0,\"bind\":\"denied\",\"error\":\"PermissionDenied: Permission denied (os error 13)\"}",
+      "enforcement": {
+        "pure": "kernel",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "deno",
+        "--allow-ffi",
+        "Landlock ABI >= 4"
+      ],
+      "residual": "Landlock restricts bind/connect but not UDP; UDP egress remains an accepted residual"
+    },
+    {
+      "id": "LL-04",
+      "category": "landlock",
+      "arm": "both",
+      "method": "read kernel.io_uring_disabled and kernel.unprivileged_bpf_disabled",
+      "status": "fail",
+      "observed": "kernel.io_uring_disabled=0, kernel.unprivileged_bpf_disabled=2",
+      "evidence": "cat /proc/sys/kernel/io_uring_disabled; cat /proc/sys/kernel/unprivileged_bpf_disabled",
+      "residual": "io_uring is enabled; io_uring operations are known to bypass parts of Landlock and seccomp, so a supervisor must add its own syscall filter"
+    },
+    {
+      "id": "SD-01",
+      "category": "systemd",
+      "arm": "pure-user-space",
+      "method": "systemctl --user show-environment and systemctl --version",
+      "status": "pass",
+      "observed": "user manager reachable (systemd 261 (261))",
+      "evidence": "show-environment: exit=0 | GTK_A11Y=none\nGTK_PATH=/home/smores/.nix-profile/lib/gtk-2.0:/home/smores/.nix-profile/lib/gtk-3.0:/home/smores/.nix-profile/lib/gtk-4.0:/nix/profile/lib/gtk-2.0:/nix/profile/lib/gtk-3.0:/nix/profile/lib/gtk-4.0:/home/smores/.local/state/nix/profile/lib/gtk-2.0:/home/smores/.local/state/nix/profile/lib/gtk-3.0:/home/smores/.local/state/nix/profile/lib/gtk-4.0:/etc/profiles/per-user/smores/lib/gtk-2.0:/etc/profiles/per-user/smores/lib/gtk-3.0:/etc/profiles/per-user/smores/lib/gtk-4.0:/nix/var/nix/profiles/default/lib/gtk-2.0:/nix/var/nix/profiles/default/lib/gtk-3.0:/nix/var/nix/profil… | version: systemd 261 (261)",
+      "prerequisites": [
+        "systemctl"
+      ],
+      "residual": "a user manager is a per-user trust domain; any same-UID process can talk to it"
+    },
+    {
+      "id": "SD-02",
+      "category": "systemd",
+      "arm": "pure-user-space",
+      "method": "start a transient user unit with hardening directives and read effective properties",
+      "status": "pass",
+      "observed": "20 hardening directives applied as requested",
+      "evidence": "exit=0 | Running as unit: kanbei-dep1-sd02.service; invocation ID: fca5a531f8c5489e9ebb363d74d8ea87 | effective {\"MemoryHigh\":\"50331648\",\"MemoryMax\":\"67108864\",\"TasksMax\":\"32\",\"RemoveIPC\":\"yes\",\"PrivateTmp\":\"yes\",\"PrivateDevices\":\"yes\",\"ProtectClock\":\"yes\",\"ProtectKernelTunables\":\"yes\",\"ProtectKernelModules\":\"yes\",\"ProtectControlGroups\":\"yes\",\"PrivateNetwork\":\"yes\",\"ProtectHome\":\"read-only\",\"ProtectSystem\":\"strict\",\"NoNewPrivileges\":\"yes\",\"LockPersonality\":\"yes\",\"RestrictAddressFamilies\":\"AF_INET AF_UNIX\",\"RestrictRealtime\":\"yes\",\"RestrictSUIDSGID\":\"yes\",\"RestrictNamespaces\":\"yes\",\"ProtectHostname\":\"yes\"}",
+      "prerequisites": [
+        "systemd-run",
+        "systemctl",
+        "sleep"
+      ]
+    },
+    {
+      "id": "SD-03",
+      "category": "systemd",
+      "arm": "pure-user-space",
+      "method": "unit with ProtectHome=read-only attempts to read and write $HOME",
+      "status": "pass",
+      "observed": "$HOME is read-only inside the unit and readable=true",
+      "evidence": "unit output: exit=0 | home-readonly\nhome-readable",
+      "enforcement": {
+        "pure": "kernel",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "systemd-run",
+        "sh"
+      ]
+    },
+    {
+      "id": "SD-04",
+      "category": "systemd",
+      "arm": "pure-user-space",
+      "method": "ProtectSystem=strict with ReadWritePaths=<state> and a state write",
+      "status": "fail",
+      "observed": "state path was read-only under ProtectSystem=strict even though ReadWritePaths named it",
+      "evidence": "unit output: exit=0 | state-readonly",
+      "enforcement": {
+        "pure": "kernel",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "systemd-run",
+        "sh"
+      ],
+      "residual": "the write fails closed (EROFS) but the directive is ineffective in this user-manager configuration; a deployment that relies on it will not start, and must refuse to start rather than run with in-memory state"
+    },
+    {
+      "id": "SD-05",
+      "category": "systemd",
+      "arm": "pure-user-space",
+      "method": "compare /tmp device:inode inside a PrivateTmp unit with the host",
+      "status": "pass",
+      "observed": "/tmp is private (unit 30:324403, host 30:13)",
+      "evidence": "unit: exit=0 | 30:324403 | host: exit=0 | 30:13",
+      "enforcement": {
+        "pure": "kernel",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "systemd-run",
+        "stat"
+      ]
+    },
+    {
+      "id": "SD-06",
+      "category": "network",
+      "arm": "pure-user-space",
+      "method": "enumerate interfaces inside a PrivateNetwork unit and compare with the host",
+      "status": "pass",
+      "observed": "unit network namespace holds only lo; host has docker0,enp0s7,lo",
+      "evidence": "unit /proc/net/dev: Inter-|   Receive                                                |  Transmit  face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed     lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0",
+      "enforcement": {
+        "pure": "kernel",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "systemd-run",
+        "sh"
+      ],
+      "residual": "the unit's loopback is a different device than the host loopback, so host 127.0.0.1 services are unreachable"
+    },
+    {
+      "id": "SD-07",
+      "category": "systemd",
+      "arm": "pure-user-space",
+      "method": "unit with RestrictAddressFamilies=AF_UNIX AF_INET tries to bind IPv4 and IPv6",
+      "status": "pass",
+      "observed": "IPv4 bind=allowed, IPv6 bind=denied",
+      "evidence": "unit output: exit=0 | {\"results\":[{\"host\":\"127.0.0.1\",\"result\":\"allowed\"},{\"host\":\"::1\",\"result\":\"denied\",\"error\":\"Error: Address family not supported by protocol (os error 97)\"}]}",
+      "enforcement": {
+        "pure": "kernel",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "systemd-run",
+        "deno"
+      ]
+    },
+    {
+      "id": "SD-08",
+      "category": "systemd",
+      "arm": "pure-user-space",
+      "method": "unit with SystemCallFilter=~@mount runs unshare --mount",
+      "status": "pass",
+      "observed": "mount syscalls were denied inside the filtered unit",
+      "evidence": "unit output: exit=1 | unshare: unshare failed: Operation not permitted",
+      "enforcement": {
+        "pure": "kernel",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "systemd-run",
+        "unshare"
+      ]
+    },
+    {
+      "id": "SD-09",
+      "category": "fail-closed",
+      "arm": "pure-user-space",
+      "method": "systemd-run with a misspelled property and an invalid value",
+      "status": "pass",
+      "observed": "systemd rejects unknown properties and invalid values instead of degrading",
+      "evidence": "misspelled: exit=1 | Unknown assignment: NotARealProperty=1 | invalid value: exit=1 | Failed to start transient service unit: Invalid ProtectSystem setting: not-a-mode",
+      "prerequisites": [
+        "systemd-run"
+      ],
+      "residual": "rejection is at unit start; a directive that is valid but ineffective (SD-04) is not caught this way"
+    },
+    {
+      "id": "SD-10",
+      "category": "recovery",
+      "arm": "pure-user-space",
+      "method": "a same-UID process stops and reconfigures a sibling unit",
+      "status": "fail",
+      "observed": "same-UID process rewrote a sibling unit ceiling from 67108864 to 134217728 and can stop it",
+      "evidence": "unit start: exit=0 | Running as unit: kanbei-dep1-sd10.service; invocation ID: 1fcad93cebaa4c5cb2d1d602db6ec3a7 | cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/kanbei-dep1-sd10.service | memory.max 67108864 -> 134217728",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "systemctl",
+        "sleep"
+      ],
+      "residual": "with Delegate=yes the user manager owns the cgroup subtree, so hard ceilings and the watchdog are conventional under pure user-space"
+    },
+    {
+      "id": "LM-01",
+      "category": "resource-limits",
+      "arm": "pure-user-space",
+      "method": "unit with MemoryMax=64M allocates 400 MiB and is observed until it dies",
+      "status": "pass",
+      "observed": "unit result=oom-kill, MemoryPeak=67108864 bytes, ActiveState=failed",
+      "evidence": "systemd-run: exit=0 Running as unit: kanbei-dep1-lm01.service; invocation ID: 0e6694c3ee684115b8f54513dd9470dc | final state {\"activeState\":\"failed\",\"result\":\"oom-kill\",\"memoryPeak\":\"67108864\",\"restarts\":\"0\"}",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "systemd-run",
+        "systemctl",
+        "deno"
+      ],
+      "residual": "the ceiling is enforced by the kernel cgroup, but a same-UID process can rewrite it (see SD-10)"
+    },
+    {
+      "id": "LM-02",
+      "category": "resource-limits",
+      "arm": "pure-user-space",
+      "method": "unit with MemoryHigh=32M allocates 400 MiB; read memory.events",
+      "status": "pass",
+      "observed": "memory.events high count=888, unit ActiveState=active, result=success",
+      "evidence": "memory.events: low 0 high 888 max 0 oom 0 oom_kill 0 oom_group_kill 0 ",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "systemd-run",
+        "systemctl",
+        "deno"
+      ],
+      "residual": "MemoryHigh throttles (reclaim pressure) rather than terminating; MemoryMax is the terminating ceiling"
+    },
+    {
+      "id": "LM-03",
+      "category": "resource-limits",
+      "arm": "pure-user-space",
+      "method": "unit with TasksMax=16 spawns 40 children",
+      "status": "pass",
+      "observed": "fork was denied at the pid ceiling; pids.max is enforced by the kernel",
+      "evidence": "unit output: exit=254 /run/current-system/sw/bin/sh: fork: retry: Resource temporarily unavailable\n/run/current-system/sw/bin/sh: fork: retry: Resource temporarily unavailable\n/run/current-system/sw/bin/sh: fork: retry: Resource temporarily unavailable\n/run/current-system/sw/bin/sh: fork: Interrupted system call",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "systemd-run",
+        "sh"
+      ],
+      "residual": "a same-UID process can raise TasksMax on its own cgroup subtree (see SD-10)"
+    },
+    {
+      "id": "LM-04",
+      "category": "resource-limits",
+      "arm": "pure-user-space",
+      "method": "unit with CPUQuota=10% runs a busy loop; read cpu.stat nr_throttled",
+      "status": "pass",
+      "observed": "cpu.max=10000 100000, nr_throttled=21",
+      "evidence": "cpu.stat: usage_usec 217597 user_usec 212001 system_usec 5595 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 21 nr_throttled 21 throttled_usec 1812763 nr_bursts 0 burst_usec 0 ",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "systemd-run",
+        "systemctl",
+        "sh"
+      ],
+      "residual": "CPU quota is enforced by the kernel; same-UID code can raise it (see SD-10)"
+    },
+    {
+      "id": "LM-05",
+      "category": "resource-limits",
+      "arm": "pure-user-space",
+      "method": "inspect delegated controllers and io.weight availability for the user manager",
+      "status": "pass",
+      "observed": "delegated controllers=[cpu io memory pids], io.weight=default 100",
+      "evidence": "cat .../user@1000.service/cgroup.controllers"
+    },
+    {
+      "id": "RC-01",
+      "category": "recovery",
+      "arm": "pure-user-space",
+      "method": "unit with Restart=on-failure and StartLimitBurst=2 exits 7 repeatedly",
+      "status": "pass",
+      "observed": "NRestarts=2, Result=start-limit-hit, ExecMainStatus=7",
+      "evidence": "systemd-run: exit=0 Running as unit: kanbei-dep1-rc01.service; invocation ID: 808a64f82c2b4b48a266e0c922146af3",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "systemd-run",
+        "systemctl",
+        "sh"
+      ],
+      "residual": "restart discipline works, but the same UID can stop, disable, or reconfigure the unit (SD-10)"
+    },
+    {
+      "id": "RC-02",
+      "category": "recovery",
+      "arm": "pure-user-space",
+      "method": "background child outlives its parent shell",
+      "status": "fail",
+      "observed": "detached sandbox-shaped child 308013 survived its parent",
+      "evidence": "setsid sleep 30 & echo $! -> pid=308013 alive=true",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "sh",
+        "setsid"
+      ],
+      "residual": "killing a supervisor leaves orphans; a system-unit KillMode=control-group or a reaper is required"
+    },
+    {
+      "id": "RC-03",
+      "category": "recovery",
+      "arm": "pure-user-space",
+      "method": "loginctl show-user <user> -p Linger",
+      "status": "fail",
+      "observed": "Linger=no",
+      "evidence": "loginctl show-user smores -p Linger -> Linger=no",
+      "prerequisites": [
+        "loginctl"
+      ],
+      "residual": "the user manager stops at logout, so an always-on deployment dies with the session; enabling linger requires a privileged change"
+    },
+    {
+      "id": "RC-04",
+      "category": "fail-closed",
+      "arm": "both",
+      "method": "kill a child after it records intent; classify the interrupted effect",
+      "status": "pass",
+      "observed": "intent recorded=true, completion recorded=false, classification=outcome_unknown",
+      "evidence": "kill -9 after intent; state dir /tmp/kanbei-dep1-fc24485423c03368/recovery/effect",
+      "prerequisites": [
+        "deno"
+      ],
+      "residual": "an interrupted non-idempotent effect must be recorded as outcome_unknown and never retried blindly"
+    },
+    {
+      "id": "RC-05",
+      "category": "recovery",
+      "arm": "both",
+      "method": "host reboot and post-boot state verification",
+      "status": "blocked",
+      "observed": "reboot is a destructive host action and was not performed",
+      "evidence": "",
+      "residual": "post-reboot recovery of the ledger writer, watchdog, and sandbox reaping remains unverified"
+    },
+    {
+      "id": "RC-06",
+      "category": "recovery",
+      "arm": "both",
+      "method": "ledger/CAS writer recovery and verified backup restore",
+      "status": "blocked",
+      "observed": "no ledger, CAS, or backup implementation exists yet in this task's scope",
+      "evidence": "",
+      "residual": "writer recovery and restore verification must be exercised in the ledger/backup tasks"
+    },
+    {
+      "id": "NW-01",
+      "category": "network",
+      "arm": "both",
+      "method": "bind 127.0.0.1, then connect via loopback and via the host's global IPv4 address",
+      "status": "pass",
+      "observed": "loopback connect=true, 10.77.0.2 connect=false",
+      "evidence": "port 42567; external error: ConnectionRefused: Connection refused (os error 111)",
+      "enforcement": {
+        "pure": "kernel",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "deno",
+        "ip"
+      ],
+      "residual": "D-6 holds only while every listener binds 127.0.0.1 explicitly; a wildcard bind is reachable"
+    },
+    {
+      "id": "NW-02",
+      "category": "network",
+      "arm": "both",
+      "method": "bind 0.0.0.0 and connect through the host's global IPv4 address",
+      "status": "fail",
+      "observed": "wildcard listener reachable on 10.77.0.2=true",
+      "evidence": "port 34543; error ",
+      "prerequisites": [
+        "deno",
+        "ip"
+      ],
+      "residual": "a wildcard bind exposes the service to the host network; the UI and broker sockets must never bind 0.0.0.0"
+    },
+    {
+      "id": "NW-03",
+      "category": "network",
+      "arm": "both",
+      "method": "list host TCP listeners and their bind addresses",
+      "status": "inconclusive",
+      "observed": "18 TCP listeners; 3 on wildcard addresses",
+      "evidence": "LISTEN 0      4096       10.77.0.2:42702 0.0.0.0:*\nLISTEN 0      4096       10.77.0.2:42700 0.0.0.0:*\nLISTEN 0      4096       10.77.0.2:42701 0.0.0.0:*\nLISTEN 0      4096   127.0.0.53%lo:53    0.0.0.0:*\nLISTEN 0      128        127.0.0.1:42702 0.0.0.0:*\nLISTEN 0      100        127.0.0.1:42700 0.0.0.0:*\nLISTEN 0      511        127.0.0.1:42701 0.0.0.0:*\nLISTEN 0      4096      127.0.0.54:53    0.0.0.0:*\nLISTEN 0      4096         0.0.0.0:5355  0.0.0.0:*\nLISTEN 0      100        127.0.0.1:18790 0.0.0.0:*\nLISTEN 0      4096       127.0.0.1:8182  0.0.0.0:*\nLISTEN 0      4096       127.0.0.1:8181…",
+      "prerequisites": [
+        "ss"
+      ],
+      "residual": "other host services listen on wildcard addresses; Kanbei must not add to that set and Access policy is the only ingress control"
+    },
+    {
+      "id": "SC-01",
+      "category": "secret-reachability",
+      "arm": "both",
+      "method": "read a 0600 file from a 0700 directory as the same UID",
+      "status": "fail",
+      "observed": "0600 file in a 0700 directory is readable by the same UID (mode 0o100600)",
+      "evidence": "open /tmp/kanbei-dep1-fc24485423c03368/secrets/credential with mode 0o100600 -> readable=true",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "deno"
+      ],
+      "residual": "file modes separate UIDs, not processes of one UID; secrets must be unreachable from the agent UID, not merely 0600"
+    },
+    {
+      "id": "SC-02",
+      "category": "secret-reachability",
+      "arm": "both",
+      "method": "stat conventional secret locations without reading contents",
+      "status": "pass",
+      "observed": "no conventional secret material exists on this host",
+      "evidence": "/home/smores/.ssh=absent | /home/smores/.config/sops=absent | /home/smores/.config/age=absent | /home/smores/.config/kanbei/secrets=absent | state-tree=0o40700",
+      "prerequisites": []
+    },
+    {
+      "id": "SC-03",
+      "category": "fail-closed",
+      "arm": "both",
+      "method": "create a 0444 audit sink in a user-owned tree, then truncate and unlink it as the same UID",
+      "status": "fail",
+      "observed": "same-UID truncate=false, unlink=true on a 0444 audit file",
+      "evidence": "/tmp/kanbei-dep1-fc24485423c03368/audit/audit.log mode 0444 owned by uid 1000",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "deno"
+      ],
+      "residual": "append-only audit is conventional, not kernel-enforced, under one UID; an agent can erase evidence of its own denied attempt"
+    },
+    {
+      "id": "SC-04",
+      "category": "secret-reachability",
+      "arm": "both",
+      "method": "check supplementary groups and the container-runtime socket ownership",
+      "status": "fail",
+      "observed": "groups=[users wheel docker], /var/run/docker.sock mode=0o140660",
+      "evidence": "id -nG -> users wheel docker",
+      "prerequisites": [
+        "id"
+      ],
+      "residual": "membership in the container-runtime group is root-equivalent; the deployment user must not hold it or every UID separation on this host is bypassable"
+    },
+    {
+      "id": "SC-05",
+      "category": "secret-reachability",
+      "arm": "both",
+      "method": "read fs.suid_dumpable and kernel.core_pattern",
+      "status": "inconclusive",
+      "observed": "fs.suid_dumpable=2, core_pattern=|/nix/store/b8zavc5rpmlcs0jjvz74b8v53zclqmww-systemd/lib/sys",
+      "evidence": "cat /proc/sys/fs/suid_dumpable; cat /proc/sys/kernel/core_pattern",
+      "residual": "core dumps are piped to the system coredump handler; a broker crash could capture credential bytes, so the broker unit needs LimitCORE=0"
+    },
+    {
+      "id": "BI-01",
+      "category": "broker-identity",
+      "arm": "both",
+      "method": "unix socket with mode 0600; server reports SO_PEERCRED of a same-UID client",
+      "status": "fail",
+      "observed": "SO_PEERCRED peer uid=1000 gid=100 pid=308077; socket mode=0600; deployment uid=1000",
+      "evidence": "perl SO_PEERCRED + nc -U -> {\"peerPid\":308077,\"peerUid\":1000,\"peerGid\":100,\"socketMode\":\"0600\"}",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "perl",
+        "nc"
+      ],
+      "residual": "socket credentials identify a UID, not a component; a same-UID agent is indistinguishable from the frozen core at the kernel level"
+    },
+    {
+      "id": "BI-02",
+      "category": "broker-identity",
+      "arm": "both",
+      "method": "connect to a 0600 unix socket from the same UID; attempt a second-UID peer",
+      "status": "blocked",
+      "observed": "cross-UID connect is untestable: effective capabilities=0000000000000000; a second UID cannot be created or entered without privilege",
+      "evidence": "CapEff=0000000000000000; uid=1000; unprivileged=true",
+      "enforcement": {
+        "pure": "conventional",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [
+        "perl",
+        "nc"
+      ],
+      "residual": "the 0600 socket mode was measured (BI-01) but its cross-UID effect could not be exercised on this host"
+    },
+    {
+      "id": "BI-03",
+      "category": "broker-identity",
+      "arm": "dedicated-uid",
+      "method": "check whether a dedicated system user could be created or entered",
+      "status": "blocked",
+      "observed": "uid=1000, effective capabilities=0000000000000000, existing kanbei service users=false",
+      "evidence": "CapEff=0000000000000000; /etc/passwd entries for kanbei service users",
+      "enforcement": {
+        "pure": "not-applicable",
+        "dedicated": "kernel"
+      },
+      "prerequisites": [],
+      "residual": "the dedicated-UID arm cannot be exercised from this unprivileged run; its enforcement is unverified, not assumed"
+    },
+    {
+      "id": "BI-04",
+      "category": "broker-identity",
+      "arm": "both",
+      "method": "enumerate SCM_CREDENTIALS prerequisites and unix socket path security",
+      "status": "inconclusive",
+      "observed": "kernel.yama.ptrace_scope=1; SCM_CREDENTIALS support was not exercised",
+      "evidence": "sysctl kernel.yama.ptrace_scope",
+      "prerequisites": [],
+      "residual": "message-level SCM_CREDENTIALS must be exercised by the broker task, not assumed from socket credentials"
+    },
+    {
+      "id": "FC-01",
+      "category": "fail-closed",
+      "arm": "both",
+      "method": "evaluate the pre-registered posture rules against this host's measured capabilities",
+      "status": "pass",
+      "observed": "declared={\"secretIsolation\":\"same-uid\",\"filesystemIsolation\":\"landlock\",\"hardCeilings\":\"cgroup\"} -> allowed",
+      "evidence": "observed={\"landlockAbi\":7,\"ptraceScope\":1,\"userNamespacesEnabled\":true,\"cgroupDelegated\":true,\"auditSinkWritable\":true}; residuals=broker secrets are readable by any process of the deployment UID (see PR-05, SC-01); memory-inspection denial depends on kernel.yama.ptrace_scope >= 1; UDP egress and io_uring are not covered by the measured enforcement",
+      "prerequisites": [],
+      "residual": "the pure user-space posture is admissible only with the accepted residuals recorded; it is not a claim of kernel-enforced secret isolation"
+    },
+    {
+      "id": "FC-02",
+      "category": "fail-closed",
+      "arm": "both",
+      "method": "make the audit sink unwritable and confirm the guarded effect is denied",
+      "status": "pass",
+      "observed": "sink writable=true, writable after chmod 0444=false, guarded effect allowed=true, guarded effect after denial=false",
+      "evidence": "audit sink /tmp/kanbei-dep1-fc24485423c03368/fail-closed/gate/audit.log; effect marker exists=false",
+      "prerequisites": [
+        "deno"
+      ],
+      "residual": "an unwritable audit sink denies the effect and records the denial; no effect runs unrecorded"
+    }
+  ],
+  "arms": [
+    {
+      "arm": "pure-user-space",
+      "kernelEnforced": [
+        "PR-02",
+        "PR-03",
+        "LL-02",
+        "LL-03",
+        "SD-03",
+        "SD-05",
+        "SD-06",
+        "SD-07",
+        "SD-08",
+        "NW-01"
+      ],
+      "conventional": [
+        "LM-01",
+        "LM-02",
+        "LM-03",
+        "LM-04",
+        "RC-01",
+        "PR-01",
+        "PR-04",
+        "PR-05",
+        "SD-04",
+        "SD-10",
+        "RC-02",
+        "SC-01",
+        "SC-03",
+        "BI-01"
+      ],
+      "unverified": [],
+      "secretIsolation": "none",
+      "note": "measured secret-isolation failures: PR-01, PR-04, PR-05, SC-01, BI-01"
+    },
+    {
+      "arm": "dedicated-uid",
+      "kernelEnforced": [],
+      "conventional": [],
+      "unverified": [
+        "PR-01",
+        "PR-02",
+        "PR-03",
+        "PR-04",
+        "PR-05",
+        "LL-02",
+        "LL-03",
+        "NW-01",
+        "SC-01",
+        "SC-03",
+        "BI-01",
+        "BI-02",
+        "BI-03"
+      ],
+      "secretIsolation": "unverified",
+      "note": "secret isolation was not exercised for this arm: PR-01, PR-02, PR-03, PR-04, PR-05, SC-01, BI-01, BI-02, BI-03"
+    }
+  ],
+  "recommendation": {
+    "variant": "D",
+    "summary": "Hybrid: core, agents, and the UI stay under the deployment user; the broker and the sandbox supervisor run as dedicated system users in system units.",
+    "rationale": [
+      "Pure user-space cannot protect broker secrets: same-UID code read an open credential descriptor and 0600 files, and signalled sibling processes (conventional: LM-01, LM-02, LM-03, LM-04, RC-01, PR-01, PR-04, PR-05, SD-04, SD-10, RC-02, SC-01, SC-03, BI-01).",
+      "The user manager is controllable by the deployment UID, so hard ceilings, restart discipline, and the watchdog are conventional rather than kernel-enforced for a pure user-space arm (SD-10, LM-01).",
+      "Kernel-enforced pieces that remain available to the user-space core are Landlock filesystem and TCP rules, Yama-scoped memory denial, cgroup ceilings inside a unit, and loopback-only binding.",
+      "Dedicated-UID enforcement claims could not be exercised from an unprivileged run (PR-01, PR-02, PR-03, PR-04, PR-05, LL-02, LL-03, NW-01, SC-01, SC-03, BI-01, BI-02, BI-03), so they are recorded as unverified rather than assumed."
+    ],
+    "requiredConditions": [
+      "Create kanbei-broker and kanbei-sandbox system users and run both as system units; the deployment user must not be able to signal, trace, or reconfigure them.",
+      "Keep broker credentials outside ~/.local/state/kanbei and outside any path writable by the deployment user; the broker UID alone must be able to read them.",
+      "Bind the UI to 127.0.0.1 and expose it only through the existing tunnel/Access convention; a wildcard bind was measured as externally reachable (NW-02).",
+      "Apply Landlock filesystem and TCP rules in the sandbox supervisor before exec, and keep kernel.yama.ptrace_scope >= 1; both were measured as effective only when present.",
+      "Verify effective systemd hardening at startup and refuse to start when a directive is accepted but ineffective (SD-04).",
+      "Set LimitCORE=0 on broker units: core dumps are piped to the system coredump handler on this host (SC-05).",
+      "Remove the deployment user from the docker group: membership is root-equivalent and would erase any UID separation on this host (SC-04).",
+      "Use system units for the watchdog and alerting; a user unit is journal-only and dies with the session unless linger is enabled (RC-03).",
+      "Kill the whole control group on supervisor termination so orphaned sandboxes cannot survive (RC-02)."
+    ],
+    "rejectedAlternatives": [
+      "A/B pure user-space (home-manager or NixOS-plane user unit): measured secret isolation is none; same-UID code reads broker-held credentials and rewrites ceilings.",
+      "C all-dedicated system units: strongest identity separation but makes mutable code and activation human-root-only, which contradicts the user-controlled mutable layer of D-2."
+    ],
+    "residuals": [
+      "Dedicated-UID enforcement is unverified on this host because no privileged operation was permitted; the decision relies on the kernel UID model plus review.",
+      "If a future host allows the deployment user to join docker or equivalent groups, all UID separation is void.",
+      "Yama ptrace scope, Landlock ABI, and cgroup delegation are host configuration; a host rebuild can silently weaken them unless startup verification checks effective values.",
+      "UDP egress, io_uring, and SCM_CREDENTIALS behaviour remain outside the measured enforcement."
+    ]
+  },
+  "decisionGate": {
+    "gate": "DG-3",
+    "status": "input-ready-human-signature-required",
+    "blocks": [
+      "E1",
+      "E2",
+      "H7"
+    ],
+    "evidenceProbes": [
+      "NS-06",
+      "PR-01",
+      "PR-04",
+      "PR-05",
+      "LL-04",
+      "SD-04",
+      "SD-10",
+      "RC-02",
+      "RC-03",
+      "RC-05",
+      "RC-06",
+      "NW-02",
+      "SC-01",
+      "SC-03",
+      "SC-04",
+      "BI-01",
+      "BI-02",
+      "BI-03"
+    ],
+    "statement": "Variant D (hybrid) is the recommended deployment plane: the broker and sandbox supervisor as dedicated system users, core/agents/UI under the deployment user. This is a decision input, not a selection; DG-3 closes only with a human signature."
+  },
+  "residuals": [
+    "PrivateUsers=yes started without changing the UID mapping",
+    "process metadata is world-readable within a UID; no secret may live in argv or environ",
+    "protection is provided by Yama; verify the sysctl remains >= 1",
+    "denial is ancestry-based; an agent that is an ancestor of the broker could attach",
+    "pure user-space cannot protect secrets a broker keeps open; closing descriptors immediately only shortens the window",
+    "the ruleset only binds processes that call landlock_restrict_self; the sandbox supervisor must do so before exec",
+    "Landlock restricts bind/connect but not UDP; UDP egress remains an accepted residual",
+    "io_uring is enabled; io_uring operations are known to bypass parts of Landlock and seccomp, so a supervisor must add its own syscall filter",
+    "a user manager is a per-user trust domain; any same-UID process can talk to it",
+    "the write fails closed (EROFS) but the directive is ineffective in this user-manager configuration; a deployment that relies on it will not start, and must refuse to start rather than run with in-memory state",
+    "the unit's loopback is a different device than the host loopback, so host 127.0.0.1 services are unreachable",
+    "rejection is at unit start; a directive that is valid but ineffective (SD-04) is not caught this way",
+    "with Delegate=yes the user manager owns the cgroup subtree, so hard ceilings and the watchdog are conventional under pure user-space",
+    "the ceiling is enforced by the kernel cgroup, but a same-UID process can rewrite it (see SD-10)",
+    "MemoryHigh throttles (reclaim pressure) rather than terminating; MemoryMax is the terminating ceiling",
+    "a same-UID process can raise TasksMax on its own cgroup subtree (see SD-10)",
+    "CPU quota is enforced by the kernel; same-UID code can raise it (see SD-10)",
+    "restart discipline works, but the same UID can stop, disable, or reconfigure the unit (SD-10)",
+    "killing a supervisor leaves orphans; a system-unit KillMode=control-group or a reaper is required",
+    "the user manager stops at logout, so an always-on deployment dies with the session; enabling linger requires a privileged change",
+    "an interrupted non-idempotent effect must be recorded as outcome_unknown and never retried blindly",
+    "post-reboot recovery of the ledger writer, watchdog, and sandbox reaping remains unverified",
+    "writer recovery and restore verification must be exercised in the ledger/backup tasks",
+    "D-6 holds only while every listener binds 127.0.0.1 explicitly; a wildcard bind is reachable",
+    "a wildcard bind exposes the service to the host network; the UI and broker sockets must never bind 0.0.0.0",
+    "other host services listen on wildcard addresses; Kanbei must not add to that set and Access policy is the only ingress control",
+    "file modes separate UIDs, not processes of one UID; secrets must be unreachable from the agent UID, not merely 0600",
+    "append-only audit is conventional, not kernel-enforced, under one UID; an agent can erase evidence of its own denied attempt",
+    "membership in the container-runtime group is root-equivalent; the deployment user must not hold it or every UID separation on this host is bypassable",
+    "core dumps are piped to the system coredump handler; a broker crash could capture credential bytes, so the broker unit needs LimitCORE=0",
+    "socket credentials identify a UID, not a component; a same-UID agent is indistinguishable from the frozen core at the kernel level",
+    "the 0600 socket mode was measured (BI-01) but its cross-UID effect could not be exercised on this host",
+    "the dedicated-UID arm cannot be exercised from this unprivileged run; its enforcement is unverified, not assumed",
+    "message-level SCM_CREDENTIALS must be exercised by the broker task, not assumed from socket credentials",
+    "the pure user-space posture is admissible only with the accepted residuals recorded; it is not a claim of kernel-enforced secret isolation",
+    "an unwritable audit sink denies the effect and records the denial; no effect runs unrecorded",
+    "Dedicated-UID enforcement is unverified on this host because no privileged operation was permitted; the decision relies on the kernel UID model plus review.",
+    "If a future host allows the deployment user to join docker or equivalent groups, all UID separation is void.",
+    "Yama ptrace scope, Landlock ABI, and cgroup delegation are host configuration; a host rebuild can silently weaken them unless startup verification checks effective values.",
+    "UDP egress, io_uring, and SCM_CREDENTIALS behaviour remain outside the measured enforcement."
+  ],
+  "blockedCapabilities": [
+    "RC-05: reboot is a destructive host action and was not performed",
+    "RC-06: no ledger, CAS, or backup implementation exists yet in this task's scope",
+    "BI-02: cross-UID connect is untestable: effective capabilities=0000000000000000; a second UID cannot be created or entered without privilege",
+    "BI-03: uid=1000, effective capabilities=0000000000000000, existing kanbei service users=false"
+  ]
+}

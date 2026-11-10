@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "task": "A5",
+  "status": "input-ready-human-signature-required",
+  "gates": [
+    {
+      "gate": "DG-1",
+      "status": "open",
+      "recommended": "none",
+      "blockers": [
+        "frozen model manifest",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "frozen OS-sandbox profile",
+        "sealed security-v1"
+      ]
+    },
+    {
+      "gate": "DG-2",
+      "status": "open",
+      "recommended": "deno@2.9.2",
+      "condition": "conditional; re-run after ledger sequencer and worker model exist"
+    },
+    {
+      "gate": "DG-3",
+      "status": "open",
+      "recommended": "variant-D-hybrid",
+      "condition": "dedicated-UID arm is unverified; no privilege in this run"
+    },
+    {
+      "gate": "DG-4",
+      "status": "open",
+      "recommended": "process-cgroup",
+      "condition": "requires systemd user cgroup delegation; no security property claimed"
+    }
+  ],
+  "decisionsClosed": [],
+  "baselineFrozen": false,
+  "evidenceBindingGaps": [
+    "security-v1 is not sealed; A1 security probes, A2, A3, and A4 security cells lack dataset-bound envelopes",
+    "A4 issued no envelope because all model cells are blocked",
+    "A2 and A3 emitted measurement records rather than envelopes"
+  ],
+  "operatorEnvelopeSchema": "src/spikes/gates/operator-envelope.ts",
+  "next": [
+    "human signs or amends DG-2, DG-3, DG-4",
+    "human resolves DG-1 model manifest and credentials or blocks F4",
+    "human decides whether to seal and re-run security-v1 binding"
+  ]
+}

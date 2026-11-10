@@ -1,0 +1,74 @@
+# A5 — Gate consolidation and baseline freeze
+
+Status: `input-ready-human-signature-required`. No decision gate is closed by this record.
+
+## Inputs
+
+| Task | Protocol             | Result                          | Gate   | Recommendation                                    |
+| ---- | -------------------- | ------------------------------- | ------ | ------------------------------------------------- |
+| `A1` | `S1` / `NODE-DENO-1` | `spikes/runtime/result.json`    | `DG-2` | `deno@2.9.2`, conditional                         |
+| `A2` | `S2` / `DEP-1`       | `spikes/deployment/result.json` | `DG-3` | variant D, hybrid dedicated-UID broker/supervisor |
+| `A3` | `S3` / `ISO-1`       | `spikes/isolation/result.json`  | `DG-4` | `process-cgroup`                                  |
+| `A4` | `S1` / `LANG-1`      | `spikes/language/result.json`   | `DG-1` | none; model arm blocked                           |
+
+## Gate records
+
+`spikes/gates/records.json` contains the four open records. Every record is `owner=human`, has no `selected` value, and has no `signedBy` or `signedAt`.
+
+### `DG-1` — execution language
+
+Status: **open**. Recommendation: **none**.
+
+All 600 model cells (18,000 planned trials) are blocked. The local matrix resolved Monty, Deno, Node, Lua 5.4, Luau, Bash, and CPython, and measured startup, RSS, host-call overhead, snapshot support, capability posture, and progressive disclosure. Those measurements are context only; they do not select a language.
+
+Blocking inputs: frozen model manifest, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, frozen OS-sandbox profile, and sealed `security-v1`.
+
+### `DG-2` — control-plane runtime
+
+Status: **open**. Recommendation: **Deno 2.9.2**, conditional.
+
+The pre-registered composite margin was 4.7%, inside the 10% margin, so the peak-RSS tie-break selected Deno. This is a near-tie: Node wins append throughput (+62%), event-loop p50, warm start, and worker startup. Deno wins cold start, peak RSS, shutdown, and single-binary packaging. The record must carry the conditions that canonical writes are serialized in the application, never by a SQLite busy handler, and that the protocol is re-run after the ledger sequencer and worker model exist.
+
+### `DG-3` — deployment plane and broker identity
+
+Status: **open**. Recommendation: **variant D** — core, agents, and UI under the deployment user; broker and sandbox supervisor as dedicated system users in system units.
+
+Pure user-space measured **no secret isolation**: a same-UID sibling read broker credential bytes through an open descriptor and 0600 files, and could signal and reconfigure sibling units. Dedicated-UID enforcement is **unverified** because this run had no privilege to create or enter a second UID. The recommendation therefore relies on the kernel UID model plus review, not on a measured dedicated-UID arm.
+
+Required conditions include dedicated system users, credentials outside the deployment user's writable paths, loopback-only binding, startup verification of effective systemd hardening, `LimitCORE=0`, removal from the `docker` group, and control-group kill on supervisor termination.
+
+### `DG-4` — inter-agent isolation
+
+Status: **open**. Recommendation: **process-cgroup**.
+
+`process-cgroup` is the only eligible arm. It passed crash, hang, OOM, fork-bomb, cleanup, orphan-reaping, IPC, resource-ceiling, and workload checks, with p95 cold start 429 ms, 15.8 MiB per agent at 16 agents, and IPC p95 0.35 ms. `wasm-instance` is excluded because it has no CPU/fuel ceiling and cannot host the LANG-1 workload. `microvm` is blocked because no runtime or sealed guest image exists on this host. **No security property is claimed** for any arm.
+
+## Operator envelope
+
+`src/spikes/gates/operator-envelope.ts` defines the provisional `HardCeilings`, `LoopBudget`, and `OperatorEnvelope` schemas from `07 §4.7.3`. No values are set here. `H4` measures the workload and proposes values; the human decides at `DG-6`.
+
+## Baseline freeze
+
+Not performed. A baseline cannot be frozen while `DG-1` through `DG-4` remain unsigned and `security-v1` is unsealed. The harness configuration that is fixed today is:
+
+- Deno 2.9.2 and Effect 4.1.2.
+- Sealed fixtures: `journey-v1`, `append-v1`, `cost-v1`, `ui-v1`.
+- Evidence contracts and virtual clock/synthetic network from A0.
+- Pre-registrations in `src/spikes/runtime/plan.ts`, `src/spikes/deployment/matrix.ts`, `src/spikes/isolation/protocol.ts`, and `src/spikes/language/pre-registration.ts`.
+
+## Evidence binding gaps
+
+- `security-v1` is not registered or sealed. A1’s permission probes, A2’s host probes, A3’s isolation probes, and A4’s security cells therefore lack a dataset-bound `EvidenceEnvelope`.
+- A4 issued no envelope because the model arm is blocked.
+- A2 and A3 emitted measurement records, not envelopes, for the same `security-v1` reason.
+- A1 emitted a valid envelope bound to `append-v1`, but its security probes remain unbound.
+
+These are recorded blockers, not waivers.
+
+## Required human decisions
+
+1. Accept, reject, or amend the `DG-2` Deno recommendation and its conditions.
+2. Accept, reject, or amend the `DG-3` hybrid dedicated-UID deployment.
+3. Accept, reject, or amend the `DG-4` process+cgroup recommendation.
+4. For `DG-1`, either provide the model manifest and credentials for a live `LANG-1` run, or explicitly accept that no language is selected and block dependent `F4`.
+5. Decide whether to seal a real `security-v1` fixture and re-run S1–S3 binding, or accept the current evidence as input with the gap recorded.

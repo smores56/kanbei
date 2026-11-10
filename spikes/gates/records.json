@@ -1,0 +1,141 @@
+[
+  {
+    "gate": "DG-1",
+    "decision": "Agent-facing execution language",
+    "owner": "human",
+    "producingTask": "A4",
+    "status": "open",
+    "recommended": "none",
+    "recommendationRationale": [
+      "All 600 model cells and 18000 planned trials are blocked; local runtime measurements cannot select a language.",
+      "The ten-task suite, host-call latency profiles, snapshot probes, capability matrix, and progressive-disclosure measurements are ready for a live model run."
+    ],
+    "conditions": [
+      "Provide spikes/language/model-manifest.json with two providers and primary plus smaller model IDs.",
+      "Provide ANTHROPIC_API_KEY and OPENAI_API_KEY for the live model arm.",
+      "Freeze the OS-sandbox profile and image digest.",
+      "Register and seal security-v1 before S1 security cells can pass."
+    ],
+    "blockers": [
+      "MI-01 frozen model manifest",
+      "MI-CRED-ANTHROPIC",
+      "MI-CRED-OPENAI",
+      "MI-04 frozen sandbox profile",
+      "MI-06 security-v1 dataset"
+    ],
+    "rejectedAlternatives": [],
+    "evidenceEnvelopes": [],
+    "evidenceArtifacts": ["spikes/language/result.json", "spikes/language/REPORT.md"],
+    "residuals": [
+      "No model success, token, turn, tool-call, or latency comparison exists yet.",
+      "No LANG-1 arm is selected or rejected on model evidence.",
+      "Monty snapshot trust is based on a local dump/load_snapshot probe only."
+    ]
+  },
+  {
+    "gate": "DG-2",
+    "decision": "Node versus Deno for the TypeScript control plane",
+    "owner": "human",
+    "producingTask": "A1",
+    "status": "open",
+    "recommended": "deno@2.9.2",
+    "recommendationRationale": [
+      "No hard fail on either arm; the weighted composite is inside the pre-registered 10% margin at 4.7%.",
+      "The peak-RSS tie-breaker favours Deno in all five runs, and Deno also wins cold start and single-binary packaging.",
+      "Node wins durable append throughput, event-loop p50, warm start, and worker startup; this is a near-tie, not a performance win."
+    ],
+    "conditions": [
+      "Do not treat the result as a performance win; re-run after the ledger sequencer and worker model exist.",
+      "Serialize canonical writes in the application; never rely on a SQLite busy handler.",
+      "Keep the ArmHost runtime seam and keep domain code free of node:* and Deno.*.",
+      "Bind S1 security probes to a sealed security-v1 dataset before the gate is fully conformant."
+    ],
+    "blockers": [
+      "security-v1 is not sealed; permission and fail-closed probes are unbound.",
+      "systemd integration and OpenTelemetry/tracing were not measured.",
+      "Node single-binary packaging is blocked in this environment."
+    ],
+    "rejectedAlternatives": ["node@24.21.0"],
+    "evidenceEnvelopes": ["spikes/runtime/result.json#envelope"],
+    "evidenceArtifacts": ["spikes/runtime/result.json", "spikes/runtime/REPORT.md"],
+    "residuals": [
+      "The composite margin is 1.5-4.7% across runs; a different worker or filesystem can flip it.",
+      "SQLite micro-versions differ: Node 3.53.3 and Deno 3.53.2.",
+      "Deno node:sqlite lacks errcode/errstr on lock contention.",
+      "Both arms park their own timer queue during a synchronous SQLite busy timeout."
+    ]
+  },
+  {
+    "gate": "DG-3",
+    "decision": "Deployment plane and broker identity",
+    "owner": "human",
+    "producingTask": "A2",
+    "status": "open",
+    "recommended": "variant-D-hybrid",
+    "recommendationRationale": [
+      "Pure user-space measured secret isolation is none: same-UID code read broker credential bytes through an open descriptor, read 0600 files, and signalled sibling processes.",
+      "The user manager is a per-user trust domain; same-UID code rewrote a sibling unit memory ceiling and could stop the unit.",
+      "Variant D keeps core, agents, and UI under the deployment user while moving the broker and sandbox supervisor to dedicated system users and system units."
+    ],
+    "conditions": [
+      "Create kanbei-broker and kanbei-sandbox system users and run both as system units.",
+      "Keep broker credentials outside ~/.local/state/kanbei and outside deployment-user-writable paths.",
+      "Bind the UI to 127.0.0.1 and expose it only through Cloudflare Tunnel and Access.",
+      "Apply Landlock filesystem and TCP rules before exec and keep kernel.yama.ptrace_scope >= 1.",
+      "Verify effective systemd hardening at startup and refuse to start when a declared directive is ineffective.",
+      "Set LimitCORE=0 on broker units.",
+      "Remove the deployment user from the docker group.",
+      "Use system units for watchdog and alerting; enable control-group kill on supervisor termination."
+    ],
+    "blockers": [
+      "The dedicated-UID arm is unverified because this run had no privilege to create or enter a second UID.",
+      "Post-reboot recovery, ledger/backup restore, and SCM_CREDENTIALS remain unmeasured.",
+      "security-v1 is not sealed, so no EvidenceEnvelope is issued."
+    ],
+    "rejectedAlternatives": [
+      "pure-user-space home-manager unit",
+      "pure-user-space NixOS-plane unit",
+      "all-dedicated system units"
+    ],
+    "evidenceEnvelopes": [],
+    "evidenceArtifacts": ["spikes/deployment/result.json", "spikes/deployment/REPORT.md"],
+    "residuals": [
+      "Yama protection is ancestry-based; an agent that is an ancestor of the broker could attach.",
+      "Landlock does not cover UDP or io_uring; io_uring is enabled on this host.",
+      "A wildcard listener was externally reachable; every Kanbei listener must bind 127.0.0.1 explicitly.",
+      "A same-UID process can still signal or reconfigure user units under the pure user-space arm.",
+      "The dedicated-UID enforcement claim is unverified, not assumed."
+    ]
+  },
+  {
+    "gate": "DG-4",
+    "decision": "Lightweight inter-agent isolation mechanism",
+    "owner": "human",
+    "producingTask": "A3",
+    "status": "open",
+    "recommended": "process-cgroup",
+    "recommendationRationale": [
+      "process-cgroup is the only eligible arm: all containment checks pass, cold-start and IPC budgets hold, and it hosts the reference agent workload.",
+      "wasm-instance is excluded on capability and ceilings, not speed: no CPU/fuel metering, no WASI, and it cannot host the LANG-1 execution surface.",
+      "microvm is blocked: no microVM runtime or sealed guest image exists on this host."
+    ],
+    "conditions": [
+      "Guarantee systemd user cgroup delegation; without it the process arm degrades to rlimits and fails containment.",
+      "Re-run S3 against the sealed security-v1 dataset before A5 is fully conformant.",
+      "Keep the container-per-agent exclusion."
+    ],
+    "blockers": [
+      "microVM runtime and sealed guest image are unavailable.",
+      "security-v1 is not sealed, so no EvidenceEnvelope is issued."
+    ],
+    "rejectedAlternatives": ["wasm-instance", "microvm"],
+    "evidenceEnvelopes": [],
+    "evidenceArtifacts": ["spikes/isolation/result.json", "spikes/isolation/REPORT.md"],
+    "residuals": [
+      "No security property is claimed; this is crash and resource containment only.",
+      "Target concurrency 16 is a spike assumption; LIM-1 owns the real ceiling.",
+      "WASM RSS is a process-level delta; per-instance memory is the declared linear-memory cap.",
+      "MicroVM containment and density are unmeasured."
+    ]
+  }
+]

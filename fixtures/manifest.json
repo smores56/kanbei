@@ -13,6 +13,18 @@
       "files": {
         "fixture.json": "sha256:75f75ce5f0ae00f3e7f9abcc2713e82d1c9aebeff80d096cd39e2925e9895f9a"
       }
+    },
+    "cost-v1@1.0.0": {
+      "treeHash": "sha256:d2f94e59665c3bf20b8222938e168575593071b93cb60497fcf80923c04a0a68",
+      "files": {
+        "workload.json": "sha256:388478999ce135dbb3672356ac806eb4a84d3232f166d4156405787ec437ad76"
+      }
+    },
+    "ui-v1@1.0.0": {
+      "treeHash": "sha256:c2b40166b9599e710046841fa0e1de03ab06394083e68efe806fd28e09b0b8a3",
+      "files": {
+        "questions.json": "sha256:61b3ab517fcb4f147078dbb1bf93d558f6b6cb4f04fa42d4aa34a015e1ca944b"
+      }
     }
   }
 }
