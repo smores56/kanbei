@@ -4,7 +4,9 @@ import type {
   ArmResult,
   CheckId,
   ContainmentCheck,
+  SupervisorInfo,
 } from "../../../src/spikes/isolation/types.ts"
+import { HOST_DEPENDENCIES } from "../../../src/spikes/isolation/supervisor.ts"
 
 export const metrics = (overrides: Partial<ArmMetrics> = {}): ArmMetrics => ({
   coldStartMs: { p50Ms: 40, p95Ms: 55, maxMs: 60, samples: 5 },
@@ -49,6 +51,15 @@ export const checks = (
   statuses: Partial<Record<CheckId, ContainmentCheck["status"]>> = {},
 ): ReadonlyArray<ContainmentCheck> =>
   passingChecks.map((id) => ({ id, status: statuses[id] ?? "pass", detail: `${id} detail` }))
+
+export const supervisor = (): SupervisorInfo => ({
+  kind: "rootless-userns-chroot-landlock",
+  uid: 1000,
+  landlockAbi: 7,
+  cgroupRoot: "/user.slice/user-1000.slice/user@1000.service/app.slice/run-1.service",
+  delegatedBy: "systemd-run --user --property=Delegate=yes --property=DelegateSubgroup=supervisor",
+  dependencies: HOST_DEPENDENCIES,
+})
 
 export const arm = (
   id: ArmId,

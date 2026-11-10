@@ -7,26 +7,23 @@
     "status": "blocked",
     "recommended": "none",
     "recommendationRationale": [
-      "All 600 model cells and 18000 planned trials are blocked; local runtime measurements cannot select a language.",
+      "All 300 model cells and 9000 planned trials are blocked; local runtime measurements cannot select a language.",
+      "Amendment AMD-1 (recorded 2026-11-10, before any trial) replaced the two-provider requirement with one NeuralWatt provider serving primary deepseek-v4.1-flash and smaller qwen-3.8-27b; spikes/language/model-manifest.json freezes both IDs.",
       "The ten-task suite, host-call latency profiles, snapshot probes, capability matrix, and progressive-disclosure measurements are ready for a live model run."
     ],
     "conditions": [
-      "Provide spikes/language/model-manifest.json with two providers and primary plus smaller model IDs.",
-      "Provide ANTHROPIC_API_KEY and OPENAI_API_KEY for the live model arm.",
+      "Provide NEURALWATT_API_KEY for the live model arm.",
+      "Build a live NeuralWatt adapter and run all 300 planned cells; no recommendation may be claimed before that.",
       "Freeze the OS-sandbox profile and image digest.",
-      "Register and seal security-v1 before S1 security cells can pass."
+      "Bind and seal security-v1 probes before S1 security cells can pass."
     ],
     "blockers": [
-      "MI-01 frozen model manifest",
-      "MI-CRED-ANTHROPIC",
-      "MI-CRED-OPENAI",
+      "No live provider adapter or model trials exist.",
+      "MI-CRED-NEURALWATT",
       "MI-04 frozen sandbox profile",
-      "MI-06 security-v1 dataset",
       "FI-01 runtime/interpreter versions",
       "FI-06 hardware fingerprint, timeouts, resource ceilings",
-      "DG-2 signed: NODE-DENO-1 winner fixes the TypeScript evaluator variant",
-      "lang-v1 is not a §7.0 registered dataset",
-      "NeuralWatt deepseek-v4.1-flash verified, but LANG-1 requires a second provider and a smaller model; only one provider credential is available."
+      "lang-v1 is not a §7.0 registered dataset"
     ],
     "rejectedAlternatives": [],
     "evidenceEnvelopes": [],
@@ -37,6 +34,8 @@
     "residuals": [
       "No model success, token, turn, tool-call, or latency comparison exists yet.",
       "No LANG-1 arm is selected or rejected on model evidence.",
+      "deepseek-v4.1-flash and qwen-3.8-27b are frozen by AMD-1 before any trial; neither model has been measured.",
+      "A single liveness probe of NeuralWatt deepseek-v4.1-flash returned OK; it is not a trial and contributes no measurement.",
       "Monty snapshot trust is based on a local dump/load_snapshot probe only."
     ],
     "blocks": [
@@ -158,37 +157,44 @@
     "status": "blocked",
     "recommended": "process-cgroup",
     "recommendationRationale": [
-      "process-cgroup is the only eligible arm: all containment checks pass, cold-start and IPC budgets hold, and it hosts the reference agent workload.",
-      "wasm-instance is excluded on capability and ceilings, not speed: no CPU/fuel metering, no WASI, and it cannot host the LANG-1 execution surface.",
-      "microvm is blocked: no microVM runtime or sealed guest image exists on this host."
+      "S3 was re-run under DG-3 option E: the supervisor is the deployment user outside the agent sandbox and owns one delegated cgroup root; each agent is a rootless user+PID+mount namespace, chroot, and Landlock ruleset with its own cgroup directory.",
+      "process-cgroup is the only eligible arm: all nine containment checks pass, and every pre-registered budget holds at p95 cold start 416 ms, 16.3 MiB per agent at 16 agents, IPC p95 0.52 ms, 700 implementation lines, and 2 host dependencies.",
+      "wasm-instance is excluded on capability and ceilings, not speed; microvm is blocked because no runtime or sealed guest image exists on this host.",
+      "The run emitted an EvidenceEnvelope: testId S3, fixture security-v1@1.0.0, outcome pass."
     ],
     "conditions": [
-      "Guarantee systemd user cgroup delegation; without it the process arm degrades to rlimits and fails containment.",
-      "Re-run S3 against the sealed security-v1 dataset before A5 is fully conformant.",
+      "Guarantee the one-time systemd user cgroup delegation; without it no per-agent cgroup ceiling exists.",
+      "Keep agent, supervisor, and broker on the deployment user; isolation is namespace, chroot, Landlock, and cgroup, not UID-based.",
+      "Add a seccomp policy and disable or restrict io_uring, which Landlock does not mediate.",
+      "Keep /sys unmounted inside the agent root; that unmount is what stops an agent from raising its own cgroup limits (reverses SD-10).",
       "Keep the container-per-agent exclusion."
     ],
     "blockers": [
-      "microVM runtime and sealed guest image are unavailable.",
-      "security-v1 is not sealed, so no EvidenceEnvelope is issued.",
-      "DG-3 must fix which UID owns the delegated cgroup subtree; S3 must be re-run under that supervisor identity",
-      "SD-10: a same-UID agent can raise its own memory.max; containment holds only for non-hostile agents",
-      "DG-3 selected E; S3 must be re-run under the rootless supervisor identity before DG-4 can close."
+      "Human sign-off is the only remaining DG-4 action; the S3 re-run is complete and its envelope is emitted.",
+      "microVM runtime and sealed guest image are unavailable, so that arm remains blocked.",
+      "No security property is claimed; containment holds for non-hostile agents only."
     ],
     "rejectedAlternatives": [
       "wasm-instance",
       "microvm"
     ],
-    "evidenceEnvelopes": [],
+    "evidenceEnvelopes": [
+      "spikes/isolation/envelope.json#envelope (testId=S3, fixture=security-v1@1.0.0, outcome=pass)"
+    ],
     "evidenceArtifacts": [
       "spikes/isolation/result.json",
-      "spikes/isolation/REPORT.md"
+      "spikes/isolation/REPORT.md",
+      "spikes/isolation/envelope.json"
     ],
     "residuals": [
       "No security property is claimed; this is crash and resource containment only.",
       "Target concurrency 16 is a spike assumption; LIM-1 owns the real ceiling.",
+      "Agent, supervisor, and broker share one UID; a same-UID host process outside the sandbox is not contained.",
+      "No seccomp policy is installed and io_uring remains enabled; Landlock does not mediate io_uring.",
+      "/sys is intentionally unmounted and never granted by Landlock, which reverses SD-10 for the agent itself.",
       "WASM RSS is a process-level delta; per-instance memory is the declared linear-memory cap.",
       "MicroVM containment and density are unmeasured.",
-      "DG-4 process-cgroup was measured under the deployment user user manager, not under DG-3 dedicated supervisor; S3 must be re-run under DG-3 identity."
+      "Cold start includes delegated-cgroup creation, namespace setup, bind mounts, chroot, Landlock, and Deno module loading."
     ],
     "blocks": [
       "E1"

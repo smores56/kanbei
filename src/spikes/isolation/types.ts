@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { EvidenceEnvelope } from "../../evidence/types.ts"
 
 export const ArmId = Schema.Literals(["process-cgroup", "wasm-instance", "microvm"])
 export type ArmId = typeof ArmId.Type
@@ -102,8 +103,10 @@ export const HostCapabilities = Schema.Struct({
   totalMemoryBytes: Schema.Number,
   cgroupVersion: Schema.Literals(["v2", "none"]),
   cgroupControllers: Schema.Array(Schema.String),
-  systemdUserDelegation: Schema.Literals(["available", "unavailable"]),
-  systemdProbe: Schema.String,
+  userNamespaces: Schema.Literals(["available", "unavailable"]),
+  landlockAbi: Schema.Number,
+  cgroupNsdelegate: Schema.Boolean,
+  delegatedParent: Schema.Literals(["owned-by-uid", "not-owned"]),
   kvmDevice: Schema.Literals(["accessible", "present-not-accessible", "absent"]),
   microvmRuntimes: Schema.Array(Schema.String),
   generalVmm: Schema.Array(Schema.String),
@@ -111,6 +114,16 @@ export const HostCapabilities = Schema.Struct({
   privilegedOperations: Schema.Literal(false),
 })
 export type HostCapabilities = typeof HostCapabilities.Type
+
+export const SupervisorInfo = Schema.Struct({
+  kind: Schema.Literal("rootless-userns-chroot-landlock"),
+  uid: Schema.Number,
+  landlockAbi: Schema.Number,
+  cgroupRoot: Schema.String,
+  delegatedBy: Schema.String,
+  dependencies: Schema.Tuple([Schema.String, Schema.String]),
+})
+export type SupervisorInfo = typeof SupervisorInfo.Type
 
 export const MatrixRow = Schema.Struct({
   check: CheckId,
@@ -136,11 +149,11 @@ export const Recommendation = Schema.Struct({
 })
 export type Recommendation = typeof Recommendation.Type
 
-export const EvidenceStatus = Schema.Struct({
-  status: Schema.Literals(["emitted", "unavailable"]),
-  reason: Schema.String,
-})
-export type EvidenceStatus = typeof EvidenceStatus.Type
+export const EvidenceBinding = Schema.Union([
+  Schema.Struct({ status: Schema.Literal("emitted"), envelope: EvidenceEnvelope }),
+  Schema.Struct({ status: Schema.Literal("unavailable"), reason: Schema.String }),
+])
+export type EvidenceBinding = typeof EvidenceBinding.Type
 
 export const SecurityStatement = Schema.Struct({
   propertyClaimed: Schema.Literal(false),
@@ -150,18 +163,19 @@ export const SecurityStatement = Schema.Struct({
 export type SecurityStatement = typeof SecurityStatement.Type
 
 export const SpikeResult = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
+  schemaVersion: Schema.Literal(2),
   spikeId: Schema.Literal("S3"),
   validationId: Schema.Literal("ISO-1"),
   dataset: Schema.Literal("security-v1"),
   generatedAt: Schema.String,
   host: HostCapabilities,
+  supervisor: SupervisorInfo,
   targetConcurrency: Schema.Number,
   security: SecurityStatement,
   arms: Schema.Array(ArmResult),
   matrix: Schema.Array(MatrixRow),
   recommendation: Recommendation,
   residuals: Schema.Array(Schema.String),
-  evidence: EvidenceStatus,
+  evidence: EvidenceBinding,
 })
 export type SpikeResult = typeof SpikeResult.Type

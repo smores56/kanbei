@@ -1,37 +1,42 @@
-import { Effect, Ref, Scope } from "effect"
-import { nowMs, ProbeError, readTextFile, runCommand, withTimeout } from "../exec.ts"
+import { Effect, Scope } from "effect"
+import { nowMs, ProbeError, readTextFile, withTimeout } from "../exec.ts"
 import { makeLineChannel } from "../line-channel.ts"
+import { AGENT_MEMORY_MAX_MIB, AGENT_TASKS_MAX } from "../protocol.ts"
+import { sandboxCommand, sandboxPath } from "../sandbox.ts"
 import {
-  AGENT_CPU_QUOTA_PERCENT,
-  AGENT_MEMORY_MAX_MIB,
-  AGENT_TASKS_MAX,
-  AGENT_WALL_CLOCK_SECONDS,
-} from "../protocol.ts"
+  awaitEmpty,
+  cgroupDirectory,
+  cgroupProcs,
+  createAgentCgroup,
+  killCgroup,
+  migratePid,
+  parsePpid,
+  removeCgroup,
+} from "../supervisor.ts"
+import type { AgentLimits, Supervisor } from "../supervisor.ts"
 
 /**
- * Minimal process-arm supervision surface: start one agent under a cgroup and
- * rlimits, speak the line protocol, expose its cgroup path, and stop the unit.
- * Measurement probes live in `process-cgroup.ts` and are excluded from the
- * operability line count.
+ * Process-arm supervision surface: one agent per delegated cgroup, each inside
+ * its own rootless user+PID+mount namespace and chroot with Landlock. The
+ * `unshare` child is the namespace waiter, never the agent: signals and limits
+ * use the cgroup and the agent's discovered host pid.
  */
 export interface ProcessSupervisionConfig {
   readonly runId: string
   readonly agentScript: string
-  readonly memoryMaxMib: number
-  readonly tasksMax: number
+  readonly entryScript: string
+  readonly sourceDir: string
+  readonly workRoot: string
+  readonly supervisor: Supervisor
 }
 
-/** Alias kept for the probe module, which configures the same shape. */
 export type ProcessArmConfig = ProcessSupervisionConfig
 
-interface AgentLimits {
-  readonly memoryMaxMib: number
-  readonly tasksMax: number
-}
-
 export interface ProcessAgent {
-  readonly unit: string
-  readonly pid: number
+  /** Host pid of the agent (PID 1 inside its namespace). */
+  readonly agentPid: number
+  /** Pid the agent reported; relative to the PID namespace, never used for signals. */
+  readonly namespacePid: number
   readonly cgroupPath: string
   readonly readyMs: number
   readonly take: Effect.Effect<string, ProbeError>
@@ -41,81 +46,115 @@ export interface ProcessAgent {
     prefix: string,
   ) => Effect.Effect<{ readonly reply: string; readonly ms: number }, ProbeError>
   readonly status: Effect.Effect<Deno.CommandStatus, ProbeError>
-  readonly stderrText: Effect.Effect<string>
+  /** cgroup.kill, wait for populated=0, remove the cgroup, reap the waiter. Never fails. */
+  readonly stop: Effect.Effect<void>
 }
 
 export const PROCESS_SUPERVISION_FILES: ReadonlyArray<string> = [
+  "src/spikes/isolation/supervisor.ts",
+  "src/spikes/isolation/sandbox.ts",
+  "src/spikes/isolation/sandbox-entry.ts",
   "src/spikes/isolation/arms/process-supervision.ts",
   "src/spikes/isolation/agent-process.ts",
   "src/spikes/isolation/line-channel.ts",
 ]
-export const stopUnit = (unit: string): Effect.Effect<void> =>
+
+const fail = (operation: string, detail: string): ProbeError =>
+  new ProbeError({ operation, detail })
+
+const supervisorCgroup = (config: ProcessArmConfig): string =>
+  cgroupDirectory(config.supervisor, "supervisor")
+
+const parentOf = (pid: number): Effect.Effect<number | null> =>
+  readTextFile(`/proc/${pid}/stat`).pipe(
+    Effect.map((text) => (text === null ? null : parsePpid(text))),
+    Effect.catch(() => Effect.succeed(null)),
+  )
+
+/**
+ * Moves any child of the waiter that forked before the waiter was migrated out
+ * of the supervisor cgroup; later forks inherit the agent cgroup directly.
+ */
+const adoptChildren = (
+  config: ProcessArmConfig,
+  cgroupPath: string,
+  waiterPid: number,
+): Effect.Effect<void, ProbeError> =>
   Effect.gen(function* () {
-    yield* runCommand("systemctl", ["--user", "stop", unit]).pipe(Effect.catch(() => Effect.void))
-    yield* runCommand("systemctl", ["--user", "reset-failed", unit]).pipe(
-      Effect.catch(() => Effect.void),
+    const procs = yield* cgroupProcs(supervisorCgroup(config))
+    yield* Effect.forEach(
+      procs.filter((pid) => pid !== waiterPid),
+      (pid) =>
+        parentOf(pid).pipe(
+          Effect.flatMap((ppid) =>
+            ppid === waiterPid
+              ? migratePid(cgroupPath, pid).pipe(Effect.catch(() => Effect.void))
+              : Effect.void
+          ),
+        ),
+      { discard: true },
     )
   })
 
-export const resolveCgroupPath = (unit: string): Effect.Effect<string, ProbeError> =>
-  runCommand("systemctl", ["--user", "show", "--property", "ControlGroup", "--value", unit]).pipe(
-    Effect.map((output) => output.stdout.trim()),
-  )
-
-export const unitResult = (unit: string): Effect.Effect<string, ProbeError> =>
-  runCommand("systemctl", ["--user", "show", "--property", "Result", "--value", unit]).pipe(
-    Effect.map((output) => output.stdout.trim()),
-  )
-
-export const cgroupCpuUsec = (cgroupPath: string): Effect.Effect<number> =>
-  readTextFile(`/sys/fs/cgroup${cgroupPath}/cpu.stat`).pipe(
-    Effect.map((text) => {
-      const match = /^usage_usec\s+(\d+)$/mu.exec(text ?? "")
-      return match?.[1] === undefined ? 0 : Number(match[1])
-    }),
-    Effect.catch(() => Effect.succeed(0)),
-  )
-
-/** Soft value of a `/proc/<pid>/limits` row. */
-export const rlimitSoft = (text: string | null, label: string): string => {
-  const row = (text ?? "").split("\n").find((line) => line.startsWith(label))
-  if (row === undefined) return "unknown"
-  return row.slice(label.length).trim().split(/\s+/u)[0] ?? "unknown"
-}
-
-const drain = (
-  stream: ReadableStream<Uint8Array>,
-  sink: Ref.Ref<ReadonlyArray<string>>,
-): Effect.Effect<void> =>
+const pollAgentPid = (
+  config: ProcessArmConfig,
+  cgroupPath: string,
+  waiterPid: number,
+  timeoutMs: number,
+): Effect.Effect<number, ProbeError> =>
   Effect.gen(function* () {
-    const reader = stream.getReader()
-    const decoder = new TextDecoder()
-    const loop: Effect.Effect<void> = Effect.gen(function* () {
-      const chunk = yield* Effect.tryPromise(() => reader.read()).pipe(
-        Effect.catch(() => Effect.succeed({ done: true as const, value: undefined })),
-      )
-      if (chunk.done) return
-      const text = decoder.decode(chunk.value, { stream: true })
-      yield* Effect.forEach(
-        text.split("\n").map((line) => line.trim()).filter((line) => line !== ""),
-        (line) => Ref.update(sink, (lines) => [...lines.slice(-19), line]),
-        { discard: true },
-      )
-      return yield* loop
-    })
-    yield* loop
+    const deadline = Date.now() + timeoutMs
+    const loop = (): Effect.Effect<number, ProbeError> =>
+      Effect.gen(function* () {
+        yield* adoptChildren(config, cgroupPath, waiterPid)
+        const procs = yield* cgroupProcs(cgroupPath)
+        const agent = procs.find((pid) => pid !== waiterPid)
+        if (agent !== undefined) return agent
+        if (Date.now() >= deadline) {
+          return yield* Effect.fail(
+            fail(
+              "discover agent pid",
+              `no agent pid in ${cgroupPath} after ${timeoutMs} ms (waiter ${waiterPid}, cgroup ${
+                procs.join(",") || "<empty>"
+              })`,
+            ),
+          )
+        }
+        yield* Effect.sleep("5 millis")
+        return yield* loop()
+      })
+    return yield* loop()
   })
 
-export const processMarkerPids = (marker: string): ReadonlyArray<number> =>
-  [...Deno.readDirSync("/proc")].flatMap((entry) => {
-    if (!/^\d+$/u.test(entry.name)) return []
-    try {
-      const cmdline = new TextDecoder().decode(Deno.readFileSync(`/proc/${entry.name}/cmdline`))
-      return cmdline.includes(marker) ? [Number(entry.name)] : []
-    } catch {
-      return []
-    }
+const workDirectory = (config: ProcessArmConfig, slot: number): string =>
+  `${config.workRoot}/slot-${slot}`
+
+const startSandbox = (config: ProcessArmConfig, slot: number): Effect.Effect<void, ProbeError> =>
+  Effect.tryPromise({
+    try: () => Deno.mkdir(`${workDirectory(config, slot)}/scratch/deno-cache`, { recursive: true }),
+    catch: (error) => fail("prepare sandbox", String(error)),
   })
+
+const stopAgent = (
+  cgroupPath: string,
+  work: string,
+  handle: Deno.ChildProcess,
+): Effect.Effect<void> =>
+  killCgroup(cgroupPath).pipe(
+    Effect.catch(() => Effect.void),
+    Effect.flatMap(() =>
+      awaitEmpty(cgroupPath, 2_000).pipe(Effect.catch(() => Effect.succeed(false)))
+    ),
+    Effect.flatMap(() => removeCgroup(cgroupPath).pipe(Effect.catch(() => Effect.void))),
+    Effect.flatMap(() => Effect.tryPromise(() => handle.status).pipe(Effect.timeout("2 seconds"))),
+    Effect.catch(() => Effect.void),
+    Effect.flatMap(() =>
+      Effect.tryPromise(() => Deno.remove(work, { recursive: true })).pipe(
+        Effect.catch(() => Effect.void),
+      )
+    ),
+    Effect.catch(() => Effect.void),
+  )
 
 export const startAgent = (
   config: ProcessArmConfig,
@@ -124,120 +163,87 @@ export const startAgent = (
   extraEnvironment?: Readonly<Record<string, string>>,
 ): Effect.Effect<ProcessAgent, ProbeError, Scope.Scope> =>
   Effect.gen(function* () {
-    const unit = `kanbei-iso-${config.runId}-${slot}`
     const startedAt = nowMs()
-    const args = [
-      "--user",
-      "--unit",
-      unit,
-      "--pipe",
-      "--wait",
-      "--quiet",
-      "--property",
-      `MemoryMax=${limits.memoryMaxMib}M`,
-      "--property",
-      "MemorySwapMax=0",
-      "--property",
-      `TasksMax=${limits.tasksMax}`,
-      "--property",
-      `CPUQuota=${AGENT_CPU_QUOTA_PERCENT}%`,
-      "--property",
-      `RuntimeMaxSec=${AGENT_WALL_CLOCK_SECONDS}s`,
-      "--property",
-      "KillMode=control-group",
-      "--property",
-      "TimeoutStopSec=2",
-      ...Object.entries(extraEnvironment ?? {}).flatMap(([key, value]) => [
-        "--setenv",
-        `${key}=${value}`,
-      ]),
-      "sh",
-      "-c",
-      `ulimit -c 0; ulimit -n 256; ulimit -f 32768; exec '${Deno.execPath()}' run --allow-env --allow-run ${config.agentScript}`,
-    ]
-
+    const cgroupPath = yield* createAgentCgroup(config.supervisor, slot, limits)
+    const work = workDirectory(config, slot)
+    yield* startSandbox(config, slot)
+    const command = sandboxCommand({
+      sandboxRoot: `${work}/root`,
+      scratchDir: `${work}/scratch`,
+      sourceDir: config.sourceDir,
+      denoPath: Deno.execPath(),
+      entryScript: sandboxPath(config.sourceDir, config.entryScript),
+      agentScript: sandboxPath(config.sourceDir, config.agentScript),
+      environment: extraEnvironment ?? {},
+    })
     const child = yield* Effect.acquireRelease(
-      Effect.sync(() =>
-        new Deno.Command("systemd-run", {
-          args,
-          stdin: "piped",
-          stdout: "piped",
-          stderr: "piped",
-        }).spawn()
-      ),
-      (handle) =>
-        Effect.gen(function* () {
-          yield* stopUnit(unit)
-          yield* Effect.tryPromise(() => handle.status).pipe(
-            Effect.timeout("5 seconds"),
-            Effect.catch(() => Effect.void),
-          )
-        }),
+      Effect.try({
+        try: () =>
+          new Deno.Command(command.command, {
+            args: [...command.args],
+            env: { ...command.env },
+            stdin: "piped",
+            stdout: "piped",
+            stderr: "inherit",
+          }).spawn(),
+        catch: (error) => fail(`${config.runId} spawn`, String(error)),
+      }),
+      (handle) => stopAgent(cgroupPath, work, handle),
     )
-
-    const stderrSink = yield* Ref.make<ReadonlyArray<string>>([])
-    yield* Effect.forkScoped(drain(child.stderr, stderrSink))
+    const waiterPid = child.pid
+    const statusPromise = child.status
     const channel = yield* makeLineChannel(child.stdout, child.stdin)
+    // Migrate before the agent touches memory so all its pages are charged to its
+    // own cgroup; migrating a running V8 heap leaves old charges behind.
+    yield* migratePid(cgroupPath, waiterPid).pipe(Effect.catch(() => Effect.void))
+    const agentPid = yield* pollAgentPid(config, cgroupPath, waiterPid, 5_000)
     const readyLine = yield* Effect.race(
-      withTimeout(channel.take, 15_000, `${unit} ready`),
+      withTimeout(channel.take, 20_000, `agent ${slot} ready`),
       Effect.tryPromise({
-        try: () => child.status,
-        catch: (error) => new ProbeError({ operation: unit, detail: String(error) }),
-      }).pipe(
-        Effect.flatMap((status) =>
-          Ref.get(stderrSink).pipe(
-            Effect.flatMap((lines) =>
-              Effect.fail(
-                new ProbeError({
-                  operation: unit,
-                  detail:
-                    `agent exited before ready (code=${status.code} signal=${status.signal}): ${
-                      lines.join(" | ")
-                    }`,
-                }),
-              )
-            ),
-          )
+        try: () => statusPromise,
+        catch: (error) => fail(`agent ${slot}`, String(error)),
+      })
+        .pipe(
+          Effect.flatMap((status) =>
+            Effect.fail(
+              fail(
+                `agent ${slot}`,
+                `sandbox exited before ready (code=${status.code}); see supervisor stderr`,
+              ),
+            )
+          ),
         ),
-      ),
     )
     const [tag = "", pidText = "0"] = readyLine.split(" ")
     if (tag !== "READY") {
-      return yield* Effect.fail(
-        new ProbeError({ operation: unit, detail: `unexpected startup line: ${readyLine}` }),
-      )
+      return yield* Effect.fail(fail(`agent ${slot}`, `unexpected startup line: ${readyLine}`))
     }
-    const cgroupPath = yield* resolveCgroupPath(unit)
-    const statusPromise = child.status
-    const readyMs = nowMs() - startedAt
+    const status: Effect.Effect<Deno.CommandStatus, ProbeError> = Effect.tryPromise({
+      try: () => statusPromise,
+      catch: (error) => fail(`agent ${slot} status`, String(error)),
+    })
     return {
-      unit,
-      pid: Number(pidText),
+      agentPid,
+      waiterPid,
+      namespacePid: Number(pidText),
       cgroupPath,
-      readyMs,
+      readyMs: nowMs() - startedAt,
       take: channel.take,
       send: channel.send,
       request: (line, prefix) =>
         Effect.gen(function* () {
           const sentAt = nowMs()
           yield* channel.send(line)
-          const reply = yield* withTimeout(channel.take, 10_000, `${unit} ${line}`)
+          const reply = yield* withTimeout(channel.take, 10_000, `agent ${slot} ${line}`)
           if (!reply.startsWith(prefix)) {
             return yield* Effect.fail(
-              new ProbeError({ operation: unit, detail: `expected ${prefix}, received ${reply}` }),
+              fail(`agent ${slot}`, `expected ${prefix}, received ${reply}`),
             )
           }
           return { reply, ms: nowMs() - sentAt }
         }),
-      status: Effect.tryPromise({
-        try: () => statusPromise,
-        catch: (error) =>
-          new ProbeError({
-            operation: `${unit} status`,
-            detail: error instanceof Error ? error.message : String(error),
-          }),
-      }),
-      stderrText: Ref.get(stderrSink).pipe(Effect.map((lines) => lines.join(" | "))),
+      status,
+      stop: stopAgent(cgroupPath, work, child),
     }
   })
 

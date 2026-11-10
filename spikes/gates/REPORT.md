@@ -1,6 +1,6 @@
 # A5 — Gate consolidation and baseline freeze
 
-Status: `partially-signed` — `DG-2` and `DG-3` closed; `DG-1` and `DG-4` blocked.
+Status: `partially-signed` — `DG-2` and `DG-3` closed; `DG-1` blocked; `DG-4` re-run complete and awaiting human sign-off.
 
 ## Inputs
 
@@ -20,9 +20,11 @@ Status: `partially-signed` — `DG-2` and `DG-3` closed; `DG-1` and `DG-4` block
 
 Status: **blocked**. Recommendation: **none**.
 
-All 600 model cells (18,000 planned trials) are blocked. The local matrix resolved Monty, Deno, Node, Lua 5.4, Luau, Bash, and CPython, and measured startup, RSS, host-call overhead, snapshot support, capability posture, and progressive disclosure. Those measurements are context only; they do not select a language.
+The pre-registration was amended before any trial: `AMD-1` (recorded 2026-11-10, `beforeTrials: true`) replaced the two-provider requirement with a single provider, NeuralWatt, serving primary `deepseek-v4.1-flash` and smaller `qwen-3.8-27b` under `NEURALWATT_API_KEY`. The manifest is frozen at `spikes/language/model-manifest.json`, and `FI-03` names both model IDs. Zero of 9,000 planned trials ran, so this is a pre-data amendment: it claims no measurement, no model selection, and no gate closure.
 
-NeuralWatt `deepseek-v4.1-flash` was verified with the provided key and returned `OK` at temperature 0. The key was not stored. LANG-1 still requires a second provider and a smaller model; only one provider credential exists. Other blockers: frozen sandbox profile, sealed `security-v1`, `FI-01`, `FI-06`, and a §7.0-registered dataset for the A4 task suite (`lang-v1` is not registered).
+All 300 model cells are blocked. The local matrix resolved Monty, Deno, Node, Lua 5.4, Luau, Bash, and CPython, and measured startup, RSS, host-call overhead, snapshot support, capability posture, and progressive disclosure. Those measurements are context only; they do not select a language.
+
+Remaining blockers: no live provider adapter or model trials exist; `NEURALWATT_API_KEY` is not configured, so every model cell stays blocked; the sandbox profile is not frozen (`MI-04`, `sandboxPosture=unverified`); `FI-01` runtime versions and `FI-06` hardware and ceilings are unfrozen; `lang-v1` is not a §7.0-registered dataset. A single liveness probe of `deepseek-v4.1-flash` returned `OK` at temperature 0; the key was not stored, and the probe is not a trial.
 
 ### `DG-2` — control-plane runtime
 
@@ -40,9 +42,11 @@ Required conditions for option E: unprivileged user namespaces and a compatible 
 
 ### `DG-4` — inter-agent isolation
 
-Status: **blocked**. Recommendation: **process-cgroup**, pending S3 re-run under the E supervisor identity.
+Status: **blocked**. Recommendation: **process-cgroup**. The S3 re-run is complete; human sign-off is the only remaining gate action.
 
-`process-cgroup` is the only eligible arm. It passed crash, hang, OOM, fork-bomb, cleanup, orphan-reaping, IPC, resource-ceiling, and workload checks, with p95 cold start 429 ms, 15.8 MiB per agent at 16 agents, and IPC p95 0.35 ms. `wasm-instance` is excluded because it has no CPU/fuel ceiling and cannot host the LANG-1 workload. `microvm` is blocked because no runtime or sealed guest image exists on this host. **No security property is claimed** for any arm. DG-4 is also not closed: DG-3 must fix which UID owns the delegated cgroup subtree, and S3 must be re-run under that supervisor identity. SD-10 means a same-UID agent can raise its own `memory.max`, so the containment pass holds only for non-hostile agents.
+`process-cgroup` is the only eligible arm. S3 was re-run under `DG-3` option E: the supervisor runs outside the agent sandbox as the deployment user and owns one delegated cgroup root; each agent runs as the init of its own rootless user+PID+mount namespace with a chroot root, a Landlock ruleset applied before agent code, and a cgroup directory under that root. All nine containment checks passed, and every pre-registered budget held: p95 cold start 416 ms, 16.3 MiB per agent at 16 agents, IPC p95 0.52 ms, 700 implementation lines, and 2 host dependencies. `wasm-instance` is excluded because it has no CPU/fuel ceiling and cannot host the LANG-1 workload. `microvm` is blocked because no runtime or sealed guest image exists on this host. **No security property is claimed** for any arm. The run emitted an `EvidenceEnvelope` at `spikes/isolation/envelope.json` (testId `S3`, fixture `security-v1@1.0.0`, outcome `pass`).
+
+Residuals carried to sign-off: agent, supervisor, and broker share one UID; no seccomp policy and io_uring remains enabled; `/sys` is intentionally unmounted and never granted by Landlock, which is what reverses `SD-10` for the agent itself; containment is measured for non-hostile agents only. A one-time systemd user cgroup delegation remains the single systemd call.
 
 ## Operator envelope
 
@@ -50,18 +54,18 @@ Status: **blocked**. Recommendation: **process-cgroup**, pending S3 re-run under
 
 ## Baseline freeze
 
-Not performed. A baseline cannot be frozen while `DG-1` through `DG-4` remain unsigned and `security-v1` is unsealed. The harness configuration that is fixed today is:
+Not performed. A baseline cannot be frozen while `DG-1` and `DG-4` remain unsigned. The harness configuration that is fixed today is:
 
 - Deno 2.9.2 and Effect 4.1.2.
-- Sealed fixtures: `journey-v1`, `append-v1`, `cost-v1`, `ui-v1`.
+- Sealed fixtures: `journey-v1`, `append-v1`, `cost-v1`, `ui-v1`, `security-v1`.
 - Evidence contracts and virtual clock/synthetic network from A0.
 - Pre-registrations in `src/spikes/runtime/plan.ts`, `src/spikes/deployment/matrix.ts`, `src/spikes/isolation/protocol.ts`, and `src/spikes/language/pre-registration.ts`.
 
 ## Evidence binding gaps
 
-- `security-v1` is not registered or sealed. A1’s permission probes, A2’s host probes, A3’s isolation probes, and A4’s security cells therefore lack a dataset-bound `EvidenceEnvelope`.
+- `security-v1` is registered and sealed in this tree. The S3 re-run emits an `EvidenceEnvelope` bound to `security-v1@1.0.0` (testId `S3`, outcome `pass`); A1’s permission probes and A2’s host probes still lack a dataset-bound envelope, and A4’s security cells remain blocked with the model arm.
 - A4 issued no envelope because the model arm is blocked.
-- A2 and A3 emitted measurement records, not envelopes, for the same `security-v1` reason.
+- A2 emitted a measurement record rather than an envelope; A3 now emits one.
 - A2b is a measurement record; it is not an `EvidenceEnvelope` and does not close `DG-3`.
 - A1 emitted a measurement envelope bound to `append-v1`; it is now marked `blocked` because `cost-v1` and `security-v1` bindings are absent.
 
@@ -69,16 +73,16 @@ These are recorded blockers, not waivers.
 
 ## Shared Nix store
 
-A2c bootstrapped a single private store, mounted it at `/nix/store`, and built `nixpkgs#hello` without touching host `/nix/store`. Direct execution of the built path passed. `nix shell` package-environment lookup still fails, so `nix profile` is not yet proven. This is a build/direct path, not a complete package-install path.
+A2c bootstrapped a single private store, mounted it at `/nix/store`, and built `nixpkgs#hello` without touching host `/nix/store`. Direct execution, `nix shell`, `nix run`, `nix profile add/list`, and execution from the installed profile all pass. The earlier `nix shell` ENOENT was a probe bug: Landlock denied `openat("/proc/self/root")`, which Nix uses to re-anchor its root after a mount-namespace round-trip; granting read on the sandbox root fixes it. `nix develop` remains unsupported because the sandbox mounts no `/dev` or `/dev/pts`.
 
 ## Cross-gate dependency
 
-`DG-3` and `DG-4` are operationally coupled. A3 measured `process-cgroup` under the deployment user systemd user manager. Variant E keeps the supervisor outside the rootless sandbox but still under the deployment user; variant D moves it to a dedicated system unit. Until DG-3 chooses E or D and fixes which identity owns the delegated cgroup subtree, DG-4 cannot be treated as measured in the target posture. S3 must be re-run under that identity before the recommendations compose.
+`DG-3` and `DG-4` are operationally coupled. S3 was re-run under `DG-3` option E: the supervisor is the deployment user outside the rootless agent sandbox and owns the delegated cgroup root, so the two recommendations now compose. `DG-3` variant D would still move the supervisor to a dedicated system unit; the S3 record would then need a re-run under that identity.
 
 ## Required human decisions
 
 1. `DG-2` is signed as Deno 2.9.2; no further action.
-2. `DG-3` is signed as option E; S3 must be re-run under the rootless supervisor identity.
-3. `DG-4` remains blocked pending that S3 re-run.
-4. `DG-1` remains blocked: provide a second provider plus a smaller model, or explicitly amend LANG-1 to one provider and accept the weaker evidence.
-5. Seal `security-v1` and re-run S1–S3, or accept the evidence gap. This is implementation work, not another gate decision.
+2. `DG-3` is signed as option E; the S3 re-run under that supervisor identity is complete.
+3. `DG-4` awaits human sign-off; `process-cgroup` is the measured recommendation and the envelope is emitted, with no further measurement action outstanding.
+4. `DG-1` remains blocked: the two-provider requirement is amended (`AMD-1`), so the remaining work is a live NeuralWatt adapter, `NEURALWATT_API_KEY`, a frozen sandbox profile, and complete paired trials. No recommendation may be claimed before those trials run.
+5. Re-run S1 and S2 so their security probes bind to the sealed `security-v1` dataset, or accept the evidence gap. S3 is already bound. A4 issues no envelope while every model cell is blocked. This is implementation work, not another gate decision.

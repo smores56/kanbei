@@ -1,11 +1,6 @@
 /**
- * S3 process-arm agent.
- *
- * Entry point launched by the supervisor under a cgroup and rlimits. It speaks a
- * line protocol on stdin/stdout. It deliberately reads no `/proc` or `/sys`: Deno
- * denies even `/proc/self` under a narrow `--allow-read` grant, so all resource
- * observation happens on the supervisor side. The agent therefore runs with the
- * smallest useful permission set.
+ * S3 process-arm agent: a line protocol on stdin/stdout inside the sandbox.
+ * It reads no `/proc` or `/sys`; all resource observation is supervisor-side.
  */
 const encoder = new TextEncoder()
 
@@ -62,10 +57,26 @@ const handle = (line: string): boolean => {
       const marker = Deno.env.get("KANBEI_ISO_MARKER") ?? "kanbei-iso-orphan"
       const child = new Deno.Command("sh", {
         args: ["-c", "sleep 300", marker],
-        stdout: "null",
-        stderr: "null",
+        stdin: "inherit",
+        stdout: "piped",
+        stderr: "piped",
       }).spawn()
+      child.unref()
       stdout(`SPAWNED ${child.pid}`)
+      return true
+    }
+    case "FORKBOMB": {
+      const marker = Deno.env.get("KANBEI_ISO_MARKER") ?? "kanbei-iso-forkbomb"
+      const script =
+        `i=0; while [ $i -lt 200 ]; do ( sh -c 'sleep 30' '${marker}' & ); i=$((i+1)); done; wait`
+      const child = new Deno.Command("sh", {
+        args: ["-c", script],
+        stdin: "inherit",
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn()
+      child.unref()
+      stdout(`FORKBOMB ${child.pid}`)
       return true
     }
     case "CRASH":

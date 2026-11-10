@@ -35,12 +35,7 @@ const pump = (
     return yield* pump(reader, queue, rest)
   })
 
-/**
- * Line-oriented pipe channel for a supervised child process.
- *
- * Adapter code: it owns stream handles, so the reader fiber is scoped and the
- * writer is closed by the caller's finalizer.
- */
+/** Line-oriented pipe channel; adapter code owns the stream handles. */
 export const makeLineChannel = (
   stdout: ReadableStream<Uint8Array>,
   stdin: WritableStream<Uint8Array>,

@@ -1,12 +1,13 @@
 import { Effect } from "effect"
-import { pathExists, readNumericFile, readTextFile, runCommand, runShell } from "./exec.ts"
+import { probeLandlockAbi } from "../deployment/rootless/landlock.ts"
+import { pathExists, readTextFile, runCommand, runShell } from "./exec.ts"
+import { CGROUP_MOUNT, cgroupMountOptions, parseControllers } from "./supervisor.ts"
+import type { Supervisor } from "./supervisor.ts"
 import type { HostCapabilities } from "./types.ts"
 
-const CGROUP_ROOT = "/sys/fs/cgroup"
-
 const controllers = (): Effect.Effect<ReadonlyArray<string>, never> =>
-  readTextFile(`${CGROUP_ROOT}/cgroup.controllers`).pipe(
-    Effect.map((text) => (text ?? "").trim().split(/\s+/u).filter((item) => item !== "")),
+  readTextFile(`${CGROUP_MOUNT}/cgroup.controllers`).pipe(
+    Effect.map((text) => parseControllers(text ?? "")),
     Effect.catch(() => Effect.succeed([])),
   )
 
@@ -19,30 +20,26 @@ const memTotalBytes = (): Effect.Effect<number, never> =>
     Effect.catch(() => Effect.succeed(0)),
   )
 
-const systemdDelegation = (): Effect.Effect<readonly [boolean, string], never> => {
-  const unit = `kanbei-iso-probe-${Deno.pid}`
-  return runCommand("systemd-run", [
-    "--user",
-    "--unit",
-    unit,
-    "--collect",
-    "--pipe",
-    "--wait",
-    "--quiet",
-    "--property",
-    "MemoryMax=32M",
-    "--property",
-    "TasksMax=8",
-    "true",
-  ]).pipe(
-    Effect.map((output) =>
-      output.code === 0
-        ? ([true, `systemd-run --user accepted MemoryMax=32M TasksMax=8 (exit 0)`] as const)
-        : ([false, `systemd-run --user rejected the probe (exit ${output.code})`] as const)
-    ),
-    Effect.catch((error) => Effect.succeed([false, error.detail] as const)),
+/** Unprivileged user namespaces are the substrate; there is no privileged fallback. */
+const userNamespaces = (): Effect.Effect<boolean, never> =>
+  runCommand("unshare", ["-Urpf", "true"]).pipe(
+    Effect.map((output) => output.code === 0),
+    Effect.catch(() => Effect.succeed(false)),
   )
-}
+
+const landlockAbi = (): Effect.Effect<number, never> =>
+  Effect.try({ try: () => probeLandlockAbi(), catch: () => 0 }).pipe(
+    Effect.catch(() => Effect.succeed(0)),
+  )
+
+const delegatedParentOwned = (supervisor: Supervisor): Effect.Effect<boolean, never> =>
+  Effect.tryPromise({
+    try: async () => {
+      const info = await Deno.stat(`${CGROUP_MOUNT}${supervisor.cgroupRoot}`)
+      return info.uid === Deno.uid()
+    },
+    catch: () => false,
+  }).pipe(Effect.catch(() => Effect.succeed(false)))
 
 const kvmDevice = (): Effect.Effect<HostCapabilities["kvmDevice"], never> =>
   Effect.gen(function* () {
@@ -58,7 +55,6 @@ const kvmDevice = (): Effect.Effect<HostCapabilities["kvmDevice"], never> =>
     }).pipe(Effect.catch(() => Effect.succeed("present-not-accessible" as const)))
   })
 
-/** MicroVM runtimes are counted only when their binary is on PATH. */
 const splitPaths = (text: string): ReadonlyArray<string> =>
   text.split("\n").map((line) => line.trim()).filter((line) => line !== "")
 
@@ -76,28 +72,36 @@ const virtualisationBinaries = (): Effect.Effect<
     Effect.catch(() => Effect.succeed([[], []] as const)),
   )
 
-export const probeHost: Effect.Effect<HostCapabilities> = Effect.gen(function* () {
-  const cgroupControllers = yield* controllers()
-  const [delegated, systemdProbe] = yield* systemdDelegation()
-  const kvm = yield* kvmDevice()
-  const [microvmRuntimes, generalVmm] = yield* virtualisationBinaries()
-  const totalMemoryBytes = yield* memTotalBytes()
-  return {
-    kernel: `${Deno.build.os}-${Deno.osRelease()}`,
-    runtime: `deno@${Deno.version.deno}`,
-    cpus: navigator.hardwareConcurrency,
-    totalMemoryBytes,
-    cgroupVersion: cgroupControllers.length > 0 ? "v2" : "none",
-    cgroupControllers: [...cgroupControllers],
-    systemdUserDelegation: delegated ? "available" : "unavailable",
-    systemdProbe,
-    kvmDevice: kvm,
-    microvmRuntimes: [...microvmRuntimes],
-    generalVmm: [...generalVmm],
-    wasmEngine: `v8@${Deno.version.v8} (core wasm, no WASI runtime on PATH)`,
-    privilegedOperations: false,
-  }
-})
+export const probeHost = (supervisor: Supervisor): Effect.Effect<HostCapabilities> =>
+  Effect.gen(function* () {
+    const cgroupControllers = yield* controllers()
+    const namespaces = yield* userNamespaces()
+    const abi = yield* landlockAbi()
+    const mountOptions = yield* readTextFile("/proc/self/mountinfo").pipe(
+      Effect.catch(() => Effect.succeed(null)),
+    )
+    const owned = yield* delegatedParentOwned(supervisor)
+    const kvm = yield* kvmDevice()
+    const [microvmRuntimes, generalVmm] = yield* virtualisationBinaries()
+    const totalMemoryBytes = yield* memTotalBytes()
+    return {
+      kernel: `${Deno.build.os}-${Deno.osRelease()}`,
+      runtime: `deno@${Deno.version.deno}`,
+      cpus: navigator.hardwareConcurrency,
+      totalMemoryBytes,
+      cgroupVersion: cgroupControllers.length > 0 ? "v2" : "none",
+      cgroupControllers: [...cgroupControllers],
+      userNamespaces: namespaces ? "available" : "unavailable",
+      landlockAbi: abi,
+      cgroupNsdelegate: cgroupMountOptions(mountOptions ?? "").includes("nsdelegate"),
+      delegatedParent: owned ? "owned-by-uid" : "not-owned",
+      kvmDevice: kvm,
+      microvmRuntimes: [...microvmRuntimes],
+      generalVmm: [...generalVmm],
+      wasmEngine: `v8@${Deno.version.v8} (core wasm, no WASI runtime on PATH)`,
+      privilegedOperations: false,
+    }
+  })
 
 export const memoryAvailableBytes: Effect.Effect<number> = readTextFile("/proc/meminfo").pipe(
   Effect.map((text) => {
@@ -106,23 +110,3 @@ export const memoryAvailableBytes: Effect.Effect<number> = readTextFile("/proc/m
   }),
   Effect.catch(() => Effect.succeed(0)),
 )
-
-export const cgroupCurrentBytes = (cgroupPath: string): Effect.Effect<number> =>
-  readNumericFile(`${CGROUP_ROOT}${cgroupPath}/memory.current`).pipe(
-    Effect.map((value) => value ?? 0),
-    Effect.catch(() => Effect.succeed(0)),
-  )
-
-export const cgroupPidsCurrent = (cgroupPath: string): Effect.Effect<number> =>
-  readNumericFile(`${CGROUP_ROOT}${cgroupPath}/pids.current`).pipe(
-    Effect.map((value) => value ?? 0),
-    Effect.catch(() => Effect.succeed(0)),
-  )
-
-export const cgroupPidsMax = (cgroupPath: string): Effect.Effect<number | null> =>
-  readNumericFile(`${CGROUP_ROOT}${cgroupPath}/pids.max`).pipe(
-    Effect.catch(() => Effect.succeed(null)),
-  )
-
-export const cgroupExists = (cgroupPath: string): Effect.Effect<boolean> =>
-  pathExists(`${CGROUP_ROOT}${cgroupPath}`).pipe(Effect.catch(() => Effect.succeed(false)))

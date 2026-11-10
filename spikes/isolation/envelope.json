@@ -1,0 +1,58 @@
+{
+  "testId": "S3",
+  "invariantIds": [
+    "crash-isolation",
+    "hang-containment",
+    "oom-containment",
+    "fork-bomb-containment",
+    "cleanup-after-kill",
+    "orphan-reaping",
+    "ipc-round-trip",
+    "resource-ceilings",
+    "hosts-agent-workload"
+  ],
+  "fixtureVersion": "security-v1@1.0.0",
+  "canonicalHead": {
+    "seq": 0,
+    "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "sequenceRange": [
+    0,
+    0
+  ],
+  "environment": {
+    "hostFingerprint": "sha256:e626bea75247a2aaaebaef3e951d5700b34ec2a7a965e7857bb853fecc66dd24",
+    "kernel": "linux-6.18.39",
+    "runtime": "deno@2.9.2",
+    "sandboxPosture": "unverified",
+    "brokerIdentity": "unconfigured"
+  },
+  "seeds": [
+    0
+  ],
+  "modelRecordings": [],
+  "artifacts": [
+    "sha256:17853dc7d10831c12ef0582d63a15ceef71ba16e20b0b68056539fef46b8cde3"
+  ],
+  "outcome": "pass",
+  "metrics": {
+    "process-cgroup.checksPassed": 9,
+    "process-cgroup.checksFailed": 0,
+    "process-cgroup.coldStartP50Ms": 290.40914899999984,
+    "process-cgroup.coldStartP95Ms": 415.6055259999998,
+    "process-cgroup.ipcP50Ms": 0.3101110000002336,
+    "process-cgroup.ipcP95Ms": 0.5220509999999194,
+    "process-cgroup.rssPerAgentMib": 16.25390625,
+    "process-cgroup.densityAtTarget": 0,
+    "wasm-instance.checksPassed": 5,
+    "wasm-instance.checksFailed": 2,
+    "wasm-instance.coldStartP50Ms": 430.9009189999997,
+    "wasm-instance.coldStartP95Ms": 443.88539500000115,
+    "wasm-instance.ipcP50Ms": 0.14369000000078813,
+    "wasm-instance.ipcP95Ms": 0.2984010000000126,
+    "wasm-instance.rssPerAgentMib": 21.1640625,
+    "wasm-instance.densityAtTarget": 0,
+    "microvm.checksPassed": 0,
+    "microvm.checksFailed": 0
+  }
+}
