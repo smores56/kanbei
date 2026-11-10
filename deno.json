@@ -2,7 +2,8 @@
   "imports": {
     "@std/assert": "jsr:@std/assert@1",
     "effect": "npm:effect@4.1.2",
-    "@effect/sql-sqlite-node": "npm:@effect/sql-sqlite-node@4.1.2"
+    "@effect/sql-sqlite-node": "npm:@effect/sql-sqlite-node@4.1.2",
+    "@effect/platform-deno": "npm:@effect/platform-deno@4.1.2"
   },
   "compilerOptions": {
     "strict": true,
@@ -22,11 +23,17 @@
     "semiColons": false,
     "singleQuote": false,
     "proseWrap": "preserve",
-    "exclude": [".worktrees", "fixtures", "docs/design"]
+    "exclude": [
+      ".worktrees",
+      "fixtures",
+      "docs/design"
+    ]
   },
   "lint": {
     "rules": {
-      "tags": ["recommended"],
+      "tags": [
+        "recommended"
+      ],
       "include": [
         "no-console",
         "no-explicit-any",
@@ -37,19 +44,26 @@
         "no-throw-literal"
       ]
     },
-    "exclude": [".worktrees", "fixtures"]
+    "exclude": [
+      ".worktrees",
+      "fixtures"
+    ]
   },
   "tasks": {
     "fmt": "deno fmt",
     "fmt:check": "deno fmt --check",
-    "lint": "deno lint && deno run -A npm:oxlint@1.92.0 -c .oxlintrc.json --deny-warnings --import-plugin --promise-plugin src tests",
+    "lint": "deno lint && deno run -A npm:oxlint@1.92.0 -c .oxlintrc.json --deny-warnings --import-plugin --promise-plugin src tests scripts",
     "lint:fix": "deno lint --fix && deno run -A npm:oxlint@1.92.0 -c .oxlintrc.json --fix --import-plugin --promise-plugin src tests",
-    "typecheck": "deno check src tests",
+    "typecheck": "deno check src tests scripts",
     "test": "deno test --allow-read --allow-write --allow-env --allow-run --allow-net --allow-sys",
     "test:unit": "deno test --allow-read --allow-write --allow-env --allow-run --allow-net --allow-sys tests/unit",
     "verify": "deno task fmt:check && deno task lint && deno task typecheck && deno task test",
     "verify:fix": "deno task fmt && deno task lint:fix && deno task typecheck && deno task test",
     "hooks:install": "git config core.hooksPath .githooks && chmod +x .githooks/pre-commit",
-    "start": "deno run --allow-read --allow-env --allow-net --allow-run --allow-sys src/main.ts"
+    "start": "deno run --allow-read --allow-env --allow-net --allow-run --allow-sys src/main.ts",
+    "fixtures:seal": "deno run -A scripts/seal-fixtures.ts",
+    "evidence:dry-run": "deno run -A src/cli/evidence.ts dry-run",
+    "evidence:determinism": "deno run -A src/cli/evidence.ts determinism",
+    "evidence:failure": "deno run -A src/cli/evidence.ts failure"
   }
 }

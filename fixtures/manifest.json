@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "generatedBy": "deno task fixtures:seal",
+  "datasets": {
+    "journey-v1@1.0.0": {
+      "treeHash": "sha256:6df0b97f20aa4b416d9f8cbb9ea501fdbb2370d811cea93496ff8047b09c3428",
+      "files": {
+        "fixture.json": "sha256:e685f8e5f3bef948850b79da504edb367e22faf89b0a93cf1ae593bdce3df9fc"
+      }
+    },
+    "append-v1@1.0.0": {
+      "treeHash": "sha256:35c0caf6e59ab01c94fafff9785246c498a62616b8ddf25433c3c1d0879aa744",
+      "files": {
+        "fixture.json": "sha256:75f75ce5f0ae00f3e7f9abcc2713e82d1c9aebeff80d096cd39e2925e9895f9a"
+      }
+    }
+  }
+}

@@ -3,8 +3,7 @@
   "categories": {
     "correctness": "error",
     "suspicious": "error",
-    "perf": "error",
-    "pedantic": "warn"
+    "perf": "error"
   },
   "plugins": ["typescript", "unicorn", "oxc", "import", "promise"],
   "rules": {
@@ -12,6 +11,7 @@
     "no-debugger": "error",
     "no-alert": "error",
     "eqeqeq": "error",
+    "no-redeclare": "off",
     "no-var": "error",
     "prefer-const": "error",
     "typescript/no-explicit-any": "error",

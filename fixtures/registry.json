@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "datasets": [
+    {
+      "id": "journey-v1",
+      "version": "1.0.0",
+      "path": "fixtures/journey-v1"
+    },
+    {
+      "id": "append-v1",
+      "version": "1.0.0",
+      "path": "fixtures/append-v1"
+    }
+  ]
+}
