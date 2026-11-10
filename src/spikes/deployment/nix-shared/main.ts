@@ -1,31 +1,21 @@
 import { Effect } from "effect"
 
+interface StepResult {
+  readonly success: boolean
+  readonly code: number
+  readonly stdout: string
+  readonly stderr: string
+}
+
 interface NixResult {
   readonly abi?: number
-  readonly build?: {
-    readonly success: boolean
-    readonly code: number
-    readonly stdout: string
-    readonly stderr: string
-  }
-  readonly shell?: {
-    readonly success: boolean
-    readonly code: number
-    readonly stdout: string
-    readonly stderr: string
-  }
-  readonly direct?: {
-    readonly success: boolean
-    readonly code: number
-    readonly stdout: string
-    readonly stderr: string
-  }
-  readonly run?: {
-    readonly success: boolean
-    readonly code: number
-    readonly stdout: string
-    readonly stderr: string
-  }
+  readonly build?: StepResult
+  readonly shell?: StepResult
+  readonly direct?: StepResult
+  readonly run?: StepResult
+  readonly profile?: StepResult
+  readonly profileList?: StepResult
+  readonly profileExec?: StepResult
   readonly hello?: boolean
   readonly fatal?: string
 }
@@ -161,6 +151,10 @@ const runSpike = async (): Promise<Record<string, unknown>> => {
       { path: "/tmp", access: "write" },
       { path: "/scratch", access: "write" },
       { path: "/nix-shared", access: "read" },
+      // Nix re-anchors its root as openat("/proc/self/root") + chroot(".").
+      // Landlock resolves that magic link to "/", so without a rule on the
+      // sandbox root the round-trip is EACCES and Nix skips the chroot.
+      { path: "/", access: "read" },
     ],
   }
   const inner = [
@@ -203,6 +197,18 @@ const runSpike = async (): Promise<Record<string, unknown>> => {
       ? false
       : await Deno.stat(sharedPath).then(() => true)
         .catch(() => false)
+    const checks = {
+      build: result.build?.success === true,
+      direct: result.direct?.success === true,
+      shell: result.shell?.success === true,
+      run: result.run?.success === true,
+      profile: result.profile?.success === true,
+      profileList: result.profileList?.success === true,
+      profileExec: result.profileExec?.success === true,
+      hello: result.hello === true,
+      hostStoreUnchanged: !hostStoreHasPath,
+      sharedStoreHasPath,
+    }
     return {
       schemaVersion: 1,
       task: "A2c",
@@ -213,21 +219,10 @@ const runSpike = async (): Promise<Record<string, unknown>> => {
         stderr: stderr.slice(0, 1000),
       },
       result,
-      checks: {
-        build: result.build?.success === true,
-        direct: result.direct?.success === true,
-        shell: result.shell?.success === true,
-        hello: result.hello === true,
-        hostStoreUnchanged: !hostStoreHasPath,
-        sharedStoreHasPath,
-      },
-      verdict: result.build?.success === true &&
-          result.direct?.success === true &&
-          result.hello === true &&
-          !hostStoreHasPath &&
-          sharedStoreHasPath
-        ? "pass"
-        : "needs-fixes",
+      checks,
+      // Deriving the verdict from the check record keeps the two from drifting;
+      // a check that does not gate the verdict is not a check.
+      verdict: Object.values(checks).every(Boolean) ? "pass" : "needs-fixes",
     }
   } finally {
     await Deno.remove(sandboxRoot, { recursive: true }).catch(() => undefined)

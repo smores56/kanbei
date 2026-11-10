@@ -10,6 +10,7 @@ const libc = Deno.dlopen("libc.so.6", {
   open: { parameters: ["i64", "i32"], result: "i32" },
   close: { parameters: ["i32"], result: "i32" },
   write: { parameters: ["i32", "i64", "usize"], result: "isize" },
+  execve: { parameters: ["i64", "i64", "i64"], result: "i32" },
 })
 
 const symbols = libc.symbols
@@ -55,8 +56,14 @@ export interface LandlockRule {
   readonly access: "read" | "write"
 }
 
-export const applyLandlock = (rules: ReadonlyArray<LandlockRule>): number => {
+/** `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`; 0 when unsupported. */
+export const probeLandlockAbi = (): number => {
   const abi = Number(symbols.syscall(LANDLOCK_CREATE_RULESET, 0n, 0n, 1n, 0n, 0n))
+  return abi < 0 ? 0 : abi
+}
+
+export const applyLandlock = (rules: ReadonlyArray<LandlockRule>): number => {
+  const abi = probeLandlockAbi()
   const attr = new BigUint64Array([WRITE, 0n])
   const ruleset = Number(
     symbols.syscall(
@@ -99,6 +106,26 @@ export const applyLandlock = (rules: ReadonlyArray<LandlockRule>): number => {
   symbols.close(ruleset)
   if (restricted !== 0) throw new Error(`landlock_restrict_self failed: ${restricted}`)
   return abi
+}
+
+const pointerArray = (items: ReadonlyArray<Uint8Array>): Uint8Array => {
+  const pointers = new BigUint64Array(items.length + 1)
+  items.forEach((item, index) => {
+    pointers[index] = BigInt(Deno.UnsafePointer.value(Deno.UnsafePointer.of(item)))
+  })
+  return new Uint8Array(pointers.buffer)
+}
+
+/** Replaces the current image so the restricted process is the agent itself. */
+export const execveProcess = (
+  program: string,
+  args: ReadonlyArray<string>,
+  env: Readonly<Record<string, string>>,
+): never => {
+  const argv = pointerArray([cString(program), ...args.map(cString)])
+  const envp = pointerArray(Object.entries(env).map(([key, value]) => cString(`${key}=${value}`)))
+  symbols.execve(pointerOf(cString(program)), pointerOf(argv), pointerOf(envp))
+  throw new Error(`execve ${program} failed`)
 }
 
 export const emit = (value: unknown): void => {

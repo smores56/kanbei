@@ -1,6 +1,6 @@
 # A2c — single shared private Nix store
 
-Status: **build/direct execution pass; `nix shell` package environment blocked.** No gate decision.
+Status: **all six checks pass — one shared store serves build, shell, run, and profile.** No gate decision.
 
 ## Design
 
@@ -14,20 +14,39 @@ Status: **build/direct execution pass; `nix shell` package environment blocked.*
 
 Published record: `spikes/deployment/nix-shared-result.json`.
 
-| Check                                                  | Result                                   |
-| ------------------------------------------------------ | ---------------------------------------- |
-| `nix build nixpkgs#hello`                              | pass                                     |
-| Output present in shared store                         | pass                                     |
-| Direct execution of built `hello`                      | pass, `Hello, world!`                    |
-| Host `/nix/store` contains output                      | no                                       |
-| `nix shell nixpkgs#hello --command <output>/bin/hello` | **blocked**: `No such file or directory` |
-| Store path                                             | `tmp/kanbei-shared-nix` in this probe    |
+| Check                                                   | Result                                |
+| ------------------------------------------------------- | ------------------------------------- |
+| `nix build nixpkgs#hello`                               | pass                                  |
+| Direct execution of built `hello`                       | pass, `Hello, world!`                 |
+| `nix shell nixpkgs#hello --command <output>/bin/hello`  | pass, `Hello, world!`                 |
+| `nix run nixpkgs#hello`                                 | pass, `Hello, world!`                 |
+| `nix profile add --profile /scratch/prof nixpkgs#hello` | pass                                  |
+| `nix profile list --profile /scratch/prof --json`       | pass, one `hello` entry               |
+| Execute `/scratch/prof/bin/hello`                       | pass, `Hello, world!`                 |
+| Output present in shared store                          | pass                                  |
+| Host `/nix/store` contains output                       | no                                    |
+| Store path                                              | `tmp/kanbei-shared-nix` in this probe |
 
-The build fetched `hello` and its closure into the shared store; the host store remained unchanged. `hello` runs directly from the shared store.
+Verdict is `pass` and is derived from the whole check record: every check must hold for it to pass, so a single red check cannot be masked.
 
-## Why `nix shell` still fails
+## Why `nix shell` and `nix run` failed before
 
-`nix shell` resolves the command through its generated environment and fails even when given the absolute output path. Direct execution of the same path succeeds. This is an environment-resolution issue in the sandbox, not a store or build failure. `nix profile` remains untested and may share the problem.
+Nix re-anchors its own root after a mount-namespace round-trip: it opens `/proc/self/root` and then `chroot(".")`. Landlock resolves that magic link to the sandbox root `/`, and the ruleset had no rule beneath `/`, so the open returned `EACCES`; Nix then skipped the chroot and later failed with `error: unable to execute '<output>/bin/hello': No such file or directory` on a path that exists. Adding `{ path: "/", access: "read" }` fixes it.
+
+Measured control: with the identical configuration and only that rule removed, `nix shell` and `nix run` reproduce the `ENOENT` while direct execution still succeeds.
+
+## Nix configuration
+
+The probe no longer leans on implicit defaults:
+
+- `NIX_CONF_DIR=/scratch/nix-conf` with a generated `nix.conf` containing `store = local`, `build-users-group =`, `sandbox = false`, and `experimental-features = nix-command flakes`.
+- `NIX_STATE_DIR=/nix/var/nix`.
+- `/etc/nix/nix.conf` inside the sandbox is a dangling symlink into the host store, so it is bypassed rather than read.
+
+Two facts about Nix 2.34.8 that shaped that file:
+
+- `store` takes a store URI, not a directory. `store = /nix/store` parses as a chroot store rooted at `/nix/store`, which then tries `mount '/nix/store/nix/store' on '/nix/store'` and fails with `Operation not permitted`. `store = local` expresses the intended default local store.
+- There is no `state` or `state-dir` setting (both warn `unknown setting`); the state directory is only reachable through `NIX_STATE_DIR` or the compiled-in default.
 
 ## Bootstrap notes
 
@@ -39,19 +58,11 @@ The build fetched `hello` and its closure into the shared store; the host store 
 
 ## Residuals
 
-- `nix shell` environment lookup is blocked; direct output execution works.
-- `nix profile` is untested.
+- `nix develop` is expected-unsupported. Measured: `error: cannot open '/dev/null': No such file or directory`, reported while reading the build-hook response, so no dev shell is created. It needs `/dev`, `/dev/pts`, and `/bin` inside the sandbox; mounting host device files does not help, because Landlock follows the source inodes and bind-mounted host devices stay denied. No device files are mounted.
+- The root read rule grants read/execute over the whole filesystem, because Landlock can only grant beneath an anchored path and Nix needs the anchor `/`. Writes remain restricted to the ruleset's writable paths; reads are not a boundary in this probe.
 - The probe store is under the worktree `tmp/`; production must use a local filesystem that supports Nix ownership and a quota/GC policy.
 - All sandboxes share one mutable store; a compromised sandbox can poison another sandbox’s tools or fill the store.
 - The store contains host `/etc` data and package closures; no secrets may be placed there.
 - `io_uring` and the kernel remain in the attack surface.
 - Bootstrap is host-specific: exact `/etc`, CA, Deno, and core tool closures must be refreshed on system changes.
-
-## Next fix
-
-To support `nix shell` and `nix profile`, either:
-
-1. run Nix through a host-side private-store service that returns a command environment, or
-2. add a launcher that executes the built output path directly from the shared store, with the package’s `bin` directories added explicitly.
-
-Direct execution already covers build-and-run; package install/profile is the remaining gap.
+- `nix profile` writes the profile under `/scratch`; a real deployment needs a durable per-sandbox profile location and a GC policy for the shared store.
