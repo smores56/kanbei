@@ -6,14 +6,14 @@ import { LATENCY_PROFILES_MS, TRIALS_PER_CELL } from "../../../src/spikes/langua
 
 const blocked = buildModelMatrix({
   manifest: undefined,
-  credentials: { ANTHROPIC_API_KEY: false, OPENAI_API_KEY: false },
+  credentials: { NEURALWATT_API_KEY: false },
   sandboxFrozen: false,
   registeredDatasets: { "cost-v1@1.0.0": true, "security-v1@1.0.0": false },
 })
 
 Deno.test("blocked model matrix enumerates every cell with zero trials and no metrics", () => {
   assertEquals(blocked.status, "blocked")
-  assertEquals(blocked.plannedCells, 5 * 4 * 10 * 3)
+  assertEquals(blocked.plannedCells, 5 * 2 * 10 * 3)
   assertEquals(blocked.plannedTrials, blocked.plannedCells * TRIALS_PER_CELL)
   assertEquals(blocked.cells.length, blocked.plannedCells)
   assertEquals(blocked.cells.every((cell) => cell.status === "blocked"), true)
@@ -33,8 +33,7 @@ Deno.test("blocked model matrix enumerates every cell with zero trials and no me
 Deno.test("blocked model matrix names the exact missing inputs", () => {
   const ids = blocked.missingInputs.map((input) => input.id)
   assertEquals(ids.includes("MI-01"), true)
-  assertEquals(ids.includes("MI-CRED-ANTHROPIC"), true)
-  assertEquals(ids.includes("MI-CRED-OPENAI"), true)
+  assertEquals(ids.includes("MI-CRED-NEURALWATT"), true)
   assertEquals(ids.includes("MI-04"), true)
   assertEquals(ids.includes("MI-06"), true)
   assertEquals(ids.includes("MI-05"), false)
@@ -52,13 +51,12 @@ Deno.test("a frozen manifest and credentials make cells ready but never invent r
   const manifest: ModelManifest = {
     schemaVersion: 1,
     providers: [
-      { provider: "anthropic", primary: "frozen-primary", smaller: "frozen-smaller" },
-      { provider: "openai", primary: "frozen-primary", smaller: "frozen-smaller" },
+      { provider: "neuralwatt", primary: "frozen-primary", smaller: "frozen-smaller" },
     ],
   }
   const ready = buildModelMatrix({
     manifest,
-    credentials: { ANTHROPIC_API_KEY: true, OPENAI_API_KEY: true },
+    credentials: { NEURALWATT_API_KEY: true },
     sandboxFrozen: true,
     registeredDatasets: { "cost-v1@1.0.0": true, "security-v1@1.0.0": true },
   })
@@ -67,5 +65,5 @@ Deno.test("a frozen manifest and credentials make cells ready but never invent r
   assertEquals(ready.cells.every((cell) => cell.status === "ready"), true)
   assertEquals(ready.cells.every((cell) => cell.blockedBy.length === 0), true)
   assertEquals(ready.cells.every((cell) => cell.trials === 0), true)
-  assertEquals(ready.slots.filter((slot) => slot.modelId?.startsWith("frozen-")).length, 4)
+  assertEquals(ready.slots.filter((slot) => slot.modelId?.startsWith("frozen-")).length, 2)
 })

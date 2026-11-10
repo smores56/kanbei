@@ -8,7 +8,11 @@ No model results are reported. The model arm could not run in this environment; 
 
 Protocol `S1` for decision `LANG-1`; datasets cost-v1@1.0.0, security-v1@1.0.0, lang-v1@1.0.0.
 
-Design: paired-interleaved; 30 trials per cell at temperature 0; host-call latencies 10, 100, 1000 ms; 2 providers with 2 models each, including a smaller model; 95% percentile bootstrap with 10000 resamples; seeds 20261109 (sha256(arm|variant|provider|model|task|latency|trialIndex), first 4 bytes mod 2^31); Holm-Bonferroni across the five arm comparisons per hypothesis family.
+Design: paired-interleaved; 30 trials per cell at temperature 0; host-call latencies 10, 100, 1000 ms; 1 provider(s) with 2 models each, including a smaller model; 95% percentile bootstrap with 10000 resamples; seeds 20261109 (sha256(arm|variant|provider|model|task|latency|trialIndex), first 4 bytes mod 2^31); Holm-Bonferroni across the five arm comparisons per hypothesis family.
+
+Amendments (pre-data):
+
+- `AMD-1` recorded 2026-11-10, before any trial: single provider by operator decision; two model tiers retained. Changes: providersRequired 2 -> 1; modelSlots anthropic/openai -> neuralwatt; credential env -> NEURALWATT_API_KEY.
 
 | arm        | candidates                     | evaluator variant rule                                                                                                                                           |
 | ---------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -52,7 +56,7 @@ Frozen inputs:
 
 - `FI-01` Runtime and interpreter versions: required before trials (unset)
 - `FI-02` Container image digests and OS-sandbox profile: required before trials (unset)
-- `FI-03` Model IDs per provider and tier: required before trials (unset)
+- `FI-03` Model IDs per provider and tier: neuralwatt: deepseek-v4.1-flash (primary), qwen-3.8-27b (smaller)
 - `FI-04` Prompt, tool catalog, and tool descriptions: task-fixture.json@1.0.0
 - `FI-05` Host-call facade semantics and latency profiles: 10ms,100ms,1000ms per call
 - `FI-06` Hardware fingerprint, timeouts, and resource ceilings: required before trials (unset)
@@ -93,39 +97,39 @@ Local measurements use one host-injected probe program per runtime variant. Host
 
 | arm        | variant | status    | version                                                  | source / missing input | startup p50 ms | startup p95 ms | peak RSS MiB | fanout gold | retry attempts | probe failure |
 | ---------- | ------- | --------- | -------------------------------------------------------- | ---------------------- | -------------- | -------------- | ------------ | ----------- | -------------- | ------------- |
-| monty      | monty   | available | pydantic-monty 0.0.17                                    | nixpkgs                | 47.95          | 83.64          | 22.4         | yes         | 3              | —             |
-| typescript | deno    | available | deno 2.9.2 (stable, release, x86_64-unknown-linux-gnu)   | path                   | 155.88         | 185.11         | 53.6         | yes         | 3              | —             |
-| typescript | node    | available | v24.21.0                                                 | nixpkgs                | 35.45          | 37.41          | 62.3         | yes         | 3              | —             |
-| lua        | lua5.4  | available | Lua 5.4.9 Copyright (C) 1994-2026 Lua.org, PUC-Rio       | nixpkgs                | 1.70           | 2.06           | 2.9          | yes         | 3              | —             |
-| lua        | luau    | available | 0.738                                                    | nixpkgs                | 1.74           | 1.87           | 5.9          | yes         | 3              | —             |
-| bash       | bash    | available | GNU bash, version 5.3.9(1)-release (x86_64-pc-linux-gnu) | path                   | 5.46           | 10.48          | 4.1          | yes         | 3              | —             |
-| cpython    | cpython | available | Python 3.14.8                                            | nixpkgs                | 30.74          | 44.16          | 19.9         | yes         | 3              | —             |
+| monty      | monty   | available | pydantic-monty 0.0.17                                    | nixpkgs                | 69.31          | 99.35          | 22.4         | yes         | 3              | —             |
+| typescript | deno    | available | deno 2.9.2 (stable, release, x86_64-unknown-linux-gnu)   | path                   | 173.18         | 181.28         | 53.3         | yes         | 3              | —             |
+| typescript | node    | available | v24.21.0                                                 | nixpkgs                | 31.15          | 63.58          | 61.6         | yes         | 3              | —             |
+| lua        | lua5.4  | available | Lua 5.4.9 Copyright (C) 1994-2026 Lua.org, PUC-Rio       | nixpkgs                | 1.24           | 1.40           | 3.0          | yes         | 3              | —             |
+| lua        | luau    | available | 0.738                                                    | nixpkgs                | 1.71           | 2.25           | 6.0          | yes         | 3              | —             |
+| bash       | bash    | available | GNU bash, version 5.3.9(1)-release (x86_64-pc-linux-gnu) | path                   | 3.94           | 5.96           | 4.1          | yes         | 3              | —             |
+| cpython    | cpython | available | Python 3.14.8                                            | nixpkgs                | 29.11          | 42.85          | 19.2         | yes         | 3              | —             |
 
 ### 4.2 Host-call latency and fan-out correctness
 
 | variant | latency ms | calls | wall ms | p50 overhead ms | p95 overhead ms | simulation     | fanout gold |
 | ------- | ---------- | ----- | ------- | --------------- | --------------- | -------------- | ----------- |
-| monty   | 10         | 50    | 574.65  | 0.09            | 0.25            | host-sleep     | yes         |
-| monty   | 100        | 20    | 2072.44 | 0.10            | 0.12            | host-sleep     | yes         |
-| monty   | 1000       | 3     | 3075.41 | 0.09            | 0.11            | host-sleep     | yes         |
-| deno    | 10         | 50    | 773.51  | 1.24            | 2.35            | sleep          | yes         |
-| deno    | 100        | 20    | 2229.72 | 1.43            | 1.79            | sleep          | yes         |
-| deno    | 1000       | 3     | 3129.50 | 1.22            | 9.24            | sleep          | yes         |
-| node    | 10         | 50    | 803.19  | 0.09            | 0.14            | sleep          | yes         |
-| node    | 100        | 20    | 2305.20 | 0.20            | 1.29            | sleep          | yes         |
-| node    | 1000       | 3     | 3320.12 | 1.28            | 1.34            | sleep          | yes         |
-| lua5.4  | 10         | 50    | 513.29  | 0.00            | 0.00            | busy-wait      | yes         |
-| lua5.4  | 100        | 20    | 2022.73 | 0.00            | 0.01            | busy-wait      | yes         |
-| lua5.4  | 1000       | 3     | 3017.64 | 0.00            | 0.00            | busy-wait      | yes         |
-| luau    | 10         | 50    | 502.89  | 0.00            | 0.00            | busy-wait      | yes         |
-| luau    | 100        | 20    | 2003.16 | 0.00            | 0.00            | busy-wait      | yes         |
-| luau    | 1000       | 3     | 3004.70 | 0.00            | 0.00            | busy-wait      | yes         |
-| bash    | 10         | 50    | 1138.17 | 7.00            | 15.00           | external-sleep | yes         |
-| bash    | 100        | 20    | 2233.21 | 7.00            | 12.00           | external-sleep | yes         |
-| bash    | 1000       | 3     | 3062.06 | 5.00            | 9.00            | external-sleep | yes         |
-| cpython | 10         | 50    | 572.79  | 0.09            | 0.16            | sleep          | yes         |
-| cpython | 100        | 20    | 2072.31 | 0.09            | 0.11            | sleep          | yes         |
-| cpython | 1000       | 3     | 3062.30 | 0.10            | 0.17            | sleep          | yes         |
+| monty   | 10         | 50    | 610.76  | 0.08            | 0.14            | host-sleep     | yes         |
+| monty   | 100        | 20    | 2077.88 | 0.08            | 0.09            | host-sleep     | yes         |
+| monty   | 1000       | 3     | 3070.47 | 0.13            | 0.25            | host-sleep     | yes         |
+| deno    | 10         | 50    | 766.64  | 1.12            | 1.39            | sleep          | yes         |
+| deno    | 100        | 20    | 2172.68 | 1.29            | 2.19            | sleep          | yes         |
+| deno    | 1000       | 3     | 3222.24 | 0.95            | 15.67           | sleep          | yes         |
+| node    | 10         | 50    | 805.60  | 0.10            | 0.19            | sleep          | yes         |
+| node    | 100        | 20    | 2319.92 | 0.31            | 0.45            | sleep          | yes         |
+| node    | 1000       | 3     | 3319.14 | 0.91            | 0.92            | sleep          | yes         |
+| lua5.4  | 10         | 50    | 520.12  | 0.00            | 0.00            | busy-wait      | yes         |
+| lua5.4  | 100        | 20    | 2026.71 | 0.00            | 0.01            | busy-wait      | yes         |
+| lua5.4  | 1000       | 3     | 3102.25 | 0.00            | 0.00            | busy-wait      | yes         |
+| luau    | 10         | 50    | 503.04  | 0.00            | 0.00            | busy-wait      | yes         |
+| luau    | 100        | 20    | 2004.24 | 0.00            | 0.00            | busy-wait      | yes         |
+| luau    | 1000       | 3     | 3006.07 | 0.00            | 0.00            | busy-wait      | yes         |
+| bash    | 10         | 50    | 1029.78 | 7.00            | 12.00           | external-sleep | yes         |
+| bash    | 100        | 20    | 2150.92 | 4.00            | 5.00            | external-sleep | yes         |
+| bash    | 1000       | 3     | 3067.47 | 7.00            | 10.00           | external-sleep | yes         |
+| cpython | 10         | 50    | 558.30  | 0.09            | 0.13            | sleep          | yes         |
+| cpython | 100        | 20    | 2040.98 | 0.08            | 0.10            | sleep          | yes         |
+| cpython | 1000       | 3     | 3041.10 | 0.10            | 0.19            | sleep          | yes         |
 
 ### 4.3 Snapshot, restore, and approval pause
 
@@ -166,30 +170,25 @@ Characters are recorded; provider token counts require the frozen tokenizer and 
 
 ## 5. Blocked model matrix
 
-| provider  | tier    | model ID | credential env    | credential present |
-| --------- | ------- | -------- | ----------------- | ------------------ |
-| anthropic | primary | unset    | ANTHROPIC_API_KEY | no                 |
-| anthropic | smaller | unset    | ANTHROPIC_API_KEY | no                 |
-| openai    | primary | unset    | OPENAI_API_KEY    | no                 |
-| openai    | smaller | unset    | OPENAI_API_KEY    | no                 |
+| provider   | tier    | model ID            | credential env     | credential present |
+| ---------- | ------- | ------------------- | ------------------ | ------------------ |
+| neuralwatt | primary | deepseek-v4.1-flash | NEURALWATT_API_KEY | no                 |
+| neuralwatt | smaller | qwen-3.8-27b        | NEURALWATT_API_KEY | no                 |
 
-Axes: 5 arms × 10 tasks × 3 host-call latencies × 4 model slots; per-cell rows are in result.json. Cells: 600; planned trials: 18000 (30 per cell at temperature 0); completed model trials: 0.
+Axes: 5 arms × 10 tasks × 3 host-call latencies × 2 model slots; per-cell rows are in result.json. Cells: 300; planned trials: 9000 (30 per cell at temperature 0); completed model trials: 0.
 
 | arm        | blocked cells | status  |
 | ---------- | ------------- | ------- |
-| monty      | 120           | blocked |
-| typescript | 120           | blocked |
-| lua        | 120           | blocked |
-| bash       | 120           | blocked |
-| cpython    | 120           | blocked |
+| monty      | 60            | blocked |
+| typescript | 60            | blocked |
+| lua        | 60            | blocked |
+| bash       | 60            | blocked |
+| cpython    | 60            | blocked |
 
 Missing inputs:
 
-- `MI-01` Frozen model manifest: spikes/language/model-manifest.json with schemaVersion=1 and providers[].primary and providers[].smaller model IDs
-- `MI-CRED-ANTHROPIC` anthropic API credential: environment variable ANTHROPIC_API_KEY must be set for a live model arm
-- `MI-CRED-OPENAI` openai API credential: environment variable OPENAI_API_KEY must be set for a live model arm
+- `MI-CRED-NEURALWATT` neuralwatt API credential: environment variable NEURALWATT_API_KEY must be set for a live model arm
 - `MI-04` Frozen OS-sandbox profile and image digest: S1 requires a frozen sandbox profile digest; this host reports sandboxPosture=unverified and has no frozen S1 sandbox profile configured
-- `MI-06` security-v1 dataset: fixtures/security-v1@1.0.0 and its fixtures/registry.json entry are missing
 
 ## 6. Failure taxonomy
 
@@ -222,8 +221,8 @@ Gate `DG-1` status: **open**; recommendation: **none**.
 
 Rationale:
 
-- 600 model cells (18000 planned trials) are blocked; 0 trials were run.
-- Blocked inputs: MI-01, MI-CRED-ANTHROPIC, MI-CRED-OPENAI, MI-04, MI-06.
+- 300 model cells (9000 planned trials) are blocked; 0 trials were run.
+- Blocked inputs: MI-CRED-NEURALWATT, MI-04.
 - A language selection requires complete paired model trials; local runtime measurements do not substitute.
 
 Supported by local evidence:
@@ -240,7 +239,7 @@ Not supported by local evidence:
 - Any security-gate pass: no frozen OS-sandbox profile is available on this host.
 - Any snapshot trust claim beyond the local Monty dump/load_snapshot probe.
 
-Closing `DG-1` requires the model manifest, provider credentials, the frozen OS-sandbox profile, the `cost-v1@1.0.0` and `security-v1@1.0.0` datasets, and complete paired trials (600 cells × 30 trials). Until then the gate stays open and no arm is selected or rejected on model evidence.
+Closing `DG-1` requires a live provider adapter, the remaining blocked inputs (`MI-CRED-NEURALWATT`, `MI-04`), `FI-01` runtime versions, `FI-06` hardware and ceilings, a §7.0 registration for the `lang-v1` task suite, the signed `DG-2` winner, and complete paired trials (300 cells × 30 trials). Until then the gate stays open and no arm is selected or rejected on model evidence.
 
 ## 8. Reproduction
 
@@ -258,8 +257,7 @@ Runtimes missing from `PATH` are resolved non-destructively from pinned nixpkgs 
 - Monty startup includes CPython process startup and pydantic-monty import; it is not an in-process sandbox-only number.
 - Progressive-disclosure rows report characters, not provider tokens; token measurement is blocked.
 - Model matrix cells remain blocked; this result contains no model-generated success, token, turn, or latency data.
-- `lang-v1` is a local task-suite fixture, not a §7.0 registered dataset; DG-1 stays blocked until the suite is bound to an allowed dataset or the human amends the registry.
 - Deno's node-compatibility shim on PATH is rejected by a version pattern; the Node arm uses nixpkgs Node, not the shim.
 - Local host-call probes use 50, 20, and 3 calls at 10, 100, and 1000 ms to bound wall time; the pre-registered model workload keeps the full task call counts.
 
-Evidence: `A4-LANG-1` class `spike` outcome `blocked`; envelope `not-issued` (no EvidenceEnvelope is issued: S1 has no completed model trials; 600 model cells are blocked; no model recordings or artifacts exist; sandboxPosture is unverified; S1 security cells cannot be decided; MI-01: spikes/language/model-manifest.json with schemaVersion=1 and providers[].primary and providers[].smaller model IDs; MI-CRED-ANTHROPIC: environment variable ANTHROPIC_API_KEY must be set for a live model arm; MI-CRED-OPENAI: environment variable OPENAI_API_KEY must be set for a live model arm; MI-04: S1 requires a frozen sandbox profile digest; this host reports sandboxPosture=unverified and has no frozen S1 sandbox profile configured; MI-06: fixtures/security-v1@1.0.0 and its fixtures/registry.json entry are missing).
+Evidence: `A4-LANG-1` class `spike` outcome `blocked`; envelope `not-issued` (no EvidenceEnvelope is issued: S1 has no completed model trials; 300 model cells are blocked; no model recordings or artifacts exist; sandboxPosture is unverified; S1 security cells cannot be decided; MI-CRED-NEURALWATT: environment variable NEURALWATT_API_KEY must be set for a live model arm; MI-04: S1 requires a frozen sandbox profile digest; this host reports sandboxPosture=unverified and has no frozen S1 sandbox profile configured).

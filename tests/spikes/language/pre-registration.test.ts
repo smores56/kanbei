@@ -10,6 +10,7 @@ import {
   TEMPERATURE,
   TRIALS_PER_CELL,
 } from "../../../src/spikes/language/types.ts"
+import { ModelManifest } from "../../../src/spikes/language/model-arm.ts"
 
 Deno.test("LANG-1 pre-registration validates and fixes the spike protocol", () => {
   const decoded = Schema.decodeUnknownSync(Lang1PreRegistration)(lang1PreRegistration)
@@ -22,9 +23,12 @@ Deno.test("LANG-1 pre-registration validates and fixes the spike protocol", () =
   assertEquals(decoded.temperature, TEMPERATURE)
 })
 
-Deno.test("pre-registration requires two providers with a primary and a smaller model each", () => {
+Deno.test("pre-registration fixes one provider with a primary and a smaller NeuralWatt model", () => {
   const providers = [...new Set(lang1PreRegistration.modelSlots.map((slot) => slot.provider))]
+  assertEquals(providers, ["neuralwatt"])
   assertEquals(providers.length, lang1PreRegistration.providersRequired)
+  assertEquals(lang1PreRegistration.providersRequired, 1)
+  assertEquals(lang1PreRegistration.modelsPerProvider, 2)
   for (const provider of providers) {
     const tiers = lang1PreRegistration.modelSlots
       .filter((slot) => slot.provider === provider)
@@ -32,8 +36,25 @@ Deno.test("pre-registration requires two providers with a primary and a smaller 
       .toSorted()
     assertEquals(tiers, ["primary", "smaller"])
   }
+  assertEquals(
+    lang1PreRegistration.modelSlots.every((slot) => slot.credentialEnv === "NEURALWATT_API_KEY"),
+    true,
+  )
   assertEquals(lang1PreRegistration.smallerModelRequired, true)
-  assertEquals(modelSlotKey({ provider: "anthropic", tier: "smaller" }), "anthropic:smaller")
+  assertEquals(modelSlotKey({ provider: "neuralwatt", tier: "smaller" }), "neuralwatt:smaller")
+})
+
+Deno.test("the single-provider amendment is recorded before any trial", () => {
+  const amendments = lang1PreRegistration.amendments
+  assertEquals(amendments.length, 1)
+  assertEquals(amendments[0]?.id, "AMD-1")
+  assertEquals(amendments[0]?.recordedAt, "2026-11-10")
+  assertEquals(amendments[0]?.beforeTrials, true)
+  assertEquals(
+    amendments[0]?.changes.includes("providersRequired 2 -> 1"),
+    true,
+  )
+  assertEquals(lang1PreRegistration.status, "pre-registered")
 })
 
 Deno.test("pre-registration declares every required metric and a blocked-safe decision rule", () => {
@@ -68,11 +89,24 @@ Deno.test("pre-registration declares every required metric and a blocked-safe de
   )
 })
 
-Deno.test("pre-registration keeps model IDs unfrozen and requires them before trials", () => {
-  assertEquals(lang1PreRegistration.modelSlots.every((slot) => slot.modelId === null), true)
+Deno.test("pre-registration freezes the model IDs through FI-03 and the manifest", async () => {
   const modelInput = lang1PreRegistration.frozenInputs.find((input) => input.id === "FI-03")
-  assertEquals(modelInput?.value, null)
+  assertEquals(modelInput?.value?.includes("deepseek-v4.1-flash"), true)
+  assertEquals(modelInput?.value?.includes("qwen-3.8-27b"), true)
   assertEquals(modelInput?.requiredBeforeTrials, true)
+  const manifest = Schema.decodeUnknownSync(ModelManifest)(
+    JSON.parse(
+      await Deno.readTextFile(
+        new URL("../../../spikes/language/model-manifest.json", import.meta.url),
+      ),
+    ),
+  )
+  const manifestIds = manifest.providers.flatMap((provider) =>
+    lang1PreRegistration.modelSlots
+      .filter((slot) => slot.provider === provider.provider)
+      .map((slot) => slot.tier === "primary" ? provider.primary : provider.smaller)
+  )
+  assertEquals(manifestIds, lang1PreRegistration.modelSlots.map((slot) => slot.modelId))
 })
 
 Deno.test("hypothesis margins are explicit and reference paired analysis", () => {

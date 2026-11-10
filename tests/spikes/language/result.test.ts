@@ -18,7 +18,7 @@ const local: LocalMeasurements = {
 
 const matrix = buildModelMatrix({
   manifest: undefined,
-  credentials: { ANTHROPIC_API_KEY: false, OPENAI_API_KEY: false },
+  credentials: { NEURALWATT_API_KEY: false },
   sandboxFrozen: false,
   registeredDatasets: { "cost-v1@1.0.0": true, "security-v1@1.0.0": false },
 })
@@ -57,7 +57,7 @@ Deno.test("a blocked model arm keeps DG-1 open and recommends nothing", async ()
   assertEquals(result.modelMatrix.status, "blocked")
   assertEquals(result.modelMatrix.modelResults, "none")
   assertEquals(result.modelMatrix.cells.every((cell) => cell.trials === 0), true)
-  assertEquals(result.modelMatrix.plannedTrials, 18_000)
+  assertEquals(result.modelMatrix.plannedTrials, 9_000)
   assertEquals(result.localMeasurements.runtimes.length, 0)
 })
 

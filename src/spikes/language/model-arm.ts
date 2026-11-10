@@ -43,7 +43,7 @@ const costInput: MissingInput = {
   id: "MI-05",
   description: "cost-v1 dataset registration",
   exact:
-    "fixtures/registry.json must register cost-v1@1.0.0; the registry lists only journey-v1 and append-v1",
+    "fixtures/registry.json must register cost-v1@1.0.0; the registry lists journey-v1, append-v1, cost-v1, and ui-v1",
 }
 
 const securityInput: MissingInput = {

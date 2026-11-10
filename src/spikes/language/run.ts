@@ -144,8 +144,7 @@ const modelMatrix = (
     return buildModelMatrix({
       manifest,
       credentials: {
-        ANTHROPIC_API_KEY: (Deno.env.get("ANTHROPIC_API_KEY") ?? "").length > 0,
-        OPENAI_API_KEY: (Deno.env.get("OPENAI_API_KEY") ?? "").length > 0,
+        NEURALWATT_API_KEY: (Deno.env.get("NEURALWATT_API_KEY") ?? "").length > 0,
       },
       sandboxFrozen: false,
       registeredDatasets: datasets,

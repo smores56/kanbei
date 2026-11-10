@@ -178,7 +178,7 @@ const modelSection = (result: BakeoffResult): string => {
   return [
     table(["provider", "tier", "model ID", "credential env", "credential present"], slotRows),
     "",
-    `Axes: 5 arms × 10 tasks × 3 host-call latencies × 4 model slots; per-cell rows are in result.json. ` +
+    `Axes: 5 arms × 10 tasks × 3 host-call latencies × ${result.modelMatrix.slots.length} model slots; per-cell rows are in result.json. ` +
     `Cells: ${result.modelMatrix.plannedCells}; planned trials: ${result.modelMatrix.plannedTrials} ` +
     `(${result.modelMatrix.trialsPerCell} per cell at temperature ${result.modelMatrix.temperature}); ` +
     `completed model trials: 0.`,
@@ -226,10 +226,17 @@ const preRegistrationSection = (result: BakeoffResult): string => {
     `${registration.temperature}; host-call latencies ${
       registration.hostCallLatenciesMs.join(", ")
     } ms; ` +
-    `${registration.providersRequired} providers with ${registration.modelsPerProvider} models each, including a ` +
+    `${registration.providersRequired} provider(s) with ${registration.modelsPerProvider} models each, including a ` +
     `smaller model; ${registration.analysis.confidenceLevel * 100}% percentile bootstrap with ` +
     `${registration.analysis.bootstrapResamples} resamples; seeds ` +
     `${registration.analysis.seeds.base} (${registration.analysis.seeds.derivation}); ${registration.analysis.multiplicity}.`,
+    "",
+    "Amendments (pre-data):",
+    "",
+    ...registration.amendments.map((amendment) =>
+      `- \`${amendment.id}\` recorded ${amendment.recordedAt}, before any trial: ${amendment.reason}. ` +
+      `Changes: ${amendment.changes.join("; ")}.`
+    ),
     "",
     table(["arm", "candidates", "evaluator variant rule"], armRows),
     "",
@@ -260,6 +267,9 @@ const preRegistrationSection = (result: BakeoffResult): string => {
     ),
   ].join("\n")
 }
+
+const missingBlockedInputs = (result: BakeoffResult): string =>
+  result.modelMatrix.missingInputs.map((input) => `\`${input.id}\``).join(", ")
 
 export const renderReport = (result: BakeoffResult): string => {
   const decision = result.decisionRecord
@@ -358,8 +368,13 @@ export const renderReport = (result: BakeoffResult): string => {
     "",
     ...decision.unsupportedFindings.map((line) => `- ${line}`),
     "",
-    "Closing `DG-1` requires the model manifest, provider credentials, the frozen OS-sandbox profile, the " +
-    "`cost-v1@1.0.0` and `security-v1@1.0.0` datasets, and complete paired trials (600 cells × 30 trials). " +
+    "Closing `DG-1` requires a live provider adapter" +
+    (missingBlockedInputs(result).length === 0
+      ? ""
+      : `, the remaining blocked inputs (${missingBlockedInputs(result)})`) +
+    ", `FI-01` runtime versions, `FI-06` hardware and ceilings, a §7.0 registration for the `lang-v1` " +
+    "task suite, the signed `DG-2` winner, and " +
+    `complete paired trials (${result.modelMatrix.plannedCells} cells × ${result.modelMatrix.trialsPerCell} trials). ` +
     "Until then the gate stays open and no arm is selected or rejected on model evidence.",
     "",
     "## 8. Reproduction",

@@ -22,6 +22,14 @@ const ModelSlot = Schema.Struct({
   credentialEnv: Schema.String,
 })
 
+const Amendment = Schema.Struct({
+  id: Schema.String,
+  recordedAt: Schema.String,
+  reason: Schema.String,
+  beforeTrials: Schema.Boolean,
+  changes: Schema.Array(Schema.String),
+})
+
 const Metric = Schema.Struct({
   id: Schema.String,
   unit: Schema.String,
@@ -69,6 +77,7 @@ export const Lang1PreRegistration = Schema.Struct({
   decisionIds: Schema.Array(Schema.Literal("LANG-1")),
   datasets: Schema.Array(Schema.String),
   status: Schema.Literal("pre-registered"),
+  amendments: Schema.Array(Amendment),
   frozenInputs: Schema.Array(FrozenInput),
   arms: Schema.Array(ArmRegistration),
   modelSlots: Schema.Array(ModelSlot),
@@ -112,7 +121,7 @@ const frozenInputs = [
   {
     id: "FI-03",
     description: "Model IDs per provider and tier",
-    value: null,
+    value: "neuralwatt: deepseek-v4.1-flash (primary), qwen-3.8-27b (smaller)",
     requiredBeforeTrials: true,
   },
   {
@@ -146,6 +155,19 @@ export const lang1PreRegistration: Lang1PreRegistration = {
   decisionIds: ["LANG-1"],
   datasets: ["cost-v1@1.0.0", "security-v1@1.0.0", "lang-v1@1.0.0"],
   status: "pre-registered",
+  amendments: [
+    {
+      id: "AMD-1",
+      recordedAt: "2026-11-10",
+      reason: "single provider by operator decision; two model tiers retained",
+      beforeTrials: true,
+      changes: [
+        "providersRequired 2 -> 1",
+        "modelSlots anthropic/openai -> neuralwatt",
+        "credential env -> NEURALWATT_API_KEY",
+      ],
+    },
+  ],
   frozenInputs: [...frozenInputs],
   arms: [
     {
@@ -186,31 +208,19 @@ export const lang1PreRegistration: Lang1PreRegistration = {
   ],
   modelSlots: [
     {
-      provider: "anthropic",
+      provider: "neuralwatt",
       tier: "primary",
-      modelId: null,
-      credentialEnv: "ANTHROPIC_API_KEY",
+      modelId: "deepseek-v4.1-flash",
+      credentialEnv: "NEURALWATT_API_KEY",
     },
     {
-      provider: "anthropic",
+      provider: "neuralwatt",
       tier: "smaller",
-      modelId: null,
-      credentialEnv: "ANTHROPIC_API_KEY",
-    },
-    {
-      provider: "openai",
-      tier: "primary",
-      modelId: null,
-      credentialEnv: "OPENAI_API_KEY",
-    },
-    {
-      provider: "openai",
-      tier: "smaller",
-      modelId: null,
-      credentialEnv: "OPENAI_API_KEY",
+      modelId: "qwen-3.8-27b",
+      credentialEnv: "NEURALWATT_API_KEY",
     },
   ],
-  providersRequired: 2,
+  providersRequired: 1,
   modelsPerProvider: 2,
   smallerModelRequired: true,
   tasks: { suiteId: "lang-v1", suiteVersion: "1.0.0", count: 10 },
