@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "task": "A5",
-  "status": "input-ready-human-signature-required",
+  "status": "partially-signed-dg1-dg4-blocked",
   "gates": [
     {
       "gate": "DG-1",
-      "status": "open",
+      "status": "blocked",
       "recommended": "none",
       "blockers": [
         "frozen model manifest",
@@ -16,29 +16,36 @@
         "FI-01 runtime/interpreter versions",
         "FI-06 hardware fingerprint, timeouts, resource ceilings",
         "DG-2 signed: NODE-DENO-1 winner fixes the TypeScript evaluator variant",
-        "lang-v1 is not a §7.0 registered dataset"
-      ]
+        "lang-v1 is not a §7.0 registered dataset",
+        "second provider or one-provider amendment"
+      ],
+      "condition": "NeuralWatt deepseek-v4.1-flash verified; LANG-1 still requires a second provider/smaller model"
     },
     {
       "gate": "DG-2",
-      "status": "open",
+      "status": "closed",
       "recommended": "deno@2.9.2",
-      "condition": "conditional; re-run after ledger sequencer and worker model exist; S1 envelope is blocked"
+      "condition": "conditional; re-run after ledger sequencer and worker model exist; S1 envelope is blocked",
+      "selected": "deno@2.9.2"
     },
     {
       "gate": "DG-3",
-      "status": "open",
+      "status": "closed",
       "recommended": "variant-E-rootless-sandbox-candidate",
-      "condition": "A2b pass; A2c shared store build/direct pass, nix shell/profile blocked; human choice pending"
+      "condition": "A2b pass; A2c shared store build/direct pass, nix shell/profile blocked; human choice pending",
+      "selected": "variant-E-rootless-sandbox"
     },
     {
       "gate": "DG-4",
-      "status": "open",
+      "status": "blocked",
       "recommended": "process-cgroup",
       "condition": "requires systemd user cgroup delegation; must be re-run under DG-3 supervisor identity; no security property claimed"
     }
   ],
-  "decisionsClosed": [],
+  "decisionsClosed": [
+    "DG-2",
+    "DG-3"
+  ],
   "baselineFrozen": false,
   "evidenceBindingGaps": [
     "security-v1 is not sealed; A1 security probes, A2, A3, and A4 security cells lack dataset-bound envelopes",

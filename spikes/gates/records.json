@@ -4,7 +4,7 @@
     "decision": "Agent-facing execution language",
     "owner": "human",
     "producingTask": "A4",
-    "status": "open",
+    "status": "blocked",
     "recommended": "none",
     "recommendationRationale": [
       "All 600 model cells and 18000 planned trials are blocked; local runtime measurements cannot select a language.",
@@ -25,7 +25,8 @@
       "FI-01 runtime/interpreter versions",
       "FI-06 hardware fingerprint, timeouts, resource ceilings",
       "DG-2 signed: NODE-DENO-1 winner fixes the TypeScript evaluator variant",
-      "lang-v1 is not a §7.0 registered dataset"
+      "lang-v1 is not a §7.0 registered dataset",
+      "NeuralWatt deepseek-v4.1-flash verified, but LANG-1 requires a second provider and a smaller model; only one provider credential is available."
     ],
     "rejectedAlternatives": [],
     "evidenceEnvelopes": [],
@@ -47,7 +48,7 @@
     "decision": "Node versus Deno for the TypeScript control plane",
     "owner": "human",
     "producingTask": "A1",
-    "status": "open",
+    "status": "closed",
     "recommended": "deno@2.9.2",
     "recommendationRationale": [
       "No hard fail on either arm; the weighted composite is inside the pre-registered 10% margin at 4.7%.",
@@ -84,14 +85,17 @@
     ],
     "blocks": [
       "B1 onward"
-    ]
+    ],
+    "selected": "deno@2.9.2",
+    "signedBy": "human",
+    "signedAt": "2026-11-10"
   },
   {
     "gate": "DG-3",
     "decision": "Deployment plane and broker identity",
     "owner": "human",
     "producingTask": "A2",
-    "status": "open",
+    "status": "closed",
     "recommended": "variant-E-rootless-sandbox-candidate",
     "recommendationRationale": [
       "A2b demonstrated a rootless user+PID+mount namespace plus chroot and Landlock ABI 7: allowed reads/writes pass, denied paths fail with EACCES, broker fd and signals are blocked, systemctl --user is blocked, and /proc/self/root cannot escape to the host.",
@@ -141,14 +145,17 @@
       "E1",
       "E2",
       "H7"
-    ]
+    ],
+    "selected": "variant-E-rootless-sandbox",
+    "signedBy": "human",
+    "signedAt": "2026-11-10"
   },
   {
     "gate": "DG-4",
     "decision": "Lightweight inter-agent isolation mechanism",
     "owner": "human",
     "producingTask": "A3",
-    "status": "open",
+    "status": "blocked",
     "recommended": "process-cgroup",
     "recommendationRationale": [
       "process-cgroup is the only eligible arm: all containment checks pass, cold-start and IPC budgets hold, and it hosts the reference agent workload.",
@@ -164,7 +171,8 @@
       "microVM runtime and sealed guest image are unavailable.",
       "security-v1 is not sealed, so no EvidenceEnvelope is issued.",
       "DG-3 must fix which UID owns the delegated cgroup subtree; S3 must be re-run under that supervisor identity",
-      "SD-10: a same-UID agent can raise its own memory.max; containment holds only for non-hostile agents"
+      "SD-10: a same-UID agent can raise its own memory.max; containment holds only for non-hostile agents",
+      "DG-3 selected E; S3 must be re-run under the rootless supervisor identity before DG-4 can close."
     ],
     "rejectedAlternatives": [
       "wasm-instance",
