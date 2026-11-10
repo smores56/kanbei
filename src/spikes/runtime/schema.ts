@@ -175,5 +175,7 @@ export const SpikeResultDocument = Schema.Struct({
   ),
   unboundProbes: Schema.Array(Schema.String),
   envelope: EvidenceEnvelope,
+  /** Present when the permission/fail-closed probes were measured. Additive to v1. */
+  securityEnvelope: Schema.optional(EvidenceEnvelope),
 })
 export type SpikeResultDocument = typeof SpikeResultDocument.Type

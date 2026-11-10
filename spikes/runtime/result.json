@@ -146,67 +146,67 @@
       "boot": {
         "coldReady": {
           "count": 11,
-          "min": 390.889,
-          "max": 667.724,
-          "mean": 524.208,
-          "p50": 566.758,
-          "p95": 657.451
+          "min": 379.653,
+          "max": 858.658,
+          "mean": 530.167,
+          "p50": 536.942,
+          "p95": 742.736
         },
         "coldStart": {
           "count": 11,
-          "min": 403.312,
-          "max": 685.915,
-          "mean": 540.356,
-          "p50": 580.452,
-          "p95": 678.008
+          "min": 391.597,
+          "max": 882.223,
+          "mean": 546.529,
+          "p50": 553.849,
+          "p95": 762.961
         },
         "warmStart": {
           "count": 40,
-          "min": 17.934,
-          "max": 27.886,
-          "mean": 20.549,
-          "p50": 19.959,
-          "p95": 25.149
+          "min": 16.831,
+          "max": 31.027,
+          "mean": 19.876,
+          "p50": 19.394,
+          "p95": 22.431
         }
       },
       "memory": {
         "rssAfterBoot": {
           "count": 3,
-          "min": 144.699,
-          "max": 144.699,
-          "mean": 144.699,
-          "p50": 144.699,
-          "p95": 144.699
+          "min": 144.289,
+          "max": 144.289,
+          "mean": 144.289,
+          "p50": 144.289,
+          "p95": 144.289
         },
-        "rssAfterLoadBytes": 153157632,
-        "peakRssBytes": 153526272
+        "rssAfterLoadBytes": 152875008,
+        "peakRssBytes": 153055232
       },
       "eventLoop": {
-        "count": 1088,
-        "min": -0.623,
-        "max": 15.339,
-        "mean": 3.196,
-        "p50": 1.434,
+        "count": 1081,
+        "min": -0.57,
+        "max": 17.724,
+        "mean": 3.423,
+        "p50": 2.364,
         "p95": 6.411
       },
       "ledger": {
         "appends": 1000,
-        "appendsPerSecond": 229,
+        "appendsPerSecond": 218,
         "append": {
           "count": 1000,
-          "min": 1.978,
-          "max": 16.272,
-          "mean": 4.366,
-          "p50": 2.769,
-          "p95": 7.155
+          "min": 2.015,
+          "max": 18.647,
+          "mean": 4.584,
+          "p50": 5.312,
+          "p95": 7.228
         },
         "read": {
           "count": 1000,
           "min": 0.01,
-          "max": 0.354,
-          "mean": 0.021,
-          "p50": 0.016,
-          "p95": 0.052
+          "max": 0.204,
+          "mean": 0.024,
+          "p50": 0.018,
+          "p95": 0.051
         },
         "walMode": "wal",
         "readYourWrites": true,
@@ -277,21 +277,21 @@
         "busyBlockMs": 252
       },
       "isolation": {
-        "workerStartupMs": 107.99,
+        "workerStartupMs": 87.804,
         "roundtrip": {
           "count": 5,
-          "min": 0.044,
-          "max": 0.187,
-          "mean": 0.088,
-          "p50": 0.068,
-          "p95": 0.165
+          "min": 0.075,
+          "max": 0.23,
+          "mean": 0.151,
+          "p50": 0.119,
+          "p95": 0.229
         },
         "crashObserved": true,
         "parentSurvivedCrash": true
       },
       "signals": {
         "handlerInvoked": true,
-        "shutdownMs": 18.878,
+        "shutdownMs": 20.8,
         "exitCode": 0
       },
       "permissions": [
@@ -334,67 +334,67 @@
       "boot": {
         "coldReady": {
           "count": 11,
-          "min": 263.797,
-          "max": 416.784,
-          "mean": 320.076,
-          "p50": 288.841,
-          "p95": 409.44
+          "min": 267.014,
+          "max": 484.015,
+          "mean": 314.593,
+          "p50": 277.795,
+          "p95": 441.736
         },
         "coldStart": {
           "count": 11,
-          "min": 272.412,
-          "max": 431.289,
-          "mean": 332.976,
-          "p50": 299.138,
-          "p95": 425.46
+          "min": 276.27,
+          "max": 505.769,
+          "mean": 327.258,
+          "p50": 289.482,
+          "p95": 460.783
         },
         "warmStart": {
           "count": 40,
-          "min": 23.006,
-          "max": 31.083,
-          "mean": 25.477,
-          "p50": 24.779,
-          "p95": 28.952
+          "min": 22.226,
+          "max": 39.122,
+          "mean": 25.007,
+          "p50": 23.757,
+          "p95": 29.757
         }
       },
       "memory": {
         "rssAfterBoot": {
           "count": 3,
-          "min": 103.68,
-          "max": 103.684,
-          "mean": 103.683,
-          "p50": 103.684,
-          "p95": 103.684
+          "min": 103.648,
+          "max": 103.656,
+          "mean": 103.652,
+          "p50": 103.652,
+          "p95": 103.656
         },
-        "rssAfterLoadBytes": 98222080,
-        "peakRssBytes": 113586176
+        "rssAfterLoadBytes": 125063168,
+        "peakRssBytes": 125059072
       },
       "eventLoop": {
-        "count": 1072,
-        "min": 0.018,
-        "max": 34.376,
-        "mean": 5.938,
-        "p50": 5.882,
-        "p95": 8.095
+        "count": 1074,
+        "min": 0.016,
+        "max": 19.347,
+        "mean": 5.833,
+        "p50": 5.859,
+        "p95": 8.487
       },
       "ledger": {
         "appends": 1000,
-        "appendsPerSecond": 141,
+        "appendsPerSecond": 142,
         "append": {
           "count": 1000,
-          "min": 4.225,
-          "max": 19.01,
-          "mean": 7.084,
-          "p50": 6.735,
-          "p95": 8.641
+          "min": 4.245,
+          "max": 20.143,
+          "mean": 7.053,
+          "p50": 6.712,
+          "p95": 9.377
         },
         "read": {
           "count": 1000,
-          "min": 0.013,
-          "max": 7.147,
-          "mean": 0.045,
-          "p50": 0.024,
-          "p95": 0.073
+          "min": 0.012,
+          "max": 0.261,
+          "mean": 0.031,
+          "p50": 0.023,
+          "p95": 0.067
         },
         "walMode": "wal",
         "readYourWrites": true,
@@ -462,24 +462,24 @@
         "failClosed": true,
         "recoveryOk": true,
         "busyBlockedEventLoop": true,
-        "busyBlockMs": 253
+        "busyBlockMs": 252
       },
       "isolation": {
-        "workerStartupMs": 234.941,
+        "workerStartupMs": 97.008,
         "roundtrip": {
           "count": 5,
-          "min": 0.213,
-          "max": 1.645,
-          "mean": 0.547,
-          "p50": 0.28,
-          "p95": 1.389
+          "min": 0.118,
+          "max": 0.587,
+          "mean": 0.289,
+          "p50": 0.188,
+          "p95": 0.55
         },
         "crashObserved": true,
         "parentSurvivedCrash": true
       },
       "signals": {
         "handlerInvoked": true,
-        "shutdownMs": 14.743,
+        "shutdownMs": 8.771,
         "exitCode": 0
       },
       "permissions": [
@@ -522,9 +522,9 @@
       "label": "cold start to ready",
       "unit": "ms",
       "direction": "lower",
-      "node": 566.758,
-      "deno": 288.841,
-      "ratio": 1.9622,
+      "node": 536.942,
+      "deno": 277.795,
+      "ratio": 1.9329,
       "winner": "deno"
     },
     {
@@ -532,9 +532,9 @@
       "label": "cold start to exit",
       "unit": "ms",
       "direction": "lower",
-      "node": 580.452,
-      "deno": 299.138,
-      "ratio": 1.9404,
+      "node": 553.849,
+      "deno": 289.482,
+      "ratio": 1.9132,
       "winner": "deno"
     },
     {
@@ -542,9 +542,9 @@
       "label": "warm start (in-process bring-up)",
       "unit": "ms",
       "direction": "lower",
-      "node": 19.959,
-      "deno": 24.779,
-      "ratio": 0.8055,
+      "node": 19.394,
+      "deno": 23.757,
+      "ratio": 0.8163,
       "winner": "node"
     },
     {
@@ -552,9 +552,9 @@
       "label": "RSS after boot",
       "unit": "MiB",
       "direction": "lower",
-      "node": 144.699,
-      "deno": 103.684,
-      "ratio": 1.3956,
+      "node": 144.289,
+      "deno": 103.652,
+      "ratio": 1.3921,
       "winner": "deno"
     },
     {
@@ -562,9 +562,9 @@
       "label": "peak RSS",
       "unit": "MiB",
       "direction": "lower",
-      "node": 146.414,
-      "deno": 108.324,
-      "ratio": 1.3516,
+      "node": 145.965,
+      "deno": 119.266,
+      "ratio": 1.2239,
       "winner": "deno"
     },
     {
@@ -573,8 +573,8 @@
       "unit": "ms",
       "direction": "lower",
       "node": 6.411,
-      "deno": 8.095,
-      "ratio": 0.792,
+      "deno": 8.487,
+      "ratio": 0.7554,
       "winner": "node"
     },
     {
@@ -582,9 +582,9 @@
       "label": "durable append p95",
       "unit": "ms",
       "direction": "lower",
-      "node": 7.155,
-      "deno": 8.641,
-      "ratio": 0.828,
+      "node": 7.228,
+      "deno": 9.377,
+      "ratio": 0.7708,
       "winner": "node"
     },
     {
@@ -592,9 +592,9 @@
       "label": "point read p95",
       "unit": "ms",
       "direction": "lower",
-      "node": 0.052,
-      "deno": 0.073,
-      "ratio": 0.7123,
+      "node": 0.051,
+      "deno": 0.067,
+      "ratio": 0.7612,
       "winner": "node"
     },
     {
@@ -602,9 +602,9 @@
       "label": "durable append throughput",
       "unit": "ops/s",
       "direction": "higher",
-      "node": 229,
-      "deno": 141,
-      "ratio": 1.6241,
+      "node": 218,
+      "deno": 142,
+      "ratio": 1.5352,
       "winner": "node"
     },
     {
@@ -612,9 +612,9 @@
       "label": "worker startup",
       "unit": "ms",
       "direction": "lower",
-      "node": 107.99,
-      "deno": 234.941,
-      "ratio": 0.4596,
+      "node": 87.804,
+      "deno": 97.008,
+      "ratio": 0.9051,
       "winner": "node"
     },
     {
@@ -622,9 +622,9 @@
       "label": "worker round-trip p95",
       "unit": "ms",
       "direction": "lower",
-      "node": 0.165,
-      "deno": 1.389,
-      "ratio": 0.1188,
+      "node": 0.229,
+      "deno": 0.55,
+      "ratio": 0.4164,
       "winner": "node"
     },
     {
@@ -632,9 +632,9 @@
       "label": "SIGTERM shutdown",
       "unit": "ms",
       "direction": "lower",
-      "node": 18.878,
-      "deno": 14.743,
-      "ratio": 1.2805,
+      "node": 20.8,
+      "deno": 8.771,
+      "ratio": 2.3715,
       "winner": "deno"
     },
     {
@@ -650,26 +650,26 @@
   ],
   "hardFails": [],
   "composite": {
-    "node": 1.2933,
-    "deno": 1.2358,
-    "margin": 0.0465
+    "node": 1.2668,
+    "deno": 1.1572,
+    "margin": 0.0947
   },
   "decision": {
     "value": "deno",
     "rule": "tie-breaker: peak RSS",
     "rationale": [
-      "composite margin 4.7% < 10%",
-      "peak RSS node=153526272 deno=113586176"
+      "composite margin 9.5% < 10%",
+      "peak RSS node=153055232 deno=125059072"
     ]
   },
   "rejectedAlternative": {
     "value": "node",
     "reasons": [
-      "cold start to ready: 566.758ms versus 288.841ms (96.2% worse)",
-      "cold start to exit: 580.452ms versus 299.138ms (94% worse)",
-      "RSS after boot: 144.699MiB versus 103.684MiB (39.6% worse)",
-      "peak RSS: 146.414MiB versus 108.324MiB (35.2% worse)",
-      "SIGTERM shutdown: 18.878ms versus 14.743ms (28% worse)"
+      "cold start to ready: 536.942ms versus 277.795ms (93.3% worse)",
+      "cold start to exit: 553.849ms versus 289.482ms (91.3% worse)",
+      "RSS after boot: 144.289MiB versus 103.652MiB (39.2% worse)",
+      "peak RSS: 145.965MiB versus 119.266MiB (22.4% worse)",
+      "SIGTERM shutdown: 20.8ms versus 8.771ms (137.1% worse)"
     ]
   },
   "residualRisks": [
@@ -688,7 +688,6 @@
     }
   ],
   "unboundProbes": [
-    "permission and fail-closed probes are unbound: `security-v1` is not registered in fixtures/registry.json, so these probes are evidence-only and are not citable as S1 security-v1 results",
     "S1 also cites `cost-v1`; the runtime arm binds `append-v1@1.0.0` for its ledger workload and does not consume the model/broker cost workload, which belongs to the LANG-1 arm (A4)"
   ],
   "envelope": {
@@ -715,44 +714,78 @@
     ],
     "modelRecordings": [],
     "artifacts": [
-      "sha256:77b08cc52e2d895fc3cf9a0a6302dabdab93fba99604ec90c25152742d7083bf"
+      "sha256:09eb7719c18f7d6b9ec80a6ecbca1fc1f75df1f7357efdf9b455213242f49415"
     ],
     "outcome": "blocked",
     "metrics": {
-      "compositeNode": 1.2933,
-      "compositeDeno": 1.2358,
-      "compositeMargin": 0.0465,
+      "compositeNode": 1.2668,
+      "compositeDeno": 1.1572,
+      "compositeMargin": 0.0947,
       "hardFails": 0,
-      "node.coldReady": 566.758,
-      "deno.coldReady": 288.841,
-      "node.coldStart": 580.452,
-      "deno.coldStart": 299.138,
-      "node.warmStart": 19.959,
-      "deno.warmStart": 24.779,
-      "node.rssAfterBoot": 144.699,
-      "deno.rssAfterBoot": 103.684,
-      "node.peakRss": 146.414,
-      "deno.peakRss": 108.324,
+      "node.coldReady": 536.942,
+      "deno.coldReady": 277.795,
+      "node.coldStart": 553.849,
+      "deno.coldStart": 289.482,
+      "node.warmStart": 19.394,
+      "deno.warmStart": 23.757,
+      "node.rssAfterBoot": 144.289,
+      "deno.rssAfterBoot": 103.652,
+      "node.peakRss": 145.965,
+      "deno.peakRss": 119.266,
       "node.eventLoopP95": 6.411,
-      "deno.eventLoopP95": 8.095,
-      "node.appendP95": 7.155,
-      "deno.appendP95": 8.641,
-      "node.readP95": 0.052,
-      "deno.readP95": 0.073,
-      "node.appendThroughput": 229,
-      "deno.appendThroughput": 141,
-      "node.workerStartup": 107.99,
-      "deno.workerStartup": 234.941,
-      "node.workerRoundtripP95": 0.165,
-      "deno.workerRoundtripP95": 1.389,
-      "node.shutdown": 18.878,
-      "deno.shutdown": 14.743,
+      "deno.eventLoopP95": 8.487,
+      "node.appendP95": 7.228,
+      "deno.appendP95": 9.377,
+      "node.readP95": 0.051,
+      "deno.readP95": 0.067,
+      "node.appendThroughput": 218,
+      "deno.appendThroughput": 142,
+      "node.workerStartup": 87.804,
+      "deno.workerStartup": 97.008,
+      "node.workerRoundtripP95": 0.229,
+      "deno.workerRoundtripP95": 0.55,
+      "node.shutdown": 20.8,
+      "deno.shutdown": 8.771,
       "node.runtimeBinary": 74.617,
       "deno.runtimeBinary": 135.985
+    }
+  },
+  "securityEnvelope": {
+    "testId": "NODE-DENO-1-SECURITY",
+    "invariantIds": [
+      "fs-write",
+      "net-connect",
+      "process-spawn",
+      "fs-read-outside-scope"
+    ],
+    "fixtureVersion": "security-v1@1.0.0",
+    "canonicalHead": {
+      "seq": 0,
+      "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     },
-    "acceptedResiduals": [
-      "security-v1 is not sealed; permission and fail-closed probes are unbound",
-      "cost-v1 is not consumed by the runtime arm; LANG-1 owns that workload"
-    ]
+    "sequenceRange": [
+      0,
+      0
+    ],
+    "environment": {
+      "hostFingerprint": "sha256:e626bea75247a2aaaebaef3e951d5700b34ec2a7a965e7857bb853fecc66dd24",
+      "kernel": "linux-6.18.39",
+      "runtime": "deno@2.9.2",
+      "sandboxPosture": "unverified",
+      "brokerIdentity": "unconfigured"
+    },
+    "seeds": [
+      0
+    ],
+    "modelRecordings": [],
+    "artifacts": [
+      "sha256:f866265d40e8743adf95309aa185cf683ce53e37c15d516464c8660bbfa576e8"
+    ],
+    "outcome": "pass",
+    "metrics": {
+      "expectedProbes": 4,
+      "nodeDeniedProbes": 3,
+      "denoDeniedProbes": 4
+    }
   }
 }

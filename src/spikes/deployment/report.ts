@@ -1,5 +1,16 @@
 import type { ArmAssessment, ProbeResult, SpikeResult } from "./types.ts"
 
+/**
+ * The security probes measure the runtime's own capability boundary. They say
+ * nothing about whether an OS sandbox holds, which is a separate deployment
+ * finding (`DEP-1` / `DG-3`).
+ */
+export const SECURITY_SCOPE =
+  "Covers inner runtime capability denial only; OS-sandbox enforcement remains DEP-1/DG-3."
+
+export const DEPLOYMENT_SCOPE =
+  "This envelope covers pure-user-space probes; DG-3 option E is the response."
+
 const cell = (value: string): string => value.replaceAll("|", "\\|").replaceAll("\n", " ")
 
 const table = (
@@ -68,7 +79,7 @@ const probeRows = (probes: ReadonlyArray<ProbeResult>): ReadonlyArray<ReadonlyAr
   probes.map((probe) => [probe.id, probe.category, probe.status, probe.observed])
 
 export const renderReport = (result: SpikeResult): string => {
-  const { host, probes, arms, recommendation, decisionGate } = result
+  const { host, probes, arms, recommendation, decisionGate, envelope } = result
   const failures = probes.filter((probe) => probe.status === "fail")
   const blocked = probes.filter((probe) => probe.status === "blocked")
   const inconclusive = probes.filter((probe) => probe.status === "inconclusive")
@@ -140,6 +151,15 @@ export const renderReport = (result: SpikeResult): string => {
     "5. A 0600 file in a 0700 directory is readable by the same UID (SC-01); a 0444 audit file can be truncated and unlinked by its owner's UID (SC-03).",
     "6. Unix socket credentials report only pid/uid/gid; a same-UID client is indistinguishable from the frozen core (BI-01).",
     "7. Supplementary group `docker` plus `/var/run/docker.sock` is root-equivalent on this host (SC-04).",
+    "",
+    "## Evidence envelope",
+    "",
+    `- test: \`${envelope.testId}\``,
+    `- fixture: \`${envelope.fixtureVersion}\``,
+    `- outcome: \`${envelope.outcome}\``,
+    `- covered invariants: ${envelope.invariantIds.join(", ")}`,
+    `- scope: ${SECURITY_SCOPE}`,
+    `- ${DEPLOYMENT_SCOPE}`,
     "",
     "## Fail-closed evidence",
     "",

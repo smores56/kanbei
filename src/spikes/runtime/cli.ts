@@ -5,8 +5,16 @@ import { EnvironmentProbe, liveEnvironmentProbeLayer } from "../../evidence/envi
 import { fixtureStoreLayer } from "../../evidence/fixture-store.ts"
 import { capture, ensureDirectory } from "./adapters/launch.ts"
 import { runBakeOff } from "./driver.ts"
-import { appendFixtureReference, outcomeOf, sealSpikeEvidence } from "./envelope.ts"
+import {
+  appendFixtureReference,
+  outcomeOf,
+  sealSecurityEvidence,
+  sealSpikeEvidence,
+  securityEnvelopeOutcome,
+  securityFixtureReference,
+} from "./envelope.ts"
 import { PRE_REGISTRATION } from "./plan.ts"
+import { renderSecurityEnvelope } from "./report.ts"
 import { SpikeResultDocument } from "./schema.ts"
 
 const repoRoot = Deno.cwd()
@@ -80,12 +88,12 @@ const ensureNodeDependencies = (nodeBinary: string, denoJson: string): Effect.Ef
     return nodeInstalled()
   })
 
-const fixtureVersion = (repoRootPath: string) =>
+const datasetVersion = (repoRootPath: string, id: string) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const text = yield* fs.readFileString(`${repoRootPath}/fixtures/registry.json`)
     const registry = Schema.decodeUnknownSync(registrySchema)(JSON.parse(text))
-    const entry = registry.datasets.find((dataset) => dataset.id === "append-v1")
+    const entry = registry.datasets.find((dataset) => dataset.id === id)
     return entry?.version ?? "1.0.0"
   })
 
@@ -139,16 +147,23 @@ const program = Effect.gen(function* () {
     unboundProbes: [...bakeOff.unboundProbes],
   }
 
-  const version = yield* fixtureVersion(repoRoot)
+  const version = yield* datasetVersion(repoRoot, "append-v1")
   const outcome = outcomeOf(
     bakeOff.outcome.decision.value,
     bakeOff.decisionBlocks,
     bakeOff.unboundProbes,
   )
   const envelope = yield* sealSpikeEvidence(base, appendFixtureReference(version), outcome)
+  const securityVersion = yield* datasetVersion(repoRoot, "security-v1")
+  const securityEnvelope = yield* sealSecurityEvidence(
+    base,
+    securityFixtureReference(securityVersion),
+    securityEnvelopeOutcome(bakeOff.arms, PRE_REGISTRATION.permissionExpectations),
+  )
   const document: SpikeResultDocument = Schema.decodeUnknownSync(SpikeResultDocument)({
     ...base,
     envelope,
+    securityEnvelope,
   })
 
   yield* fs.makeDirectory(`${repoRoot}/spikes/runtime`, { recursive: true })
@@ -169,6 +184,7 @@ const program = Effect.gen(function* () {
     yield* Console.log(`  blocked ${entry.arm} ${entry.measurement}: ${entry.reason}`)
   }
   yield* Console.log(`envelope outcome: ${document.envelope.outcome}`)
+  yield* Console.log(renderSecurityEnvelope(document))
 })
 
 const provided = program.pipe(Effect.provide(layers), Effect.provide(DenoServices.layer))

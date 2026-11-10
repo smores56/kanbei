@@ -45,15 +45,16 @@
   "baselineFrozen": false,
   "evidenceBindingGaps": [
     "security-v1 is registered and sealed in this tree; the S3 re-run emits an EvidenceEnvelope bound to security-v1@1.0.0 (outcome pass)",
+    "A1's permission and fail-closed probes are bound via a second envelope, testId NODE-DENO-1-SECURITY, fixture security-v1@1.0.0, outcome pass; the A1 main NODE-DENO-1 envelope stays blocked on cost-v1",
+    "A2 now emits a DEP-1 envelope bound to security-v1@1.0.0 with outcome fail by design: pure user-space has no secret isolation; this is a finding, not a defect",
     "A4 issued no envelope because all model cells are blocked",
-    "A2 emitted a measurement record rather than an envelope; A3 now emits one",
-    "A1 S1 envelope is blocked because cost-v1/security-v1 bindings are absent"
+    "A3 emits an envelope as well (testId S3, outcome pass); A2b is a measurement record, not an EvidenceEnvelope"
   ],
   "operatorEnvelopeSchema": "src/spikes/gates/operator-envelope.ts",
   "next": [
     "human signs or amends DG-4",
     "human provides NEURALWATT_API_KEY and a live adapter for DG-1 trials or blocks F4",
-    "human decides whether to re-run A1/A2 security probes against the sealed security-v1 dataset or accept the gap"
+    "human decides whether to accept the remaining evidence gaps: the A1 main envelope stays blocked on cost-v1 and the A2 DEP-1 outcome is fail by design"
   ],
   "crossGate": "S3 was re-run under DG-3 option E: the supervisor is the deployment user outside the rootless agent sandbox and owns the delegated cgroup root. DG-4 now needs human sign-off only; DG-3 variant D would still move the supervisor to a dedicated system unit.",
   "a2b": {

@@ -125,7 +125,7 @@
       "method": "same-UID sibling opens /proc/<broker>/mem",
       "status": "pass",
       "observed": "same-UID sibling was denied /proc/<broker>/mem",
-      "evidence": "attacker mem {\"ok\":true,\"opened\":false,\"error\":\"PermissionDenied: Permission denied (os error 13): open '/proc/317883/mem'\"}; kernel.yama.ptrace_scope=1",
+      "evidence": "attacker mem {\"ok\":true,\"opened\":false,\"error\":\"PermissionDenied: Permission denied (os error 13): open '/proc/367414/mem'\"}; kernel.yama.ptrace_scope=1",
       "enforcement": {
         "pure": "kernel",
         "dedicated": "kernel"
@@ -143,7 +143,7 @@
       "method": "strace -p <broker> from a sibling; strace -f on an own child as control",
       "status": "pass",
       "observed": "PTRACE attach on a same-UID sibling denied; own child attach allowed=true",
-      "evidence": "sibling: exit=1 | /run/current-system/sw/bin/strace: attach: ptrace(PTRACE_SEIZE, 317899): Operation not permitted\n/run/current-system/sw/bin/strace: sysctl kernel.yama.ptrace_scope = 1 may be restricting this attach | own child: exit=0",
+      "evidence": "sibling: exit=1 | /run/current-system/sw/bin/strace: attach: ptrace(PTRACE_SEIZE, 367430): Operation not permitted\n/run/current-system/sw/bin/strace: sysctl kernel.yama.ptrace_scope = 1 may be restricting this attach | own child: exit=0",
       "enforcement": {
         "pure": "kernel",
         "dedicated": "kernel"
@@ -265,7 +265,7 @@
       "method": "systemctl --user show-environment and systemctl --version",
       "status": "pass",
       "observed": "user manager reachable (systemd 261 (261))",
-      "evidence": "show-environment: exit=0 | GTK_A11Y=none\nGTK_PATH=/home/smores/.nix-profile/lib/gtk-2.0:/home/smores/.nix-profile/lib/gtk-3.0:/home/smores/.nix-profile/lib/gtk-4.0:/nix/profile/lib/gtk-2.0:/nix/profile/lib/gtk-3.0:/nix/profile/lib/gtk-4.0:/home/smores/.local/state/nix/profile/lib/gtk-2.0:/home/smores/.local/state/nix/profile/lib/gtk-3.0:/home/smores/.local/state/nix/profile/lib/gtk-4.0:/etc/profiles/per-user/smores/lib/gtk-2.0:/etc/profiles/per-user/smores/lib/gtk-3.0:/etc/profiles/per-user/smores/lib/gtk-4.0:/nix/var/nix/profiles/default/lib/gtk-2.0:/nix/var/nix/profiles/default/lib/gtk-3.0:/nix/var/nix/profil… | version: systemd 261 (261)",
+      "evidence": "show-environment: exit=0 | DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus\nGTK_A11Y=none\nGTK_PATH=/home/smores/.nix-profile/lib/gtk-2.0:/home/smores/.nix-profile/lib/gtk-3.0:/home/smores/.nix-profile/lib/gtk-4.0:/nix/profile/lib/gtk-2.0:/nix/profile/lib/gtk-3.0:/nix/profile/lib/gtk-4.0:/home/smores/.local/state/nix/profile/lib/gtk-2.0:/home/smores/.local/state/nix/profile/lib/gtk-3.0:/home/smores/.local/state/nix/profile/lib/gtk-4.0:/etc/profiles/per-user/smores/lib/gtk-2.0:/etc/profiles/per-user/smores/lib/gtk-3.0:/etc/profiles/per-user/smores/lib/gtk-4.0:/nix/var/nix/profiles/default/lib/gtk-2.0:/nix/va… | version: systemd 261 (261)",
       "prerequisites": [
         "systemctl"
       ],
@@ -278,7 +278,7 @@
       "method": "start a transient user unit with hardening directives and read effective properties",
       "status": "pass",
       "observed": "20 hardening directives applied as requested",
-      "evidence": "exit=0 | Running as unit: kanbei-dep1-sd02.service; invocation ID: 24a2cddb975b4bb387f50f577378e85b | effective {\"MemoryHigh\":\"50331648\",\"MemoryMax\":\"67108864\",\"TasksMax\":\"32\",\"RemoveIPC\":\"yes\",\"PrivateTmp\":\"yes\",\"PrivateDevices\":\"yes\",\"ProtectClock\":\"yes\",\"ProtectKernelTunables\":\"yes\",\"ProtectKernelModules\":\"yes\",\"ProtectControlGroups\":\"yes\",\"PrivateNetwork\":\"yes\",\"ProtectHome\":\"read-only\",\"ProtectSystem\":\"strict\",\"NoNewPrivileges\":\"yes\",\"LockPersonality\":\"yes\",\"RestrictAddressFamilies\":\"AF_INET AF_UNIX\",\"RestrictRealtime\":\"yes\",\"RestrictSUIDSGID\":\"yes\",\"RestrictNamespaces\":\"yes\",\"ProtectHostname\":\"yes\"}",
+      "evidence": "exit=0 | Running as unit: kanbei-dep1-sd02.service; invocation ID: 3b3d210d83a04374a6ca776b181dc68e | effective {\"MemoryHigh\":\"50331648\",\"MemoryMax\":\"67108864\",\"TasksMax\":\"32\",\"RemoveIPC\":\"yes\",\"PrivateTmp\":\"yes\",\"PrivateDevices\":\"yes\",\"ProtectClock\":\"yes\",\"ProtectKernelTunables\":\"yes\",\"ProtectKernelModules\":\"yes\",\"ProtectControlGroups\":\"yes\",\"PrivateNetwork\":\"yes\",\"ProtectHome\":\"read-only\",\"ProtectSystem\":\"strict\",\"NoNewPrivileges\":\"yes\",\"LockPersonality\":\"yes\",\"RestrictAddressFamilies\":\"AF_INET AF_UNIX\",\"RestrictRealtime\":\"yes\",\"RestrictSUIDSGID\":\"yes\",\"RestrictNamespaces\":\"yes\",\"ProtectHostname\":\"yes\"}",
       "prerequisites": [
         "systemd-run",
         "systemctl",
@@ -326,8 +326,8 @@
       "arm": "pure-user-space",
       "method": "compare /tmp device:inode inside a PrivateTmp unit with the host",
       "status": "pass",
-      "observed": "/tmp is private (unit 30:325161, host 30:13)",
-      "evidence": "unit: exit=0 | 30:325161 | host: exit=0 | 30:13",
+      "observed": "/tmp is private (unit 30:329590, host 30:13)",
+      "evidence": "unit: exit=0 | 30:329590 | host: exit=0 | 30:13",
       "enforcement": {
         "pure": "kernel",
         "dedicated": "kernel"
@@ -409,7 +409,7 @@
       "method": "a same-UID process stops and reconfigures a sibling unit",
       "status": "fail",
       "observed": "same-UID process rewrote a sibling unit ceiling from 67108864 to 134217728 and can stop it",
-      "evidence": "unit start: exit=0 | Running as unit: kanbei-dep1-sd10.service; invocation ID: 12a8bd74bfb949baac5993d9aaa4b70e | cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/kanbei-dep1-sd10.service | memory.max 67108864 -> 134217728",
+      "evidence": "unit start: exit=0 | Running as unit: kanbei-dep1-sd10.service; invocation ID: fb9907f7dd524f12bad9e088b780911e | cgroup /user.slice/user-1000.slice/user@1000.service/app.slice/kanbei-dep1-sd10.service | memory.max 67108864 -> 134217728",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -427,7 +427,7 @@
       "method": "unit with MemoryMax=64M allocates 400 MiB and is observed until it dies",
       "status": "pass",
       "observed": "unit result=oom-kill, MemoryPeak=67108864 bytes, ActiveState=failed",
-      "evidence": "systemd-run: exit=0 Running as unit: kanbei-dep1-lm01.service; invocation ID: 59549a14eae440018f78e332aab53c72 | final state {\"activeState\":\"failed\",\"result\":\"oom-kill\",\"memoryPeak\":\"67108864\",\"restarts\":\"0\"}",
+      "evidence": "systemd-run: exit=0 Running as unit: kanbei-dep1-lm01.service; invocation ID: ffacc3391fc043a6a7ce8b919f11cf7a | final state {\"activeState\":\"failed\",\"result\":\"oom-kill\",\"memoryPeak\":\"67108864\",\"restarts\":\"0\"}",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -445,8 +445,8 @@
       "arm": "pure-user-space",
       "method": "unit with MemoryHigh=32M allocates 400 MiB; read memory.events",
       "status": "pass",
-      "observed": "memory.events high count=915, unit ActiveState=active, result=success",
-      "evidence": "memory.events: low 0 high 915 max 0 oom 0 oom_kill 0 oom_group_kill 0 ",
+      "observed": "memory.events high count=1390, unit ActiveState=active, result=success",
+      "evidence": "memory.events: low 0 high 1390 max 0 oom 0 oom_kill 0 oom_group_kill 0 ",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -483,7 +483,7 @@
       "method": "unit with CPUQuota=10% runs a busy loop; read cpu.stat nr_throttled",
       "status": "pass",
       "observed": "cpu.max=10000 100000, nr_throttled=20",
-      "evidence": "cpu.stat: usage_usec 210971 user_usec 207078 system_usec 3892 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 20 nr_throttled 20 throttled_usec 1750082 nr_bursts 0 burst_usec 0 ",
+      "evidence": "cpu.stat: usage_usec 210444 user_usec 203995 system_usec 6449 nice_usec 0 core_sched.force_idle_usec 0 nr_periods 20 nr_throttled 20 throttled_usec 1723925 nr_bursts 0 burst_usec 0 ",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -511,7 +511,7 @@
       "method": "unit with Restart=on-failure and StartLimitBurst=2 exits 7 repeatedly",
       "status": "pass",
       "observed": "NRestarts=2, Result=start-limit-hit, ExecMainStatus=7",
-      "evidence": "systemd-run: exit=0 Running as unit: kanbei-dep1-rc01.service; invocation ID: b9ec710a91ab4d80ad9389ef96f686b6",
+      "evidence": "systemd-run: exit=0 Running as unit: kanbei-dep1-rc01.service; invocation ID: a999fc2dbaeb423db167b227be1572de",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -529,8 +529,8 @@
       "arm": "pure-user-space",
       "method": "background child outlives its parent shell",
       "status": "fail",
-      "observed": "detached sandbox-shaped child 318163 survived its parent",
-      "evidence": "setsid sleep 30 & echo $! -> pid=318163 alive=true",
+      "observed": "detached sandbox-shaped child 367693 survived its parent",
+      "evidence": "setsid sleep 30 & echo $! -> pid=367693 alive=true",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -561,7 +561,7 @@
       "method": "kill a child after it records intent; classify the interrupted effect",
       "status": "pass",
       "observed": "intent recorded=true, completion recorded=false, classification=outcome_unknown",
-      "evidence": "kill -9 after intent; state dir /tmp/kanbei-dep1-278d6c06b72d8a42/recovery/effect",
+      "evidence": "kill -9 after intent; state dir /tmp/kanbei-dep1-de09eeb5db28c18d/recovery/effect",
       "prerequisites": [
         "deno"
       ],
@@ -594,7 +594,7 @@
       "method": "bind 127.0.0.1, then connect via loopback and via the host's global IPv4 address",
       "status": "pass",
       "observed": "loopback connect=true, 10.77.0.2 connect=false",
-      "evidence": "port 34755; external error: ConnectionRefused: Connection refused (os error 111)",
+      "evidence": "port 46245; external error: ConnectionRefused: Connection refused (os error 111)",
       "enforcement": {
         "pure": "kernel",
         "dedicated": "kernel"
@@ -612,7 +612,7 @@
       "method": "bind 0.0.0.0 and connect through the host's global IPv4 address",
       "status": "fail",
       "observed": "wildcard listener reachable on 10.77.0.2=true",
-      "evidence": "port 33309; error ",
+      "evidence": "port 44519; error ",
       "prerequisites": [
         "deno",
         "ip"
@@ -639,7 +639,7 @@
       "method": "read a 0600 file from a 0700 directory as the same UID",
       "status": "fail",
       "observed": "0600 file in a 0700 directory is readable by the same UID (mode 0o100600)",
-      "evidence": "open /tmp/kanbei-dep1-278d6c06b72d8a42/secrets/credential with mode 0o100600 -> readable=true",
+      "evidence": "open /tmp/kanbei-dep1-de09eeb5db28c18d/secrets/credential with mode 0o100600 -> readable=true",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -666,7 +666,7 @@
       "method": "create a 0444 audit sink in a user-owned tree, then truncate and unlink it as the same UID",
       "status": "fail",
       "observed": "same-UID truncate=false, unlink=true on a 0444 audit file",
-      "evidence": "/tmp/kanbei-dep1-278d6c06b72d8a42/audit/audit.log mode 0444 owned by uid 1000",
+      "evidence": "/tmp/kanbei-dep1-de09eeb5db28c18d/audit/audit.log mode 0444 owned by uid 1000",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -705,8 +705,8 @@
       "arm": "both",
       "method": "unix socket with mode 0600; server reports SO_PEERCRED of a same-UID client",
       "status": "fail",
-      "observed": "SO_PEERCRED peer uid=1000 gid=100 pid=318227; socket mode=0600; deployment uid=1000",
-      "evidence": "perl SO_PEERCRED + nc -U -> {\"peerPid\":318227,\"peerUid\":1000,\"peerGid\":100,\"socketMode\":\"0600\"}",
+      "observed": "SO_PEERCRED peer uid=1000 gid=100 pid=367757; socket mode=0600; deployment uid=1000",
+      "evidence": "perl SO_PEERCRED + nc -U -> {\"peerPid\":367757,\"peerUid\":1000,\"peerGid\":100,\"socketMode\":\"0600\"}",
       "enforcement": {
         "pure": "conventional",
         "dedicated": "kernel"
@@ -779,7 +779,7 @@
       "method": "make the audit sink unwritable and confirm the guarded effect is denied",
       "status": "pass",
       "observed": "sink writable=true, writable after chmod 0444=false, guarded effect allowed=true, guarded effect after denial=false",
-      "evidence": "audit sink /tmp/kanbei-dep1-278d6c06b72d8a42/fail-closed/gate/audit.log; effect marker exists=false",
+      "evidence": "audit sink /tmp/kanbei-dep1-de09eeb5db28c18d/fail-closed/gate/audit.log; effect marker exists=false",
       "prerequisites": [
         "deno"
       ],
@@ -964,5 +964,42 @@
     "RC-06: no ledger, CAS, or backup implementation exists yet in this task's scope",
     "BI-02: cross-UID connect is untestable: effective capabilities=0000000000000000; a second UID cannot be created or entered without privilege",
     "BI-03: uid=1000, effective capabilities=0000000000000000, existing kanbei service users=false"
-  ]
+  ],
+  "envelope": {
+    "testId": "DEP-1",
+    "invariantIds": [
+      "same-uid-process-inspection",
+      "same-uid-signal",
+      "secret-fd-reachability"
+    ],
+    "fixtureVersion": "security-v1@1.0.0",
+    "canonicalHead": {
+      "seq": 0,
+      "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "sequenceRange": [
+      0,
+      0
+    ],
+    "environment": {
+      "hostFingerprint": "sha256:e626bea75247a2aaaebaef3e951d5700b34ec2a7a965e7857bb853fecc66dd24",
+      "kernel": "linux-6.18.39",
+      "runtime": "deno@2.9.2",
+      "sandboxPosture": "unverified",
+      "brokerIdentity": "unconfigured"
+    },
+    "seeds": [
+      0
+    ],
+    "modelRecordings": [],
+    "artifacts": [
+      "sha256:a6ba4e34b8ba24875b80dcdbdeb18b1164b08d48149bb2524e4b439a5022eb46"
+    ],
+    "outcome": "fail",
+    "metrics": {
+      "probes": 51,
+      "failures": 14,
+      "blocked": 4
+    }
+  }
 }

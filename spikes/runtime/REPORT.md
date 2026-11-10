@@ -5,8 +5,8 @@ Machine-readable arm: [`result.json`](./result.json). Pre-registration is frozen
 [`src/spikes/runtime/plan.ts`](../../src/spikes/runtime/plan.ts) and republished inside `result.json` as
 `preRegistration`, so this document can be checked against the run.
 
-Status: **complete for the assigned measurement set; the decision gate is blocked on two protocol bindings that
-this task cannot create** (see [Protocol gaps](#protocol-gaps-and-blockers)). Recommendation in
+Status: **complete for the assigned measurement set; the decision gate is blocked on the `cost-v1` protocol
+binding that this task cannot create** (see [Protocol gaps](#protocol-gaps-and-blockers)). Recommendation in
 [Recommendation for `DG-2`](#recommendation-for-dg-2).
 
 ---
@@ -17,7 +17,7 @@ this task cannot create** (see [Protocol gaps](#protocol-gaps-and-blockers)). Re
 | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Protocol                      | `S1`                                                                                                                                                                                                                                                                                   |
 | Decision                      | `NODE-DENO-1`                                                                                                                                                                                                                                                                          |
-| Dataset binding               | `append-v1@1.0.0` (the only sealed dataset this workload can bind; see protocol gaps)                                                                                                                                                                                                  |
+| Dataset binding               | `append-v1@1.0.0` for the ledger workload; `security-v1@1.0.0` for the permission probes (see protocol gaps)                                                                                                                                                                           |
 | Arms                          | `node@24.21.0` (nix `nixpkgs#nodejs_24`), `deno@2.9.2`                                                                                                                                                                                                                                 |
 | Cold-start runs per arm       | 11 (spawn → ready, spawn → exit)                                                                                                                                                                                                                                                       |
 | Warm-start iterations per arm | 40 (in-process bring-up: open DB, prepare, insert, read, close)                                                                                                                                                                                                                        |
@@ -87,23 +87,23 @@ loads and the first database open completes. Warm = re-running app-layer bring-u
 ## 3. Raw tables (published run, `result.json`)
 
 All units are milliseconds unless noted; `p50`/`p95` come from the run's own sample vectors. Sample counts:
-cold 11 per arm, warm 40 per arm, appends 1000 per arm, event-loop 1088 (node) / 1072 (deno), worker 5 per arm.
+cold 11 per arm, warm 40 per arm, appends 1000 per arm, event-loop 1081 (node) / 1074 (deno), worker 5 per arm.
 
 | Metric                            |                node |                deno |
 | --------------------------------- | ------------------: | ------------------: |
-| cold start to ready p50 / p95     |       566.8 / 657.5 |       288.8 / 409.4 |
-| cold start to exit p50 / p95      |       580.5 / 678.0 |       299.1 / 425.5 |
-| warm start p50 / p95              |         20.0 / 25.1 |         24.8 / 29.0 |
-| RSS after boot p50 (MiB)          |               144.7 |               103.7 |
-| RSS after load (MiB)              |               146.1 |                93.7 |
-| peak RSS (`VmHWM`) (MiB)          |               146.4 |               108.3 |
-| event-loop lag p50 / p95 / max    | 1.43 / 6.41 / 15.34 | 5.88 / 8.10 / 34.38 |
-| durable append p50 / p95 / mean   |  2.77 / 7.16 / 4.37 |  6.74 / 8.64 / 7.08 |
-| point read p50 / p95              |       0.016 / 0.052 |       0.024 / 0.073 |
-| durable append throughput (ops/s) |                 229 |                 141 |
-| worker startup                    |               108.0 |               234.9 |
-| worker round-trip p50 / p95       |       0.068 / 0.165 |         0.28 / 1.39 |
-| `SIGTERM` shutdown                |                18.9 |                14.7 |
+| cold start to ready p50 / p95     |       536.9 / 742.7 |       277.8 / 441.7 |
+| cold start to exit p50 / p95      |       553.8 / 763.0 |       289.5 / 460.8 |
+| warm start p50 / p95              |         19.4 / 22.4 |         23.8 / 29.8 |
+| RSS after boot p50 (MiB)          |               144.3 |               103.7 |
+| RSS after load (MiB)              |               145.8 |               119.3 |
+| peak RSS (`VmHWM`) (MiB)          |               146.0 |               119.3 |
+| event-loop lag p50 / p95 / max    | 2.36 / 6.41 / 17.72 | 5.86 / 8.49 / 19.35 |
+| durable append p50 / p95 / mean   |  5.31 / 7.23 / 4.58 |  6.71 / 9.38 / 7.05 |
+| point read p50 / p95              |       0.018 / 0.051 |       0.023 / 0.067 |
+| durable append throughput (ops/s) |                 218 |                 142 |
+| worker startup                    |                87.8 |                97.0 |
+| worker round-trip p50 / p95       |       0.119 / 0.229 |       0.188 / 0.550 |
+| `SIGTERM` shutdown                |                20.8 |                 8.8 |
 | runtime binary (MiB)              |                74.6 |               136.0 |
 | compiled single binary (MiB)      |             blocked |               199.4 |
 | SQLite version                    |              3.53.3 |              3.53.2 |
@@ -142,7 +142,21 @@ The last row is a real, if small, driver-parity difference: Deno's `node:sqlite`
 Deno's model is inner and default-deny; Node's is an opt-in process flag and has no network capability, so
 network containment for the Node arm stays an OS-sandbox obligation. No probe failed open.
 
-### 3.3 Run-to-run stability (5 runs, same machine, same worktree)
+### 3.3 Security evidence envelope
+
+- test: `NODE-DENO-1-SECURITY`
+- fixture: `security-v1@1.0.0`
+- outcome: `pass`
+- covered probes: fs-write, net-connect, process-spawn, fs-read-outside-scope
+- scope: Covers inner runtime capability denial only; OS-sandbox enforcement remains DEP-1/DG-3.
+
+The probe artifact and the `securityEnvelope` in `result.json` are emitted by
+`src/spikes/runtime/envelope.ts`. The outcome is the probe data's verdict, not the runtime decision: every
+pre-registered denial held on both arms, so it is `pass`. The main `NODE-DENO-1` envelope stays `blocked` on
+the `cost-v1` binding. Node's `net-connect` probe is not a denial case — Node has no network capability and
+reports `ECONNREFUSED` — so it is excluded from the invariant set.
+
+### 3.4 Run-to-run stability (6 runs, same machine, same worktree)
 
 | Run | composite node | composite deno | margin | decision | rule               | cold-ready node/deno | peak RSS node/deno | append ops/s node/deno |
 | --- | -------------: | -------------: | -----: | -------- | ------------------ | -------------------: | -----------------: | ---------------------: |
@@ -151,11 +165,13 @@ network containment for the Node arm stays an OS-sandbox obligation. No probe fa
 | 3   |         1.1656 |         1.1485 |  1.5 % | deno     | peak-RSS tie-break |            589 / 414 |      146.5 / 104.8 |              213 / 136 |
 | 4   |         1.2880 |         1.2507 |  3.0 % | deno     | peak-RSS tie-break |            602 / 299 |      146.9 / 119.0 |              230 / 142 |
 | 5   |         1.2933 |         1.2358 |  4.7 % | deno     | peak-RSS tie-break |            567 / 289 |      146.4 / 108.3 |              229 / 141 |
+| 6   |         1.2668 |         1.1572 |  9.5 % | deno     | peak-RSS tie-break |            537 / 278 |      146.0 / 119.3 |              218 / 142 |
 
 The composite is inside the pre-registered 10 % margin in every run, so the tie-breaker decides every time.
 Per-metric signs are mixed and stable: Deno wins cold start and peak RSS, Node wins warm start, event-loop tail,
-append tail and throughput. That the weighted sum stays within 1.5–4.7 % is exactly why the margin exists.
+append tail and throughput. That the weighted sum stays within 1.5–9.5 % is exactly why the margin exists.
 Peak RSS and cold start separate the arms consistently across runs; append throughput consistently favours Node.
+Run 6 is the published run this report quotes.
 
 ## 4. Decision matrix
 
@@ -163,18 +179,18 @@ Normalized cost = own value ÷ better value (lower is better). Composite = Σ we
 
 | Metric              | Weight |      node |      deno |  node cost |  deno cost | Winner                     |
 | ------------------- | -----: | --------: | --------: | ---------: | ---------: | -------------------------- |
-| cold start to ready |   0.25 |  566.8 ms |  288.8 ms |     1.9622 |     1.0000 | deno                       |
-| peak RSS            |   0.15 | 146.4 MiB | 108.3 MiB |     1.3516 |     1.0000 | deno                       |
-| event-loop lag p95  |   0.20 |   6.41 ms |   8.10 ms |     1.0000 |     1.2627 | node                       |
-| durable append p95  |   0.20 |   7.16 ms |   8.64 ms |     1.0000 |     1.2077 | node                       |
-| warm start          |   0.10 |   20.0 ms |   24.8 ms |     1.0000 |     1.2415 | node                       |
-| worker startup      |   0.10 |  108.0 ms |  234.9 ms |     1.0000 |     2.1756 | node                       |
-| **Composite**       |   1.00 |           |           | **1.2933** | **1.2358** | deno (margin 4.7 % < 10 %) |
+| cold start to ready |   0.25 |  536.9 ms |  277.8 ms |     1.9328 |     1.0000 | deno                       |
+| peak RSS            |   0.15 | 146.0 MiB | 119.3 MiB |     1.2239 |     1.0000 | deno                       |
+| event-loop lag p95  |   0.20 |   6.41 ms |   8.49 ms |     1.0000 |     1.3238 | node                       |
+| durable append p95  |   0.20 |   7.23 ms |   9.38 ms |     1.0000 |     1.2973 | node                       |
+| warm start          |   0.10 |   19.4 ms |   23.8 ms |     1.0000 |     1.2249 | node                       |
+| worker startup      |   0.10 |   87.8 ms |   97.0 ms |     1.0000 |     1.1048 | node                       |
+| **Composite**       |   1.00 |           |           | **1.2668** | **1.1572** | deno (margin 9.5 % < 10 %) |
 
-Tie-breaker applied: **peak RSS** — node 146.4 MiB versus deno 108.3 MiB (deno lower) → **Deno**.
+Tie-breaker applied: **peak RSS** — node 146.0 MiB versus deno 119.3 MiB (deno lower) → **Deno**.
 
-Secondary (not weighted, recorded for the gate): point-read p95 0.052 vs 0.073 ms (node);
-worker round-trip p95 0.165 vs 1.39 ms (node); `SIGTERM` shutdown 18.9 vs 14.7 ms (deno); runtime binary
+Secondary (not weighted, recorded for the gate): point-read p95 0.051 vs 0.067 ms (node);
+worker round-trip p95 0.229 vs 0.550 ms (node); `SIGTERM` shutdown 20.8 vs 8.8 ms (deno); runtime binary
 74.6 vs 136.0 MiB (node); compiled single binary — node blocked, deno 199.4 MiB.
 
 ## 5. Hard-fail list — result: none tripped
@@ -185,10 +201,11 @@ worker round-trip p95 0.165 vs 1.39 ms (node); `SIGTERM` shutdown 18.9 vs 14.7 m
 | `HF-SINGLE-WRITER` | clear | clear | concurrent writer refused, not visible, recovery ok |
 | `HF-INTEGRITY`     | clear | clear | `integrity_check=ok` after 1000 appends             |
 | `HF-DATA-LOSS`     | clear | clear | 1000 issued, 1000 stored                            |
-| `HF-TAIL-LATENCY`  | clear | clear | p95 6.41 / 8.10 ms, threshold 250 ms                |
-| `HF-APPEND-TAIL`   | clear | clear | p95 7.16 / 8.64 ms, threshold 100 ms                |
+| `HF-TAIL-LATENCY`  | clear | clear | p95 6.41 / 8.49 ms, threshold 250 ms                |
+| `HF-APPEND-TAIL`   | clear | clear | p95 7.23 / 9.38 ms, threshold 100 ms                |
 | `HF-ISOLATION`     | clear | clear | crash observed, parent survived, heartbeat ran      |
-| `HF-SIGNAL`        | clear | clear | handler invoked, 18.9 / 14.7 ms, exit 0             |
+| `HF-SIGNAL`        | clear | clear | handler invoked, 20.8 / 8.8 ms, exit 0              |
+| `HF-PERMISSION`    | clear | clear | no configured denial succeeded                      |
 | `HF-PERMISSION`    | clear | clear | no configured denial succeeded                      |
 
 Hazards recorded but not disqualifying (both arms): a synchronous SQLite busy handler parks the caller's own
@@ -200,24 +217,24 @@ runtime difference.
 
 Node is rejected **on this protocol and this host**, not "in general":
 
-- cold start to ready is 1.96× slower (567 ms vs 289 ms p50; 1.61× on p95);
-- peak RSS is 1.35× higher; RSS after boot 1.40× higher (145 vs 104 MiB);
+- cold start to ready is 1.93× slower (537 ms vs 278 ms p50; 1.68× on p95);
+- peak RSS is 1.22× higher; RSS after boot 1.39× higher (144 vs 104 MiB);
 - network containment is not expressible inside the runtime (no network capability in `--permission`);
 - single-binary packaging is unavailable in this environment (SEA + postject), so deployment would carry the
   full `node_modules` closure (54 MiB for the pinned `effect` tree) as well as the 74.6 MiB runtime;
-- it wins on durable append (p95 7.16 vs 8.64 ms, 1.62× throughput), event-loop p50 (1.43 vs 5.88 ms), warm
-  start (0.81× the time) and worker isolation (startup 2.18× faster, round-trip p95 8.4× faster).
+- it wins on durable append (p95 7.23 vs 9.38 ms, 1.54× throughput), event-loop p50 (2.36 vs 5.86 ms), warm
+  start (0.82× the time) and worker isolation (startup 1.10× faster, round-trip p95 2.4× faster).
 
 Those Node advantages are real and matter for the append-heavy path and for per-task worker isolation. They are
 weighted at 0.6 of the composite and do not offset the cold-start/RSS gap by the pre-registered margin.
 
 ## 7. Residual risks
 
-1. **The composite is inside the margin in every run (1.5–4.7 %).** The outcome rests on a pre-registered
+1. **The composite is inside the margin in every run (1.5–9.5 %).** The outcome rests on a pre-registered
    tie-breaker, not on a clear performance win. A future change in worker model, or a different filesystem,
    can flip the weighted composite.
 2. **One full workload run per arm per session.** Cold start has 11 samples per arm; append/read and event-loop
-   distributions have 1000+ samples, but each arm's full run happened once. The four archived runs bound the
+   distributions have 1000+ samples, but each arm's full run happened once. The five archived runs bound the
    run-to-run spread (tables above) rather than a confidence interval.
 3. **SQLite micro-version differs** (Node 3.53.3, Deno 3.53.2). Same API surface, not the same build.
 4. **Environment is unverified for containment.** `sandboxPosture=unverified`, `brokerIdentity=unconfigured`.
@@ -238,13 +255,13 @@ weighted at 0.6 of the composite and do not offset the cold-start/RSS gap by the
 These are gaps in the _protocol binding_, not silent defaults. They are listed in `result.json`
 (`unboundProbes`, `blocked`) and must be resolved before `DG-2` is signed as fully conformant.
 
-| Gap                                     | Detail                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Owner                                                                  |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| `security-v1` is not a sealed dataset   | `S1` cites `cost-v1` + `security-v1`. The runtime arm binds `append-v1@1.0.0` (its ledger workload) and does not consume `cost-v1`, which is a model/broker workload owned by the `LANG-1` arm (`A4`). `security-v1` is absent from `fixtures/registry.json`, so the permission and fail-closed probes are evidence-only and unbound. (`cost-v1@1.0.0` and `ui-v1@1.0.0` were registered by concurrent work after this run started; `append-v1` hashes did not change.) | `A0` extension (cannot be created here: `fixtures/**` is out of scope) |
-| Node single-binary packaging unmeasured | Node 24 single-executable applications require a SEA blob injected with postject; that toolchain is not in this sandbox. Runtime binary and dependency closure are measured instead. Marked `blocked` in `result.json`.                                                                                                                                                                                                                                                 | `A5` / packaging task                                                  |
-| systemd integration not measured        | `A1`'s scope lists systemd integration. The user manager here reports `degraded` and is shared with other work; installing and starting units was judged unsafe for a paired measurement in this session. Signal handling is measured instead (the property systemd actually consumes).                                                                                                                                                                                 | `A2` (deployment plane) is the better owner                            |
-| OpenTelemetry/tracing not measured      | Requires a third dependency stack (`@opentelemetry/*`) for both arms; not installed, not measured.                                                                                                                                                                                                                                                                                                                                                                      | `A5` / observability task                                              |
-| Security probes not red-team grade      | Permission fail-closed behaviour is measured; secret-canary reachability, redirect and broker-abuse probes belong to `security-v1` and were not run.                                                                                                                                                                                                                                                                                                                    | `E*` red-team tasks                                                    |
+| Gap                                       | Detail                                                                                                                                                                                                                                                                                                                                                                          | Owner                                       |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- |
+| `cost-v1` not consumed by the runtime arm | `S1` cites `cost-v1` + `security-v1`. The permission and fail-closed probes now emit `NODE-DENO-1-SECURITY` bound to `security-v1@1.0.0` (outcome `pass`). The main `NODE-DENO-1` envelope stays `blocked`: the runtime arm binds `append-v1@1.0.0` for its ledger workload and does not consume the model/broker `cost-v1` workload, which belongs to the `LANG-1` arm (`A4`). | `A4` (`LANG-1`)                             |
+| Node single-binary packaging unmeasured   | Node 24 single-executable applications require a SEA blob injected with postject; that toolchain is not in this sandbox. Runtime binary and dependency closure are measured instead. Marked `blocked` in `result.json`.                                                                                                                                                         | `A5` / packaging task                       |
+| systemd integration not measured          | `A1`'s scope lists systemd integration. The user manager here reports `degraded` and is shared with other work; installing and starting units was judged unsafe for a paired measurement in this session. Signal handling is measured instead (the property systemd actually consumes).                                                                                         | `A2` (deployment plane) is the better owner |
+| OpenTelemetry/tracing not measured        | Requires a third dependency stack (`@opentelemetry/*`) for both arms; not installed, not measured.                                                                                                                                                                                                                                                                              | `A5` / observability task                   |
+| Security probes not red-team grade        | Permission fail-closed behaviour is measured; secret-canary reachability, redirect and broker-abuse probes belong to `security-v1` and were not run.                                                                                                                                                                                                                            | `E*` red-team tasks                         |
 
 ## 9. Recommendation for `DG-2`
 
@@ -254,9 +271,9 @@ above.**
 Rationale, in the order the pre-registration ranks it:
 
 1. no hard fail on either arm, so the choice is a preference, not a disqualification;
-2. the weighted composite is inside the 10 % margin (4.7 % in the published run), so the decision is made by the
+2. the weighted composite is inside the 10 % margin (9.5 % in the published run), so the decision is made by the
    pre-registered tie-breaker;
-3. the first tie-breaker, peak RSS, favours Deno in all five runs (≈ 1.23–1.53× lower), which is the property
+3. the first tie-breaker, peak RSS, favours Deno in all six runs (≈ 1.22–1.53× lower), which is the property
    the control plane shares with agents on one host;
 4. Deno's cold start to ready is 1.4–2.0× faster in every run, which shortens supervisor restarts;
 5. Deno's inner permission model denies file, network and process access by default, while Node's model has no
@@ -268,12 +285,12 @@ Rationale, in the order the pre-registration ranks it:
 Conditions the gate record should carry:
 
 - **Do not treat this as a performance win.** Re-run the paired protocol after the worker model and the ledger
-  sequencer exist (`B2`), because append throughput (Node +62 %) and worker startup (Node 2.2× faster) are the
+  sequencer exist (`B2`), because append throughput (Node +54 %) and worker startup (Node 10 % faster) are the
   two places where the current result could invert.
 - **Serialize canonical writes in the application**, never with a SQLite busy handler (hazard measured on both).
 - **Keep the runtime-swap seam.** `ArmHost` + the runtime entrypoints show the minimum surface a swap touches;
   keep domain code free of `node:*` and `Deno.*`.
-- **Node's fallback cost is real but bounded:** ~280 ms extra cold start to ready and ~38 MiB extra peak RSS,
+- **Node's fallback cost is real but bounded:** ~259 ms extra cold start to ready and ~27 MiB extra peak RSS,
   with a resolve hook standing in for the import map.
 
 Rejected alternative for the record: **Node 24** (reasons in §6). If the gate rejects Deno, the same evidence
@@ -297,9 +314,9 @@ deno test --allow-read --allow-write --allow-env --allow-run --allow-net --allow
 Node binary resolution: `KANBEI_NODE_BIN=/path/to/node` overrides the default `nix build nixpkgs#nodejs_24`
 lookup. Node dependencies are installed under `tmp/` (git-ignored) at the version pinned in `deno.json`.
 
-`deno task verify` was deliberately not run for this task: several agents write to this worktree concurrently, so
-verification was scoped to the files above (`deno check`, `deno lint`, `oxlint`, `deno test`, `deno fmt --check`
-on `src/spikes/runtime`, `tests/spikes/runtime`, `spikes/runtime`). Run the full gate once the worktree is quiet.
+`deno task verify` was deliberately not run for the original measurement task: several agents write to this
+worktree concurrently, so verification was scoped to `src/spikes/runtime`, `tests/spikes/runtime`, and
+`spikes/runtime`. Run the full gate once the worktree is quiet.
 
 ## 11. Files
 
@@ -313,9 +330,10 @@ on `src/spikes/runtime`, `tests/spikes/runtime`, `spikes/runtime`). Run the full
 | `src/spikes/runtime/decision.ts`                                             | pre-registered hard fails, composite, decision rule             |
 | `src/spikes/runtime/driver.ts`                                               | harness host: spawns, times, packages, aggregates               |
 | `src/spikes/runtime/envelope.ts`                                             | `EvidenceEnvelope` binding through the A0 harness               |
+| `src/spikes/runtime/report.ts`                                               | security-envelope markdown rendering                            |
 | `src/spikes/runtime/cli.ts`                                                  | entrypoint that writes `result.json`                            |
 | `src/spikes/runtime/plan.ts`                                                 | frozen pre-registration                                         |
 | `src/spikes/runtime/adapters/*`                                              | `Deno`/`node`/`node:sqlite`/`worker_threads`/process boundaries |
 | `src/spikes/runtime/deno/main.ts`, `node/main.ts`, `node/register-hooks.mjs` | runtime entrypoints and the Node resolve hook                   |
-| `tests/spikes/runtime/*.test.ts`                                             | 28 targeted tests                                               |
+| `tests/spikes/runtime/*.test.ts`                                             | 33 targeted tests                                               |
 | `spikes/runtime/result.json`                                                 | machine-readable result, decision matrix and envelope           |

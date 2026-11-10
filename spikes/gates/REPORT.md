@@ -63,11 +63,11 @@ Not performed. A baseline cannot be frozen while `DG-1` and `DG-4` remain unsign
 
 ## Evidence binding gaps
 
-- `security-v1` is registered and sealed in this tree. The S3 re-run emits an `EvidenceEnvelope` bound to `security-v1@1.0.0` (testId `S3`, outcome `pass`); A1’s permission probes and A2’s host probes still lack a dataset-bound envelope, and A4’s security cells remain blocked with the model arm.
+- `security-v1` is registered and sealed in this tree. The S3 re-run emits an `EvidenceEnvelope` bound to `security-v1@1.0.0` (testId `S3`, outcome `pass`); A4's security cells remain blocked with the model arm.
+- A1's permission and fail-closed probes are bound via a second envelope, testId `NODE-DENO-1-SECURITY`, fixture `security-v1@1.0.0`, outcome `pass`. The A1 main `NODE-DENO-1` envelope stays `blocked` on the `cost-v1` binding.
+- A2 now emits a `DEP-1` envelope bound to `security-v1@1.0.0` with outcome `fail` by design: pure user-space has no secret isolation. It is a finding, not a defect, and it does not change the `DG-3` record.
 - A4 issued no envelope because the model arm is blocked.
-- A2 emitted a measurement record rather than an envelope; A3 now emits one.
-- A2b is a measurement record; it is not an `EvidenceEnvelope` and does not close `DG-3`.
-- A1 emitted a measurement envelope bound to `append-v1`; it is now marked `blocked` because `cost-v1` and `security-v1` bindings are absent.
+- A3 emits an envelope as well (testId `S3`, outcome `pass`). A2b is a measurement record; it is not an `EvidenceEnvelope` and does not close `DG-3`.
 
 These are recorded blockers, not waivers.
 

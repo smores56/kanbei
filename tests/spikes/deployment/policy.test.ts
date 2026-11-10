@@ -202,6 +202,24 @@ const syntheticResult = (): SpikeResult => {
     },
     residuals: ["residual one"],
     blockedCapabilities: ["BI-02: unavailable"],
+    envelope: {
+      testId: "DEP-1",
+      invariantIds: ["same-uid-process-inspection", "same-uid-signal", "secret-fd-reachability"],
+      fixtureVersion: "security-v1@1.0.0",
+      canonicalHead: { seq: 0, hash: "sha256:" + "0".repeat(64) },
+      sequenceRange: [0, 0],
+      environment: {
+        hostFingerprint: "sha256:" + "a".repeat(64),
+        kernel: "linux-test",
+        runtime: "deno@test",
+        sandboxPosture: "test",
+        brokerIdentity: "test",
+      },
+      seeds: [0],
+      modelRecordings: [],
+      artifacts: [],
+      outcome: "fail",
+    },
   }
 }
 

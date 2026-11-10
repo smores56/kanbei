@@ -1,4 +1,5 @@
 import { Schema } from "effect"
+import { EvidenceEnvelope } from "../../evidence/types.ts"
 
 export const ProbeStatus = Schema.Literals(["pass", "fail", "blocked", "inconclusive"])
 export type ProbeStatus = typeof ProbeStatus.Type
@@ -119,5 +120,8 @@ export const SpikeResult = Schema.Struct({
   decisionGate: DecisionGateInput,
   residuals: Schema.Array(Schema.String),
   blockedCapabilities: Schema.Array(Schema.String),
+  /** Bound to `security-v1`; a `fail` outcome here is the measured finding. */
+  envelope: EvidenceEnvelope,
 })
 export type SpikeResult = typeof SpikeResult.Type
+export type SpikeResultBody = Omit<SpikeResult, "envelope">

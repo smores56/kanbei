@@ -415,7 +415,6 @@ export const runBakeOff = (
       decisionBlocks,
       outcome,
       unboundProbes: [
-        "permission and fail-closed probes are unbound: `security-v1` is not registered in fixtures/registry.json, so these probes are evidence-only and are not citable as S1 security-v1 results",
         "S1 also cites `cost-v1`; the runtime arm binds `append-v1@1.0.0` for its ledger workload and does not consume the model/broker cost workload, which belongs to the LANG-1 arm (A4)",
       ],
       residualRisks: [

@@ -14,7 +14,7 @@ import { secretProbes } from "./probes/secrets.ts"
 import { systemdProbes } from "./probes/systemd.ts"
 import { ProbeEnv } from "./probe.ts"
 import type { ProbeEnvShape } from "./probe.ts"
-import type { DecisionGateInput, HostProfile, ProbeResult, SpikeResult } from "./types.ts"
+import type { DecisionGateInput, HostProfile, ProbeResult, SpikeResultBody } from "./types.ts"
 
 const firstLine = (text: string): string => text.split("\n")[0]?.trim() ?? ""
 
@@ -106,7 +106,7 @@ const decisionGate = (probes: ReadonlyArray<ProbeResult>): DecisionGateInput => 
 
 export const buildSpikeResult = (
   probes: ReadonlyArray<ProbeResult>,
-): Effect.Effect<SpikeResult, unknown, ProbeEnvShape> =>
+): Effect.Effect<SpikeResultBody, unknown, ProbeEnvShape> =>
   Effect.gen(function* () {
     const arms = [assessArm(probes, "pure"), assessArm(probes, "dedicated")]
     const recommendation = buildRecommendation(arms)
@@ -138,7 +138,7 @@ export const buildSpikeResult = (
     }
   })
 
-export const runSpike: Effect.Effect<SpikeResult, unknown, ProbeEnvShape> = Effect.gen(
+export const runSpike: Effect.Effect<SpikeResultBody, unknown, ProbeEnvShape> = Effect.gen(
   function* () {
     const probes = yield* collectProbes
     return yield* buildSpikeResult(probes)

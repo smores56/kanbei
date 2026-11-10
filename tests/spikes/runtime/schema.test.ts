@@ -50,9 +50,34 @@ Deno.test("the published envelope outcome agrees with the published decision", (
   }
 })
 
-Deno.test("the security probes are flagged as unbound from a sealed dataset", () => {
+Deno.test("the security probes bind security-v1 in their own envelope", () => {
   const published = Schema.decodeUnknownSync(SpikeResultDocument)(
     readJson("spikes/runtime/result.json"),
   )
-  assert(published.unboundProbes.some((probe) => probe.includes("security-v1")))
+  const security = published.securityEnvelope
+  assert(security !== undefined, "result.json carries a securityEnvelope")
+  assertEquals(security.testId, "NODE-DENO-1-SECURITY")
+  assertEquals(security.fixtureVersion, "security-v1@1.0.0")
+  assertEquals(security.sequenceRange, [0, 0])
+  assertEquals(security.invariantIds, [
+    "fs-write",
+    "net-connect",
+    "process-spawn",
+    "fs-read-outside-scope",
+  ])
+  const allExpectedDenied = (["deno", "node"] as const).every((arm) =>
+    PRE_REGISTRATION.permissionExpectations[arm].every((id) =>
+      published.arms[arm].permissions.some((probe) => probe.id === id && probe.denied)
+    )
+  )
+  assertEquals(security.outcome, allExpectedDenied ? "pass" : "fail")
+})
+
+Deno.test("the security probes are no longer listed as unbound and cost-v1 still blocks", () => {
+  const published = Schema.decodeUnknownSync(SpikeResultDocument)(
+    readJson("spikes/runtime/result.json"),
+  )
+  assert(!published.unboundProbes.some((probe) => probe.includes("security-v1")))
+  assert(published.unboundProbes.some((probe) => probe.includes("cost-v1")))
+  assertEquals(published.envelope.outcome, "blocked")
 })

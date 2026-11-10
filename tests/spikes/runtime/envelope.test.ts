@@ -8,7 +8,11 @@ import type { SpikeResultDocument } from "../../../src/spikes/runtime/schema.ts"
 import {
   appendFixtureReference,
   outcomeOf,
+  sealSecurityEvidence,
   sealSpikeEvidence,
+  securityEnvelopeOutcome,
+  securityFixtureReference,
+  securityInvariantIds,
 } from "../../../src/spikes/runtime/envelope.ts"
 import { PRE_REGISTRATION } from "../../../src/spikes/runtime/plan.ts"
 
@@ -155,4 +159,101 @@ Deno.test("a blocked decision produces a blocked envelope", () => {
   assertEquals(outcomeOf("deno", [], ["security-v1: unbound"]), "blocked")
   assertEquals(outcomeOf("inconclusive", []), "inconclusive")
   assertEquals(outcomeOf("node", []), "pass")
+})
+
+const permission = (id: string, denied: boolean) => ({
+  id,
+  denied,
+  code: denied ? "denied" : "allowed",
+  model: "test",
+})
+
+const armsWith = (
+  node: ReadonlyArray<ReturnType<typeof permission>>,
+  deno: ReadonlyArray<ReturnType<typeof permission>>,
+): SpikeResultDocument["arms"] => ({
+  node: { ...document.arms.node, permissions: [...node] },
+  deno: { ...document.arms.deno, permissions: [...deno] },
+})
+
+const allDenied = (...ids: ReadonlyArray<string>) => ids.map((id) => permission(id, true))
+
+Deno.test("the security invariant set is the union of both arms' pre-registered denials", () => {
+  assertEquals(securityInvariantIds(PRE_REGISTRATION.permissionExpectations), [
+    "fs-write",
+    "net-connect",
+    "process-spawn",
+    "fs-read-outside-scope",
+  ])
+  const fixture = securityFixtureReference("1.0.0")
+  assertEquals(fixture.id, "security-v1")
+  assertEquals(fixture.version, "1.0.0")
+  assertEquals(fixture.sequenceRange, [0, 0])
+  assertEquals(fixture.canonicalHead.seq, 0)
+})
+
+Deno.test("the security outcome passes when every expected probe denies on both arms", () => {
+  const arms = armsWith(
+    [
+      permission("fs-write", true),
+      permission("net-connect", false),
+      permission("process-spawn", true),
+      permission("fs-read-outside-scope", true),
+    ],
+    allDenied("fs-write", "net-connect", "process-spawn", "fs-read-outside-scope"),
+  )
+  assertEquals(securityEnvelopeOutcome(arms, PRE_REGISTRATION.permissionExpectations), "pass")
+})
+
+Deno.test("the security outcome fails when an expected probe is allowed", () => {
+  const arms = armsWith(
+    [
+      permission("fs-write", true),
+      permission("net-connect", false),
+      permission("process-spawn", true),
+      permission("fs-read-outside-scope", true),
+    ],
+    [
+      permission("fs-write", true),
+      permission("net-connect", false),
+      permission("process-spawn", true),
+      permission("fs-read-outside-scope", true),
+    ],
+  )
+  assertEquals(securityEnvelopeOutcome(arms, PRE_REGISTRATION.permissionExpectations), "fail")
+})
+
+Deno.test("the security envelope binds security-v1 and records the probe outcome", async () => {
+  const cas = await Deno.makeTempDir({ prefix: "kanbei-spike-envelope-" })
+  try {
+    const arms = armsWith(
+      [
+        permission("fs-write", true),
+        permission("net-connect", false),
+        permission("process-spawn", true),
+        permission("fs-read-outside-scope", true),
+      ],
+      allDenied("fs-write", "net-connect", "process-spawn", "fs-read-outside-scope"),
+    )
+    const envelope = await Effect.runPromise(
+      sealSecurityEvidence(
+        { ...document, arms },
+        securityFixtureReference("1.0.0"),
+        securityEnvelopeOutcome(arms, PRE_REGISTRATION.permissionExpectations),
+      ).pipe(Effect.provide(dependencies(cas))),
+    )
+    assertEquals(envelope.testId, "NODE-DENO-1-SECURITY")
+    assertEquals(envelope.fixtureVersion, "security-v1@1.0.0")
+    assertEquals(envelope.invariantIds, [
+      "fs-write",
+      "net-connect",
+      "process-spawn",
+      "fs-read-outside-scope",
+    ])
+    assertEquals(envelope.outcome, "pass")
+    assertEquals(envelope.artifacts.length, 1)
+    assertEquals(envelope.metrics?.["expectedProbes"], 4)
+  } finally {
+    await Deno.remove(cas, { recursive: true })
+  }
 })

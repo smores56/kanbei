@@ -74,19 +74,19 @@ from this unprivileged run and is never converted into a pass.
 | SD-02 | systemd             | pass         | 20 hardening directives applied as requested                                                                                          |
 | SD-03 | systemd             | pass         | $HOME is read-only inside the unit and readable=true                                                                                  |
 | SD-04 | systemd             | fail         | state path was read-only under ProtectSystem=strict even though ReadWritePaths named it                                               |
-| SD-05 | systemd             | pass         | /tmp is private (unit 30:325161, host 30:13)                                                                                          |
+| SD-05 | systemd             | pass         | /tmp is private (unit 30:329590, host 30:13)                                                                                          |
 | SD-06 | network             | pass         | unit network namespace holds only lo; host has docker0,enp0s7,lo                                                                      |
 | SD-07 | systemd             | pass         | IPv4 bind=allowed, IPv6 bind=denied                                                                                                   |
 | SD-08 | systemd             | pass         | mount syscalls were denied inside the filtered unit                                                                                   |
 | SD-09 | fail-closed         | pass         | systemd rejects unknown properties and invalid values instead of degrading                                                            |
 | SD-10 | recovery            | fail         | same-UID process rewrote a sibling unit ceiling from 67108864 to 134217728 and can stop it                                            |
 | LM-01 | resource-limits     | pass         | unit result=oom-kill, MemoryPeak=67108864 bytes, ActiveState=failed                                                                   |
-| LM-02 | resource-limits     | pass         | memory.events high count=915, unit ActiveState=active, result=success                                                                 |
+| LM-02 | resource-limits     | pass         | memory.events high count=1390, unit ActiveState=active, result=success                                                                |
 | LM-03 | resource-limits     | pass         | fork was denied at the pid ceiling; pids.max is enforced by the kernel                                                                |
 | LM-04 | resource-limits     | pass         | cpu.max=10000 100000, nr_throttled=20                                                                                                 |
 | LM-05 | resource-limits     | pass         | delegated controllers=[cpu io memory pids], io.weight=default 100                                                                     |
 | RC-01 | recovery            | pass         | NRestarts=2, Result=start-limit-hit, ExecMainStatus=7                                                                                 |
-| RC-02 | recovery            | fail         | detached sandbox-shaped child 318163 survived its parent                                                                              |
+| RC-02 | recovery            | fail         | detached sandbox-shaped child 367693 survived its parent                                                                              |
 | RC-03 | recovery            | fail         | Linger=no                                                                                                                             |
 | RC-04 | fail-closed         | pass         | intent recorded=true, completion recorded=false, classification=outcome_unknown                                                       |
 | RC-05 | recovery            | blocked      | reboot is a destructive host action and was not performed                                                                             |
@@ -99,7 +99,7 @@ from this unprivileged run and is never converted into a pass.
 | SC-03 | fail-closed         | fail         | same-UID truncate=false, unlink=true on a 0444 audit file                                                                             |
 | SC-04 | secret-reachability | fail         | groups=[users wheel docker], /var/run/docker.sock mode=0o140660                                                                       |
 | SC-05 | secret-reachability | inconclusive | fs.suid_dumpable=2, core_pattern=\|/nix/store/b8zavc5rpmlcs0jjvz74b8v53zclqmww-systemd/lib/sys                                        |
-| BI-01 | broker-identity     | fail         | SO_PEERCRED peer uid=1000 gid=100 pid=318227; socket mode=0600; deployment uid=1000                                                   |
+| BI-01 | broker-identity     | fail         | SO_PEERCRED peer uid=1000 gid=100 pid=367757; socket mode=0600; deployment uid=1000                                                   |
 | BI-02 | broker-identity     | blocked      | cross-UID connect is untestable: effective capabilities=0000000000000000; a second UID cannot be created or entered without privilege |
 | BI-03 | broker-identity     | blocked      | uid=1000, effective capabilities=0000000000000000, existing kanbei service users=false                                                |
 | BI-04 | broker-identity     | inconclusive | kernel.yama.ptrace_scope=1; SCM_CREDENTIALS support was not exercised                                                                 |
@@ -122,7 +122,7 @@ The decisive question for `DEP-1` is what another process of the same UID can do
 | SC-02 | secret-reachability | pass         | no conventional secret material exists on this host                                                                                   |
 | SC-04 | secret-reachability | fail         | groups=[users wheel docker], /var/run/docker.sock mode=0o140660                                                                       |
 | SC-05 | secret-reachability | inconclusive | fs.suid_dumpable=2, core_pattern=\|/nix/store/b8zavc5rpmlcs0jjvz74b8v53zclqmww-systemd/lib/sys                                        |
-| BI-01 | broker-identity     | fail         | SO_PEERCRED peer uid=1000 gid=100 pid=318227; socket mode=0600; deployment uid=1000                                                   |
+| BI-01 | broker-identity     | fail         | SO_PEERCRED peer uid=1000 gid=100 pid=367757; socket mode=0600; deployment uid=1000                                                   |
 | BI-02 | broker-identity     | blocked      | cross-UID connect is untestable: effective capabilities=0000000000000000; a second UID cannot be created or entered without privilege |
 | BI-03 | broker-identity     | blocked      | uid=1000, effective capabilities=0000000000000000, existing kanbei service users=false                                                |
 | BI-04 | broker-identity     | inconclusive | kernel.yama.ptrace_scope=1; SCM_CREDENTIALS support was not exercised                                                                 |
@@ -136,6 +136,15 @@ Interpretation, limited to what was measured:
 5. A 0600 file in a 0700 directory is readable by the same UID (SC-01); a 0444 audit file can be truncated and unlinked by its owner's UID (SC-03).
 6. Unix socket credentials report only pid/uid/gid; a same-UID client is indistinguishable from the frozen core (BI-01).
 7. Supplementary group `docker` plus `/var/run/docker.sock` is root-equivalent on this host (SC-04).
+
+## Evidence envelope
+
+- test: `DEP-1`
+- fixture: `security-v1@1.0.0`
+- outcome: `fail`
+- covered invariants: same-uid-process-inspection, same-uid-signal, secret-fd-reachability
+- scope: Covers inner runtime capability denial only; OS-sandbox enforcement remains DEP-1/DG-3.
+- This envelope covers pure-user-space probes; DG-3 option E is the response.
 
 ## Fail-closed evidence
 
