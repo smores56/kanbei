@@ -1,0 +1,12 @@
+.worktrees/
+.deno/
+coverage/
+dist/
+tmp/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.*
+!.env.example
+fixtures/generated/
