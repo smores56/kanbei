@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "task": "A2c",
+  "sharedStore": "/home/smores/repos/github.com/smores56/kanbei/.worktrees/smores-kanbei-implementation/tmp/kanbei-shared-nix",
+  "sandbox": {
+    "processExit": 0,
+    "processSuccess": true,
+    "stderr": ""
+  },
+  "result": {
+    "abi": 7,
+    "build": {
+      "success": true,
+      "code": 0,
+      "stdout": "/nix/store/pa6rydwgjxxmmvdxap7qk9c85h8jbimy-hello-2.12.3",
+      "stderr": ""
+    },
+    "shell": {
+      "success": false,
+      "code": 1,
+      "stdout": "",
+      "stderr": "error: unable to execute '/nix/store/pa6rydwgjxxmmvdxap7qk9c85h8jbimy-hello-2.12.3/bin/hello': No such file or directory"
+    },
+    "direct": {
+      "success": true,
+      "code": 0,
+      "stdout": "Hello, world!",
+      "stderr": ""
+    },
+    "hello": true
+  },
+  "checks": {
+    "build": true,
+    "direct": true,
+    "shell": false,
+    "hello": true,
+    "hostStoreUnchanged": true,
+    "sharedStoreHasPath": true
+  },
+  "verdict": "pass"
+}

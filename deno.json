@@ -55,7 +55,7 @@
     "lint": "deno lint && deno run -A npm:oxlint@1.92.0 -c .oxlintrc.json --deny-warnings --import-plugin --promise-plugin src tests scripts",
     "lint:fix": "deno lint --fix && deno run -A npm:oxlint@1.92.0 -c .oxlintrc.json --fix --import-plugin --promise-plugin src tests",
     "typecheck": "deno check src tests scripts",
-    "test": "deno test --allow-read --allow-write --allow-env --allow-run --allow-net --allow-sys",
+    "test": "deno test --allow-read --allow-write --allow-env --allow-run --allow-net --allow-sys tests",
     "test:unit": "deno test --allow-read --allow-write --allow-env --allow-run --allow-net --allow-sys tests/unit",
     "verify": "deno task fmt:check && deno task lint && deno task typecheck && deno task test",
     "verify:fix": "deno task fmt && deno task lint:fix && deno task typecheck && deno task test",
@@ -65,6 +65,7 @@
     "evidence:dry-run": "deno run -A src/cli/evidence.ts dry-run",
     "evidence:determinism": "deno run -A src/cli/evidence.ts determinism",
     "evidence:failure": "deno run -A src/cli/evidence.ts failure",
-    "rootless:probe": "deno run -A src/spikes/deployment/rootless/main.ts"
+    "rootless:probe": "deno run -A src/spikes/deployment/rootless/main.ts",
+    "nix:shared": "deno run -A src/spikes/deployment/nix-shared/main.ts"
   }
 }

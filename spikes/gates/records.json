@@ -103,12 +103,14 @@
       "Mount a minimal root with only runtime, /etc, /proc, allowed project roots, scratch, and the broker socket.",
       "Keep credentials memory-only in the broker and outside every agent-visible mount.",
       "Disable or restrict io_uring; add a seccomp policy.",
-      "Re-run S3 under this rootless supervisor identity before DG-4 can compose with DG-3."
+      "Re-run S3 under this rootless supervisor identity before DG-4 can compose with DG-3.",
+      "One shared private Nix store mounted at /nix/store; host /nix/store not mounted; direct build output execution works, but nix shell/profile resolution remains a blocker."
     ],
     "blockers": [
       "Human decision between E and D is pending.",
       "A2b did not exercise cgroup delegation, real capabilities, backup/restore, or reboot.",
-      "security-v1 is not sealed, so no EvidenceEnvelope is issued."
+      "security-v1 is not sealed, so no EvidenceEnvelope is issued.",
+      "nix shell package-environment lookup and nix profile are not yet working against the shared store."
     ],
     "rejectedAlternatives": [
       "pure-user-space home-manager unit",
@@ -120,7 +122,9 @@
       "spikes/deployment/result.json",
       "spikes/deployment/REPORT.md",
       "spikes/deployment/A2B-ROOTLESS-SANDBOX.md",
-      "spikes/deployment/rootless-result.json"
+      "spikes/deployment/rootless-result.json",
+      "spikes/deployment/A2C-SHARED-NIX-STORE.md",
+      "spikes/deployment/nix-shared-result.json"
     ],
     "residuals": [
       "Yama protection is ancestry-based; an agent that is an ancestor of the broker could attach.",

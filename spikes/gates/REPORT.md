@@ -67,6 +67,10 @@ Not performed. A baseline cannot be frozen while `DG-1` through `DG-4` remain un
 
 These are recorded blockers, not waivers.
 
+## Shared Nix store
+
+A2c bootstrapped a single private store, mounted it at `/nix/store`, and built `nixpkgs#hello` without touching host `/nix/store`. Direct execution of the built path passed. `nix shell` package-environment lookup still fails, so `nix profile` is not yet proven. This is a build/direct path, not a complete package-install path.
+
 ## Cross-gate dependency
 
 `DG-3` and `DG-4` are operationally coupled. A3 measured `process-cgroup` under the deployment user systemd user manager. Variant E keeps the supervisor outside the rootless sandbox but still under the deployment user; variant D moves it to a dedicated system unit. Until DG-3 chooses E or D and fixes which identity owns the delegated cgroup subtree, DG-4 cannot be treated as measured in the target posture. S3 must be re-run under that identity before the recommendations compose.

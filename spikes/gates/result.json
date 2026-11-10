@@ -29,7 +29,7 @@
       "gate": "DG-3",
       "status": "open",
       "recommended": "variant-E-rootless-sandbox-candidate",
-      "condition": "A2b passed; human choice E vs D pending; cgroups and security-v1 remain open"
+      "condition": "A2b pass; A2c shared store build/direct pass, nix shell/profile blocked; human choice pending"
     },
     {
       "gate": "DG-4",
@@ -57,5 +57,10 @@
     "status": "pass",
     "artifact": "spikes/deployment/rootless-result.json",
     "report": "spikes/deployment/A2B-ROOTLESS-SANDBOX.md"
+  },
+  "a2c": {
+    "status": "build-direct-pass-shell-blocked",
+    "artifact": "spikes/deployment/nix-shared-result.json",
+    "report": "spikes/deployment/A2C-SHARED-NIX-STORE.md"
   }
 }
