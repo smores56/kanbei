@@ -5,6 +5,7 @@ import type { TodoLimits } from "../channels/todo/writer.ts"
 import { TodoWriter, todoWriterLayer } from "../channels/todo/writer.ts"
 import type { SearchConfig, SearchOutcome } from "../channels/search/client.ts"
 import { SearchChannel, SearchClient, searchClientLayer } from "../channels/search/client.ts"
+import { searchBudgetFileLayer } from "../adapters/search-budget-file.ts"
 import type { SearchQuery, SearchReply } from "../channels/search/schema.ts"
 import { SearchQuery as SearchQuerySchema } from "../channels/search/schema.ts"
 import { Ledger, ledgerLayer } from "../kernel/ledger.ts"
@@ -405,7 +406,18 @@ export const stepSearch = async (context: StepContext): Promise<JourneyStepOutco
   const channel = Layer.succeed(SearchChannel)({
     search: (query) => Effect.succeed(handler(query)),
   })
-  const clientFor = (config: SearchConfig) => searchClientLayer(config).pipe(Layer.provide(channel))
+  // Each scenario gets a durable budget file, so a restart inside the scenario
+  // cannot reset the ceiling the way an in-memory counter would.
+  const budgetRoot = Deno.makeTempDirSync({ prefix: "kanbei-journey-search-budget-" })
+  const clientFor = (config: SearchConfig) =>
+    searchClientLayer(config).pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          channel,
+          searchBudgetFileLayer(`${budgetRoot}/${crypto.randomUUID()}.json`),
+        ),
+      ),
+    )
   const run = <A>(
     config: SearchConfig,
     effect: Effect.Effect<A, never, SearchClient>,

@@ -7,6 +7,7 @@ import {
 } from "../../../src/channels/search/client.ts"
 import type { SearchHit, SearchQuery, SearchReply } from "../../../src/channels/search/schema.ts"
 import { SearchTransportError } from "../../../src/channels/search/client.ts"
+import { memorySearchBudgetLayer } from "../../../src/channels/search/budget.ts"
 
 export const config: SearchConfig = {
   maxQueryChars: 100,
@@ -72,7 +73,9 @@ export const harness = (
   Effect.gen(function* () {
     const search = yield* fakeSearch(handler)
     return {
-      clients: searchClientLayer({ ...config, ...overrides }).pipe(Layer.provide(search.layer)),
+      clients: searchClientLayer({ ...config, ...overrides }).pipe(
+        Layer.provide(Layer.mergeAll(search.layer, memorySearchBudgetLayer)),
+      ),
       calls: search.calls,
     }
   })

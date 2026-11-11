@@ -1,4 +1,4 @@
-import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema } from "effect"
+import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema, Semaphore } from "effect"
 import { canonicalize } from "../../evidence/canonical.ts"
 import { sha256Text } from "../../evidence/digest.ts"
 import type { SearchBlockReason, SearchHit, SearchQuery, SearchReply } from "./schema.ts"
@@ -9,6 +9,7 @@ import {
   SEARCH_MAX_SNIPPET_CHARS,
 } from "./schema.ts"
 import { capText, stripMarkup } from "./text.ts"
+import { SearchBudgetStore } from "./budget.ts"
 
 export interface SearchConfig {
   readonly maxQueryChars: number
@@ -128,7 +129,7 @@ const shapeHits = (
 
 export const searchClientLayer = (
   config: SearchConfig,
-): Layer.Layer<SearchClient, never, SearchChannel> =>
+): Layer.Layer<SearchClient, never, SearchChannel | SearchBudgetStore> =>
   Layer.effect(
     SearchClient,
     Effect.gen(function* () {
@@ -137,8 +138,10 @@ export const searchClientLayer = (
         return yield* Effect.die(new Error(`invalid search config: ${issues.join("; ")}`))
       }
       const channel = yield* SearchChannel
+      const budget = yield* SearchBudgetStore
       const receipts = yield* Ref.make<ReadonlyArray<SearchReceipt>>([])
-      const admitted = yield* Ref.make<ReadonlyArray<number>>([])
+      // One admit at a time: a concurrent burst must not read the same window twice.
+      const admit = yield* Semaphore.make(1)
 
       const blocked = (
         query: SearchQuery,
@@ -170,16 +173,21 @@ export const searchClientLayer = (
           if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > config.maxLimit) {
             return yield* blocked(input, queryDigest, "schema", at)
           }
-          const log = yield* Ref.get(admitted)
-          const hourly = log.filter((stamp) => at - stamp < HOUR_MS)
-          if (hourly.length >= config.queriesPerHour) {
-            return yield* blocked(input, queryDigest, "rate", at)
+          const verdict = yield* admit.withPermits(1)(
+            Effect.gen(function* () {
+              const stored = yield* Effect.result(budget.load)
+              if (Result.isFailure(stored)) return "error" as const
+              const retained = stored.success.filter((stamp) => at - stamp < DAY_MS)
+              const hourly = retained.filter((stamp) => at - stamp < HOUR_MS)
+              if (hourly.length >= config.queriesPerHour) return "rate" as const
+              if (retained.length >= config.queriesPerDay) return "budget" as const
+              const saved = yield* Effect.result(budget.save([...retained, at]))
+              return Result.isFailure(saved) ? "error" as const : "admitted" as const
+            }),
+          )
+          if (verdict !== "admitted") {
+            return yield* blocked(input, queryDigest, verdict, at)
           }
-          const daily = log.filter((stamp) => at - stamp < DAY_MS)
-          if (daily.length >= config.queriesPerDay) {
-            return yield* blocked(input, queryDigest, "budget", at)
-          }
-          yield* Ref.set(admitted, [...log, at])
 
           const reply = yield* channel.search({ query: input.query, limit: input.limit }).pipe(
             Effect.result,
