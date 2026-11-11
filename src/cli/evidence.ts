@@ -15,13 +15,13 @@ class SimulatedFailure extends Data.TaggedError("SimulatedFailure")<{
 }> {}
 
 const journeyReference: FixtureReference = {
-  id: "journey-v1",
+  id: "journey-v2",
   version: "1.0.0",
   canonicalHead: {
-    seq: 12,
-    hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    seq: 24,
+    hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   },
-  sequenceRange: [1, 12],
+  sequenceRange: [1, 24],
 }
 
 const layers = (root: string) =>

@@ -16,7 +16,7 @@ import { ledgerLayer } from "../../src/kernel/ledger.ts"
 import { withTempDir } from "../support.ts"
 
 const reference: FixtureReference = {
-  id: "journey-v1",
+  id: "journey-v2",
   version: "1.0.0",
   canonicalHead: { seq: 1, hash: `sha256:${"c".repeat(64)}` },
   sequenceRange: [1, 1],
@@ -79,7 +79,7 @@ Deno.test("candidate approval emits an evidence envelope for ZT-08, ZT-10, and I
 
     assertEquals(envelope.outcome, "pass")
     assertEquals(envelope.invariantIds, ["ZT-08", "ZT-10", "I-14"])
-    assertEquals(envelope.fixtureVersion, "journey-v1@1.0.0")
+    assertEquals(envelope.fixtureVersion, "journey-v2@1.0.0")
     assertEquals(envelope.metrics?.candidates, 1)
   })
 })

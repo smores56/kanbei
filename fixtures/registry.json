@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "datasets": [
     {
-      "id": "journey-v1",
+      "id": "journey-v2",
       "version": "1.0.0",
-      "path": "fixtures/journey-v1"
+      "path": "fixtures/journey-v2"
     },
     {
       "id": "append-v1",

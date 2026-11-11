@@ -1,0 +1,4 @@
+# fixture-only key for ingest-v1 test batches; not an operational secret
+# created: 2026-11-11T16:56:31-05:00
+# public key: age1gyzseyvd0cumhe3svg3ey6x54lwfhmqvp2wf9dre8d0sycs5e3qscwpgqa
+AGE-SECRET-KEY-1HGP8L53J4LGAAGF6QR4RU8Z842YLA76R5KAM0TT49QJD4259ZC9S5PAHA0

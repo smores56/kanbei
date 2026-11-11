@@ -12,10 +12,10 @@ import type { EvidenceEnvelope, FixtureReference } from "../../src/evidence/type
 class SimulatedFailure extends Data.TaggedError("SimulatedFailure")<Record<PropertyKey, never>> {}
 
 const reference: FixtureReference = {
-  id: "journey-v1",
+  id: "journey-v2",
   version: "1.0.0",
-  canonicalHead: { seq: 12, hash: "sha256:" + "a".repeat(64) },
-  sequenceRange: [1, 12],
+  canonicalHead: { seq: 24, hash: "sha256:" + "0".repeat(64) },
+  sequenceRange: [1, 24],
 }
 
 const environmentLayer = fixedEnvironmentProbeLayer({
@@ -88,11 +88,11 @@ Deno.test("fixture store rejects a tampered sealed fixture", async () => {
   try {
     await new Deno.Command("cp", { args: ["-R", `${Deno.cwd()}/fixtures`, `${temp}/fixtures`] })
       .output()
-    await Deno.writeTextFile(`${temp}/fixtures/journey-v1/fixture.json`, "{}\n")
+    await Deno.writeTextFile(`${temp}/fixtures/journey-v2/fixture.json`, "{}\n")
 
     const program = Effect.gen(function* () {
       const store = yield* FixtureStore
-      return yield* store.load("journey-v1", "1.0.0")
+      return yield* store.load("journey-v2", "1.0.0")
     }).pipe(Effect.provide(dependencies(temp, `${temp}/cas`)))
 
     await assertRejects(() => Effect.runPromise(program), FixtureError)

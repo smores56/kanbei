@@ -1,0 +1,194 @@
+{
+  "schemaVersion": 1,
+  "dataset": "journey-v2@1.0.0",
+  "fixtureTreeHash": "sha256:78fd8157e4b4d27ed3b9053c39c1dfeabacaab3a93afde385289f4280f63773c",
+  "thresholdBasis": "The sealed slice is exhaustively hand-labelled, so agreement is the threshold: a miss is a defect, not a tuning target. Population thresholds for DG-6 and DG-7 stay open and are not set here; changing this file is a fixture change with a new version.",
+  "thresholds": {
+    "schemaVersion": 1,
+    "dataset": "journey-v2",
+    "version": "1.0.0",
+    "basis": "The sealed slice is exhaustively hand-labelled, so agreement is the threshold: a miss is a defect, not a tuning target. Population thresholds for DG-6 and DG-7 stay open and are not set here; changing this file is a fixture change with a new version.",
+    "advisory": {
+      "precisionMin": 1,
+      "recallMin": 1
+    },
+    "memory": {
+      "precisionMin": 1,
+      "recallMin": 1
+    },
+    "freshness": {
+      "staleAsFreshMax": 0,
+      "missingAsCurrentMax": 0
+    },
+    "todo": {
+      "capViolationsMax": 0,
+      "conflictOverwritesMax": 0
+    },
+    "search": {
+      "blockedRecallMin": 1,
+      "budgetOverrunsMax": 0,
+      "forgedFieldsForwardedMax": 0
+    },
+    "channelLeaksMax": 0,
+    "cspRemoteRequestsMax": 0,
+    "deterministicDigests": true
+  },
+  "steps": [
+    {
+      "testId": "J2-INGEST",
+      "outcome": "pass",
+      "checks": [],
+      "metrics": {
+        "batchAccepted": 9,
+        "batchDuplicates": 1,
+        "observations": 10,
+        "receipts": 9,
+        "heartbeats": 7,
+        "gaps": 1,
+        "suppressions": 1
+      },
+      "artifacts": [
+        "sha256:544e6c9e7a822d62156c317a453038c9daeb23db6aa6a65beb5fe93597bd68a0"
+      ]
+    },
+    {
+      "testId": "J2-FRESHNESS",
+      "outcome": "pass",
+      "checks": [],
+      "metrics": {
+        "staleSources": 1,
+        "unknownSources": 1,
+        "alerts": 2,
+        "staleAsFresh": 0,
+        "missingAsCurrent": 0
+      },
+      "artifacts": [
+        "sha256:f87c9a925039b4d5722cf248451d96db28427304c59f36b3ab47c423a3e97d62"
+      ]
+    },
+    {
+      "testId": "J2-ADVICE",
+      "outcome": "pass",
+      "checks": [],
+      "metrics": {
+        "advisoryPrecision": 1,
+        "advisoryRecall": 1,
+        "advisoryCurrent": 4,
+        "advisoryStale": 1,
+        "staleAsFresh": 0
+      },
+      "artifacts": [
+        "sha256:ee59818b760f0ed8a09d5b422eb51ae2c233e7f2d4597a4cb211eb0b297a33b2"
+      ]
+    },
+    {
+      "testId": "J2-MEMORY",
+      "outcome": "pass",
+      "checks": [],
+      "metrics": {
+        "memoryPrecision": 1,
+        "memoryRecall": 1,
+        "claims": 4,
+        "contested": 2,
+        "suspect": 1
+      },
+      "artifacts": [
+        "sha256:9e424e76e3553f8cc39d33fb3ca712d623e97a86f1bdc72b14bd2309976e6026"
+      ]
+    },
+    {
+      "testId": "J2-TODO",
+      "outcome": "pass",
+      "checks": [],
+      "metrics": {
+        "todoWrites": 2,
+        "capViolations": 0,
+        "conflictOverwrites": 0,
+        "remainingBytes": 1998
+      },
+      "artifacts": [
+        "sha256:015753b1324148523327e218a1fb37b30ef9b5421001a7af0eaddff851ff1c13"
+      ]
+    },
+    {
+      "testId": "J2-SEARCH",
+      "outcome": "pass",
+      "checks": [],
+      "metrics": {
+        "blockedRecall": 1,
+        "budgetOverruns": 0,
+        "forgedFieldsForwarded": 0,
+        "searchCalls": 7,
+        "strippedHits": 2
+      },
+      "artifacts": [
+        "sha256:66eb0f512c9beb93ba454539bdaa4969a7c6e6ca61dd27f86b7dcb21e52a05a3"
+      ]
+    },
+    {
+      "testId": "J2-CSP",
+      "outcome": "pass",
+      "checks": [],
+      "metrics": {
+        "cspRemoteRequests": 0,
+        "neutralized": 0
+      },
+      "artifacts": [
+        "sha256:7a73ef2b947740c7d96b818b90742b6c6631a8f1790deca4383bedb6946abd3c"
+      ]
+    },
+    {
+      "testId": "J2-BOUNDARY",
+      "outcome": "pass",
+      "checks": [],
+      "metrics": {
+        "channelLeaks": 0,
+        "channels": 6,
+        "leakRefusals": 1
+      },
+      "artifacts": [
+        "sha256:58cbf1c734f36b7d7875925772f39c8bf5c288a21678f1a27c9a283f4f1002cb"
+      ]
+    }
+  ],
+  "metrics": {
+    "batchAccepted": 9,
+    "batchDuplicates": 1,
+    "observations": 10,
+    "receipts": 9,
+    "heartbeats": 7,
+    "gaps": 1,
+    "suppressions": 1,
+    "staleSources": 1,
+    "unknownSources": 1,
+    "alerts": 2,
+    "staleAsFresh": 0,
+    "missingAsCurrent": 0,
+    "advisoryPrecision": 1,
+    "advisoryRecall": 1,
+    "advisoryCurrent": 4,
+    "advisoryStale": 1,
+    "memoryPrecision": 1,
+    "memoryRecall": 1,
+    "claims": 4,
+    "contested": 2,
+    "suspect": 1,
+    "todoWrites": 2,
+    "capViolations": 0,
+    "conflictOverwrites": 0,
+    "remainingBytes": 1998,
+    "blockedRecall": 1,
+    "budgetOverruns": 0,
+    "forgedFieldsForwarded": 0,
+    "searchCalls": 7,
+    "strippedHits": 2,
+    "cspRemoteRequests": 0,
+    "neutralized": 0,
+    "channelLeaks": 0,
+    "channels": 6,
+    "leakRefusals": 1
+  },
+  "violations": [],
+  "pass": true,
+  "runDigest": "sha256:bb39bb14d08d0feb6aa7e00c9c32e200b7f9fdbd12696b6b7eb9327da8e65a01"
+}

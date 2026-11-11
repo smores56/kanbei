@@ -2,10 +2,24 @@
   "schemaVersion": 1,
   "generatedBy": "deno task fixtures:seal",
   "datasets": {
-    "journey-v1@1.0.0": {
-      "treeHash": "sha256:6df0b97f20aa4b416d9f8cbb9ea501fdbb2370d811cea93496ff8047b09c3428",
+    "journey-v2@1.0.0": {
+      "treeHash": "sha256:78fd8157e4b4d27ed3b9053c39c1dfeabacaab3a93afde385289f4280f63773c",
       "files": {
-        "fixture.json": "sha256:e685f8e5f3bef948850b79da504edb367e22faf89b0a93cf1ae593bdce3df9fc"
+        "batches/brave-1.age": "sha256:6f75dfcaad8d6f3aa4349a79a17b643ed905823113cd4fa04cde27dfb3e0a854",
+        "batches/finance-1.age": "sha256:933ea2d7e07039dd2d7c468f1aafa3839c16298b95e10cb3272b74304f4aa0ce",
+        "batches/git-1.age": "sha256:227ef7f7fb9bd7e115024be1040fa87e66d1a6e2f2db2738c50876475cd774a2",
+        "batches/git-2.age": "sha256:537b76898b1e6a9b222dba91abef260a1e41b08a20e48bc09f68f6688c486c7a",
+        "batches/immich-1.age": "sha256:da3d8bc88b4c4d1a0abb4d5d43b44287cdf329a8e5b8f33c7a3fbf1baa3d1843",
+        "batches/phone-1.age": "sha256:b9d4f96e002f20960abaa15fe580814a56046ebaa7d4ef6ee69950a3506c74f6",
+        "batches/tuta-calendar-1.age": "sha256:4af90dc5a8a6de6dcb6b29388f63c62e03ef71d0c8f809b476ad43a697ed780d",
+        "batches/tuta-mail-1-replay.age": "sha256:1653e859cc9c4eaebaed16e6f9b4585eeb8ae5ff418d85a5c32a1e157b929d90",
+        "batches/tuta-mail-1.age": "sha256:1f272bf1e64e6e84165c23eb20e724540b3eb0392eeddc5b5591cbdb73bbd98c",
+        "batches/tuta-mail-3.age": "sha256:c85511aaa464cdd7757f8cd8def15f496ba45659cbbd1f4a22fb391665e21521",
+        "fixture.json": "sha256:f70de812dfe51e21b89bbcd5c4279b32c51f7ec1ecf4e8a5ee559454edbf5fc4",
+        "keys/identity.txt": "sha256:b052a683f7ba5b57aabc5a599d659d3c4b2bac8b2dc78b6d9e6e7640611e4795",
+        "keys/recipient.txt": "sha256:55acdedb630b5606f9b21763cb788590581989a7c0b1cd39b124dc3b777fa2ab",
+        "source.json": "sha256:dfae3e0efaecbadbd7e5560f53b412e6d3597e7a74121ed704e1f8f6fc55669c",
+        "thresholds.json": "sha256:412ab9ae8c35179c613b7e99b386d0c9719c3ad65d117dce55979f816908fb2d"
       }
     },
     "append-v1@1.0.0": {
@@ -27,9 +41,10 @@
       }
     },
     "security-v1@1.0.0": {
-      "treeHash": "sha256:d5dd0ed90f029a1e72fb567f1f87b37c2598566359fa9240d23593ebd0f3c709",
+      "treeHash": "sha256:a7117bef60a3ee63be4dea5076daeb6b6fd5034411a3cca811e36f0a0b4b578f",
       "files": {
-        "cases.json": "sha256:7ca6cfe54ed9da7bf27dfc5e1744fb96d9554451ae0eab3e230f32049b6d69ba"
+        "cases.json": "sha256:7ca6cfe54ed9da7bf27dfc5e1744fb96d9554451ae0eab3e230f32049b6d69ba",
+        "channel-probes.json": "sha256:47dbde052ffd5ed4a3b43fe9554bda7019ce76b1b00111ea07674b8c95afd028"
       }
     },
     "ingest-v1@1.0.0": {

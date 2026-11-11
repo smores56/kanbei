@@ -8,7 +8,7 @@ import * as Effect from "effect/Effect"
 const validEnvelope = {
   testId: "ZT-01",
   invariantIds: ["I-01"],
-  fixtureVersion: "journey-v1@1.0.0",
+  fixtureVersion: "journey-v2@1.0.0",
   canonicalHead: { seq: 1, hash: "sha256:" + "a".repeat(64) },
   sequenceRange: [1, 1] as const,
   environment: {
