@@ -13,6 +13,7 @@ export interface VaultRead {
   readonly pathClass: "vault"
   readonly digest: ContentDigest
   readonly bytes: number
+  readonly content: Uint8Array
   readonly modifiedAt: string
 }
 
@@ -125,6 +126,7 @@ export const vaultReaderLayer = (
             pathClass: "vault",
             digest,
             bytes: opened.bytes.length,
+            content: opened.bytes,
             modifiedAt: new Date(opened.stat.modifiedAtMs).toISOString(),
           }
         })

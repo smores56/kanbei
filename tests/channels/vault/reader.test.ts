@@ -59,6 +59,7 @@ Deno.test("a vault read returns hashed bytes, size, time, and a receipt", async 
     assertEquals(outcome.result.path, "note.md")
     assertEquals(outcome.result.digest, await hash(content))
     assertEquals(outcome.result.bytes, content.length)
+    assertEquals(new TextDecoder().decode(outcome.result.content), content)
     assertEquals(outcome.result.pathClass, "vault")
     assert(outcome.result.modifiedAt.length > 0)
     assertEquals(outcome.receipts.length, 1)
