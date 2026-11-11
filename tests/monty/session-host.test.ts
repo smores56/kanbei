@@ -1,5 +1,5 @@
 import { assert, assertEquals } from "@std/assert"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Result } from "effect"
 import { Scope } from "effect"
 import { MontyHost, montyHostLayer, type ProcessLimits } from "../../src/monty/host.ts"
 import { stub } from "../../src/monty/stubs.ts"
@@ -168,4 +168,28 @@ Deno.test("the process-wide session budget fails closed and releases on close", 
   )
   assertEquals(result.blocked.reason, "session_budget_exceeded")
   assertEquals(result.afterRelease, 1)
+})
+
+Deno.test("concurrent opens cannot exceed the process session budget", async () => {
+  const tight: ProcessLimits = { ...limits, maxSessions: 1 }
+  const tightLayer = montyHostLayer(tight).pipe(Layer.provide(wasmEngineLayer(tight)))
+  const results = await Effect.runPromise(
+    Effect.gen(function* () {
+      const host = yield* MontyHost
+      return yield* Effect.forEach(
+        [1, 2, 3],
+        (n) =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const session = yield* host.open({ agentId: `agent-${n}`, stubs: [] })
+              yield* Effect.sleep("20 millis")
+              return session.agentId
+            }),
+          ).pipe(Effect.result),
+        { concurrency: "unbounded" },
+      )
+    }).pipe(Effect.provide(tightLayer), Effect.orDie),
+  )
+  assertEquals(results.filter(Result.isSuccess).length, 1)
+  assertEquals(results.filter(Result.isFailure).length, 2)
 })

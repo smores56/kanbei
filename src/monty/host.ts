@@ -120,16 +120,21 @@ export const montyHostLayer = (
           }
           yield* Effect.acquireRelease(
             Effect.gen(function* () {
-              const current = yield* Ref.get(active)
-              if (current >= limits.maxSessions) {
+              const admitted = yield* Ref.modify(
+                active,
+                (count) =>
+                  count >= limits.maxSessions
+                    ? [false, count] as const
+                    : [true, count + 1] as const,
+              )
+              if (!admitted) {
                 return yield* Effect.fail(
                   new MontyFailure({
                     reason: "session_budget_exceeded",
-                    detail: `${current} of ${limits.maxSessions} sessions are open`,
+                    detail: `all ${limits.maxSessions} sessions are open`,
                   }),
                 )
               }
-              yield* Ref.update(active, (count) => count + 1)
               return true
             }),
             () => Ref.update(active, (count) => count - 1),
