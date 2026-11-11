@@ -111,4 +111,6 @@ export const VIEW_BUDGET = {
   maxCellsPerRow: 8,
   maxTextChars: 2000,
   maxAnchors: 64,
+  /** Canonical document bytes a staged revision may occupy. */
+  maxDocumentBytes: 65_536,
 } as const

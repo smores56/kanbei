@@ -7,6 +7,7 @@ export type TodoErrorCode =
   | "todo_path_invalid"
   | "todo_symlink"
   | "todo_conflict"
+  | "todo_expectation_required"
   | "todo_io"
 
 export class TodoError extends Data.TaggedError("TodoError")<{

@@ -67,11 +67,12 @@ const receipts = (context: Scenario): Promise<ReadonlyArray<TodoReceipt>> =>
 Deno.test("a write and its read-back produce matching digests and two receipts", async () => {
   await scenario(async (context) => {
     const text = "first\nsecond\n"
+    const empty = await hash("")
     const outcome = await onWriter(
       context,
       Effect.gen(function* () {
         const writer = yield* TodoWriterTag
-        const receipt = yield* writer.write({ text })
+        const receipt = yield* writer.write({ text, expectedDigest: empty })
         const read = yield* writer.read
         return { receipt, read, receipts: yield* writer.receipts }
       }),
@@ -87,11 +88,12 @@ Deno.test("a write and its read-back produce matching digests and two receipts",
 
 const capRefusal = (overrides: Partial<TodoLimits>) =>
   scenario(async (context) => {
+    const empty = await hash("")
     const receiptCount = await onWriter(
       context,
       Effect.gen(function* () {
         const writer = yield* TodoWriterTag
-        yield* writer.write({ text: "original\n" })
+        yield* writer.write({ text: "original\n", expectedDigest: empty })
         const over = yield* Effect.flip(writer.write({ text: "x".repeat(450) }))
         assertEquals(over.code, "todo_cap_exceeded")
         const written = yield* writer.receipts
@@ -146,7 +148,7 @@ Deno.test("a path outside the todo mount is refused", async () => {
 
 Deno.test("an external edit is detected against the expected digest", async () => {
   await scenario(async (context) => {
-    await write(context, { text: "planned\n" })
+    await write(context, { text: "planned\n", expectedDigest: await hash("") })
     const original = await onWriter(
       context,
       Effect.gen(function* () {
@@ -177,10 +179,37 @@ Deno.test("a dry run reports the would-be digest without writing", async () => {
 
 Deno.test("an atomic replace leaves no temporary file behind", async () => {
   await scenario(async (context) => {
-    await write(context, { text: "one\n" })
-    await write(context, { text: "two\n" })
+    const empty = await hash("")
+    const one = await write(context, { text: "one\n", expectedDigest: empty })
+    await write(context, { text: "two\n", expectedDigest: one.digest })
     const names = [...Deno.readDirSync(context.root)].map((entry) => entry.name).toSorted()
     assertEquals(names, ["todo.txt"])
     assertEquals(await Deno.readTextFile(`${context.root}/todo.txt`), "two\n")
+  })
+})
+
+Deno.test("an applied write without an expected digest is refused", async () => {
+  await scenario(async (context) => {
+    const error = await writeFailure(context, { text: "blind\n" })
+    assertEquals(error.code, "todo_expectation_required")
+    const exists = await Deno.stat(`${context.root}/todo.txt`).catch(() => null)
+    assertEquals(exists, null)
+    assertEquals((await receipts(context)).length, 0)
+  })
+})
+
+Deno.test("a create is allowed against the empty digest but not against a guess", async () => {
+  await scenario(async (context) => {
+    const empty = await hash("")
+    const refused = await writeFailure(context, {
+      text: "first\n",
+      expectedDigest: await hash("something else"),
+    })
+    assertEquals(refused.code, "todo_conflict")
+    const created = await write(context, { text: "first\n", expectedDigest: empty })
+    assertEquals(created.applied, true)
+    const replaced = await write(context, { text: "second\n", expectedDigest: created.digest })
+    assertEquals(replaced.applied, true)
+    assertEquals(await Deno.readTextFile(`${context.root}/todo.txt`), "second\n")
   })
 })

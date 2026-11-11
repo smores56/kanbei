@@ -33,6 +33,7 @@ import { appendMemoryEvents, readMemory } from "./memory.ts"
 import type { JourneyStepOutcome } from "./schema.ts"
 import type { JourneyFixture, JourneySource } from "./schema.ts"
 import { makeClock, runWorld, sourceStates } from "./world.ts"
+import { sha256Text } from "../evidence/digest.ts"
 import type { World } from "./world.ts"
 
 export interface StepContext {
@@ -297,8 +298,15 @@ export const stepTodo = async (context: StepContext): Promise<JourneyStepOutcome
   const limits: TodoLimits = context.fixture.todo.limits
   const program = Effect.gen(function* () {
     const writer = yield* TodoWriter
-    const created = yield* writer.write({ text: context.fixture.todo.create })
-    const completed = yield* writer.write({ text: context.fixture.todo.complete })
+    const empty = yield* sha256Text("").pipe(Effect.orDie)
+    const created = yield* writer.write({
+      text: context.fixture.todo.create,
+      expectedDigest: empty,
+    })
+    const completed = yield* writer.write({
+      text: context.fixture.todo.complete,
+      expectedDigest: created.digest,
+    })
     const read = yield* writer.read
     const overSizeText = Array.from(
       { length: 3 },

@@ -1,4 +1,5 @@
 import { Data, Result, Schema } from "effect"
+import { canonicalize } from "../evidence/canonical.ts"
 import { DISCLOSURE_FIELDS, VIEW_BUDGET, ViewDocument } from "./model.ts"
 import type { ViewAction, ViewDocument as ViewDocumentType } from "./model.ts"
 
@@ -20,6 +21,8 @@ export type ViewIssueCode =
   | "decision_affordance_removed"
   | "decision_affordance_missing"
   | "freshness_inconsistent"
+  | "disclosure_unsafe"
+  | "budget_exceeded"
 
 export class ViewIssue extends Data.TaggedClass("ViewIssue")<{
   readonly code: ViewIssueCode
@@ -121,6 +124,13 @@ const disclosureIssues = (document: ViewDocumentType): ReadonlyArray<ViewIssue> 
   for (const rule of document.disclosure) {
     if (!(DISCLOSURE_FIELDS as ReadonlyArray<string>).includes(rule.field)) {
       issues.push(issue("disclosure_unknown", `${rule.field} is not a disclosure field`))
+    }
+    // Hiding the ruling affordance or the currency signal would misrepresent the
+    // view to the human; those fields may only be included.
+    if (rule.mode === "hide" && (rule.field === "actions" || rule.field === "freshness")) {
+      issues.push(
+        issue("disclosure_unsafe", `${rule.field} cannot be hidden from the ruling surface`),
+      )
     }
   }
   return issues
@@ -232,3 +242,27 @@ export const validateViewDocument = (
 
 export const issueCodes = (issues: ReadonlyArray<ViewIssue>): ReadonlyArray<ViewIssueCode> =>
   issues.map((entry) => entry.code)
+
+/** The document as the model sees it: hidden provenance and badges are stripped. */
+export const applyDisclosure = (document: ViewDocumentType): ViewDocumentType => {
+  const hidden = new Set(
+    document.disclosure.filter((rule) => rule.mode === "hide").map((rule) => rule.field),
+  )
+  return {
+    ...document,
+    sections: document.sections.map((section) => ({
+      ...section,
+      rows: section.rows.map((row) => ({
+        ...row,
+        provenance: hidden.has("provenance")
+          ? { observationId: "", span: "", derivation: "", scope: "" }
+          : row.provenance,
+        badges: hidden.has("badges") ? [] : row.badges,
+      })),
+    })),
+  }
+}
+
+/** Canonical byte size of a staged document; the caller bounds it before storing. */
+export const documentBytes = (document: ViewDocumentType): number =>
+  new TextEncoder().encode(canonicalize(Schema.decodeUnknownSync(Schema.Json)(document))).length

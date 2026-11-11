@@ -1,8 +1,10 @@
-import { Clock, Context, Effect, Layer, Option, Ref, Schema } from "effect"
+import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema } from "effect"
 import { canonicalize } from "../evidence/canonical.ts"
 import { Ledger } from "../kernel/ledger.ts"
 import type { LedgerError } from "../kernel/ledger.ts"
+import { VIEW_BUDGET } from "./model.ts"
 import type { ViewDocument } from "./model.ts"
+import { applyDisclosure, documentBytes, validateViewDocument, ViewIssue } from "./validation.ts"
 
 export const VisibilityDiff = Schema.Struct({
   added: Schema.Array(Schema.String),
@@ -31,8 +33,13 @@ export interface TurnStart {
  * Declarative activation is live at the next turn boundary. The running turn
  * pins the revision it started with; a staged document never swaps mid-turn.
  */
+/** A staged revision that failed validation never becomes live. */
+export class StageRefusal extends Data.TaggedError("StageRefusal")<{
+  readonly issues: ReadonlyArray<ViewIssue>
+}> {}
+
 export interface ViewActivation {
-  readonly stage: (document: ViewDocument) => Effect.Effect<void>
+  readonly stage: (document: ViewDocument) => Effect.Effect<void, StageRefusal>
   readonly beginTurn: () => Effect.Effect<TurnStart, LedgerError>
   readonly endTurn: () => Effect.Effect<void>
   readonly current: Effect.Effect<ViewDocument>
@@ -73,6 +80,7 @@ export const visibilityDiff = (previous: ViewDocument, next: ViewDocument): Visi
 
 export const viewActivationLayer = (
   initial: ViewDocument,
+  options: { readonly authorizedSources?: ReadonlyArray<string> } = {},
 ): Layer.Layer<ViewActivation, never, Ledger> =>
   Layer.effect(
     ViewActivation,
@@ -129,7 +137,33 @@ export const viewActivationLayer = (
 
       return {
         stage: (document) =>
-          Ref.update(state, (current) => ({ ...current, staged: Option.some(document) })),
+          Effect.gen(function* () {
+            const current = yield* Ref.get(state)
+            const checked = validateViewDocument(document, {
+              authorizedSources: options.authorizedSources ?? [],
+              base: current.live,
+            })
+            if (Result.isFailure(checked)) {
+              return yield* Effect.fail(new StageRefusal({ issues: checked.failure }))
+            }
+            if (documentBytes(checked.success) > VIEW_BUDGET.maxDocumentBytes) {
+              return yield* Effect.fail(
+                new StageRefusal({
+                  issues: [
+                    new ViewIssue({
+                      code: "budget_exceeded",
+                      detail: `document exceeds ${VIEW_BUDGET.maxDocumentBytes} bytes`,
+                    }),
+                  ],
+                }),
+              )
+            }
+            // Stage what the model sees: disclosure is applied before the turn boundary.
+            yield* Ref.set(state, {
+              ...current,
+              staged: Option.some(applyDisclosure(checked.success)),
+            })
+          }),
         beginTurn,
         endTurn: () => Ref.update(state, (current) => ({ ...current, running: Option.none() })),
         current: Ref.get(state).pipe(Effect.map((current) => current.live)),

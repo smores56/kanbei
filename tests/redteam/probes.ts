@@ -313,7 +313,10 @@ export const todoProbes = async (
       directory,
       Effect.gen(function* () {
         const writer = yield* TodoWriter
-        yield* writer.write({ text: "planned\n" })
+        yield* writer.write({
+          text: "planned\n",
+          expectedDigest: yield* sha256Text("").pipe(Effect.orDie),
+        })
         const original = yield* writer.read
         yield* Effect.promise(() => Deno.writeTextFile(`${directory}/todo.txt`, "owner edit\n"))
         const error = yield* Effect.flip(

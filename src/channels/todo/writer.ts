@@ -176,20 +176,36 @@ export const todoWriterLayer = (
           if (Option.isSome(existing) && existing.value.kind !== "file") {
             return yield* Effect.fail(fail("todo_io", target, `kind ${existing.value.kind}`))
           }
-          if (input.expectedDigest !== undefined) {
-            if (Option.isNone(existing)) {
-              return yield* Effect.fail(
-                fail("todo_conflict", target, "expected a file but none exists"),
-              )
-            }
-            const current = yield* files.read(target).pipe(
-              Effect.mapError((error) => fail("todo_io", target, error.reason)),
+          // An applied write must name the digest it replaces: a blind overwrite
+          // loses a concurrent owner edit.
+          if (input.dryRun !== true && input.expectedDigest === undefined) {
+            return yield* Effect.fail(
+              fail(
+                "todo_expectation_required",
+                target,
+                "a non-dry-run write must carry the digest it replaces",
+              ),
             )
-            const currentDigest = yield* sha256(current.bytes).pipe(Effect.orDie)
-            if (currentDigest !== input.expectedDigest) {
-              return yield* Effect.fail(
-                fail("todo_conflict", target, `current ${currentDigest} != expected`),
+          }
+          if (input.expectedDigest !== undefined) {
+            const emptyDigest = yield* sha256(encoder.encode("")).pipe(Effect.orDie)
+            if (Option.isNone(existing)) {
+              // The empty digest is how a caller states "this file does not exist yet".
+              if (input.expectedDigest !== emptyDigest) {
+                return yield* Effect.fail(
+                  fail("todo_conflict", target, "expected a file but none exists"),
+                )
+              }
+            } else {
+              const current = yield* files.read(target).pipe(
+                Effect.mapError((error) => fail("todo_io", target, error.reason)),
               )
+              const currentDigest = yield* sha256(current.bytes).pipe(Effect.orDie)
+              if (currentDigest !== input.expectedDigest) {
+                return yield* Effect.fail(
+                  fail("todo_conflict", target, `current ${currentDigest} != expected`),
+                )
+              }
             }
           }
 
