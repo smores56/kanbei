@@ -3,7 +3,7 @@ import { canonicalize } from "../../evidence/canonical.ts"
 import type { CsrRequest, HostResponse, LeafCertificate } from "./schema.ts"
 import { csrFieldsIssue, parseCsrRequest } from "./schema.ts"
 import type { SessionKey } from "./key.ts"
-import { generateSessionKey, isP256Spki, signText, verifyText } from "./key.ts"
+import { exportPkcs8, generateSessionKey, isP256Spki, signText, verifyText } from "./key.ts"
 import type { InstalledCertificate } from "./store.ts"
 import { CertificateStore } from "./store.ts"
 
@@ -152,9 +152,11 @@ const leafExpired = (leaf: LeafCertificate, at: number): boolean => {
 const certificateOf = (
   response: HostResponse,
   installedAt: number,
+  privateKeyPkcs8: string,
 ): InstalledCertificate => ({
   leaf: response.leaf,
   chain: response.chain,
+  privateKeyPkcs8,
   installedAt: new Date(installedAt).toISOString(),
 })
 
@@ -303,7 +305,10 @@ export const csrClientLayer = (
             )
           ),
         )
-        const certificate = certificateOf(response, at)
+        const privateKeyPkcs8 = yield* exportPkcs8(key).pipe(
+          Effect.mapError((error) => fail("csr_key_failed", error.reason)),
+        )
+        const certificate = certificateOf(response, at, privateKeyPkcs8)
         yield* store.stage(certificate).pipe(
           Effect.mapError((error) => fail("csr_store_failed", error.reason)),
         )

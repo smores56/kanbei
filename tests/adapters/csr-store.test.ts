@@ -14,6 +14,7 @@ const certificate: InstalledCertificate = {
     notAfter: "2026-04-01T00:00:00.000Z",
   },
   chain: [{ subject: "fake-ca", issuer: "root-ca", spki: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE" }],
+  privateKeyPkcs8: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg",
   installedAt: "2026-01-01T00:00:00.000Z",
 }
 

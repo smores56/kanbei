@@ -98,6 +98,9 @@ Deno.test("a due renewal emits the fixed CSR and stages without promoting", asyn
     "renewal_request:ok",
   ])
   assertEquals(receipts[0]?.sans, CSR_SANS)
+  const staged = Option.getOrThrow(outcome.staged)
+  assertEquals(staged.privateKeyPkcs8.length > 20, true)
+  assertEquals(JSON.stringify(receipts).includes(staged.privateKeyPkcs8), false)
 })
 
 Deno.test("a different CN, an extra SAN, and a different key algorithm refuse before the CA", async () => {

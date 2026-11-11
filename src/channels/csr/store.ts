@@ -5,6 +5,7 @@ import type { CertificateName, LeafCertificate } from "./schema.ts"
 export interface InstalledCertificate {
   readonly leaf: LeafCertificate
   readonly chain: ReadonlyArray<CertificateName>
+  readonly privateKeyPkcs8: string
   readonly installedAt: string
 }
 

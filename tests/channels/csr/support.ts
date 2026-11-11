@@ -196,6 +196,7 @@ export const installed = (
     notAfter,
   },
   chain: [],
+  privateKeyPkcs8: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg",
   installedAt: new Date(0).toISOString(),
 })
 

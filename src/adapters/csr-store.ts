@@ -4,6 +4,7 @@ import type { InstalledCertificate } from "../channels/csr/store.ts"
 
 const StoredCertificate = Schema.Struct({
   installedAt: Schema.String,
+  privateKeyPkcs8: Schema.String,
   leaf: Schema.Struct({
     subject: Schema.Literal("kanbei.sammohr.dev"),
     issuer: Schema.String,
@@ -39,6 +40,7 @@ const readCertificate = (
           leaf: parsed.leaf,
           chain: parsed.chain,
           installedAt: parsed.installedAt,
+          privateKeyPkcs8: parsed.privateKeyPkcs8,
         })
       } catch (error) {
         if (error instanceof Deno.errors.NotFound) return Option.none()

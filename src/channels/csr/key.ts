@@ -90,3 +90,13 @@ export const isP256Spki = (spki: string): Effect.Effect<boolean, CsrKeyError> =>
     Effect.map(() => true),
     Effect.catch(() => Effect.succeed(false)),
   )
+
+/** The serving key is persisted with the certificate, never in a receipt or log. */
+export const exportPkcs8 = (key: SessionKey): Effect.Effect<string, CsrKeyError> =>
+  Effect.tryPromise({
+    try: async () => {
+      const pkcs8 = await crypto.subtle.exportKey("pkcs8", key.privateKey)
+      return new Uint8Array(pkcs8).toBase64()
+    },
+    catch: (error) => keyError("generate", error),
+  })
