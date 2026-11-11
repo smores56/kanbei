@@ -73,6 +73,22 @@ Substantive changes:
 - `07 §7` and `04` are normative for the deployed system; `08` orders the work and the
   registry mapping in #509 tracks it.
 
+## Validation, packaging, and recorded evidence
+
+- `journey-v2` is the sealed life-admin slice. `deno task journey` runs the ingest,
+  freshness, advice, memory, Todo, search, CSP, and boundary steps against it and records
+  `docs/evidence/journey-v2.json`; `deno task journey:check` fails on a digest drift or a
+  stale record. Thresholds are pre-registered in `fixtures/journey-v2/thresholds.json`;
+  `DG-6`/`DG-7` population thresholds remain open.
+- `deno task redteam` attacks every channel end-to-end in-process from
+  `fixtures/security-v1/channel-probes.json` and records `docs/evidence/redteam-v1.json`;
+  `deno task redteam:check` is part of `deno task verify` and CI. It covers `ZT-15`
+  (manifest/mount/socket drift, NIC present, weaker posture), `ZT-16` (planted image,
+  link, CSS `url()`, iframe, autolink: zero requests), `ZT-17` (Todo cap, symlink,
+  conflict) and `ZT-18` (stale/unknown never current) at the channel boundary.
+- `flake.nix` builds the control plane as `packages.default` and runs the unit suite; the
+  nix-config pin and `kanbeiVm.package` wiring are in `04 §8.3.1`.
+
 ## Not carried
 
 - Any document that assumes a broker, managed model or search provider, unrestricted

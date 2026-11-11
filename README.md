@@ -63,15 +63,38 @@ deno task fmt             # format
 deno task lint            # deno lint + oxlint
 deno task typecheck       # strict TypeScript check
 deno task test            # test suite
+deno task test:unit       # deterministic, unprivileged unit suite
 deno task verify          # all merge-blocking checks
 deno task verify:fix      # format and auto-fix, then verify
 deno task fixtures:seal   # regenerate the sealed fixture manifest
+deno task journey:seal    # reseal the journey-v2 age batches (changes digests)
+deno task journey         # run journey-v2 and record docs/evidence/journey-v2.json
+deno task journey:check   # rerun, assert identical digests, assert the record is current
+deno task redteam         # run the channel-leak/CSP suite, record docs/evidence/redteam-v1.json
+deno task redteam:check   # rerun, assert identical digests, assert the record is current
 deno task evidence:dry-run
 deno task evidence:determinism
 deno task evidence:failure
 ```
 
-The pre-commit hook runs `deno task verify`. CI runs the same command.
+The pre-commit hook and CI run `deno task verify`, which includes `journey:check` and
+`redteam:check`. Recorded runs live in `docs/evidence/`.
+
+## Packaging
+
+`flake.nix` builds the Deno control plane as `packages.default` and runs
+`deno task test:unit` in the derivation's check phase. Remote modules are vendored into
+a fixed-output derivation, so the build, the tests, and the runtime use no network
+(`--no-remote`).
+
+```sh
+nix build .#default
+nix flake check
+```
+
+nix-config consumes this package from a pinned `git+ssh://` flake input and copies the
+store path into the guest image; the exact input, `kanbeiVm.package` wiring, and the
+private-repository auth caveat are in `docs/design/04-security-deployment.md` §8.3.1.
 
 ## Design
 

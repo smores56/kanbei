@@ -424,6 +424,43 @@ The pre-split deployment alternatives (pure user-space unit, NixOS-plane unit, d
 - Startup records the pinned commit, the image digest, and the Nix generation as a `kernel_generation` receipt, and verifies that core, channel hosts, the supervisor, and `llama.cpp` run from the image.
 - The watchdog alerts on drift between the flake pin, the running image digest, and the recorded generation.
 
+### 8.3.1 Pin, build, and host wiring
+
+The `smores56/kanbei` repository owns the packaging contract; nix-config owns the VM
+definition. The kanbei `flake.nix` builds the Deno control plane as
+`packages.<system>.default` and vendors every remote module into a fixed-output
+derivation, so the build and the runtime never fetch. `nix build .#default` runs
+`deno task test:unit` in its `checkPhase`, and `nix flake check` evaluates the same
+derivation.
+
+nix-config applies exactly this input and wiring once the commit is human-merged:
+
+```nix
+# flake.nix (nix-config)
+inputs.kanbei = {
+  # Private repository: SSH, not an anonymous github: fetch. Replace the rev with
+  # the human-merged commit and refresh flake.lock in the same commit.
+  url = "git+ssh://git@github.com/smores56/kanbei?rev=<HUMAN_MERGED_COMMIT>";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+```nix
+# modules/hosts/<host>/kanbei.nix (nix-config), where kanbeiVm is the host module
+kanbeiVm.package =
+  inputs.kanbei.packages.${pkgs.stdenv.hostPlatform.system}.default;
+kanbeiVm.commit = "<HUMAN_MERGED_COMMIT>"; # the same rev as the input above
+```
+
+Private-repository caveat: `github:smores56/kanbei` is not anonymously fetchable, so
+the input must be `git+ssh://` or use a configured `access-tokens`/`netrc` entry, and
+the builder identity needs a read-only deploy key for both the lock update and every
+rebuild. A missing or revoked key fails the evaluation; it never falls back to an
+unpinned fetch. Never commit a token, and never add `flake = false` here: the whole
+point is that the guest consumes the flake's `packages.default`. The image copies
+that store path into the guest's `/nix/store`; the guest runs it with
+`--no-remote`, so no network fetch or package install happens at VM runtime.
+
 ### 8.4 Ingress
 
 - The static UI binds `127.0.0.1:<port>` inside the VM. The host relay forwards the API and serves nothing else.
