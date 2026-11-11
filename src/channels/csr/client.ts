@@ -245,6 +245,15 @@ export const csrClientLayer = (
           })
         })
 
+      const refuseOnError = <A>(effect: Effect.Effect<A, CsrError>): Effect.Effect<A, CsrError> =>
+        effect.pipe(
+          Effect.tapError((error) =>
+            receipt("renewal_refused", "refused", `${error.code}: ${error.detail}`).pipe(
+              Effect.flatMap(() => Ref.set(state, "refused")),
+            )
+          ),
+        )
+
       const raise = (alert: CsrAlert): Effect.Effect<void> =>
         Effect.gen(function* () {
           yield* Ref.update(alertLog, (current) => [...current, alert])
@@ -286,31 +295,26 @@ export const csrClientLayer = (
           )
         }
         yield* Ref.set(state, "requested")
-        const key = yield* generateSessionKey().pipe(
-          Effect.mapError((error) => fail("csr_key_failed", error.reason)),
-        )
-        const built = yield* buildRequest(config, key)
-        const response = yield* transport.exchange(built).pipe(
-          Effect.mapError((error) => fail("csr_transport_failed", error.reason)),
-          Effect.tapError((error) =>
-            receipt("renewal_refused", "refused", `${error.code}: ${error.detail}`).pipe(
-              Effect.flatMap(() => Ref.set(state, "refused")),
-            )
+        const key = yield* refuseOnError(
+          generateSessionKey().pipe(
+            Effect.mapError((error) => fail("csr_key_failed", error.reason)),
           ),
         )
-        yield* validateResponse(config, response, key, at).pipe(
-          Effect.tapError((error) =>
-            receipt("renewal_refused", "refused", `${error.code}: ${error.detail}`).pipe(
-              Effect.flatMap(() => Ref.set(state, "refused")),
-            )
+        const built = yield* refuseOnError(buildRequest(config, key))
+        const response = yield* refuseOnError(
+          transport.exchange(built).pipe(
+            Effect.mapError((error) => fail("csr_transport_failed", error.reason)),
           ),
         )
-        const privateKeyPkcs8 = yield* exportPkcs8(key).pipe(
-          Effect.mapError((error) => fail("csr_key_failed", error.reason)),
+        yield* refuseOnError(validateResponse(config, response, key, at))
+        const privateKeyPkcs8 = yield* refuseOnError(
+          exportPkcs8(key).pipe(Effect.mapError((error) => fail("csr_key_failed", error.reason))),
         )
         const certificate = certificateOf(response, at, privateKeyPkcs8)
-        yield* store.stage(certificate).pipe(
-          Effect.mapError((error) => fail("csr_store_failed", error.reason)),
+        yield* refuseOnError(
+          store.stage(certificate).pipe(
+            Effect.mapError((error) => fail("csr_store_failed", error.reason)),
+          ),
         )
         yield* receipt(
           "renewal_request",
