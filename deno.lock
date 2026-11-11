@@ -5,6 +5,7 @@
     "jsr:@std/internal@^1.0.12": "1.0.14",
     "npm:@effect/platform-deno@4.1.2": "4.1.2_effect@4.1.2",
     "npm:@effect/sql-sqlite-node@4.1.2": "4.1.2_effect@4.1.2",
+    "npm:@pydantic/monty@1.5.0": "1.5.0",
     "npm:effect@4.1.2": "4.1.2",
     "npm:oxlint@1.92.0": "1.92.0"
   },
@@ -20,6 +21,9 @@
     }
   },
   "npm": {
+    "@bytecodealliance/preview2-shim@0.19.0": {
+      "integrity": "sha512-OSUlcM62fXLuzYP0DjBn/SwjKMZ/y/2PMXZ8v5cRiiFcroauntlPRl/oCnx0xYjYiqdYvE0PY50VCNutll0xOw=="
+    },
     "@effect/platform-deno@4.1.2_effect@4.1.2": {
       "integrity": "sha512-dPVVkuZdeFupWHzkrcCj+04gZJDFuLUlpaoCfimNqarfLtoJ00LhPSM1Pnf5idIYNhJ6CIHi8IB6GZsf1F9qCw==",
       "dependencies": [
@@ -128,6 +132,15 @@
       ],
       "tarball": "https://npm.jsr.io/~/11/@jsr/std__streams/1.2.0.tgz"
     },
+    "@opentelemetry/api-logs@0.222.0": {
+      "integrity": "sha512-9mb1If+IF6u0ZVXkHQ6ogEae5HwA6ajIVUgpSDQyRASxft6BSXHvBvPooRle3yFN/fKnCdSOnuu0OC3PLcF6+g==",
+      "dependencies": [
+        "@opentelemetry/api"
+      ]
+    },
+    "@opentelemetry/api@1.10.0": {
+      "integrity": "sha512-lMkyes8iHrG+mk6WH7X70MdCLI2RS0FwNBY1PyQ8UemaijE2m5mv5A0Niy3HtbYTFrgkUEQjFMXmSAk2hQDuPQ=="
+    },
     "@oxlint/binding-android-arm-eabi@1.92.0": {
       "integrity": "sha512-k3Sd4ixQfiOrybv1gT+AMI81HSdtAFsiCFx+xXxWdFkmKW2HNrSiOfwn20o5nl/ggwbzU1oNLDeU/fRPinTVZQ==",
       "os": ["android"],
@@ -223,6 +236,46 @@
       "os": ["win32"],
       "cpu": ["x64"]
     },
+    "@pydantic/monty-darwin-arm64@1.5.0": {
+      "integrity": "sha512-WbffCrpYehMYyf9yyLE8AOiGIfwBQu8oIIZXq+wEjnjN3S4+exniCF+kRQ6Q5I+2LfMuipWvlmw4wkzCHLSgPA==",
+      "os": ["darwin"],
+      "cpu": ["arm64"]
+    },
+    "@pydantic/monty-darwin-x64@1.5.0": {
+      "integrity": "sha512-B4wiXB2TwTeNyvphcX5h3QP5xM3tzXVt0n9XISNjZzJk4udpCTjs2zZGPswMRuWOr45dfgcqrSD/om1roW6Ong==",
+      "os": ["darwin"],
+      "cpu": ["x64"]
+    },
+    "@pydantic/monty-linux-arm64-gnu@1.5.0": {
+      "integrity": "sha512-MRFByR0DMtbryNHleokHOxS89Qg8EUwQkIGRZNkkwqw30zS95T14vwXXGfP+5Ys9T4JY5sGd32vb0G7QVliMCw==",
+      "os": ["linux"],
+      "cpu": ["arm64"]
+    },
+    "@pydantic/monty-linux-x64-gnu@1.5.0": {
+      "integrity": "sha512-bA9PE7g2Q5G/SVfG5z3YV4+W2EQUyK26v7nJM2Rog/LRKc/9QWxKulC1DMOFlu0lcahOmspwxlfkvSuRSetxVA==",
+      "os": ["linux"],
+      "cpu": ["x64"]
+    },
+    "@pydantic/monty-win32-x64-msvc@1.5.0": {
+      "integrity": "sha512-xC36k+kbMgq6IfkUSNOB5Q4byhpo32HXNkoXf/pKwu00XRhOhvT9eMacijw8mrx8YfZ3v5Ls5NaP7tgbE9Wqxg==",
+      "os": ["win32"],
+      "cpu": ["x64"]
+    },
+    "@pydantic/monty@1.5.0": {
+      "integrity": "sha512-YnGWRXFBF+67b6KGpe72ghnMXZac7zyV7VF4crUma6i57KSDgDBECyynVWEoNOSeGrWHSzJXLDdFgMSoTJLNKw==",
+      "dependencies": [
+        "@bytecodealliance/preview2-shim",
+        "@opentelemetry/api",
+        "@opentelemetry/api-logs"
+      ],
+      "optionalDependencies": [
+        "@pydantic/monty-darwin-arm64",
+        "@pydantic/monty-darwin-x64",
+        "@pydantic/monty-linux-arm64-gnu",
+        "@pydantic/monty-linux-x64-gnu",
+        "@pydantic/monty-win32-x64-msvc"
+      ]
+    },
     "@types/node@26.6.6": {
       "integrity": "sha512-MzQj+8Kx3XI40OmUAE6Qoh58ZMNstNNMwn2nfd3qWsfe7nDNSqJNzes4njhz6AHwrSHOffSLwXU6yb474Q4aog==",
       "dependencies": [
@@ -278,6 +331,7 @@
       "jsr:@std/assert@1",
       "npm:@effect/platform-deno@4.1.2",
       "npm:@effect/sql-sqlite-node@4.1.2",
+      "npm:@pydantic/monty@1.5.0",
       "npm:effect@4.1.2"
     ]
   }
