@@ -9,7 +9,8 @@ import {
   inboxReaderLayer,
 } from "../../../src/channels/inbox/reader.ts"
 import { BlobSink } from "../../../src/kernel/blob-sink.ts"
-import { buildBatch, hash, makeKey, withTempDir, writeBatch } from "./support.ts"
+import { buildBatch, makeKey, writeBatch } from "./support.ts"
+import { hash, withTempDir } from "../../support.ts"
 
 const limits: InboxLimits = {
   maxBatchBytes: 1_000_000,

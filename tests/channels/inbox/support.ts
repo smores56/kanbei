@@ -1,12 +1,9 @@
-import { Effect } from "effect"
 import type { Schema } from "effect"
 import { canonicalize } from "../../../src/evidence/canonical.ts"
-import { sha256Text } from "../../../src/evidence/digest.ts"
+import { hash } from "../../support.ts"
 
 const decoder = new TextDecoder()
 const encoder = new TextEncoder()
-
-export const hash = (text: string): Promise<string> => Effect.runPromise(sha256Text(text))
 
 export const base64 = (text: string): string => btoa(String.fromCharCode(...encoder.encode(text)))
 
@@ -114,16 +111,4 @@ export const writeBatch = async (
   recipient: string,
 ): Promise<void> => {
   await encryptFile(plaintext, recipient, path)
-}
-
-export const withTempDir = async <A>(
-  prefix: string,
-  run: (directory: string) => Promise<A>,
-): Promise<A> => {
-  const directory = await Deno.makeTempDir({ prefix: `kanbei-${prefix}-` })
-  try {
-    return await run(directory)
-  } finally {
-    await Deno.remove(directory, { recursive: true })
-  }
 }

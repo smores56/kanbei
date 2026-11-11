@@ -7,7 +7,7 @@ import {
   vaultReaderLayer,
 } from "../../../src/channels/vault/reader.ts"
 import { VaultError } from "../../../src/channels/vault/errors.ts"
-import { hash, withTempDir } from "../inbox/support.ts"
+import { hash, withTempDir } from "../../support.ts"
 
 const policy: VaultPolicy = { roots: [""], maxBytes: 1_024 }
 
