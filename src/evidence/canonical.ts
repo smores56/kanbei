@@ -13,6 +13,10 @@ const encodeNumber = (value: number): string => {
   return JSON.stringify(value)
 }
 
+/** JCS orders keys by UTF-16 code unit, not by locale collation. */
+const compareCodeUnits = (left: string, right: string): number =>
+  left < right ? -1 : left > right ? 1 : 0
+
 const encode = (value: Json, seen: Set<object>): string => {
   if (value === null) return "null"
 
@@ -33,7 +37,7 @@ const encode = (value: Json, seen: Set<object>): string => {
         ? `[${value.map((item) => encode(item, seen)).join(",")}]`
         : `{${
           Object.entries(value)
-            .toSorted(([left], [right]) => left.localeCompare(right))
+            .toSorted(([left], [right]) => compareCodeUnits(left, right))
             .map(([key, item]) => `${encodeString(key)}:${encode(item, seen)}`)
             .join(",")
         }}`
