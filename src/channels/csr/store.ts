@@ -1,11 +1,11 @@
 import { Context, Data, Effect } from "effect"
 import type { Option } from "effect"
-import type { CertificateName, LeafCertificate } from "./schema.ts"
-
 export interface InstalledCertificate {
-  readonly leaf: LeafCertificate
-  readonly chain: ReadonlyArray<CertificateName>
+  readonly chainPem: string
+  readonly leafPem: string
   readonly privateKeyPkcs8: string
+  readonly spki: string
+  readonly notAfter: string
   readonly installedAt: string
 }
 

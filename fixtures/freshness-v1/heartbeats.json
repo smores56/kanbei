@@ -6,7 +6,7 @@
     {
       "origin": "tuta-mail",
       "sequence": 12,
-      "producedAt": "2026-11-10T23:59:00.000Z",
+      "producedAt": "2026-11-10T22:59:59.000Z",
       "receivedAt": "2026-11-10T22:59:59.000Z",
       "coverage": { "complete": true, "gaps": 0, "suppressed": 0 },
       "state": "stale"

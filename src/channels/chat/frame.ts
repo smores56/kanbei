@@ -1,3 +1,8 @@
+/* EXPERIMENTAL: the length-prefixed frame API is not the deployed chat contract.
+ * The authority is the HTTP `POST /api/chat {message}` + bearer session surface in
+ * `nix-config modules/lib/kanbei/ui/server.py`, implemented in `./http.ts`.
+ * This frame API stays only for spike/property tests and must not be exposed.
+ */
 import { Data, Result, Schema } from "effect"
 
 export type ChatFrameErrorCode = "frame_too_large" | "frame_invalid"

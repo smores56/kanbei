@@ -2,7 +2,12 @@ import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema } from
 import { canonicalize } from "../../evidence/canonical.ts"
 import { sha256Text } from "../../evidence/digest.ts"
 import type { SearchBlockReason, SearchHit, SearchQuery, SearchReply } from "./schema.ts"
-import { parseSearchReply } from "./schema.ts"
+import {
+  parseSearchReply,
+  SEARCH_MAX_QUERY_CHARS,
+  SEARCH_MAX_RESULTS,
+  SEARCH_MAX_SNIPPET_CHARS,
+} from "./schema.ts"
 import { capText, stripMarkup } from "./text.ts"
 
 export interface SearchConfig {
@@ -70,7 +75,20 @@ const configIssues = (config: SearchConfig): ReadonlyArray<string> => {
       queriesPerDay: config.queriesPerDay,
     })
   ) {
-    if (!Number.isInteger(value) || value <= 0) issues.push(`${name} must be a positive integer`)
+    if (!Number.isInteger(value) || value <= 0) {
+      issues.push(`${name} must be a positive integer`)
+    }
+  }
+  // The deployed searchd caps are the authority; a wider local config would
+  // frame requests the host refuses.
+  if (config.maxQueryChars > SEARCH_MAX_QUERY_CHARS) {
+    issues.push(`maxQueryChars exceeds the host cap `)
+  }
+  if (config.maxLimit > SEARCH_MAX_RESULTS) {
+    issues.push(`maxLimit exceeds the host cap `)
+  }
+  if (config.maxTextChars > SEARCH_MAX_SNIPPET_CHARS) {
+    issues.push(`maxTextChars exceeds the host snippet cap `)
   }
   return issues
 }

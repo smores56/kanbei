@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "dataset": "journey-v2@1.0.0",
-  "fixtureTreeHash": "sha256:78fd8157e4b4d27ed3b9053c39c1dfeabacaab3a93afde385289f4280f63773c",
+  "fixtureTreeHash": "sha256:27d0077a649615e255ca59d4405123cc0386d46dca1ba0077f95fc28b44a87ad",
   "thresholdBasis": "The sealed slice is exhaustively hand-labelled, so agreement is the threshold: a miss is a defect, not a tuning target. Population thresholds for DG-6 and DG-7 stay open and are not set here; changing this file is a fixture change with a new version.",
   "thresholds": {
     "schemaVersion": 1,
@@ -42,6 +42,8 @@
         "batchAccepted": 9,
         "batchDuplicates": 1,
         "observations": 10,
+        "ledgerRecords": 10,
+        "ledgerCaptures": 10,
         "receipts": 9,
         "heartbeats": 7,
         "gaps": 1,
@@ -63,7 +65,7 @@
         "missingAsCurrent": 0
       },
       "artifacts": [
-        "sha256:f87c9a925039b4d5722cf248451d96db28427304c59f36b3ab47c423a3e97d62"
+        "sha256:8fe63defaca871bbd8fd86665736aaee7cdb9137dde5e0b05b01d90cab20baf7"
       ]
     },
     {
@@ -93,7 +95,7 @@
         "suspect": 1
       },
       "artifacts": [
-        "sha256:9e424e76e3553f8cc39d33fb3ca712d623e97a86f1bdc72b14bd2309976e6026"
+        "sha256:4a87881a70e00dd50ced430e769092644bd4b20500806ecb8ee45e3a91628fb9"
       ]
     },
     {
@@ -147,7 +149,7 @@
         "leakRefusals": 1
       },
       "artifacts": [
-        "sha256:58cbf1c734f36b7d7875925772f39c8bf5c288a21678f1a27c9a283f4f1002cb"
+        "sha256:73540a68dc1da7c82455ab61db97ed926c684ac43c6b56093d2543ca0e6d3211"
       ]
     }
   ],
@@ -155,6 +157,8 @@
     "batchAccepted": 9,
     "batchDuplicates": 1,
     "observations": 10,
+    "ledgerRecords": 10,
+    "ledgerCaptures": 10,
     "receipts": 9,
     "heartbeats": 7,
     "gaps": 1,
@@ -190,5 +194,5 @@
   },
   "violations": [],
   "pass": true,
-  "runDigest": "sha256:bb39bb14d08d0feb6aa7e00c9c32e200b7f9fdbd12696b6b7eb9327da8e65a01"
+  "runDigest": "sha256:d418f55454d90298b12f571d578c76502cc979d879c8ca77ae323ac7fedddb18"
 }

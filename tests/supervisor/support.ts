@@ -12,6 +12,7 @@ export const manifest: SandboxManifest = {
     { path: "/todo", access: "rw", class: "todo" },
     { path: "/scratch", access: "rw", class: "scratch" },
   ],
+  writableRoots: ["/todo", "/scratch"],
   channels: ["inbox", "vault", "todo"],
   limits: {
     wallMs: 60_000,
@@ -29,5 +30,6 @@ export const posture = (overrides: Partial<ObservedPosture> = {}): ObservedPostu
   addresses: ["lo"],
   channelSockets: ["inbox", "vault", "todo"],
   mounts: manifest.mounts,
+  writableRoots: manifest.writableRoots,
   ...overrides,
 })

@@ -1,29 +1,36 @@
-import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema } from "effect"
-import { canonicalize } from "../../evidence/canonical.ts"
-import type { CsrRequest, HostResponse, LeafCertificate } from "./schema.ts"
-import { csrFieldsIssue, parseCsrRequest } from "./schema.ts"
+import { Clock, Context, Data, Effect, Layer, Option, Ref } from "effect"
 import type { SessionKey } from "./key.ts"
-import { exportPkcs8, generateSessionKey, isP256Spki, signText, verifyText } from "./key.ts"
+import { exportPkcs8, generateSessionKey, signDerBytes } from "./key.ts"
+import {
+  buildCsrPem,
+  CsrPolicyError,
+  parseCsrPem,
+  splitChain,
+  verifyIssuedChain,
+} from "./pkcs10.ts"
+import { pemEncode } from "./der.ts"
 import type { InstalledCertificate } from "./store.ts"
 import { CertificateStore } from "./store.ts"
+import { CSR_COMMON_NAME, csrFieldsIssue } from "./schema.ts"
 
 export const CSR_RENEWAL_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 
 export interface CsrConfig {
   readonly commonName: string
-  readonly keyAlgorithm: string
-  readonly sans: ReadonlyArray<string>
   readonly renewalWindowMs: number
-  readonly issuerPublicKeySpki: string
-  readonly rootSubject: string
 }
 
 export class CsrTransportError extends Data.TaggedError("CsrTransportError")<{
   readonly reason: string
 }> {}
 
+export interface CsrTransportReply {
+  readonly chain: string
+  readonly notAfter: string
+}
+
 export interface CsrTransport {
-  readonly exchange: (request: CsrRequest) => Effect.Effect<HostResponse, CsrTransportError>
+  readonly exchange: (csrPem: string) => Effect.Effect<CsrTransportReply, CsrTransportError>
 }
 
 export const CsrTransport = Context.Service<CsrTransport>("kanbei/channel/csr/Transport")
@@ -60,7 +67,7 @@ export class CsrError extends Data.TaggedError("CsrError")<{
 export interface CsrReceipt {
   readonly kind: "renewal_request" | "renewal_refused" | "reload"
   readonly commonName: string
-  readonly keyAlgorithm: string
+  readonly keyAlgorithm: "ec-p256"
   readonly sans: ReadonlyArray<string>
   readonly outcome: "ok" | "refused"
   readonly detail: string
@@ -85,125 +92,32 @@ export interface CsrClient {
 
 export const CsrClient = Context.Service<CsrClient>("kanbei/channel/csr/Client")
 
+const KEY_ALGORITHM = "ec-p256" as const
+
 const fail = (code: CsrErrorCode, detail: string): CsrError => new CsrError({ code, detail })
 
 const now = (): Effect.Effect<number> => Clock.currentTimeMillis
 
-const asJson = (value: unknown): Schema.Json => Schema.decodeUnknownSync(Schema.Json)(value)
+const policy = (error: unknown): string =>
+  error instanceof CsrPolicyError || error instanceof Error
+    ? error.message.slice(0, 300)
+    : String(error)
 
-interface RequestBody {
-  readonly version: 1
-  readonly commonName: string
-  readonly keyAlgorithm: string
-  readonly sans: ReadonlyArray<string>
-  readonly publicKeySpki: string
-}
-
-const buildRequest = (
-  config: CsrConfig,
-  key: SessionKey,
-): Effect.Effect<CsrRequest, CsrError> =>
-  Effect.gen(function* () {
-    const body: RequestBody = {
-      version: 1,
-      commonName: config.commonName,
-      keyAlgorithm: config.keyAlgorithm,
-      sans: config.sans,
-      publicKeySpki: key.publicKeySpki,
-    }
-    const signature = yield* signText(key, canonicalize(asJson(body))).pipe(
-      Effect.mapError((error) => fail("csr_key_failed", error.reason)),
-    )
-    const candidate = { ...body, signature }
-    const parsed = Result.try({
-      try: () => parseCsrRequest(candidate),
-      catch: (error) =>
-        fail(
-          "csr_fields_refused",
-          error instanceof Error ? error.message.slice(0, 200) : String(error),
-        ),
-    })
-    if (Result.isFailure(parsed)) return yield* Effect.fail(parsed.failure)
-    return parsed.success
-  })
-
-const chainIssue = (response: HostResponse, rootSubject: string): string | undefined => {
-  if (response.chain.length === 0) return "chain is empty"
-  const first = response.chain[0]
-  if (first === undefined || first.subject !== response.leaf.issuer) {
-    return "leaf issuer is not the first chain subject"
+const configIssues = (config: CsrConfig): ReadonlyArray<string> => {
+  const issues: Array<string> = []
+  if (!Number.isFinite(config.renewalWindowMs) || config.renewalWindowMs < 0) {
+    issues.push("renewalWindowMs must not be negative")
   }
-  const broken = response.chain.slice(0, -1).findIndex((current, index) =>
-    current.issuer !== response.chain[index + 1]?.subject
-  )
-  if (broken !== -1) return `chain is broken at ${broken}`
-  const last = response.chain.at(-1)
-  if (last === undefined || last.issuer !== rootSubject) {
-    return `chain root is not ${rootSubject}`
-  }
-  return undefined
+  return issues
 }
-
-const leafExpired = (leaf: LeafCertificate, at: number): boolean => {
-  const notAfter = Date.parse(leaf.notAfter)
-  return !Number.isFinite(notAfter) || notAfter <= at
-}
-
-const certificateOf = (
-  response: HostResponse,
-  installedAt: number,
-  privateKeyPkcs8: string,
-): InstalledCertificate => ({
-  leaf: response.leaf,
-  chain: response.chain,
-  privateKeyPkcs8,
-  installedAt: new Date(installedAt).toISOString(),
-})
 
 const dueAt = (
   config: CsrConfig,
   active: Option.Option<InstalledCertificate>,
   at: number,
 ): boolean =>
-  Option.isNone(active) || Date.parse(active.value.leaf.notAfter) - at <= config.renewalWindowMs
-
-const validateResponse = (
-  config: CsrConfig,
-  response: HostResponse,
-  key: SessionKey,
-  at: number,
-): Effect.Effect<void, CsrError> =>
-  Effect.gen(function* () {
-    if (response.leaf.spki !== key.publicKeySpki) {
-      return yield* Effect.fail(
-        fail("csr_response_refused", "leaf SPKI does not match the session key"),
-      )
-    }
-    if (
-      !(yield* isP256Spki(response.leaf.spki).pipe(
-        Effect.mapError((error) => fail("csr_key_failed", error.reason)),
-      ))
-    ) {
-      return yield* Effect.fail(fail("csr_response_refused", "leaf SPKI is not P-256"))
-    }
-    const proofValid = yield* verifyText(
-      config.issuerPublicKeySpki,
-      response.proof,
-      canonicalize(asJson(response.leaf)),
-    ).pipe(Effect.mapError((error) => fail("csr_key_failed", error.reason)))
-    if (!proofValid) {
-      return yield* Effect.fail(fail("csr_response_refused", "leaf proof does not verify"))
-    }
-    const chain = chainIssue(response, config.rootSubject)
-    if (chain !== undefined) {
-      return yield* Effect.fail(fail("csr_response_refused", chain))
-    }
-    if (leafExpired(response.leaf, at)) {
-      return yield* Effect.fail(
-        fail("csr_response_refused", "returned certificate is already expired"),
-      )
-    }
-  })
+  Option.isNone(active) ||
+  !(Date.parse(active.value.notAfter) - at > config.renewalWindowMs)
 
 export const csrClientLayer = (
   config: CsrConfig,
@@ -211,6 +125,10 @@ export const csrClientLayer = (
   Layer.effect(
     CsrClient,
     Effect.gen(function* () {
+      const issues = configIssues(config)
+      if (issues.length > 0) {
+        return yield* Effect.die(new Error(`invalid csr config: ${issues.join("; ")}`))
+      }
       const transport = yield* CsrTransport
       const store = yield* CertificateStore
       const alerts = yield* AlertSink
@@ -225,24 +143,25 @@ export const csrClientLayer = (
         Effect.mapError((error) => fail("csr_store_failed", error.reason)),
       )
 
-      const record = (receipt: CsrReceipt): Effect.Effect<void> =>
-        Ref.update(receipts, (current) => [...current, receipt])
-
       const receipt = (
         kind: CsrReceipt["kind"],
         outcome: CsrReceipt["outcome"],
         detail: string,
       ): Effect.Effect<void> =>
         Effect.gen(function* () {
-          yield* record({
-            kind,
-            commonName: config.commonName,
-            keyAlgorithm: config.keyAlgorithm,
-            sans: config.sans,
-            outcome,
-            detail,
-            at: new Date(yield* now()).toISOString(),
-          })
+          const at = new Date(yield* now()).toISOString()
+          yield* Ref.update(receipts, (current) => [
+            ...current,
+            {
+              kind,
+              commonName: config.commonName,
+              keyAlgorithm: KEY_ALGORITHM,
+              sans: [config.commonName],
+              outcome,
+              detail,
+              at,
+            },
+          ])
         })
 
       const refuseOnError = <A>(effect: Effect.Effect<A, CsrError>): Effect.Effect<A, CsrError> =>
@@ -271,6 +190,17 @@ export const csrClientLayer = (
           return { state: next, renewed, active, staged }
         })
 
+      const buildRequest = (key: SessionKey): Effect.Effect<string, CsrError> =>
+        Effect.tryPromise({
+          try: () =>
+            buildCsrPem({
+              commonName: config.commonName,
+              spkiDer: key.publicKeySpkiDer,
+              sign: (info) => signDerBytes(key, info),
+            }),
+          catch: (error) => fail("csr_key_failed", policy(error)),
+        })
+
       const renew: CsrClient["renew"] = Effect.gen(function* () {
         const fields = csrFieldsIssue(config)
         const activeBefore = yield* readActive
@@ -280,11 +210,11 @@ export const csrClientLayer = (
           return yield* Effect.fail(fail("csr_fields_refused", fields))
         }
         const at = yield* now()
-        if (Option.isSome(activeBefore) && Date.parse(activeBefore.value.leaf.notAfter) <= at) {
+        if (Option.isSome(activeBefore) && Date.parse(activeBefore.value.notAfter) <= at) {
           yield* raise({
             kind: "certificate_expired",
-            detail: `certificate expired at ${activeBefore.value.leaf.notAfter}`,
-            notAfter: Option.some(activeBefore.value.leaf.notAfter),
+            detail: `certificate expired at ${activeBefore.value.notAfter}`,
+            notAfter: Option.some(activeBefore.value.notAfter),
             at: new Date(at).toISOString(),
           })
           yield* Ref.set(state, "expired")
@@ -300,27 +230,55 @@ export const csrClientLayer = (
             Effect.mapError((error) => fail("csr_key_failed", error.reason)),
           ),
         )
-        const built = yield* refuseOnError(buildRequest(config, key))
+        const csrPem = yield* refuseOnError(buildRequest(key))
+        // The host parser is the authority; never send a CSR it would refuse.
+        yield* refuseOnError(
+          Effect.try({
+            try: () => parseCsrPem(csrPem, CSR_COMMON_NAME),
+            catch: (error) => fail("csr_fields_refused", policy(error)),
+          }).pipe(Effect.asVoid),
+        )
         const response = yield* refuseOnError(
-          transport.exchange(built).pipe(
+          transport.exchange(csrPem).pipe(
             Effect.mapError((error) => fail("csr_transport_failed", error.reason)),
           ),
         )
-        yield* refuseOnError(validateResponse(config, response, key, at))
+        const verified = yield* refuseOnError(
+          Effect.try({
+            try: () => verifyIssuedChain(response.chain, key.publicKeySpkiDer, CSR_COMMON_NAME, at),
+            catch: (error) => fail("csr_response_refused", policy(error)),
+          }),
+        )
+        if (verified.notAfter !== response.notAfter) {
+          return yield* refuseOnError(
+            Effect.fail(
+              fail("csr_response_refused", "response not_after disagrees with the leaf"),
+            ),
+          )
+        }
         const privateKeyPkcs8 = yield* refuseOnError(
           exportPkcs8(key).pipe(Effect.mapError((error) => fail("csr_key_failed", error.reason))),
         )
-        const certificate = certificateOf(response, at, privateKeyPkcs8)
+        const leafDer = splitChain(response.chain)[0]
+        if (leafDer === undefined) {
+          return yield* refuseOnError(
+            Effect.fail(fail("csr_response_refused", "chain holds no leaf")),
+          )
+        }
+        const certificate: InstalledCertificate = {
+          chainPem: response.chain,
+          leafPem: pemEncode("CERTIFICATE", leafDer),
+          privateKeyPkcs8,
+          spki: key.publicKeySpki,
+          notAfter: verified.notAfter,
+          installedAt: new Date(at).toISOString(),
+        }
         yield* refuseOnError(
           store.stage(certificate).pipe(
             Effect.mapError((error) => fail("csr_store_failed", error.reason)),
           ),
         )
-        yield* receipt(
-          "renewal_request",
-          "ok",
-          `issued until ${response.leaf.notAfter}`,
-        )
+        yield* receipt("renewal_request", "ok", `issued until ${verified.notAfter}`)
         return yield* outcome("issued", true)
       })
 

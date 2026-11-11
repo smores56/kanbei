@@ -1,0 +1,6 @@
+This envelope was produced by the deployed host producer contract:
+
+  nix-config modules/lib/ingest/policy.py (PROTOCOL_VERSION, validate_batch)
+
+and sealed with `age -r <fixtures/ingest-v1 recipient>`. The reader must accept
+it without any reader-specific schema having produced it.

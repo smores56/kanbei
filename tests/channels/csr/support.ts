@@ -1,20 +1,27 @@
 import { Clock, Effect, Layer, Option, Ref } from "effect"
-import { canonicalize } from "../../../src/evidence/canonical.ts"
-import { Schema } from "effect"
-import type { CsrAlert, CsrConfig } from "../../../src/channels/csr/client.ts"
+import type { CsrAlert, CsrConfig, CsrTransportReply } from "../../../src/channels/csr/client.ts"
 import {
+  AlertSink,
   CSR_RENEWAL_WINDOW_MS,
   CsrClient,
   csrClientLayer,
+  CsrTransport,
+  CsrTransportError,
 } from "../../../src/channels/csr/client.ts"
-import type { CsrRequest, HostResponse, LeafCertificate } from "../../../src/channels/csr/schema.ts"
-import { CSR_COMMON_NAME, CSR_KEY_ALGORITHM, CSR_SANS } from "../../../src/channels/csr/schema.ts"
-import { CsrTransport } from "../../../src/channels/csr/client.ts"
 import { CertificateStore } from "../../../src/channels/csr/store.ts"
 import type { InstalledCertificate } from "../../../src/channels/csr/store.ts"
-import { AlertSink } from "../../../src/channels/csr/client.ts"
-import type { SessionKey } from "../../../src/channels/csr/key.ts"
-import { generateSessionKey, signText, verifyText } from "../../../src/channels/csr/key.ts"
+import {
+  encodeDnsName,
+  encodeIntegerValue,
+  encodeOid,
+  encodeSequence,
+  encodeSet,
+  encodeTlv,
+  encodeUtf8,
+  pemEncode,
+} from "../../../src/channels/csr/der.ts"
+import { CSR_COMMON_NAME } from "../../../src/channels/csr/schema.ts"
+import { parseCsrPem } from "../../../src/channels/csr/pkcs10.ts"
 
 const DAY = 24 * 60 * 60 * 1000
 
@@ -27,6 +34,63 @@ export const clockAt = (millis: number): Clock.Clock => ({
   monotonicTimeNanos: Effect.succeed(0n),
   sleep: () => Effect.void,
 })
+
+const utcTime = (millis: number): Uint8Array => {
+  const text = new Date(millis).toISOString().replace(/[-:T]/gu, "").slice(2, 14)
+  return encodeTlv(0x17, new TextEncoder().encode(`${text}Z`))
+}
+
+const name = (cn: string): Uint8Array =>
+  encodeSequence(encodeSet(encodeSequence(encodeOid("2.5.4.3"), encodeUtf8(cn))))
+
+/** A minimal but structurally valid leaf: the client checks names, SPKI, and time. */
+export const certificateFor = (
+  cn: string,
+  spkiDer: Uint8Array,
+  notBefore: number,
+  notAfter: number,
+): string => {
+  const san = encodeSequence(
+    encodeOid("2.5.29.17"),
+    encodeTlv(0x04, encodeSequence(encodeDnsName(cn))),
+  )
+  const extensions = encodeTlv(0xa3, encodeSequence(san))
+  const signatureAlgorithm = encodeSequence(encodeOid("1.2.840.10045.4.3.2"))
+  const tbs = encodeSequence(
+    encodeIntegerValue(1),
+    signatureAlgorithm,
+    name("kanbei-test-root"),
+    encodeSequence(utcTime(notBefore), utcTime(notAfter)),
+    name(cn),
+    spkiDer,
+    extensions,
+  )
+  const der = encodeSequence(
+    tbs,
+    signatureAlgorithm,
+    encodeTlv(0x03, new Uint8Array(65)),
+  )
+  return pemEncode("CERTIFICATE", der)
+}
+
+export interface FakeTransport {
+  readonly layer: Layer.Layer<CsrTransport>
+  readonly calls: Ref.Ref<ReadonlyArray<string>>
+}
+
+export const fakeTransport = (
+  responder: (csrPem: string) => Effect.Effect<CsrTransportReply, CsrTransportError>,
+): Effect.Effect<FakeTransport> =>
+  Effect.gen(function* () {
+    const calls = yield* Ref.make<ReadonlyArray<string>>([])
+    const layer = Layer.succeed(CsrTransport)({
+      exchange: (csrPem) =>
+        Ref.update(calls, (current) => [...current, csrPem]).pipe(
+          Effect.flatMap(() => responder(csrPem)),
+        ),
+    })
+    return { layer, calls }
+  })
 
 export interface MemoryStore {
   readonly layer: Layer.Layer<CertificateStore>
@@ -55,177 +119,68 @@ export const memoryStore = (
     return { layer, active, staged }
   })
 
-export interface FakeSigner {
-  readonly issuer: SessionKey
-  readonly responder: (request: CsrRequest) => Effect.Effect<HostResponse, never>
-}
-
-const leafFor = (
-  request: CsrRequest,
-  now: number,
-  validityMs: number,
-): LeafCertificate => ({
-  subject: CSR_COMMON_NAME,
-  issuer: "fake-ca",
-  spki: request.publicKeySpki,
-  notBefore: new Date(now - DAY).toISOString(),
-  notAfter: new Date(now + validityMs).toISOString(),
+export const installed = (notAfter: string): InstalledCertificate => ({
+  chainPem: "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n",
+  leafPem: "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n",
+  privateKeyPkcs8: "AA==",
+  spki: "AA==",
+  notAfter,
+  installedAt: new Date(Date.parse(notAfter) - 60 * DAY).toISOString(),
 })
 
-/** A fake CA: verifies the session signature and signs the leaf with a pinned key. */
-export const fakeSigner = (
-  now: number,
-  validityMs = 90 * DAY,
-): Effect.Effect<FakeSigner> =>
-  Effect.gen(function* () {
-    const issuer = yield* generateSessionKey().pipe(Effect.orDie)
-    const respond = (request: CsrRequest): Effect.Effect<HostResponse> =>
-      Effect.gen(function* () {
-        const body = {
-          version: request.version,
-          commonName: request.commonName,
-          keyAlgorithm: request.keyAlgorithm,
-          sans: request.sans,
-          publicKeySpki: request.publicKeySpki,
-        }
-        const valid = yield* verifyText(
-          request.publicKeySpki,
-          request.signature,
-          canonicalize(Schema.decodeUnknownSync(Schema.Json)(body)),
-        ).pipe(Effect.orDie)
-        if (!valid) return yield* Effect.die("fake CA received an invalid signature")
-        const leaf = leafFor(request, now, validityMs)
-        const proof = yield* signText(
-          issuer,
-          canonicalize(Schema.decodeUnknownSync(Schema.Json)(leaf)),
-        ).pipe(Effect.orDie)
-        return {
-          version: 1,
-          leaf,
-          chain: [
-            { subject: "fake-ca", issuer: "root-ca", spki: issuer.publicKeySpki },
-            { subject: "root-ca", issuer: "root-ca", spki: issuer.publicKeySpki },
-          ],
-          proof,
-        }
-      })
-    return { issuer, responder: respond }
-  })
+export const config = (overrides: Partial<CsrConfig> = {}): CsrConfig => ({
+  commonName: CSR_COMMON_NAME,
+  renewalWindowMs: CSR_RENEWAL_WINDOW_MS,
+  ...overrides,
+})
 
-export interface FakeTransport {
-  readonly layer: Layer.Layer<CsrTransport>
-  readonly calls: Ref.Ref<ReadonlyArray<CsrRequest>>
+export const defaultResponder = (
+  csrPem: string,
+  now: number,
+  validityMs: number,
+  cn = CSR_COMMON_NAME,
+): CsrTransportReply => {
+  const parsed = parseCsrPem(csrPem, CSR_COMMON_NAME)
+  const leaf = certificateFor(cn, parsed.spkiDer, now - DAY, now + validityMs)
+  return {
+    chain: leaf,
+    notAfter: new Date(now + validityMs).toISOString().replace(/\.\d{3}Z$/u, "Z"),
+  }
 }
 
-export const fakeTransport = (
-  signer: FakeSigner,
-  mutate: (response: HostResponse) => HostResponse = (response) => response,
-): Effect.Effect<FakeTransport> =>
-  Effect.gen(function* () {
-    const calls = yield* Ref.make<ReadonlyArray<CsrRequest>>([])
-    const layer = Layer.succeed(CsrTransport)({
-      exchange: (request) =>
-        Ref.update(calls, (current) => [...current, request]).pipe(
-          Effect.flatMap(() => signer.responder(request)),
-          Effect.map(mutate),
-        ),
-    })
-    return { layer, calls }
-  })
-
-export interface AlertRecorder {
-  readonly layer: Layer.Layer<AlertSink>
+export interface Harness {
+  readonly layer: Layer.Layer<CsrClient>
+  readonly store: MemoryStore
+  readonly transport: FakeTransport
   readonly alerts: Ref.Ref<ReadonlyArray<CsrAlert>>
 }
 
-export const alertRecorder = (): Effect.Effect<AlertRecorder> =>
-  Effect.gen(function* () {
-    const alerts = yield* Ref.make<ReadonlyArray<CsrAlert>>([])
-    const layer = Layer.succeed(AlertSink)({
-      emit: (alert) => Ref.update(alerts, (current) => [...current, alert]),
-    })
-    return { layer, alerts }
-  })
-
-export interface Harness {
-  readonly clients: Layer.Layer<CsrClient>
-  readonly transport: FakeTransport
-  readonly store: MemoryStore
-  readonly alerts: AlertRecorder
-  readonly config: CsrConfig
-}
-
 export const harness = (
-  options: {
-    readonly now: number
-    readonly validityMs?: number
-    readonly config?: Partial<CsrConfig>
-    readonly active?: Option.Option<InstalledCertificate>
-    readonly mutate?: (response: HostResponse) => HostResponse
-  },
+  responder: (csrPem: string) => Effect.Effect<CsrTransportReply, CsrTransportError>,
+  initial: Option.Option<InstalledCertificate> = Option.none(),
+  overrides: Partial<CsrConfig> = {},
 ): Effect.Effect<Harness> =>
   Effect.gen(function* () {
-    const signer = yield* fakeSigner(options.now, options.validityMs)
-    const transport = yield* fakeTransport(signer, options.mutate)
-    const store = yield* memoryStore(options.active ?? Option.none())
-    const alerts = yield* alertRecorder()
-    const config: CsrConfig = {
-      commonName: CSR_COMMON_NAME,
-      keyAlgorithm: CSR_KEY_ALGORITHM,
-      sans: CSR_SANS,
-      renewalWindowMs: CSR_RENEWAL_WINDOW_MS,
-      issuerPublicKeySpki: signer.issuer.publicKeySpki,
-      rootSubject: "root-ca",
-      ...options.config,
-    }
-    const clients = csrClientLayer(config).pipe(
-      Layer.provide(Layer.mergeAll(transport.layer, store.layer, alerts.layer)),
+    const transport = yield* fakeTransport(responder)
+    const store = yield* memoryStore(initial)
+    const alerts = yield* Ref.make<ReadonlyArray<CsrAlert>>([])
+    const sink = Layer.succeed(AlertSink)({
+      emit: (alert) => Ref.update(alerts, (current) => [...current, alert]),
+    })
+    const layer = csrClientLayer(config(overrides)).pipe(
+      Layer.provide(Layer.mergeAll(transport.layer, store.layer, sink)),
     )
-    return { clients, transport, store, alerts, config }
+    return { layer, store, transport, alerts }
   })
 
-export const installed = (
-  notAfter: string,
-  spki = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE",
-): InstalledCertificate => ({
-  leaf: {
-    subject: CSR_COMMON_NAME,
-    issuer: "fake-ca",
-    spki,
-    notBefore: new Date(Date.parse(notAfter) - 90 * DAY).toISOString(),
-    notAfter,
-  },
-  chain: [],
-  privateKeyPkcs8: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg",
-  installedAt: new Date(0).toISOString(),
-})
-
 export const runWith = <A, E>(
-  harnessValue: Harness,
+  h: Harness,
   now: number,
   effect: Effect.Effect<A, E, CsrClient>,
 ): Promise<A> =>
   Effect.runPromise(
     effect.pipe(
-      Effect.provide(harnessValue.clients),
+      Effect.provide(h.layer),
       Effect.provideService(Clock.Clock, clockAt(now)),
-      Effect.orDie,
     ),
   )
-
-export const requestSignatureValid = (
-  request: CsrRequest,
-): Effect.Effect<boolean> =>
-  verifyText(
-    request.publicKeySpki,
-    request.signature,
-    canonicalize(
-      Schema.decodeUnknownSync(Schema.Json)({
-        version: request.version,
-        commonName: request.commonName,
-        keyAlgorithm: request.keyAlgorithm,
-        sans: request.sans,
-        publicKeySpki: request.publicKeySpki,
-      }),
-    ),
-  ).pipe(Effect.orDie)

@@ -1,38 +1,37 @@
 import { assert, assertEquals } from "@std/assert"
 import { Effect, Layer, Option } from "effect"
-import { ageDecryptorLayer } from "../../../src/adapters/age.ts"
-import { memoryBlobSinkLayer } from "../../../src/adapters/blob-sink.ts"
-import { directoryLayer } from "../../../src/adapters/inbox-directory.ts"
 import type { InboxConfig, InboxLimits, InboxReader } from "../../../src/channels/inbox/reader.ts"
-import {
-  InboxReader as InboxReaderTag,
-  inboxReaderLayer,
-} from "../../../src/channels/inbox/reader.ts"
+import { InboxReader as InboxReaderTag } from "../../../src/channels/inbox/reader.ts"
 import { BlobSink } from "../../../src/kernel/blob-sink.ts"
-import { buildBatch, buildBatchFromFixture, makeKey, writeBatch } from "./support.ts"
+import { ContentStore } from "../../../src/kernel/cas.ts"
+import { Ledger } from "../../../src/kernel/ledger.ts"
+import {
+  buildBatch,
+  buildBatchFromFixture,
+  inboxTestLayers,
+  makeKey,
+  testLimits,
+  writeBatch,
+} from "./support.ts"
 import { hash, withTempDir } from "../../support.ts"
+import { MAX_BATCH_BYTES } from "../../../src/channels/inbox/wire.ts"
 
-const limits: InboxLimits = {
-  maxBatchBytes: 1_000_000,
-  maxBatchesPerPoll: 10,
-  maxEntriesPerBatch: 100,
-  maxEntryBytes: 100_000,
-  maxTotalBlobBytes: 500_000,
-}
+const limits: InboxLimits = { ...testLimits, maxBatchesPerPoll: 10 }
 
 interface Scenario {
   readonly directory: string
   readonly identityPath: string
   readonly recipient: string
-  readonly layer: Layer.Layer<InboxReader | BlobSink>
+  readonly layer: Layer.Layer<InboxReader | BlobSink | ContentStore | Ledger>
 }
 
 const scenario = <A>(
   run: (context: Scenario) => Promise<A>,
   overrides: Partial<InboxConfig> = {},
+  fixedKey?: { readonly identityPath: string; readonly recipient: string },
 ): Promise<A> =>
   withTempDir("inbox", async (directory) => {
-    const key = await makeKey(directory)
+    const key = fixedKey ?? await makeKey(directory)
     const config: InboxConfig = {
       identityPath: key.identityPath,
       allowedOrigins: ["tuta-mail", "git"],
@@ -40,20 +39,19 @@ const scenario = <A>(
       freshnessWindowMs: 3_600_000,
       ...overrides,
     }
-    const blobs = memoryBlobSinkLayer()
-    const reader = inboxReaderLayer(config).pipe(
-      Layer.provide(directoryLayer(directory)),
-      Layer.provide(ageDecryptorLayer({ identityPath: key.identityPath })),
-      Layer.provide(blobs),
-    )
-    const layer = Layer.merge(reader, blobs)
-    return run({ directory, identityPath: key.identityPath, recipient: key.recipient, layer })
+    const layers = inboxTestLayers(directory, config)
+    return run({
+      directory,
+      identityPath: key.identityPath,
+      recipient: key.recipient,
+      layer: layers.layer,
+    })
   })
 
 /** One build of the layer for the whole scenario: state must survive between calls. */
 const withReader = <A, E>(
   context: Scenario,
-  effect: Effect.Effect<A, E, InboxReader | BlobSink>,
+  effect: Effect.Effect<A, E, InboxReader | BlobSink | ContentStore | Ledger>,
 ): Promise<A> => Effect.runPromise(effect.pipe(Effect.provide(context.layer), Effect.orDie))
 
 const pollOnce = Effect.gen(function* () {
@@ -110,16 +108,11 @@ Deno.test("a valid batch publishes blobs, observations, one coverage receipt, an
   })
 })
 
-Deno.test("re-reading a batch adds no observation or coverage row", async () => {
+Deno.test("a second file carrying the same batch is a duplicate, and neither file is re-read", async () => {
   await scenario(async (context) => {
-    await write(
-      context.directory,
-      context.recipient,
-      "batch-1.age",
-      await buildBatch({
-        recipient: context.recipient,
-      }),
-    )
+    const plaintext = await buildBatch({ recipient: context.recipient })
+    await write(context.directory, context.recipient, "batch-1.age", plaintext)
+    await write(context.directory, context.recipient, "batch-2.age", plaintext)
     const outcome = await withReader(
       context,
       Effect.gen(function* () {
@@ -131,12 +124,14 @@ Deno.test("re-reading a batch adds no observation or coverage row", async () => 
         return { first, second }
       }),
     )
-    assertEquals(outcome.second.observations.length, outcome.first.observations.length)
-    assertEquals(outcome.second.receipts.length, outcome.first.receipts.length)
+    assertEquals(outcome.first.observations.length, 1)
+    assertEquals(outcome.first.receipts.length, 1)
+    assertEquals(outcome.first.duplicates, 1)
+    assertEquals(outcome.second.observations.length, 1)
+    assertEquals(outcome.second.receipts.length, 1)
     assertEquals(outcome.second.duplicates, 1)
   })
 })
-
 Deno.test("a duplicate item inside one batch is deduplicated by item hash", async () => {
   await scenario(async (context) => {
     const body = '{"subject":"same"}'
@@ -365,4 +360,90 @@ Deno.test("a source past its freshness window reports stale", async () => {
     },
     { freshnessWindowMs: 1 },
   )
+})
+
+Deno.test("the sealed host wire envelope parses as observations without a reader-specific schema", async () => {
+  await scenario(
+    async (context) => {
+      const fixture = new URL("../../../fixtures/inbox-v1/wire", import.meta.url).pathname
+      await Deno.copyFile(`${fixture}/host-batch-1.age`, `${context.directory}/host-batch-1.age`)
+      const outcome = await withReader(
+        context,
+        Effect.gen(function* () {
+          const reader = yield* InboxReaderTag
+          yield* reader.poll
+          return yield* reader.state
+        }),
+      )
+      assertEquals(outcome.quarantined, [])
+      assertEquals(outcome.observations.length, 2)
+      assertEquals(outcome.observations[0]?.origin, "tuta-mail")
+      assertEquals(outcome.observations[0]?.sequence, 7)
+      assertEquals(outcome.observations[0]?.resourceKey, "message-7")
+      assertEquals(outcome.receipts[0]?.entries, 2)
+      assertEquals(outcome.receipts[0]?.coverage.complete, true)
+    },
+    {},
+    {
+      identityPath:
+        new URL("../../../fixtures/ingest-v1/keys/identity.txt", import.meta.url).pathname,
+      recipient: "age1gyzseyvd0cumhe3svg3ey6x54lwfhmqvp2wf9dre8d0sycs5e3qscwpgqa",
+    },
+  )
+})
+
+Deno.test("handled files and the last sequence survive a restart without replay", async () => {
+  await scenario(async (context) => {
+    await write(
+      context.directory,
+      context.recipient,
+      "batch-1.age",
+      await buildBatch({ recipient: context.recipient }),
+    )
+    const first = await withReader(context, pollOnce)
+    assertEquals(first.observations.length, 1)
+    const second = await withReader(context, pollOnce)
+    assertEquals(second.observations.length, 0)
+    assertEquals(second.receipts.length, 0)
+    const checkpoint = JSON.parse(
+      await Deno.readTextFile(`${context.directory}/checkpoint.json`),
+    ) as { handled: ReadonlyArray<string>; lastSequence: Readonly<Record<string, number>> }
+    assertEquals(checkpoint.handled, ["batch-1.age"])
+    assertEquals(checkpoint.lastSequence["tuta-mail"], 1)
+  })
+})
+
+Deno.test("a poll window selects the next unprocessed files, not the first N names", async () => {
+  await scenario(
+    async (context) => {
+      const names = ["a.age", "b.age", "c.age"]
+      const plaintexts = await Promise.all(
+        names.map((name) =>
+          buildBatch({ recipient: context.recipient, sequence: name.charCodeAt(0) - 96 })
+        ),
+      )
+      await Promise.all(
+        names.map((name, index) =>
+          write(context.directory, context.recipient, name, plaintexts[index] ?? "")
+        ),
+      )
+      const outcome = await withReader(
+        context,
+        Effect.gen(function* () {
+          const reader = yield* InboxReaderTag
+          yield* reader.poll
+          yield* reader.poll
+          yield* reader.poll
+          return yield* reader.state
+        }),
+      )
+      assertEquals(outcome.receipts.length, 3)
+      assertEquals(outcome.observations.length, 3)
+    },
+    { limits: { ...limits, maxBatchesPerPoll: 1 } },
+  )
+})
+
+Deno.test("the inbox cap is the host's 1 MiB frame cap", () => {
+  assertEquals(MAX_BATCH_BYTES, 1_048_576)
 })

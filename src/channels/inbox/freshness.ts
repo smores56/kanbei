@@ -156,8 +156,12 @@ const buildSource = (
     }
   }
   const windowMs = windowFor(config, origin)
+  // Producer time is the freshness watermark; delivery time only stands in when
+  // the producer did not state one.
+  const produced = Date.parse(heartbeat.producedAt)
   const received = Date.parse(heartbeat.receivedAt)
-  const age = Number.isFinite(received) ? Math.max(0, now - received) : undefined
+  const basis = Number.isFinite(produced) ? produced : received
+  const age = Number.isFinite(basis) ? Math.max(0, now - basis) : undefined
   const state: FreshnessState = age === undefined || age > windowMs
     ? "stale"
     : entries === 0

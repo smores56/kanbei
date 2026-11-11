@@ -1,16 +1,17 @@
 import { Data, Effect } from "effect"
+import { rawEcdsaToDer } from "./pkcs10.ts"
 
 export class CsrKeyError extends Data.TaggedError("CsrKeyError")<{
-  readonly operation: "generate" | "sign" | "verify" | "import"
+  readonly operation: "generate" | "sign" | "export"
   readonly reason: string
 }> {}
 
 export interface SessionKey {
   readonly privateKey: CryptoKey
+  /** SubjectPublicKeyInfo DER, the exact bytes a CSR carries. */
+  readonly publicKeySpkiDer: Uint8Array
   readonly publicKeySpki: string
 }
-
-const encoder = new TextEncoder()
 
 const keyError = (operation: CsrKeyError["operation"], error: unknown): CsrKeyError =>
   new CsrKeyError({
@@ -25,71 +26,39 @@ export const generateSessionKey = (): Effect.Effect<SessionKey, CsrKeyError> =>
   Effect.tryPromise({
     try: async () => {
       const pair = await crypto.subtle.generateKey(ecP256, true, ["sign", "verify"])
-      const spki = await crypto.subtle.exportKey("spki", pair.publicKey)
+      const spki = new Uint8Array(await crypto.subtle.exportKey("spki", pair.publicKey))
       return {
         privateKey: pair.privateKey,
-        publicKeySpki: new Uint8Array(spki).toBase64(),
+        publicKeySpkiDer: spki,
+        publicKeySpki: spki.toBase64(),
       }
     },
     catch: (error) => keyError("generate", error),
   })
 
-export const signText = (
+/** PKCS#10 wants a DER ECDSA-Sig-Value; WebCrypto returns the raw r||s pair. */
+export const signDerBytes = async (
   key: SessionKey,
-  text: string,
-): Effect.Effect<string, CsrKeyError> =>
+  info: Uint8Array,
+): Promise<Uint8Array> => {
+  const data = new ArrayBuffer(info.length)
+  new Uint8Array(data).set(info)
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    key.privateKey,
+    data,
+  )
+  return rawEcdsaToDer(new Uint8Array(signature))
+}
+
+export const signDer = (
+  key: SessionKey,
+  info: Uint8Array,
+): Effect.Effect<Uint8Array, CsrKeyError> =>
   Effect.tryPromise({
-    try: async () => {
-      const signature = await crypto.subtle.sign(
-        { name: "ECDSA", hash: "SHA-256" },
-        key.privateKey,
-        encoder.encode(text),
-      )
-      return new Uint8Array(signature).toBase64()
-    },
+    try: () => signDerBytes(key, info),
     catch: (error) => keyError("sign", error),
   })
-
-export const importSpki = (
-  spki: string,
-): Effect.Effect<CryptoKey, CsrKeyError> =>
-  Effect.tryPromise({
-    try: () =>
-      crypto.subtle.importKey(
-        "spki",
-        Uint8Array.fromBase64(spki),
-        ecP256,
-        true,
-        ["verify"],
-      ),
-    catch: (error) => keyError("import", error),
-  })
-
-export const verifyText = (
-  spki: string,
-  signature: string,
-  text: string,
-): Effect.Effect<boolean, CsrKeyError> =>
-  importSpki(spki).pipe(
-    Effect.flatMap((publicKey) =>
-      Effect.tryPromise({
-        try: () =>
-          crypto.subtle.verify(
-            { name: "ECDSA", hash: "SHA-256" },
-            publicKey,
-            Uint8Array.fromBase64(signature),
-            encoder.encode(text),
-          ),
-        catch: (error) => keyError("verify", error),
-      })
-    ),
-  )
-
-export const isP256Spki = (spki: string): Effect.Effect<boolean, CsrKeyError> =>
-  importSpki(spki).pipe(
-    Effect.map(() => true),
-    Effect.catch(() => Effect.succeed(false)),
-  )
 
 /** The serving key is persisted with the certificate, never in a receipt or log. */
 export const exportPkcs8 = (key: SessionKey): Effect.Effect<string, CsrKeyError> =>
@@ -98,5 +67,5 @@ export const exportPkcs8 = (key: SessionKey): Effect.Effect<string, CsrKeyError>
       const pkcs8 = await crypto.subtle.exportKey("pkcs8", key.privateKey)
       return new Uint8Array(pkcs8).toBase64()
     },
-    catch: (error) => keyError("generate", error),
+    catch: (error) => keyError("export", error),
   })

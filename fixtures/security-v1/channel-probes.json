@@ -98,14 +98,14 @@
     {
       "id": "CSR-WRONG-SAN",
       "channel": "csr",
-      "probe": "extra-san",
-      "expected": "denied:csr_fields_refused"
+      "probe": "extra-san-in-issued-leaf",
+      "expected": "denied:csr_response_refused"
     },
     {
       "id": "CSR-WRONG-KEY",
       "channel": "csr",
-      "probe": "foreign-key-algorithm",
-      "expected": "denied:csr_fields_refused"
+      "probe": "foreign-leaf-key",
+      "expected": "denied:csr_response_refused"
     },
     {
       "id": "CSR-WRONG-SPKI",

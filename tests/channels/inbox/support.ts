@@ -60,7 +60,7 @@ export interface BatchOptions {
   readonly extraEnvelope?: Readonly<Record<string, unknown>>
 }
 
-const iso = "2026-11-11T00:00:00.000Z"
+const iso = (): string => new Date().toISOString()
 
 export const buildBatch = async (options: BatchOptions): Promise<string> => {
   const origin = options.origin ?? "tuta-mail"
@@ -75,19 +75,19 @@ export const buildBatch = async (options: BatchOptions): Promise<string> => {
     resourceKey: entry.body.key,
     kind: "capture",
     locator: `fixture:${entry.body.key}`,
-    capturedAt: iso,
+    capturedAt: iso(),
     body: entry.digest,
     evidence: { adapter: "fixture-v1" },
   }))
   const baseManifest: Schema.Json = {
     origin,
     sequence: options.sequence ?? 1,
-    producedAt: iso,
+    producedAt: iso(),
     scan: {
       mode: "event",
       scopeHash: "a".repeat(64),
-      startedAt: iso,
-      completedAt: iso,
+      startedAt: iso(),
+      completedAt: iso(),
     },
     entries,
     coverage: options.coverage ?? { complete: true, gaps: 0, suppressed: 0 },
@@ -134,4 +134,48 @@ export const buildBatchFromFixture = async (
     })),
   )
   return buildBatch({ recipient, bodies })
+}
+
+import { Layer } from "effect"
+import { ageDecryptorLayer } from "../../../src/adapters/age.ts"
+import { fileBlobSinkLayer } from "../../../src/adapters/blob-sink.ts"
+import { fileInboxCheckpointLayer } from "../../../src/adapters/inbox-checkpoint.ts"
+import { directoryLayer } from "../../../src/adapters/inbox-directory.ts"
+import { fileLedgerStoreLayer } from "../../../src/adapters/ledger-file.ts"
+import type { InboxConfig } from "../../../src/channels/inbox/reader.ts"
+import { inboxReaderLayer } from "../../../src/channels/inbox/reader.ts"
+import { contentStoreLayer } from "../../../src/kernel/cas.ts"
+import { ledgerLayer } from "../../../src/kernel/ledger.ts"
+
+export const testLimits = {
+  maxBatchBytes: 1 << 20,
+  maxBatchesPerPoll: 20,
+  maxEntriesPerBatch: 100,
+  maxEntryBytes: 100_000,
+  maxTotalBlobBytes: 500_000,
+} as const
+
+/**
+ * The real canonical ingest stack: file CAS, file ledger, file checkpoint, the
+ * inbox reader, and the decryptor. Tests never mock the durable path.
+ */
+export const inboxTestLayers = (directory: string, config: InboxConfig) => {
+  const blobs = fileBlobSinkLayer(`${directory}/cas`)
+  const cas = contentStoreLayer.pipe(Layer.provide(blobs))
+  const ledger = ledgerLayer("inbox-test").pipe(
+    Layer.provide(fileLedgerStoreLayer(`${directory}/ledger.jsonl`)),
+  )
+  const checkpoints = fileInboxCheckpointLayer(`${directory}/checkpoint.json`)
+  const reader = inboxReaderLayer(config).pipe(
+    Layer.provide(directoryLayer(directory)),
+    Layer.provide(ageDecryptorLayer({ identityPath: config.identityPath })),
+    Layer.provide(checkpoints),
+    Layer.provide(cas),
+    Layer.provide(ledger),
+  )
+  return {
+    layer: Layer.mergeAll(reader, blobs, cas, ledger, checkpoints),
+    reader,
+    blobs,
+  }
 }

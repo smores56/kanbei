@@ -1,11 +1,11 @@
 import { assertEquals } from "@std/assert"
-import { Clock, Effect, Layer, Option, Schema } from "effect"
-import { ageDecryptorLayer } from "../../../src/adapters/age.ts"
-import { memoryBlobSinkLayer } from "../../../src/adapters/blob-sink.ts"
-import { directoryLayer } from "../../../src/adapters/inbox-directory.ts"
+import { Clock, Effect, Option, Schema } from "effect"
 import type { InboxConfig, InboxLimits } from "../../../src/channels/inbox/reader.ts"
-import { InboxReader, inboxReaderLayer } from "../../../src/channels/inbox/reader.ts"
+import { InboxReader } from "../../../src/channels/inbox/reader.ts"
+import { inboxTestLayers, testLimits } from "./support.ts"
 import { BlobSink } from "../../../src/kernel/blob-sink.ts"
+import { ContentStore } from "../../../src/kernel/cas.ts"
+import { Ledger } from "../../../src/kernel/ledger.ts"
 import { withTempDir } from "../../support.ts"
 
 const fixtureRoot = new URL("../../../fixtures/ingest-v1", import.meta.url).pathname
@@ -41,13 +41,7 @@ const allOrigins: ReadonlyArray<InboxConfig["allowedOrigins"][number]> = [
   "git",
 ]
 
-const limits: InboxLimits = {
-  maxBatchBytes: 1_000_000,
-  maxBatchesPerPoll: 20,
-  maxEntriesPerBatch: 8,
-  maxEntryBytes: 100_000,
-  maxTotalBlobBytes: 500_000,
-}
+const limits: InboxLimits = { ...testLimits, maxBatchesPerPoll: 20, maxEntriesPerBatch: 8 }
 
 interface ClockRef {
   now: number
@@ -65,7 +59,7 @@ const makeClock = (reference: ClockRef): Clock.Clock => ({
 
 interface Scenario {
   readonly run: <A, E>(
-    effect: Effect.Effect<A, E, InboxReader | BlobSink>,
+    effect: Effect.Effect<A, E, InboxReader | BlobSink | ContentStore | Ledger>,
   ) => Promise<A>
   readonly clock: ClockRef
 }
@@ -74,7 +68,7 @@ const scenario = <A>(
   caseIds: ReadonlyArray<string>,
   body: (scenario: Scenario) => Promise<A>,
   overrides: Partial<InboxConfig> = {},
-  startMillis = 1_000_000,
+  startMillis = Date.parse("2026-11-11T00:00:00.000Z"),
 ): Promise<A> =>
   withTempDir("ingest-batches", async (directory) => {
     await Promise.all(
@@ -90,13 +84,7 @@ const scenario = <A>(
       freshnessWindowMs: 3_600_000,
       ...overrides,
     }
-    const blobs = memoryBlobSinkLayer()
-    const reader = inboxReaderLayer(config).pipe(
-      Layer.provide(directoryLayer(directory)),
-      Layer.provide(ageDecryptorLayer({ identityPath })),
-      Layer.provide(blobs),
-    )
-    const layer = Layer.merge(reader, blobs)
+    const { layer } = inboxTestLayers(directory, config)
     return body({
       clock,
       run: (effect) =>

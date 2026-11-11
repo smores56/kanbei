@@ -76,9 +76,18 @@ export const stepIngest = async (context: StepContext): Promise<JourneyStepOutco
   check(checks, world.poll.accepted === context.fixture.ingest.acceptedBatches.length, "accepted")
   check(checks, world.poll.duplicates === 1, "duplicate-batch-not-idempotent")
   check(checks, world.poll.quarantined === 0, "unexpected-quarantine")
-  check(checks, world.state.observations.length === 10, "observation-count")
-  check(checks, world.state.receipts.length === 9, "coverage-receipt-count")
-  check(checks, world.state.heartbeats.length === 7, "heartbeat-count")
+  // Counts come from the canonical ledger and the declared batch set, never from
+  // constants in the harness.
+  const accepted = context.fixture.ingest.acceptedBatches.length
+  const originsSeen = new Set(world.state.receipts.map((entry) => entry.origin))
+  check(checks, world.state.receipts.length === accepted, "coverage-receipt-count")
+  check(
+    checks,
+    world.state.observations.length === world.ledger.captureCount,
+    "observation-ledger-divergence",
+  )
+  check(checks, world.ledger.recordCount === world.ledger.headSeq, "ledger-head-divergence")
+  check(checks, world.state.heartbeats.length === originsSeen.size, "heartbeat-count")
   check(
     checks,
     world.state.observations.every((entry) =>
@@ -116,6 +125,8 @@ export const stepIngest = async (context: StepContext): Promise<JourneyStepOutco
       batchAccepted: world.poll.accepted,
       batchDuplicates: world.poll.duplicates,
       observations: world.state.observations.length,
+      ledgerRecords: world.ledger.recordCount,
+      ledgerCaptures: world.ledger.captureCount,
       receipts: world.state.receipts.length,
       heartbeats: world.state.heartbeats.length,
       gaps: world.state.gaps.filter((entry) => entry.kind === "gap").length,
@@ -587,7 +598,7 @@ const mountsFor = (fixture: JourneyFixture): ReadonlyArray<SandboxMount> =>
     return {
       path: `/run/kanbei/${name}`,
       access: mountClass === "inbox" || mountClass === "vault" || mountClass === "image" ||
-          mountClass === "mutable_code"
+          mountClass === "mutable_code" || mountClass === "runtime"
         ? "ro" as const
         : "rw" as const,
       class: mountClass,
@@ -613,6 +624,9 @@ export const stepBoundary = (context: StepContext): Promise<JourneyStepOutcome> 
     cgroupPath: "/kanbei/journey-v2",
     enforcementRequired: "process_cgroup",
     mounts: mountsFor(context.fixture),
+    writableRoots: mountsFor(context.fixture)
+      .filter((mount) => mount.access === "rw")
+      .map((mount) => mount.path),
     channels,
     limits,
   })
@@ -622,6 +636,7 @@ export const stepBoundary = (context: StepContext): Promise<JourneyStepOutcome> 
     addresses: ["lo"],
     channelSockets: channels,
     mounts: manifest.mounts,
+    writableRoots: manifest.writableRoots,
   }
   const declared = verifyStartup(manifest, observed)
   const leakManifest: SandboxManifest = {

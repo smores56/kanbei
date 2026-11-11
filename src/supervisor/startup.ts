@@ -12,6 +12,8 @@ export type StartupRefusalCode =
   | "undeclared_mount"
   | "channel_missing"
   | "undeclared_channel"
+  | "writable_root_missing"
+  | "undeclared_writable_root"
 
 export interface StartupRefusal {
   readonly code: StartupRefusalCode
@@ -67,5 +69,15 @@ export const verifyStartup = (
   if (missing.length > 0) return refuse(manifest, "channel_missing", missing.join(","))
   const extra = observed.channelSockets.filter((channel) => !declared.has(channel))
   if (extra.length > 0) return refuse(manifest, "undeclared_channel", extra.join(","))
+  const observedWritable = new Set(observed.writableRoots)
+  const missingWritable = manifest.writableRoots.filter((root) => !observedWritable.has(root))
+  if (missingWritable.length > 0) {
+    return refuse(manifest, "writable_root_missing", missingWritable.join(","))
+  }
+  const declaredWritable = new Set(manifest.writableRoots)
+  const extraWritable = observed.writableRoots.filter((root) => !declaredWritable.has(root))
+  if (extraWritable.length > 0) {
+    return refuse(manifest, "undeclared_writable_root", extraWritable.join(","))
+  }
   return Result.succeed(manifest)
 }

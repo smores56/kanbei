@@ -1,0 +1,14 @@
+{
+  "producer": "nix-config modules/lib/kanbei/vsock.py (validate_csr, csr_spki, validate_cert)",
+  "csr": {
+    "cn": "kanbei.sammohr.dev",
+    "key_type": "ec",
+    "key_bits": 256
+  },
+  "cert": {
+    "cn": "kanbei.sammohr.dev",
+    "not_after": "2027-02-09T22:47:04Z",
+    "spki": "3059301306072a8648ce3d020106082a8648ce3d03010703420004a7d26fbbccba9508bb3f5bd89eee58533c7f6c005f07b663b09c2f37b16ee74c77ef3a2a53e5a9cf7f496573984885c2fbc07c97dad2a9bcf2c68e25d4e12727"
+  },
+  "chain_blocks": 2
+}

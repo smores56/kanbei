@@ -44,6 +44,8 @@ export const SandboxManifest = Schema.Struct({
   cgroupPath: Schema.String,
   enforcementRequired: EnforcementClass,
   mounts: Schema.Array(SandboxMount),
+  /** Every path the sandbox may write; must equal the declared rw mounts. */
+  writableRoots: Schema.Array(Schema.String),
   channels: Schema.Array(ChannelId),
   limits: SandboxLimits,
 })
@@ -56,6 +58,7 @@ export const ObservedPosture = Schema.Struct({
   addresses: Schema.Array(Schema.String),
   channelSockets: Schema.Array(ChannelId),
   mounts: Schema.Array(SandboxMount),
+  writableRoots: Schema.Array(Schema.String),
 })
 export type ObservedPosture = typeof ObservedPosture.Type
 
@@ -64,6 +67,14 @@ const enforcementRank: Readonly<Record<EnforcementClass, number>> = {
   monty_wasm: 1,
   process_cgroup: 2,
 }
+
+const READ_ONLY_CLASSES: ReadonlySet<MountClass> = new Set([
+  "image",
+  "inbox",
+  "vault",
+  "mutable_code",
+  "runtime",
+])
 
 const mountKey = (mount: SandboxMount): string => `${mount.path}|${mount.access}|${mount.class}`
 
@@ -79,16 +90,33 @@ export const manifestIssues = (manifest: SandboxManifest): ReadonlyArray<string>
   if (new Set(manifest.channels).size !== manifest.channels.length) {
     issues.push("duplicate channel")
   }
-  if (!mountClasses.has("inbox") || !mountClasses.has("vault")) {
-    issues.push("inbox and vault mounts are required")
+  const required: ReadonlyArray<MountClass> = ["inbox", "vault", "todo"]
+  for (const name of required) {
+    if (!mountClasses.has(name)) issues.push(`${name} mount is required`)
   }
   for (const mount of manifest.mounts) {
-    if (mount.class === "inbox" || mount.class === "vault") {
-      if (mount.access !== "ro") issues.push(`${mount.class} mount must be read-only`)
+    if (READ_ONLY_CLASSES.has(mount.class) && mount.access !== "ro") {
+      issues.push(`${mount.class} mount must be read-only`)
     }
-    if (mount.class === "todo" && mount.access !== "rw") {
-      issues.push("todo mount must be read-write")
+    if (mount.class === "scratch" || mount.class === "agent_state") {
+      if (mount.access !== "rw") issues.push(`${mount.class} mount must be read-write`)
     }
+  }
+  const writableRoots = manifest.writableRoots
+  if (new Set(writableRoots).size !== writableRoots.length) {
+    issues.push("writableRoots must be unique")
+  }
+  const rwPaths = new Set(
+    manifest.mounts.filter((mount) => mount.access === "rw").map((mount) => mount.path),
+  )
+  for (const root of writableRoots) {
+    if (!root.startsWith("/") || root === "/") {
+      issues.push(`writable root ${root} must be an absolute non-root path`)
+    }
+    if (!rwPaths.has(root)) issues.push(`writable root ${root} is not an rw mount`)
+  }
+  for (const path of rwPaths) {
+    if (!writableRoots.includes(path)) issues.push(`rw mount ${path} is not declared writable`)
   }
   const limits = manifest.limits
   if (

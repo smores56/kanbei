@@ -2,11 +2,16 @@ import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema } from
 import { canonicalize } from "../../evidence/canonical.ts"
 import { sha256, sha256Text } from "../../evidence/digest.ts"
 import type { ContentDigest } from "../../kernel/blob-sink.ts"
-import { BlobSink } from "../../kernel/blob-sink.ts"
+import { ContentStore } from "../../kernel/cas.ts"
+import { Ledger } from "../../kernel/ledger.ts"
+import { publishCapture } from "../../kernel/observation.ts"
 import { AgeDecryptor } from "./age.ts"
+import { InboxCheckpointStore } from "./checkpoint.ts"
+import type { InboxCheckpoint } from "./checkpoint.ts"
 import { InboxDirectory } from "./directory.ts"
 import { IngestBatchEnvelope } from "./schema.ts"
 import type { IngestBatchEnvelope as BatchEnvelope, OriginId, ScanCoverage } from "./schema.ts"
+import { hostEnvelopeToBatch, isHostEnvelope, parseHostEnvelope } from "./wire.ts"
 
 export interface InboxLimits {
   readonly maxBatchBytes: number
@@ -108,12 +113,12 @@ export interface PollResult {
 }
 
 export class InboxError extends Data.TaggedError("InboxError")<{
-  readonly operation: "list"
+  readonly operation: "list" | "checkpoint"
   readonly reason: string
 }> {}
 
 export interface InboxReader {
-  readonly poll: Effect.Effect<PollResult, InboxError>
+  readonly poll: Effect.Effect<PollResult, InboxError, ContentStore | Ledger>
   readonly state: Effect.Effect<InboxSnapshot>
   readonly sourceState: (
     origin: OriginId,
@@ -141,6 +146,8 @@ interface InboxState {
   readonly seenBatches: ReadonlySet<string>
   readonly seenItems: ReadonlySet<string>
   readonly lastSequence: Readonly<Record<string, number>>
+  readonly handled: ReadonlySet<string>
+  readonly quarantineNames: ReadonlySet<string>
   readonly duplicates: number
 }
 
@@ -154,8 +161,30 @@ const emptyState: InboxState = {
   seenBatches: new Set(),
   seenItems: new Set(),
   lastSequence: {},
+  handled: new Set(),
+  quarantineNames: new Set(),
   duplicates: 0,
 }
+
+const stateFromCheckpoint = (checkpoint: InboxCheckpoint): InboxState => ({
+  ...emptyState,
+  seenBatches: new Set(checkpoint.seenBatches),
+  seenItems: new Set(checkpoint.seenItems),
+  lastSequence: { ...checkpoint.lastSequence },
+  handled: new Set(checkpoint.handled),
+  quarantineNames: new Set(Object.keys(checkpoint.quarantined)),
+})
+
+const checkpointFromState = (state: InboxState): InboxCheckpoint => ({
+  version: 1,
+  handled: [...state.handled].toSorted(),
+  quarantined: Object.fromEntries(
+    state.quarantined.map((record) => [record.name, record.reason]),
+  ),
+  seenBatches: [...state.seenBatches].toSorted(),
+  seenItems: [...state.seenItems].toSorted(),
+  lastSequence: { ...state.lastSequence },
+})
 
 interface InvalidBatch {
   readonly reason: QuarantineReason
@@ -174,23 +203,50 @@ const decodeBase64 = (value: string): Result.Result<Uint8Array, string> => {
   }
 }
 
-/** Strict: unknown fields, an unknown version, or a bad manifest is a parse failure. */
-export const parseEnvelope = (
-  plaintext: Uint8Array,
-): Result.Result<BatchEnvelope, InvalidBatch> => {
+const invalid = (detail: string): InvalidBatch => ({ reason: "parse_failed", detail })
+
+const decodeJson = (plaintext: Uint8Array): Result.Result<unknown, InvalidBatch> => {
   try {
-    const json = JSON.parse(new TextDecoder().decode(plaintext))
-    const decoded = Schema.decodeUnknownSync(IngestBatchEnvelope, {
-      onExcessProperty: "error",
-    })(json)
-    return Result.succeed(decoded)
+    return Result.succeed(JSON.parse(new TextDecoder().decode(plaintext)))
   } catch (error) {
-    return Result.fail({
-      reason: "parse_failed",
-      detail: error instanceof Error ? error.message.slice(0, 300) : String(error),
-    })
+    return Result.fail(
+      invalid(error instanceof Error ? error.message.slice(0, 300) : String(error)),
+    )
   }
 }
+
+/**
+ * Accept both producers: the host writer's `{v,source,kind,seq,sent_at,items}`
+ * envelope (converted to the rich form) and the rich manifest+blobs envelope the
+ * journey fixtures ship. Unknown versions and extra fields are refusals.
+ */
+export const parseBatch = (
+  plaintext: Uint8Array,
+  name: string,
+): Effect.Effect<Result.Result<BatchEnvelope, InvalidBatch>> =>
+  Effect.gen(function* () {
+    const json = decodeJson(plaintext)
+    if (Result.isFailure(json)) return Result.fail(json.failure)
+    if (isHostEnvelope(json.success)) {
+      const host = yield* Effect.result(Effect.try({
+        try: () => parseHostEnvelope(json.success),
+        catch: (error) => error,
+      }))
+      if (Result.isFailure(host)) {
+        return Result.fail(invalid("host envelope does not match the wire schema"))
+      }
+      const converted = yield* Effect.result(hostEnvelopeToBatch(host.success, name))
+      return Result.isFailure(converted)
+        ? Result.fail(invalid("host envelope could not be converted"))
+        : Result.succeed(converted.success)
+    }
+    return Result.try({
+      try: () =>
+        Schema.decodeUnknownSync(IngestBatchEnvelope, { onExcessProperty: "error" })(json.success),
+      catch: (error) =>
+        invalid(error instanceof Error ? error.message.slice(0, 300) : String(error)),
+    })
+  })
 
 const CREDENTIAL_KEY =
   /(^|\.)(authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?token|secret|password|credential)$/iu
@@ -269,7 +325,8 @@ const iso = (millis: number): string => new Date(millis).toISOString()
 
 const heartbeatAt = (entry: HeartbeatEntry, now: number, window: number): SourceHeartbeat => ({
   ...entry,
-  state: now - Date.parse(entry.receivedAt) > window ? "stale" : "current",
+  // Freshness is the producer's clock: a late delivery of an old batch is stale.
+  state: now - Date.parse(entry.producedAt) > window ? "stale" : "current",
 })
 
 const configIssues = (config: InboxConfig): ReadonlyArray<string> => {
@@ -286,7 +343,11 @@ const configIssues = (config: InboxConfig): ReadonlyArray<string> => {
 
 export const inboxReaderLayer = (
   config: InboxConfig,
-): Layer.Layer<InboxReader, never, InboxDirectory | AgeDecryptor | BlobSink> =>
+): Layer.Layer<
+  InboxReader,
+  never,
+  InboxDirectory | AgeDecryptor | InboxCheckpointStore | ContentStore | Ledger
+> =>
   Layer.effect(
     InboxReader,
     Effect.gen(function* () {
@@ -296,8 +357,9 @@ export const inboxReaderLayer = (
       }
       const directory = yield* InboxDirectory
       const decryptor = yield* AgeDecryptor
-      const sink = yield* BlobSink
-      const state = yield* Ref.make<InboxState>(emptyState)
+      const checkpoints = yield* InboxCheckpointStore
+      const checkpoint = yield* checkpoints.load.pipe(Effect.orDie)
+      const state = yield* Ref.make<InboxState>(stateFromCheckpoint(checkpoint))
 
       const quarantine = (
         name: string,
@@ -316,12 +378,14 @@ export const inboxReaderLayer = (
               ...(ciphertextDigest === undefined ? {} : { ciphertextDigest }),
             },
           ],
+          handled: new Set([...current.handled, name]),
+          quarantineNames: new Set([...current.quarantineNames, name]),
         }))
 
       const processFile = (
         name: string,
         size: number,
-      ): Effect.Effect<"accepted" | "quarantined" | "duplicate", never> =>
+      ): Effect.Effect<"accepted" | "quarantined" | "duplicate", never, ContentStore | Ledger> =>
         Effect.gen(function* () {
           if (size > config.limits.maxBatchBytes + 65_536) {
             yield* quarantine(name, "batch_too_large", `ciphertext ${size} bytes`)
@@ -344,7 +408,7 @@ export const inboxReaderLayer = (
             yield* quarantine(name, "batch_too_large", `plaintext ${plaintext.length} bytes`)
             return "quarantined" as const
           }
-          const parsed = parseEnvelope(plaintext)
+          const parsed = yield* parseBatch(plaintext, name)
           if (Result.isFailure(parsed)) {
             yield* quarantine(name, parsed.failure.reason, parsed.failure.detail, ciphertextDigest)
             return "quarantined" as const
@@ -368,7 +432,11 @@ export const inboxReaderLayer = (
           const current = yield* Ref.get(state)
           const key = batchKey(manifest.origin, manifest.batchDigest)
           if (current.seenBatches.has(key)) {
-            yield* Ref.update(state, (value) => ({ ...value, duplicates: value.duplicates + 1 }))
+            yield* Ref.update(state, (value) => ({
+              ...value,
+              duplicates: value.duplicates + 1,
+              handled: new Set([...value.handled, name]),
+            }))
             return "duplicate" as const
           }
 
@@ -456,19 +524,37 @@ export const inboxReaderLayer = (
             return "quarantined" as const
           }
 
+          // Canonical order: bytes, manifest, ledger append. The ledger's
+          // idempotency key makes a crash-and-replay converge on one record.
           const published = yield* Effect.forEach(
-            [...blobs.entries()],
-            ([digest, bytes]) =>
-              sink.put(bytes).pipe(Effect.map((value) => [digest, value] as const)),
+            manifest.entries,
+            (entry) => {
+              const bytes = blobs.get(entry.body)
+              if (bytes === undefined) {
+                return Effect.fail(`entry ${entry.resourceKey} has no body`)
+              }
+              return publishCapture({
+                origin: manifest.origin,
+                sequence: manifest.sequence,
+                resourceKey: entry.resourceKey,
+                locator: entry.locator,
+                capturedAt: entry.capturedAt,
+                mediaType: entry.mediaType ?? "application/octet-stream",
+                bytes,
+                coverage: manifest.coverage,
+                idempotencyKey:
+                  `inbox:${manifest.origin}:${manifest.sequence}:${entry.resourceKey}:${entry.body}`,
+              }).pipe(Effect.mapError((error) => error.detail), Effect.asVoid)
+            },
             { concurrency: 1 },
           ).pipe(Effect.result)
           if (Result.isFailure(published)) {
-            yield* quarantine(name, "publish_failed", published.failure.reason, ciphertextDigest)
-            return "quarantined" as const
-          }
-          const mismatched = published.success.filter(([digest, stored]) => digest !== stored)
-          if (mismatched.length > 0) {
-            yield* quarantine(name, "digest_mismatch", "blob sink returned a different digest")
+            yield* quarantine(
+              name,
+              "publish_failed",
+              String(published.failure).slice(0, 300),
+              ciphertextDigest,
+            )
             return "quarantined" as const
           }
 
@@ -541,6 +627,7 @@ export const inboxReaderLayer = (
             gaps: [...value.gaps, ...batchGaps],
             seenBatches: new Set([...value.seenBatches, key]),
             seenItems,
+            handled: new Set([...value.handled, name]),
             duplicates: value.duplicates + duplicateItems,
             lastSequence: { ...value.lastSequence, [manifest.origin]: delta.next },
           }))
@@ -551,14 +638,26 @@ export const inboxReaderLayer = (
         const listing = yield* directory.list.pipe(
           Effect.mapError((error) => new InboxError({ operation: "list", reason: error.reason })),
         )
+        const current = yield* Ref.get(state)
+        // Select the next unprocessed files, not the first N names: handled and
+        // quarantined files stay on disk but never occupy the poll window again.
         const names = listing
           .filter((file) => file.name.endsWith(".age"))
+          .filter((file) =>
+            !current.handled.has(file.name) && !current.quarantineNames.has(file.name)
+          )
           .toSorted((left, right) => left.name.localeCompare(right.name))
           .slice(0, config.limits.maxBatchesPerPoll)
         const outcomes = yield* Effect.forEach(
           names,
           (file) => processFile(file.name, file.size),
           { concurrency: 1 },
+        )
+        const next = yield* Ref.get(state)
+        yield* checkpoints.save(checkpointFromState(next)).pipe(
+          Effect.mapError((error) =>
+            new InboxError({ operation: "checkpoint", reason: error.reason })
+          ),
         )
         return {
           processed: outcomes.length,

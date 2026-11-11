@@ -37,7 +37,7 @@ Deno.test("a 200-character query and an over-limit query deny without reaching t
   const clock = await Effect.runPromise(mutableClock(NOW))
   const { outcomes, receipts } = await runQueries(h, clock, [
     { query: "x".repeat(200), limit: 5 },
-    { query: "fine", limit: 11 },
+    { query: "fine", limit: 6 },
   ])
   assertEquals(outcomes.map((outcome) => outcome.verdict), ["blocked", "blocked"])
   assertEquals(outcomes.map((outcome) => outcome.reason), ["schema", "schema"])

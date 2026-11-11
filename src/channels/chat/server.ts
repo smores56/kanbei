@@ -1,3 +1,8 @@
+/* EXPERIMENTAL: the length-prefixed frame API is not the deployed chat contract.
+ * The authority is the HTTP `POST /api/chat {message}` + bearer session surface in
+ * `nix-config modules/lib/kanbei/ui/server.py`, implemented in `./http.ts`.
+ * This frame API stays only for spike/property tests and must not be exposed.
+ */
 import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema } from "effect"
 import { canonicalize } from "../../evidence/canonical.ts"
 import { sha256Text } from "../../evidence/digest.ts"

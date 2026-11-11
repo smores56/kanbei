@@ -1,72 +1,60 @@
 import { Schema } from "effect"
 
+/**
+ * The deployed certificate channel (`nix-config modules/lib/kanbei/vsock.py` and
+ * `cert_guest.py`): a `KANBEI-AUTH 1 <token>` line, then a 4-byte big-endian
+ * length-prefixed JSON frame `{v,cn,csr}` carrying a PEM CSR. The reply is
+ * either `{v,cn,chain,not_after}` or `{v,error}`.
+ */
 export const CSR_COMMON_NAME = "kanbei.sammohr.dev"
-export const CSR_KEY_ALGORITHM = "ec-p256"
-export const CSR_SANS: ReadonlyArray<string> = [CSR_COMMON_NAME]
 export const CSR_VERSION = 1
+export const CSR_MAX_FRAME_BYTES = 64 * 1024
+export const CSR_AUTH_PREFIX = "KANBEI-AUTH 1 "
 
-const Base64 = Schema.String.pipe(
-  Schema.check(Schema.isPattern(/^[A-Za-z0-9+/]+={0,2}$/u)),
-)
+const strict = { onExcessProperty: "error" } as const
 
-/** The only CSR shape the channel can carry: one CN, one key algorithm, one SAN set. */
-export const CsrRequest = Schema.Struct({
-  version: Schema.Literal(CSR_VERSION),
-  commonName: Schema.Literal(CSR_COMMON_NAME),
-  keyAlgorithm: Schema.Literal(CSR_KEY_ALGORITHM),
-  sans: Schema.Tuple([Schema.Literal(CSR_COMMON_NAME)]),
-  publicKeySpki: Base64,
-  signature: Base64,
+export const CsrWireRequest = Schema.Struct({
+  v: Schema.Literal(CSR_VERSION),
+  cn: Schema.Literal(CSR_COMMON_NAME),
+  csr: Schema.String,
 })
-export type CsrRequest = typeof CsrRequest.Type
+export type CsrWireRequest = typeof CsrWireRequest.Type
 
-export const CertificateName = Schema.Struct({
-  subject: Schema.String,
-  issuer: Schema.String,
-  spki: Base64,
+export const CsrWireSuccess = Schema.Struct({
+  v: Schema.Literal(CSR_VERSION),
+  cn: Schema.Literal(CSR_COMMON_NAME),
+  chain: Schema.String,
+  not_after: Schema.String,
 })
-export type CertificateName = typeof CertificateName.Type
+export type CsrWireSuccess = typeof CsrWireSuccess.Type
 
-export const LeafCertificate = Schema.Struct({
-  subject: Schema.Literal(CSR_COMMON_NAME),
-  issuer: Schema.String,
-  spki: Base64,
-  notBefore: Schema.String,
-  notAfter: Schema.String,
+export const CsrWireError = Schema.Struct({
+  v: Schema.Literal(CSR_VERSION),
+  error: Schema.String,
 })
-export type LeafCertificate = typeof LeafCertificate.Type
+export type CsrWireError = typeof CsrWireError.Type
 
-export const HostResponse = Schema.Struct({
-  version: Schema.Literal(CSR_VERSION),
-  leaf: LeafCertificate,
-  chain: Schema.Array(CertificateName),
-  proof: Base64,
-})
-export type HostResponse = typeof HostResponse.Type
+export const CsrWireResponse = Schema.Union([CsrWireSuccess, CsrWireError])
+export type CsrWireResponse = typeof CsrWireResponse.Type
 
-export const parseCsrRequest = (value: unknown): CsrRequest =>
-  Schema.decodeUnknownSync(CsrRequest, { onExcessProperty: "error" })(value)
+export const parseCsrWireResponse = (value: unknown): CsrWireResponse =>
+  Schema.decodeUnknownSync(CsrWireResponse, strict)(value)
 
-export const parseHostResponse = (value: unknown): HostResponse =>
-  Schema.decodeUnknownSync(HostResponse, { onExcessProperty: "error" })(value)
+export const encodeCsrWireRequest = (csr: string): Uint8Array =>
+  new TextEncoder().encode(
+    JSON.stringify(
+      Schema.encodeSync(CsrWireRequest)({
+        v: CSR_VERSION,
+        cn: CSR_COMMON_NAME,
+        csr,
+      }),
+    ),
+  )
 
 /** Fields that must equal the fixed contract; any drift refuses before the CA. */
 export const csrFieldsIssue = (fields: {
   readonly commonName: string
-  readonly keyAlgorithm: string
-  readonly sans: ReadonlyArray<string>
-}): string | undefined => {
-  if (fields.commonName !== CSR_COMMON_NAME) {
-    return `commonName ${fields.commonName} != ${CSR_COMMON_NAME}`
-  }
-  if (fields.keyAlgorithm !== CSR_KEY_ALGORITHM) {
-    return `keyAlgorithm ${fields.keyAlgorithm} != ${CSR_KEY_ALGORITHM}`
-  }
-  if (fields.sans.length !== CSR_SANS.length) {
-    return `sans ${fields.sans.join(",")} != ${CSR_SANS.join(",")}`
-  }
-  if (fields.sans.some((san, index) => san !== CSR_SANS[index])) {
-    return `sans ${fields.sans.join(",")} != ${CSR_SANS.join(",")}`
-  }
-  return undefined
-}
+}): string | undefined =>
+  fields.commonName === CSR_COMMON_NAME
+    ? undefined
+    : `commonName ${fields.commonName} != ${CSR_COMMON_NAME}`

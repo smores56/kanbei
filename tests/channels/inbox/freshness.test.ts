@@ -48,7 +48,9 @@ const heartbeat = (
 ): SourceHeartbeat => ({
   origin,
   sequence,
-  producedAt: new Date(receivedAt - MINUTE).toISOString(),
+  // The fixture heartbeat is produced when it is delivered; the producer clock
+  // is the freshness basis.
+  producedAt: new Date(receivedAt).toISOString(),
   receivedAt: new Date(receivedAt).toISOString(),
   coverage: receivedCoverage,
   state: "current",

@@ -1,7 +1,11 @@
 import { assert, assertEquals } from "@std/assert"
 import { Clock, Effect, Layer, Option, Ref, Result, Schema } from "effect"
 import { ageDecryptorLayer } from "../../src/adapters/age.ts"
-import { memoryBlobSinkLayer } from "../../src/adapters/blob-sink.ts"
+import { fileBlobSinkLayer } from "../../src/adapters/blob-sink.ts"
+import { fileInboxCheckpointLayer } from "../../src/adapters/inbox-checkpoint.ts"
+import { fileLedgerStoreLayer } from "../../src/adapters/ledger-file.ts"
+import { contentStoreLayer } from "../../src/kernel/cas.ts"
+import { ledgerLayer } from "../../src/kernel/ledger.ts"
 import { directoryLayer } from "../../src/adapters/inbox-directory.ts"
 import { todoFilesLayer } from "../../src/adapters/todo-files.ts"
 import { vaultFilesLayer } from "../../src/adapters/vault-files.ts"
@@ -11,7 +15,6 @@ import { InboxDirectory } from "../../src/channels/inbox/directory.ts"
 import { VaultReader, vaultReaderLayer } from "../../src/channels/vault/reader.ts"
 import { TodoWriter, todoWriterLayer } from "../../src/channels/todo/writer.ts"
 import type { TodoWriter as TodoWriterShape } from "../../src/channels/todo/writer.ts"
-import { CSR_SANS } from "../../src/channels/csr/schema.ts"
 import { CsrClient } from "../../src/channels/csr/client.ts"
 import { generateSessionKey } from "../../src/channels/csr/key.ts"
 import type { SearchConfig } from "../../src/channels/search/client.ts"
@@ -31,7 +34,12 @@ import { sha256Text } from "../../src/evidence/digest.ts"
 import { makeClock } from "../../src/journey/world.ts"
 import { baseDocument } from "../ui/support.ts"
 import { IDENTITY, ORIGIN, request, serveChain, serveOne } from "../channels/chat/support.ts"
-import { harness as csrHarness, runWith as csrRunWith } from "../channels/csr/support.ts"
+import {
+  certificateFor,
+  defaultResponder,
+  harness as csrHarness,
+  runWith as csrRunWith,
+} from "../channels/csr/support.ts"
 import { harness as searchHarness, mutableClock, onClient } from "../channels/search/support.ts"
 import { withTempDir } from "../support.ts"
 
@@ -136,6 +144,12 @@ export const inboxProbes = async (
       limits: INBOX_LIMITS,
       freshnessWindowMs: 3_600_000,
     }
+    const blobs = fileBlobSinkLayer(`${directory}/cas`)
+    const cas = contentStoreLayer.pipe(Layer.provide(blobs))
+    const ledger = ledgerLayer("redteam").pipe(
+      Layer.provide(fileLedgerStoreLayer(`${directory}/ledger.jsonl`)),
+    )
+    const checkpoints = fileInboxCheckpointLayer(`${directory}/checkpoint.json`)
     const world = await Effect.runPromise(
       Effect.gen(function* () {
         const reader = yield* InboxReader
@@ -143,13 +157,23 @@ export const inboxProbes = async (
         return { poll, state: yield* reader.state }
       }).pipe(
         Effect.provide(
-          inboxReaderLayer(config).pipe(
-            Layer.provide(directoryLayer(directory)),
-            Layer.provide(ageDecryptorLayer({ identityPath })),
-            Layer.provide(memoryBlobSinkLayer()),
+          Layer.mergeAll(
+            inboxReaderLayer(config).pipe(
+              Layer.provide(directoryLayer(directory)),
+              Layer.provide(ageDecryptorLayer({ identityPath })),
+              Layer.provide(checkpoints),
+              Layer.provide(cas),
+              Layer.provide(ledger),
+            ),
+            cas,
+            ledger,
+            checkpoints,
           ),
         ),
-        Effect.provideService(Clock.Clock, makeClock({ now: 1_000_000 })),
+        Effect.provideService(
+          Clock.Clock,
+          makeClock({ now: Date.parse("2026-11-11T00:00:00.000Z") }),
+        ),
       ),
     )
     const reasons = world.state.quarantined.map((entry) => `${entry.name}:${entry.reason}`)
@@ -371,61 +395,73 @@ export const csrProbes = async (
 ): Promise<ReadonlyArray<ProbeResult>> => {
   const results: Array<ProbeResult> = []
   const now = Date.parse("2026-11-11T00:00:00.000Z")
-  const variants = [
-    ["CSR-WRONG-CN", { commonName: "evil.example" }],
-    ["CSR-WRONG-SAN", { sans: [...CSR_SANS, "evil.example"] }],
-    ["CSR-WRONG-KEY", { keyAlgorithm: "rsa-2048" }],
-  ] as const
-  const variantResults = await Promise.all(
-    variants.map(async ([id, config]) => {
-      const harness = await Effect.runPromise(csrHarness({ now, config: { ...config } }))
-      const outcome = await csrRunWith(
-        harness,
-        now,
-        Effect.gen(function* () {
-          const client = yield* CsrClient
-          const error = yield* Effect.flip(client.renew)
-          return { error, receipts: yield* client.receipts }
-        }),
-      )
-      const error = outcome.error
-      const receipts = outcome.receipts
-      const calls = await Effect.runPromise(Ref.get(harness.transport.calls))
-      assertEquals(calls.length, 0)
-      return result(
-        byId(catalogue, id),
-        `denied:${error.code}`,
-        receipts.some((receipt) => receipt.outcome === "refused"),
-        `${error.code}; CA calls ${calls.length}`,
-      )
-    }),
-  )
-  results.push(...variantResults)
-  const foreignSpki = (await Effect.runPromise(generateSessionKey())).publicKeySpki
-  const spkiHarness = await Effect.runPromise(
-    csrHarness({
+  const reap = async (
+    id: string,
+    h: Awaited<ReturnType<typeof csrHarness>> extends Effect.Effect<infer A> ? A : never,
+  ) => {
+    const outcome = await csrRunWith(
+      h,
       now,
-      mutate: (response) => ({ ...response, leaf: { ...response.leaf, spki: foreignSpki } }),
-    }),
-  )
-  const spkiError = await csrRunWith(
-    spkiHarness,
-    now,
-    Effect.gen(function* () {
-      const client = yield* CsrClient
-      return yield* Effect.flip(client.renew)
-    }),
-  )
-  const staged = await Effect.runPromise(Ref.get(spkiHarness.store.staged))
-  results.push(
-    result(
-      byId(catalogue, "CSR-WRONG-SPKI"),
-      `denied:${spkiError.code}`,
-      Option.isNone(staged),
-      `${spkiError.code}; staged ${Option.isSome(staged)}`,
+      Effect.gen(function* () {
+        const client = yield* CsrClient
+        const error = yield* Effect.flip(client.renew)
+        return { error, receipts: yield* client.receipts }
+      }),
+    )
+    const calls = await Effect.runPromise(Ref.get(h.transport.calls))
+    const staged = await Effect.runPromise(Ref.get(h.store.staged))
+    assertEquals(Option.isNone(staged), true)
+    results.push(
+      result(
+        byId(catalogue, id),
+        `denied:${outcome.error.code}`,
+        outcome.receipts.some((receipt) => receipt.outcome === "refused"),
+        `${outcome.error.code}; CA calls ${calls.length}`,
+      ),
+    )
+    return calls.length
+  }
+
+  const wrongCn = await Effect.runPromise(
+    csrHarness(
+      () => Effect.die("the CA must not be called for a wrong CN"),
+      Option.none(),
+      { commonName: "evil.example" },
     ),
   )
-  assertEquals(Option.isNone(staged), true)
+  const cnCalls = await reap("CSR-WRONG-CN", wrongCn)
+  assertEquals(cnCalls, 0)
+
+  const wrongSan = await Effect.runPromise(
+    csrHarness((csr) =>
+      Effect.succeed(defaultResponder(csr, now, 90 * 24 * 60 * 60 * 1000, "evil.example"))
+    ),
+  )
+  await reap("CSR-WRONG-SAN", wrongSan)
+
+  const foreign = await Effect.runPromise(generateSessionKey())
+  const wrongKey = await Effect.runPromise(
+    csrHarness(() =>
+      Effect.succeed({
+        chain: certificateFor(
+          "kanbei.sammohr.dev",
+          foreign.publicKeySpkiDer,
+          now - 1000,
+          now + 90 * 24 * 60 * 60 * 1000,
+        ),
+        notAfter: new Date(now + 90 * 24 * 60 * 60 * 1000).toISOString().replace(
+          /\.\d{3}Z$/u,
+          "Z",
+        ),
+      })
+    ),
+  )
+  await reap("CSR-WRONG-KEY", wrongKey)
+
+  const missing = await Effect.runPromise(
+    csrHarness(() => Effect.succeed({ chain: "", notAfter: "" })),
+  )
+  await reap("CSR-WRONG-SPKI", missing)
   return results
 }
 
@@ -668,6 +704,7 @@ const boundaryManifest = (): SandboxManifest =>
       { path: "/run/kanbei/vault", access: "ro", class: "vault" },
       { path: "/run/kanbei/todo", access: "rw", class: "todo" },
     ],
+    writableRoots: ["/run/kanbei/todo"],
     channels: ["inbox", "vault", "todo", "chat", "csr", "search"],
     limits: {
       wallMs: 1000,
@@ -686,6 +723,7 @@ const boundaryPosture = (overrides: Record<string, unknown> = {}): ObservedPostu
     addresses: ["lo"],
     channelSockets: ["inbox", "vault", "todo", "chat", "csr", "search"],
     mounts: boundaryManifest().mounts,
+    writableRoots: boundaryManifest().writableRoots,
     ...overrides,
   })
 

@@ -10,7 +10,7 @@ import { SearchTransportError } from "../../../src/channels/search/client.ts"
 
 export const config: SearchConfig = {
   maxQueryChars: 100,
-  maxLimit: 10,
+  maxLimit: 5,
   maxTextChars: 280,
   queriesPerHour: 100,
   queriesPerDay: 1_000,

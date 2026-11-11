@@ -5,16 +5,10 @@ import type { InstalledCertificate } from "../channels/csr/store.ts"
 const StoredCertificate = Schema.Struct({
   installedAt: Schema.String,
   privateKeyPkcs8: Schema.String,
-  leaf: Schema.Struct({
-    subject: Schema.Literal("kanbei.sammohr.dev"),
-    issuer: Schema.String,
-    spki: Schema.String,
-    notBefore: Schema.String,
-    notAfter: Schema.String,
-  }),
-  chain: Schema.Array(
-    Schema.Struct({ subject: Schema.String, issuer: Schema.String, spki: Schema.String }),
-  ),
+  spki: Schema.String,
+  notAfter: Schema.String,
+  leafPem: Schema.String,
+  chainPem: Schema.String,
 })
 type StoredCertificate = typeof StoredCertificate.Type
 
@@ -36,12 +30,7 @@ const readCertificate = (
         const parsed = Schema.decodeUnknownSync(StoredCertificate)(
           JSON.parse(await Deno.readTextFile(path)),
         )
-        return Option.some({
-          leaf: parsed.leaf,
-          chain: parsed.chain,
-          installedAt: parsed.installedAt,
-          privateKeyPkcs8: parsed.privateKeyPkcs8,
-        })
+        return Option.some(parsed)
       } catch (error) {
         if (error instanceof Deno.errors.NotFound) return Option.none()
         throw error
@@ -50,6 +39,19 @@ const readCertificate = (
     catch: (error) => storeError("read", error),
   })
 
+const syncDirectory = (directory: string): void => {
+  try {
+    const handle = Deno.openSync(directory, { read: true })
+    try {
+      handle.syncSync()
+    } finally {
+      handle.close()
+    }
+  } catch {
+    // Not every filesystem exposes a directory handle; the rename is still atomic.
+  }
+}
+
 const writeAtomic = (
   path: string,
   value: InstalledCertificate,
@@ -57,8 +59,15 @@ const writeAtomic = (
   Effect.tryPromise({
     try: async () => {
       const temporary = `${path}.${crypto.randomUUID()}.tmp`
-      await Deno.writeTextFile(temporary, JSON.stringify(value), { mode: 0o600 })
+      const file = await Deno.open(temporary, { write: true, createNew: true, mode: 0o600 })
+      try {
+        await file.write(new TextEncoder().encode(JSON.stringify(value)))
+        await file.sync()
+      } finally {
+        file.close()
+      }
       await Deno.rename(temporary, path)
+      syncDirectory(path.slice(0, path.lastIndexOf("/")))
     },
     catch: (error) => storeError("stage", error),
   })

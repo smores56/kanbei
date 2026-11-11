@@ -11,7 +11,7 @@
     "start": "2026-11-11T00:00:00.000Z",
     "freshnessWindowMs": 3600000,
     "staleWindowMs": 60000,
-    "staleAdvanceMs": 90000
+    "staleAdvanceMs": 300000
   },
   "sources": {
     "lifeAdmin": ["tuta-mail", "tuta-calendar", "finance", "immich", "brave", "phone"],
@@ -101,7 +101,7 @@
   "search": {
     "config": {
       "maxQueryChars": 100,
-      "maxLimit": 10,
+      "maxLimit": 5,
       "maxTextChars": 280,
       "queriesPerHour": 100,
       "queriesPerDay": 3

@@ -64,7 +64,8 @@ export const IngestBatchManifest = Schema.Struct({
   suppressed: Schema.Number,
   encryption: Schema.Struct({
     scheme: Schema.Literal("age"),
-    recipient: Schema.String,
+    /** The host writer does not put its recipient on the wire envelope. */
+    recipient: Schema.optional(Schema.String),
   }),
   batchDigest: Digest,
 })

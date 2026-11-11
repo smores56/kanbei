@@ -1,79 +1,122 @@
 import { Effect, Layer, Result } from "effect"
 import { SearchChannel, SearchTransportError } from "../channels/search/client.ts"
 import type { SearchQuery, SearchReply } from "../channels/search/schema.ts"
-import { parseSearchReply } from "../channels/search/schema.ts"
+import {
+  encodeSearchWireRequest,
+  parseSearchWireReply,
+  SEARCH_MAX_ID_CHARS,
+  SEARCH_MAX_RESPONSE_BYTES,
+  SEARCH_MAX_RESULTS,
+  SEARCH_MAX_SNIPPET_CHARS,
+  SEARCH_MAX_TITLE_CHARS,
+  SEARCH_MAX_URL_CHARS,
+  toSearchReply,
+} from "../channels/search/schema.ts"
+
+/** The deployed relay's first line; searchd refuses anything else. */
+export const AUTH_PREFIX = "KANBEI-AUTH 1 "
+const TOKEN_PATTERN = /^[A-Za-z0-9._-]{32,128}$/u
+
+export interface SearchVsockOptions {
+  readonly path: string
+  readonly token: string
+  readonly maxResponseBytes?: number
+  readonly id?: string
+}
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
 const error = (reason: string): SearchTransportError => new SearchTransportError({ reason })
 
-const readExact = async (
-  connection: Deno.Conn,
-  length: number,
-  buffer = new Uint8Array(length),
-  offset = 0,
-): Promise<Uint8Array | null> => {
-  if (offset >= length) return buffer
-  const read = await connection.read(buffer.subarray(offset))
-  if (read === null) return null
-  return readExact(connection, length, buffer, offset + read)
-}
-
 const writeAll = async (
   connection: Deno.Conn,
-  frame: Uint8Array,
+  bytes: Uint8Array,
   offset = 0,
 ): Promise<void> => {
-  if (offset >= frame.length) return
-  const written = await connection.write(frame.subarray(offset))
+  if (offset >= bytes.length) return
+  const written = await connection.write(bytes.subarray(offset))
   if (written === 0) throw new Error("short write")
-  return writeAll(connection, frame, offset + written)
+  return writeAll(connection, bytes, offset + written)
 }
 
-const frameOf = (value: unknown): Uint8Array => {
-  const payload = encoder.encode(JSON.stringify(value))
-  const framed = new Uint8Array(4 + payload.length)
-  new DataView(framed.buffer).setUint32(0, payload.length, false)
-  framed.set(payload, 4)
-  return framed
+const readLine = async (
+  connection: Deno.Conn,
+  maxBytes: number,
+  buffer = new Uint8Array(maxBytes),
+  offset = 0,
+): Promise<string> => {
+  if (offset >= maxBytes) throw new Error(`reply exceeds ${maxBytes} bytes`)
+  const read = await connection.read(buffer.subarray(offset))
+  if (read === null) throw new Error("search VM closed before a reply")
+  const end = offset + read
+  const newline = buffer.subarray(0, end).indexOf(0x0a)
+  if (newline !== -1) return decoder.decode(buffer.subarray(0, newline))
+  return readLine(connection, maxBytes, buffer, end)
+}
+
+const fieldIssues = (wire: ReturnType<typeof parseSearchWireReply>): ReadonlyArray<string> => {
+  const issues: Array<string> = []
+  if (wire.results.length > SEARCH_MAX_RESULTS) {
+    issues.push(`${wire.results.length} results > ${SEARCH_MAX_RESULTS}`)
+  }
+  if (wire.id !== undefined && wire.id.length > SEARCH_MAX_ID_CHARS) {
+    issues.push("reply id is too long")
+  }
+  for (const result of wire.results) {
+    if (
+      result.title.length > SEARCH_MAX_TITLE_CHARS ||
+      result.snippet.length > SEARCH_MAX_SNIPPET_CHARS ||
+      result.url.length > SEARCH_MAX_URL_CHARS
+    ) {
+      issues.push("reply result exceeds a host field cap")
+    }
+  }
+  return issues
 }
 
 const exchangeOnce = async (
-  path: string,
+  options: SearchVsockOptions,
   query: SearchQuery,
   maxResponseBytes: number,
 ): Promise<SearchReply> => {
-  const connection = await Deno.connect({ transport: "unix", path })
+  if (!TOKEN_PATTERN.test(options.token)) {
+    throw new Error("search token is not 32..128 URL-safe characters")
+  }
+  const connection = await Deno.connect({ transport: "unix", path: options.path })
   try {
-    await writeAll(connection, frameOf(query))
-    const header = await readExact(connection, 4)
-    if (header === null) throw new Error("search VM closed before a reply")
-    const length = new DataView(header.buffer, header.byteOffset, 4).getUint32(0, false)
-    if (length > maxResponseBytes) throw new Error(`reply ${length} > ${maxResponseBytes}`)
-    const body = await readExact(connection, length)
-    if (body === null) throw new Error("truncated search reply")
+    await writeAll(connection, encoder.encode(`${AUTH_PREFIX}${options.token}\n`))
+    const request = encodeSearchWireRequest({
+      v: 1,
+      op: "search",
+      query: query.query,
+      ...(options.id === undefined ? {} : { id: options.id }),
+    })
+    await writeAll(connection, encoder.encode(`${request}\n`))
+    const line = await readLine(connection, maxResponseBytes)
     const parsed = Result.try({
-      try: () => parseSearchReply(JSON.parse(decoder.decode(body))),
+      try: () => parseSearchWireReply(JSON.parse(line)),
       catch: (failure) =>
         failure instanceof Error ? failure.message.slice(0, 200) : String(failure),
     })
-    if (Result.isFailure(parsed)) throw new Error(parsed.failure)
-    return parsed.success
+    if (Result.isFailure(parsed)) throw new Error(`malformed search reply: ${parsed.failure}`)
+    const issues = fieldIssues(parsed.success)
+    if (issues.length > 0) throw new Error(issues.join("; "))
+    return toSearchReply(parsed.success)
   } finally {
     connection.close()
   }
 }
 
-/** The only egress from Kanbei: one capped query frame to the Search VM. */
+/** The only egress from Kanbei: one authenticated, capped query line to the Search VM. */
 export const vsockSearchChannelLayer = (
-  path: string,
-  maxResponseBytes: number,
+  options: SearchVsockOptions,
 ): Layer.Layer<SearchChannel> =>
   Layer.succeed(SearchChannel)({
     search: (query) =>
       Effect.tryPromise({
-        try: () => exchangeOnce(path, query, maxResponseBytes),
+        try: () =>
+          exchangeOnce(options, query, options.maxResponseBytes ?? SEARCH_MAX_RESPONSE_BYTES),
         catch: (failure) => error(failure instanceof Error ? failure.message : String(failure)),
       }),
   })

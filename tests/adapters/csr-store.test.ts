@@ -6,15 +6,12 @@ import { CertificateStore } from "../../src/channels/csr/store.ts"
 import { withTempDir } from "../support.ts"
 
 const certificate: InstalledCertificate = {
-  leaf: {
-    subject: "kanbei.sammohr.dev",
-    issuer: "fake-ca",
-    spki: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE",
-    notBefore: "2026-01-01T00:00:00.000Z",
-    notAfter: "2026-04-01T00:00:00.000Z",
-  },
-  chain: [{ subject: "fake-ca", issuer: "root-ca", spki: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE" }],
+  chainPem:
+    "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+  leafPem: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
   privateKeyPkcs8: "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg",
+  spki: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE",
+  notAfter: "2026-04-01T00:00:00.000Z",
   installedAt: "2026-01-01T00:00:00.000Z",
 }
 

@@ -102,20 +102,20 @@
     {
       "id": "CSR-WRONG-KEY",
       "channel": "csr",
-      "probe": "foreign-key-algorithm",
-      "expected": "denied:csr_fields_refused",
-      "outcome": "denied:csr_fields_refused",
+      "probe": "foreign-leaf-key",
+      "expected": "denied:csr_response_refused",
+      "outcome": "denied:csr_response_refused",
       "receipt": true,
-      "detail": "csr_fields_refused; CA calls 0"
+      "detail": "csr_response_refused; CA calls 1"
     },
     {
       "id": "CSR-WRONG-SAN",
       "channel": "csr",
-      "probe": "extra-san",
-      "expected": "denied:csr_fields_refused",
-      "outcome": "denied:csr_fields_refused",
+      "probe": "extra-san-in-issued-leaf",
+      "expected": "denied:csr_response_refused",
+      "outcome": "denied:csr_response_refused",
       "receipt": true,
-      "detail": "csr_fields_refused; CA calls 0"
+      "detail": "csr_response_refused; CA calls 1"
     },
     {
       "id": "CSR-WRONG-SPKI",
@@ -124,7 +124,7 @@
       "expected": "denied:csr_response_refused",
       "outcome": "denied:csr_response_refused",
       "receipt": true,
-      "detail": "csr_response_refused; staged false"
+      "detail": "csr_response_refused; CA calls 1"
     },
     {
       "id": "INBOX-CIPHERTEXT-SUBSTITUTION",
@@ -273,5 +273,5 @@
   ],
   "failures": [],
   "pass": true,
-  "runDigest": "sha256:a46191313ba136d22893da82f6b5f5156a76083a703188464d760d079d5852c2"
+  "runDigest": "sha256:5c8e90c6d8db24cc95b3240b1d7811e5c5c0902d80ae70ad5b4b08f703dcc2c2"
 }
