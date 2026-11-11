@@ -17,3 +17,6 @@ jobs:
         with:
           deno-version: v2.9.2
       - run: deno task verify
+      # The red team suite is repeated as its own step so a channel-leak or CSP
+      # regression is attributable without reading the whole verify log.
+      - run: deno task redteam:check

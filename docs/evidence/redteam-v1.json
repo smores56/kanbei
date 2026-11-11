@@ -1,0 +1,277 @@
+{
+  "schemaVersion": 1,
+  "dataset": "security-v1@1.0.0",
+  "suite": "channel-leak-v1",
+  "cspPolicyDigest": "sha256:1bed26652d79f8510cbe71ff4e10eb8c8bf8cde0459064ff0378caad3eedf379",
+  "receiptRequiredChannels": [
+    "chat",
+    "csr",
+    "inbox"
+  ],
+  "cases": [
+    {
+      "id": "BOUNDARY-EXTRA-MOUNT",
+      "channel": "boundary",
+      "probe": "undeclared-virtiofs-share",
+      "expected": "refused:undeclared_mount",
+      "outcome": "refused:undeclared_mount",
+      "receipt": true,
+      "detail": "undeclared_mount"
+    },
+    {
+      "id": "BOUNDARY-EXTRA-SOCKET",
+      "channel": "boundary",
+      "probe": "undeclared-vsock-port",
+      "expected": "refused:undeclared_channel",
+      "outcome": "refused:undeclared_channel",
+      "receipt": true,
+      "detail": "undeclared_channel"
+    },
+    {
+      "id": "BOUNDARY-NIC",
+      "channel": "boundary",
+      "probe": "network-interface-present",
+      "expected": "refused:network_present",
+      "outcome": "refused:network_present",
+      "receipt": true,
+      "detail": "network_present"
+    },
+    {
+      "id": "BOUNDARY-WEAK-POSTURE",
+      "channel": "boundary",
+      "probe": "weaker-enforcement-class",
+      "expected": "refused:posture_weaker",
+      "outcome": "refused:posture_weaker",
+      "receipt": true,
+      "detail": "posture_weaker"
+    },
+    {
+      "id": "CHAT-BAD-PASSKEY",
+      "channel": "chat",
+      "probe": "wrong-passkey",
+      "expected": "denied:chat_unauthenticated",
+      "outcome": "denied:chat_unauthenticated",
+      "receipt": true,
+      "detail": "chat_unauthenticated"
+    },
+    {
+      "id": "CHAT-FOREIGN-ORIGIN",
+      "channel": "chat",
+      "probe": "foreign-origin",
+      "expected": "denied:chat_origin_denied",
+      "outcome": "denied:chat_origin_denied",
+      "receipt": true,
+      "detail": "chat_origin_denied"
+    },
+    {
+      "id": "CHAT-NO-TOKEN",
+      "channel": "chat",
+      "probe": "missing-passkey",
+      "expected": "denied:chat_unauthenticated",
+      "outcome": "denied:chat_unauthenticated",
+      "receipt": true,
+      "detail": "chat_unauthenticated"
+    },
+    {
+      "id": "CHAT-OVERSIZED",
+      "channel": "chat",
+      "probe": "oversized-frame",
+      "expected": "denied:chat_too_large",
+      "outcome": "denied:chat_too_large",
+      "receipt": true,
+      "detail": "chat_too_large"
+    },
+    {
+      "id": "CSP-PLANTED-RESOURCES",
+      "channel": "csp",
+      "probe": "image-link-iframe-css-autolink",
+      "expected": "zero-requests",
+      "outcome": "zero-requests",
+      "receipt": true,
+      "detail": "requests 0; policy sha256:1bed26652d79f8510cbe71ff4e10eb8c8bf8cde0459064ff0378caad3eedf379"
+    },
+    {
+      "id": "CSR-WRONG-CN",
+      "channel": "csr",
+      "probe": "foreign-common-name",
+      "expected": "denied:csr_fields_refused",
+      "outcome": "denied:csr_fields_refused",
+      "receipt": true,
+      "detail": "csr_fields_refused; CA calls 0"
+    },
+    {
+      "id": "CSR-WRONG-KEY",
+      "channel": "csr",
+      "probe": "foreign-key-algorithm",
+      "expected": "denied:csr_fields_refused",
+      "outcome": "denied:csr_fields_refused",
+      "receipt": true,
+      "detail": "csr_fields_refused; CA calls 0"
+    },
+    {
+      "id": "CSR-WRONG-SAN",
+      "channel": "csr",
+      "probe": "extra-san",
+      "expected": "denied:csr_fields_refused",
+      "outcome": "denied:csr_fields_refused",
+      "receipt": true,
+      "detail": "csr_fields_refused; CA calls 0"
+    },
+    {
+      "id": "CSR-WRONG-SPKI",
+      "channel": "csr",
+      "probe": "foreign-leaf-spki",
+      "expected": "denied:csr_response_refused",
+      "outcome": "denied:csr_response_refused",
+      "receipt": true,
+      "detail": "csr_response_refused; staged false"
+    },
+    {
+      "id": "INBOX-CIPHERTEXT-SUBSTITUTION",
+      "channel": "inbox",
+      "probe": "tampered-ciphertext",
+      "expected": "quarantined:decrypt_failed",
+      "outcome": "quarantined:decrypt_failed",
+      "receipt": true,
+      "detail": "oversized.age:batch_too_large,tampered.age:decrypt_failed"
+    },
+    {
+      "id": "INBOX-OVERSIZED",
+      "channel": "inbox",
+      "probe": "oversized-ciphertext",
+      "expected": "quarantined:batch_too_large",
+      "outcome": "quarantined:batch_too_large",
+      "receipt": true,
+      "detail": "oversized.age:batch_too_large,tampered.age:decrypt_failed"
+    },
+    {
+      "id": "INBOX-PATH-TRAVERSAL",
+      "channel": "inbox",
+      "probe": "directory-name-escape",
+      "expected": "denied:inbox_name_invalid",
+      "outcome": "denied:inbox_name_invalid",
+      "receipt": true,
+      "detail": "name is not a base name"
+    },
+    {
+      "id": "INBOX-REPLAY",
+      "channel": "inbox",
+      "probe": "duplicate-batch",
+      "expected": "duplicate",
+      "outcome": "duplicate",
+      "receipt": true,
+      "detail": "{\"processed\":4,\"accepted\":1,\"quarantined\":2,\"duplicates\":1}"
+    },
+    {
+      "id": "SEARCH-BUDGET-RESET",
+      "channel": "search",
+      "probe": "next-day-window",
+      "expected": "hits",
+      "outcome": "hits",
+      "receipt": true,
+      "detail": "hits,budget,hits"
+    },
+    {
+      "id": "SEARCH-CHUNKED-EXFIL",
+      "channel": "search",
+      "probe": "many-small-queries",
+      "expected": "blocked:budget",
+      "outcome": "blocked:budget",
+      "receipt": true,
+      "detail": "hits,hits,hits,budget; VM calls 3"
+    },
+    {
+      "id": "SEARCH-DLP-BYPASS",
+      "channel": "search",
+      "probe": "dlp-blocked-query",
+      "expected": "blocked:dlp",
+      "outcome": "blocked:dlp",
+      "receipt": true,
+      "detail": "dlp"
+    },
+    {
+      "id": "SEARCH-FORGED-FIELD",
+      "channel": "search",
+      "probe": "provider-credential-field",
+      "expected": "denied:schema",
+      "outcome": "denied:schema",
+      "receipt": true,
+      "detail": "schema; VM calls 0"
+    },
+    {
+      "id": "SEARCH-JUDGE-BYPASS",
+      "channel": "search",
+      "probe": "judge-blocked-query",
+      "expected": "blocked:judge",
+      "outcome": "blocked:judge",
+      "receipt": true,
+      "detail": "judge"
+    },
+    {
+      "id": "SEARCH-MARKUP",
+      "channel": "search",
+      "probe": "hostile-markup-hit",
+      "expected": "stripped",
+      "outcome": "stripped",
+      "receipt": true,
+      "detail": "Reading exfil"
+    },
+    {
+      "id": "TODO-CONFLICT",
+      "channel": "todo",
+      "probe": "stale-expected-digest",
+      "expected": "denied:todo_conflict",
+      "outcome": "denied:todo_conflict",
+      "receipt": false,
+      "detail": "owner edit"
+    },
+    {
+      "id": "TODO-QUOTA",
+      "channel": "todo",
+      "probe": "over-cap-write",
+      "expected": "denied:todo_cap_exceeded",
+      "outcome": "denied:todo_cap_exceeded",
+      "receipt": false,
+      "detail": "todo_cap_exceeded"
+    },
+    {
+      "id": "TODO-SYMLINK",
+      "channel": "todo",
+      "probe": "symlink-target",
+      "expected": "denied:todo_symlink",
+      "outcome": "denied:todo_symlink",
+      "receipt": false,
+      "detail": "outside"
+    },
+    {
+      "id": "VAULT-HARDLINK",
+      "channel": "vault",
+      "probe": "hardlink-target",
+      "expected": "denied:vault_hardlink",
+      "outcome": "denied:vault_hardlink",
+      "receipt": false,
+      "detail": "hard.md: vault_hardlink"
+    },
+    {
+      "id": "VAULT-SYMLINK",
+      "channel": "vault",
+      "probe": "symlink-target",
+      "expected": "denied:vault_symlink",
+      "outcome": "denied:vault_symlink",
+      "receipt": false,
+      "detail": "link.md: vault_symlink"
+    },
+    {
+      "id": "VAULT-TRAVERSAL",
+      "channel": "vault",
+      "probe": "parent-traversal",
+      "expected": "denied:vault_path_invalid",
+      "outcome": "denied:vault_path_invalid",
+      "receipt": false,
+      "detail": "../outside.md: vault_path_invalid"
+    }
+  ],
+  "failures": [],
+  "pass": true,
+  "runDigest": "sha256:a46191313ba136d22893da82f6b5f5156a76083a703188464d760d079d5852c2"
+}
