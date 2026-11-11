@@ -1,0 +1,11 @@
+{
+  "request": {
+    "version": 1,
+    "commonName": "kanbei.sammohr.dev",
+    "keyAlgorithm": "ec-p256",
+    "sans": ["kanbei.sammohr.dev"],
+    "publicKeySpki": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE",
+    "signature": "MEUCIQDexample"
+  },
+  "renewalWindowMs": 2592000000
+}
