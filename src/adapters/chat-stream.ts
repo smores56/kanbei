@@ -3,10 +3,14 @@ import type { Scope } from "effect"
 import type { ChatStream } from "../channels/chat/stream.ts"
 import { ChatTransportError } from "../channels/chat/stream.ts"
 
+/** One frame may not ask the adapter to allocate more than this. */
+export const CHAT_MAX_FRAME_BYTES = 256 * 1024
+
 export interface TlsChatOptions {
   readonly hostname: string
   readonly port: number
   readonly caCerts?: ReadonlyArray<string>
+  readonly maxFrameBytes?: number
 }
 
 const transport = (operation: "read" | "write" | "close", error: unknown): ChatTransportError =>
@@ -38,6 +42,28 @@ const readExact = async (
   return readExact(connection, length, buffer, offset + read)
 }
 
+/**
+ * The declared length is checked before the body buffer exists: a hostile peer
+ * must not be able to make the adapter allocate a gigabyte.
+ */
+export const readChatFrame = async (
+  connection: Deno.Conn,
+  maxBytes: number,
+): Promise<Option.Option<Uint8Array>> => {
+  const header = await readExact(connection, 4)
+  if (header === null) return Option.none()
+  const length = new DataView(header.buffer, header.byteOffset, 4).getUint32(0, false)
+  if (length > maxBytes) {
+    throw new Error(`declared frame ${length} exceeds the ${maxBytes}-byte cap`)
+  }
+  const body = await readExact(connection, length)
+  if (body === null) return Option.none()
+  const frame = new Uint8Array(4 + body.length)
+  frame.set(header, 0)
+  frame.set(body, 4)
+  return Option.some(frame)
+}
+
 /** Client side of the in-VM TLS listener; the relay is never in this path. */
 export const connectTlsChatStream = (
   options: TlsChatOptions,
@@ -64,17 +90,7 @@ export const connectTlsChatStream = (
     Effect.map((connection) => ({
       peer: "loopback" as const,
       readFrame: Effect.tryPromise({
-        try: async () => {
-          const header = await readExact(connection, 4)
-          if (header === null) return Option.none()
-          const length = new DataView(header.buffer, header.byteOffset, 4).getUint32(0, false)
-          const body = await readExact(connection, length)
-          if (body === null) return Option.none()
-          const frame = new Uint8Array(4 + body.length)
-          frame.set(header, 0)
-          frame.set(body, 4)
-          return Option.some(frame)
-        },
+        try: () => readChatFrame(connection, options.maxFrameBytes ?? CHAT_MAX_FRAME_BYTES),
         catch: (error) => transport("read", error),
       }),
       writeFrame: (frame: Uint8Array) =>

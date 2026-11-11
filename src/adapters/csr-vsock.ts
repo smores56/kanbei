@@ -31,6 +31,22 @@ const writeAll = async (
   return writeAll(connection, bytes, offset + written)
 }
 
+/**
+ * The declared length is checked before the body buffer exists: a hostile host
+ * must not be able to make the adapter allocate a gigabyte.
+ */
+export const readCsrFrame = async (
+  connection: Deno.Conn,
+  maxBytes: number,
+): Promise<Uint8Array> => {
+  const header = await readExact(connection, 4)
+  const length = new DataView(header.buffer, header.byteOffset, 4).getUint32(0, false)
+  if (length === 0 || length > maxBytes) {
+    throw new Error(`response ${length} outside 1..${maxBytes}`)
+  }
+  return readExact(connection, length)
+}
+
 const readExact = async (
   connection: Deno.Conn,
   length: number,
@@ -62,12 +78,7 @@ const exchangeOnce = async (
   try {
     await writeAll(connection, encoder.encode(`${CSR_AUTH_PREFIX}${options.token}\n`))
     await writeAll(connection, frameOf(encodeCsrWireRequest(csrPem)))
-    const header = await readExact(connection, 4)
-    const length = new DataView(header.buffer, header.byteOffset, 4).getUint32(0, false)
-    if (length === 0 || length > maxResponseBytes) {
-      throw new Error(`response ${length} outside 1..${maxResponseBytes}`)
-    }
-    const body = await readExact(connection, length)
+    const body = await readCsrFrame(connection, maxResponseBytes)
     const parsed = Result.try({
       try: () => parseCsrWireResponse(JSON.parse(new TextDecoder().decode(body))),
       catch: (failure) =>
