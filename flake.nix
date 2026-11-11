@@ -80,7 +80,13 @@
               export HOME=$TMPDIR
               export XDG_CACHE_HOME=$TMPDIR/cache
               export DENO_DIR=${denoDeps}/deno-dir
+              # Evidence runs write under the repo tree; check against a copy.
+              cp -r . $TMPDIR/work
+              cd $TMPDIR/work
               deno task test:unit
+              deno task typecheck
+              deno task journey:check
+              deno task redteam:check
               runHook postCheck
             '';
             installPhase = ''
@@ -88,7 +94,10 @@
               mkdir -p $out/lib/kanbei $out/bin
               cp -r src deno.json deno.lock $out/lib/kanbei/
               makeWrapper ${pkgs.deno}/bin/deno $out/bin/kanbei \
-                --add-flags "run --no-remote --allow-read --allow-env --allow-net --allow-run --allow-sys" \
+                --add-flags "run --no-remote" \
+                --add-flags "--allow-read=/var/lib/kanbei,/var/lib/data,/var/lib/ingest,/run/kanbei,/etc/kanbei" \
+                --add-flags "--allow-write=/var/lib/kanbei,/run/kanbei" \
+                --add-flags "--allow-env=KANBEI_*" \
                 --add-flags "$out/lib/kanbei/src/main.ts" \
                 --set DENO_DIR ${denoDeps}/deno-dir
               runHook postInstall
