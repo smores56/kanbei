@@ -221,14 +221,19 @@ export const vaultProbes = async (
 ): Promise<ReadonlyArray<ProbeResult>> => {
   const results: Array<ProbeResult> = []
   await withTempDir("redteam-vault", async (directory) => {
+    // The probe mounts a realistic subtree, not the whole temp dir: a root of
+    // "" would make every path inside the mount trivially allowed.
+    const vault = `${directory}/vault`
+    await Deno.mkdir(vault)
     await Deno.writeTextFile(`${directory}/outside.md`, "secret")
-    await Deno.symlink(`${directory}/outside.md`, `${directory}/link.md`)
-    await Deno.writeTextFile(`${directory}/original.md`, "linked")
-    await Deno.link(`${directory}/original.md`, `${directory}/hard.md`)
+    await Deno.writeTextFile(`${vault}/outside.md`, "secret")
+    await Deno.symlink(`${directory}/outside.md`, `${vault}/link.md`)
+    await Deno.writeTextFile(`${vault}/original.md`, "linked")
+    await Deno.link(`${vault}/original.md`, `${vault}/hard.md`)
     const probes = [
-      ["VAULT-SYMLINK", "link.md"],
-      ["VAULT-HARDLINK", "hard.md"],
-      ["VAULT-TRAVERSAL", "../outside.md"],
+      ["VAULT-SYMLINK", "vault/link.md"],
+      ["VAULT-HARDLINK", "vault/hard.md"],
+      ["VAULT-TRAVERSAL", "vault/../outside.md"],
     ] as const
     const outcomes = await Promise.all(
       probes.map(async ([id, path]) => {
@@ -238,7 +243,7 @@ export const vaultProbes = async (
             return yield* Effect.flip(reader.read(path))
           }).pipe(
             Effect.provide(
-              vaultReaderLayer({ roots: [""], maxBytes: 4_096 }).pipe(
+              vaultReaderLayer({ roots: ["vault"], maxBytes: 4_096 }).pipe(
                 Layer.provide(vaultFilesLayer(directory)),
               ),
             ),

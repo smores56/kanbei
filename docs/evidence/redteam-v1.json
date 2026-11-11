@@ -250,7 +250,7 @@
       "expected": "denied:vault_hardlink",
       "outcome": "denied:vault_hardlink",
       "receipt": false,
-      "detail": "hard.md: vault_hardlink"
+      "detail": "vault/hard.md: vault_hardlink"
     },
     {
       "id": "VAULT-SYMLINK",
@@ -259,7 +259,7 @@
       "expected": "denied:vault_symlink",
       "outcome": "denied:vault_symlink",
       "receipt": false,
-      "detail": "link.md: vault_symlink"
+      "detail": "vault/link.md: vault_symlink"
     },
     {
       "id": "VAULT-TRAVERSAL",
@@ -268,10 +268,10 @@
       "expected": "denied:vault_path_invalid",
       "outcome": "denied:vault_path_invalid",
       "receipt": false,
-      "detail": "../outside.md: vault_path_invalid"
+      "detail": "vault/../outside.md: vault_path_invalid"
     }
   ],
   "failures": [],
   "pass": true,
-  "runDigest": "sha256:5c8e90c6d8db24cc95b3240b1d7811e5c5c0902d80ae70ad5b4b08f703dcc2c2"
+  "runDigest": "sha256:4880b7f9459d0ed886fcf18f521fff997559ee5a3b489096d2aed42d83562ab8"
 }

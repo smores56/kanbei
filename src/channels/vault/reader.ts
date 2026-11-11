@@ -3,7 +3,7 @@ import { sha256 } from "../../evidence/digest.ts"
 import type { ContentDigest } from "../../kernel/blob-sink.ts"
 import { VaultError } from "./errors.ts"
 import { VaultFiles } from "./files.ts"
-import { parseVaultPath, prefixesOf } from "./policy.ts"
+import { parseVaultPath, prefixesOf, rootIssues } from "./policy.ts"
 import type { VaultPolicy } from "./policy.ts"
 
 export type { VaultPolicy } from "./policy.ts"
@@ -36,8 +36,7 @@ const fail = (code: VaultError["code"], path: string, detail: string): VaultErro
   new VaultError({ code, path, detail })
 
 const configIssues = (policy: VaultPolicy): ReadonlyArray<string> => {
-  const issues: Array<string> = []
-  if (policy.roots.length === 0) issues.push("roots must not be empty")
+  const issues: Array<string> = [...rootIssues(policy)]
   if (!Number.isFinite(policy.maxBytes) || policy.maxBytes <= 0) {
     issues.push("maxBytes must be positive")
   }

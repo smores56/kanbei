@@ -14,6 +14,16 @@ export interface VaultSegments {
 const invalid = (path: string, detail: string): VaultError =>
   new VaultError({ code: "vault_path_invalid", path, detail })
 
+/**
+ * A root of "" or "/" would allow every path on the mount; the policy must name
+ * a real subtree.
+ */
+export const rootIssues = (policy: VaultPolicy): ReadonlyArray<string> =>
+  policy.roots.length === 0 ? ["roots must not be empty"] : policy.roots.flatMap((root) => {
+    const trimmed = root.replace(/^\/+|\/+$/gu, "")
+    return trimmed === "" ? ["an empty root would allow the whole mount"] : []
+  })
+
 /** Relative paths only: no absolute roots, no traversal, no NUL or separators. */
 export const parseVaultPath = (
   path: string,
@@ -27,8 +37,10 @@ export const parseVaultPath = (
   if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
     return Result.fail(invalid(path, "empty, current, or parent segment"))
   }
+  const rootProblems = rootIssues(policy)
+  if (rootProblems.length > 0) return Result.fail(invalid(path, rootProblems.join("; ")))
   const roots = policy.roots.map((root) => root.replace(/^\/+|\/+$/gu, ""))
-  const allowed = roots.some((root) => root === "" || path === root || path.startsWith(`${root}/`))
+  const allowed = roots.some((root) => path === root || path.startsWith(`${root}/`))
   if (!allowed) {
     return Result.fail(
       new VaultError({

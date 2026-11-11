@@ -35,13 +35,24 @@ const readFully = async (
   return readFully(file, buffer, offset + read)
 }
 
-const readOnce = async (root: string, relative: string): Promise<VaultFile> => {
-  // `lstat` in the domain proves the path is not a symlink; opening and then
-  // comparing fstat identity closes the swap window between those two steps.
-  const file = await Deno.open(`${root}/${relative}`, { read: true })
+/**
+ * Resolve the full path before opening: a symlink swapped in after the domain
+ * lstat would otherwise escape the mount. The inode is re-checked after the
+ * open, so a swap between realpath and open is also refused.
+ */
+const readOnce = async (root: string, realRoot: string, relative: string): Promise<VaultFile> => {
+  const resolved = await Deno.realPath(`${root}/${relative}`)
+  if (resolved !== realRoot && !resolved.startsWith(`${realRoot}/`)) {
+    throw new Deno.errors.PermissionDenied(`${relative} resolves outside the vault mount`)
+  }
+  const file = await Deno.open(resolved, { read: true })
   try {
     const info = await file.stat()
     const stat = statOf(info)
+    const checked = await Deno.lstat(resolved)
+    if (checked.dev !== stat.dev || checked.ino !== stat.ino) {
+      throw new Deno.errors.PermissionDenied(`${relative} changed inode between checks`)
+    }
     const buffer = new Uint8Array(stat.size)
     const total = await readFully(file, buffer, 0)
     return { bytes: buffer.subarray(0, total), stat }
@@ -51,26 +62,37 @@ const readOnce = async (root: string, relative: string): Promise<VaultFile> => {
 }
 
 /** Read-only adapter over the vault mount; there is no write method to leak. */
-export const vaultFilesLayer = (root: string): Layer.Layer<VaultFiles> =>
+export const vaultFilesLayer = (root: string): Layer.Layer<VaultFiles, VaultIoError> =>
   Layer.effect(
     VaultFiles,
-    Effect.succeed({
-      lstat: (relative: string) =>
-        Effect.tryPromise({
-          try: async () => {
-            try {
-              return Option.some(statOf(await Deno.lstat(`${root}/${relative}`)))
-            } catch (error) {
-              if (error instanceof Deno.errors.NotFound) return Option.none()
-              throw error
-            }
-          },
-          catch: (error) => io("lstat", relative, error),
-        }),
-      read: (relative: string) =>
-        Effect.tryPromise({
-          try: () => readOnce(root, relative),
-          catch: (error) => io("read", relative, error),
-        }),
+    Effect.gen(function* () {
+      const realRoot = yield* Effect.tryPromise({
+        try: () => Deno.realPath(root),
+        catch: (error) =>
+          new VaultIoError({
+            operation: "lstat",
+            path: root,
+            reason: error instanceof Error ? error.message : String(error),
+          }),
+      })
+      return {
+        lstat: (relative: string) =>
+          Effect.tryPromise({
+            try: async () => {
+              try {
+                return Option.some(statOf(await Deno.lstat(`${root}/${relative}`)))
+              } catch (error) {
+                if (error instanceof Deno.errors.NotFound) return Option.none()
+                throw error
+              }
+            },
+            catch: (error) => io("lstat", relative, error),
+          }),
+        read: (relative: string) =>
+          Effect.tryPromise({
+            try: () => readOnce(root, realRoot, relative),
+            catch: (error) => io("read", relative, error),
+          }),
+      }
     }),
   )
