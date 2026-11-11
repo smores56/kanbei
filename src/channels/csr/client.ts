@@ -1,6 +1,6 @@
-import { Clock, Context, Data, Effect, Layer, Option, Ref } from "effect"
+import { Clock, Context, Data, Effect, Layer, Option, Ref, Result } from "effect"
 import type { SessionKey } from "./key.ts"
-import { exportPkcs8, generateSessionKey, signDerBytes } from "./key.ts"
+import { exportPkcs8, generateSessionKey, privateKeyMatchesSpki, signDerBytes } from "./key.ts"
 import {
   buildCsrPem,
   CsrPolicyError,
@@ -14,10 +14,17 @@ import { CertificateStore } from "./store.ts"
 import { CSR_COMMON_NAME, csrFieldsIssue } from "./schema.ts"
 
 export const CSR_RENEWAL_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
+/** An agent may trigger renewal, so attempts need a floor and a failure backoff. */
+export const CSR_MIN_RENEWAL_INTERVAL_MS = 15 * 60 * 1000
+export const CSR_MAX_BACKOFF_MS = 6 * 60 * 60 * 1000
 
 export interface CsrConfig {
   readonly commonName: string
   readonly renewalWindowMs: number
+  readonly minRenewalIntervalMs?: number
+  readonly maxBackoffMs?: number
+  /** The ACME intermediate the leaf must name; absent means any non-self issuer. */
+  readonly issuerCommonName?: string
 }
 
 export class CsrTransportError extends Data.TaggedError("CsrTransportError")<{
@@ -58,6 +65,8 @@ export type CsrErrorCode =
   | "csr_response_refused"
   | "csr_store_failed"
   | "csr_reload_failed"
+  | "csr_rate_limited"
+  | "csr_backoff"
 
 export class CsrError extends Data.TaggedError("CsrError")<{
   readonly code: CsrErrorCode
@@ -108,6 +117,18 @@ const configIssues = (config: CsrConfig): ReadonlyArray<string> => {
   if (!Number.isFinite(config.renewalWindowMs) || config.renewalWindowMs < 0) {
     issues.push("renewalWindowMs must not be negative")
   }
+  if (
+    config.minRenewalIntervalMs !== undefined &&
+    (!Number.isFinite(config.minRenewalIntervalMs) || config.minRenewalIntervalMs < 0)
+  ) {
+    issues.push("minRenewalIntervalMs must not be negative")
+  }
+  if (
+    config.maxBackoffMs !== undefined &&
+    (!Number.isFinite(config.maxBackoffMs) || config.maxBackoffMs < 0)
+  ) {
+    issues.push("maxBackoffMs must not be negative")
+  }
   return issues
 }
 
@@ -135,6 +156,13 @@ export const csrClientLayer = (
       const state = yield* Ref.make<CsrState>("idle")
       const receipts = yield* Ref.make<ReadonlyArray<CsrReceipt>>([])
       const alertLog = yield* Ref.make<ReadonlyArray<CsrAlert>>([])
+      const attempts = yield* Ref.make<{
+        readonly lastAt: Option.Option<number>
+        readonly failures: number
+        readonly backoffUntil: Option.Option<number>
+      }>({ lastAt: Option.none(), failures: 0, backoffUntil: Option.none() })
+      const minInterval = config.minRenewalIntervalMs ?? CSR_MIN_RENEWAL_INTERVAL_MS
+      const maxBackoff = config.maxBackoffMs ?? CSR_MAX_BACKOFF_MS
 
       const readActive = store.active.pipe(
         Effect.mapError((error) => fail("csr_store_failed", error.reason)),
@@ -164,10 +192,29 @@ export const csrClientLayer = (
           ])
         })
 
-      const refuseOnError = <A>(effect: Effect.Effect<A, CsrError>): Effect.Effect<A, CsrError> =>
+      /** A failed attempt doubles the wait; a success clears it. */
+      const noteFailure = (at: number): Effect.Effect<void> =>
+        Ref.update(attempts, (current) => {
+          const failures = current.failures + 1
+          const wait = Math.min(maxBackoff, minInterval * 2 ** failures)
+          return {
+            lastAt: Option.some(at),
+            failures,
+            backoffUntil: Option.some(at + wait),
+          }
+        })
+
+      const noteSuccess = (at: number): Effect.Effect<void> =>
+        Ref.set(attempts, { lastAt: Option.some(at), failures: 0, backoffUntil: Option.none() })
+
+      const refuseOnError = <A>(
+        effect: Effect.Effect<A, CsrError>,
+        at: number,
+      ): Effect.Effect<A, CsrError> =>
         effect.pipe(
           Effect.tapError((error) =>
             receipt("renewal_refused", "refused", `${error.code}: ${error.detail}`).pipe(
+              Effect.flatMap(() => noteFailure(at)),
               Effect.flatMap(() => Ref.set(state, "refused")),
             )
           ),
@@ -201,6 +248,58 @@ export const csrClientLayer = (
           catch: (error) => fail("csr_key_failed", policy(error)),
         })
 
+      /**
+       * A stored pair is only installable when the chain parses under the fixed
+       * CN, the leaf is unexpired and names the expected issuer, and the private
+       * key really is the certificate2019s key.
+       */
+      const installableIssue = (
+        certificate: InstalledCertificate,
+        at: number,
+      ): Effect.Effect<Option.Option<CsrError>> =>
+        Effect.gen(function* () {
+          let spki: Uint8Array
+          try {
+            spki = Uint8Array.fromBase64(certificate.spki)
+          } catch {
+            return Option.some(fail("csr_reload_failed", "stored SPKI is not base64"))
+          }
+          let verified: ReturnType<typeof verifyIssuedChain>
+          try {
+            verified = verifyIssuedChain(certificate.chainPem, spki, CSR_COMMON_NAME, at)
+          } catch (error) {
+            return Option.some(fail("csr_reload_failed", policy(error)))
+          }
+          if (verified.notAfter !== certificate.notAfter) {
+            return Option.some(
+              fail("csr_reload_failed", "stored notAfter disagrees with the leaf"),
+            )
+          }
+          if (Date.parse(certificate.notAfter) <= at) {
+            return Option.some(fail("csr_reload_failed", "stored certificate is expired"))
+          }
+          if (
+            config.issuerCommonName !== undefined &&
+            verified.leaf.issuer !== config.issuerCommonName
+          ) {
+            return Option.some(
+              fail(
+                "csr_reload_failed",
+                `leaf issuer ${verified.leaf.issuer} != ${config.issuerCommonName}`,
+              ),
+            )
+          }
+          const bound = yield* Effect.result(
+            privateKeyMatchesSpki(certificate.privateKeyPkcs8, spki),
+          )
+          if (Result.isFailure(bound) || !bound.success) {
+            return Option.some(
+              fail("csr_reload_failed", "stored private key does not match the certificate"),
+            )
+          }
+          return Option.none()
+        })
+
       const renew: CsrClient["renew"] = Effect.gen(function* () {
         const fields = csrFieldsIssue(config)
         const activeBefore = yield* readActive
@@ -210,6 +309,21 @@ export const csrClientLayer = (
           return yield* Effect.fail(fail("csr_fields_refused", fields))
         }
         const at = yield* now()
+        // An agent can call this route: a second attempt inside the floor is refused.
+        const attempt = yield* Ref.get(attempts)
+        if (Option.isSome(attempt.backoffUntil) && at < attempt.backoffUntil.value) {
+          yield* Ref.set(state, "refused")
+          return yield* Effect.fail(
+            fail("csr_backoff", `next attempt after ${new Date(attempt.backoffUntil.value)}`),
+          )
+        }
+        if (Option.isSome(attempt.lastAt) && at - attempt.lastAt.value < minInterval) {
+          yield* Ref.set(state, "refused")
+          return yield* Effect.fail(
+            fail("csr_rate_limited", `${at - attempt.lastAt.value}ms < ${minInterval}ms`),
+          )
+        }
+        yield* Ref.update(attempts, (current) => ({ ...current, lastAt: Option.some(at) }))
         if (Option.isSome(activeBefore) && Date.parse(activeBefore.value.notAfter) <= at) {
           yield* raise({
             kind: "certificate_expired",
@@ -229,40 +343,47 @@ export const csrClientLayer = (
           generateSessionKey().pipe(
             Effect.mapError((error) => fail("csr_key_failed", error.reason)),
           ),
+          at,
         )
-        const csrPem = yield* refuseOnError(buildRequest(key))
+        const csrPem = yield* refuseOnError(buildRequest(key), at)
         // The host parser is the authority; never send a CSR it would refuse.
         yield* refuseOnError(
           Effect.try({
             try: () => parseCsrPem(csrPem, CSR_COMMON_NAME),
             catch: (error) => fail("csr_fields_refused", policy(error)),
           }).pipe(Effect.asVoid),
+          at,
         )
         const response = yield* refuseOnError(
           transport.exchange(csrPem).pipe(
             Effect.mapError((error) => fail("csr_transport_failed", error.reason)),
           ),
+          at,
         )
         const verified = yield* refuseOnError(
           Effect.try({
             try: () => verifyIssuedChain(response.chain, key.publicKeySpkiDer, CSR_COMMON_NAME, at),
             catch: (error) => fail("csr_response_refused", policy(error)),
           }),
+          at,
         )
         if (verified.notAfter !== response.notAfter) {
           return yield* refuseOnError(
             Effect.fail(
               fail("csr_response_refused", "response not_after disagrees with the leaf"),
             ),
+            at,
           )
         }
         const privateKeyPkcs8 = yield* refuseOnError(
           exportPkcs8(key).pipe(Effect.mapError((error) => fail("csr_key_failed", error.reason))),
+          at,
         )
         const leafDer = splitChain(response.chain)[0]
         if (leafDer === undefined) {
           return yield* refuseOnError(
             Effect.fail(fail("csr_response_refused", "chain holds no leaf")),
+            at,
           )
         }
         const certificate: InstalledCertificate = {
@@ -273,11 +394,29 @@ export const csrClientLayer = (
           notAfter: verified.notAfter,
           installedAt: new Date(at).toISOString(),
         }
+        const installable = yield* installableIssue(certificate, at)
+        if (Option.isSome(installable)) {
+          return yield* refuseOnError(Effect.fail(installable.value), at)
+        }
         yield* refuseOnError(
           store.stage(certificate).pipe(
             Effect.mapError((error) => fail("csr_store_failed", error.reason)),
           ),
+          at,
         )
+        const promoted = yield* refuseOnError(
+          store.promote.pipe(
+            Effect.mapError((error) => fail("csr_store_failed", error.reason)),
+          ),
+          at,
+        )
+        if (Option.isNone(promoted)) {
+          return yield* refuseOnError(
+            Effect.fail(fail("csr_store_failed", "staged certificate did not promote")),
+            at,
+          )
+        }
+        yield* noteSuccess(at)
         yield* receipt("renewal_request", "ok", `issued until ${verified.notAfter}`)
         return yield* outcome("issued", true)
       })
@@ -293,6 +432,12 @@ export const csrClientLayer = (
           const staged = yield* readStaged
           if (Option.isNone(staged)) {
             return yield* Effect.fail(fail("csr_reload_failed", "no staged certificate"))
+          }
+          const at = yield* now()
+          const installable = yield* installableIssue(staged.value, at)
+          if (Option.isSome(installable)) {
+            yield* receipt("reload", "refused", installable.value.detail)
+            return yield* Effect.fail(installable.value)
           }
           yield* store.promote.pipe(
             Effect.mapError((error) => fail("csr_store_failed", error.reason)),

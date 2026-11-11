@@ -69,3 +69,41 @@ export const exportPkcs8 = (key: SessionKey): Effect.Effect<string, CsrKeyError>
     },
     catch: (error) => keyError("export", error),
   })
+
+/**
+ * Proves the stored private key is the certificate's key: sign a fresh
+ * challenge with the PKCS#8 key and verify it with the certificate's SPKI.
+ */
+export const privateKeyMatchesSpki = (
+  privateKeyPkcs8Base64: string,
+  spkiDer: Uint8Array,
+): Effect.Effect<boolean, CsrKeyError> =>
+  Effect.tryPromise({
+    try: async () => {
+      const signing = await crypto.subtle.importKey(
+        "pkcs8",
+        Uint8Array.fromBase64(privateKeyPkcs8Base64),
+        ecP256,
+        false,
+        ["sign"],
+      )
+      const copy = new Uint8Array(spkiDer.length)
+      copy.set(spkiDer)
+      const verifying = await crypto.subtle.importKey("spki", copy.buffer, ecP256, false, [
+        "verify",
+      ])
+      const challenge = crypto.getRandomValues(new Uint8Array(32))
+      const signature = await crypto.subtle.sign(
+        { name: "ECDSA", hash: "SHA-256" },
+        signing,
+        challenge,
+      )
+      return await crypto.subtle.verify(
+        { name: "ECDSA", hash: "SHA-256" },
+        verifying,
+        signature,
+        challenge,
+      )
+    },
+    catch: (error) => keyError("sign", error),
+  })

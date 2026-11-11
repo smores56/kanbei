@@ -1,8 +1,16 @@
 import { assertEquals } from "@std/assert"
-import { Effect, Option, Ref } from "effect"
+import { Clock, Effect, Option, Ref } from "effect"
 import { CsrClient, CsrTransportError } from "../../../src/channels/csr/client.ts"
 import type { CsrReceipt } from "../../../src/channels/csr/client.ts"
-import { certificateFor, defaultResponder, harness, installed, runWith } from "./support.ts"
+import {
+  certificateFor,
+  defaultResponder,
+  harness,
+  installed,
+  issuedPair,
+  movableCsrClock,
+  runWith,
+} from "./support.ts"
 import type { Harness } from "./support.ts"
 import { parseCsrPem } from "../../../src/channels/csr/pkcs10.ts"
 
@@ -31,17 +39,17 @@ const runRefusal = (h: Harness) =>
     }),
   )
 
-Deno.test("a due renewal emits a host-parsable PEM CSR and stages without promoting", async () => {
+Deno.test("a due renewal emits a host-parsable PEM CSR and promotes it", async () => {
   const h = await Effect.runPromise(
     harness((csr) => Effect.succeed(defaultResponder(csr, NOW, 90 * DAY))),
   )
   const result = await runRenew(h)
   assertEquals(result.outcome.renewed, true)
   assertEquals(result.state, "issued")
-  assertEquals(Option.isNone(result.outcome.active), true)
-  const staged = Option.getOrThrow(result.outcome.staged)
-  assertEquals(staged.notAfter, "2027-02-09T00:00:00Z")
-  assertEquals(staged.chainPem.includes("BEGIN CERTIFICATE"), true)
+  const active = Option.getOrThrow(result.outcome.active)
+  assertEquals(Option.isNone(result.outcome.staged), true)
+  assertEquals(active.notAfter, "2027-02-09T00:00:00Z")
+  assertEquals(active.chainPem.includes("BEGIN CERTIFICATE"), true)
   const calls = await Effect.runPromise(Ref.get(h.transport.calls))
   const parsed = parseCsrPem(calls[0] ?? "", "kanbei.sammohr.dev")
   assertEquals(parsed.keyType, "ec")
@@ -116,11 +124,14 @@ Deno.test("a transport failure is receipted and refuses the renewal", async () =
   assertEquals(result.state, "refused")
 })
 
-Deno.test("reload promotes the staged certificate", async () => {
+Deno.test("reload validates and promotes a staged certificate", async () => {
+  const pair = await Effect.runPromise(issuedPair(NOW))
   const h = await Effect.runPromise(
-    harness((csr) => Effect.succeed(defaultResponder(csr, NOW, 90 * DAY))),
+    harness(() => Effect.die("reload must not touch the CA"), Option.none(), {
+      issuerCommonName: "kanbei-test-root",
+    }),
   )
-  await runRenew(h)
+  await Effect.runPromise(Ref.set(h.store.staged, Option.some(pair)))
   const reloaded = await runWith(
     h,
     NOW,
@@ -139,4 +150,114 @@ Deno.test("a fabricated success without a chain refuses", async () => {
   )
   const result = await runRefusal(h)
   assertEquals(result.failure.code, "csr_response_refused")
+})
+
+Deno.test("an agent-triggered renewal is rate-limited and backs off after a failure", async () => {
+  const clock = movableCsrClock(NOW)
+  const h = await Effect.runPromise(
+    harness(
+      () => Effect.fail(new CsrTransportError({ reason: "CA down" })),
+      Option.none(),
+      { minRenewalIntervalMs: 60_000, maxBackoffMs: 10 * 60_000 },
+    ),
+  )
+  const outcome = await Effect.runPromise(
+    Effect.gen(function* () {
+      const client = yield* CsrClient
+      const first = yield* Effect.flip(client.renew)
+      const second = yield* Effect.flip(client.renew)
+      clock.advance(61_000)
+      const third = yield* Effect.flip(client.renew)
+      clock.advance(20 * 60_000)
+      const fourth = yield* Effect.flip(client.renew)
+      return { first, second, third, fourth }
+    }).pipe(Effect.provide(h.layer), Effect.provideService(Clock.Clock, clock.clock)),
+  )
+  assertEquals(outcome.first.code, "csr_transport_failed")
+  assertEquals(outcome.second.code, "csr_backoff")
+  assertEquals(outcome.third.code, "csr_backoff")
+  assertEquals(outcome.fourth.code, "csr_transport_failed")
+})
+
+Deno.test("reload refuses a staged certificate whose key does not match", async () => {
+  const pair = await Effect.runPromise(issuedPair(NOW))
+  const foreign = await Effect.runPromise(issuedPair(NOW))
+  const h = await Effect.runPromise(
+    harness(() => Effect.die("reload must not touch the CA"), Option.none(), {
+      issuerCommonName: "kanbei-test-root",
+    }),
+  )
+  await Effect.runPromise(
+    Ref.set(h.store.staged, Option.some({ ...pair, privateKeyPkcs8: foreign.privateKeyPkcs8 })),
+  )
+  const error = await runWith(
+    h,
+    NOW,
+    Effect.gen(function* () {
+      const client = yield* CsrClient
+      return yield* Effect.flip(client.reload)
+    }),
+  )
+  assertEquals(error.code, "csr_reload_failed")
+  assertEquals(Option.isNone(await Effect.runPromise(Ref.get(h.store.active))), true)
+})
+
+Deno.test("reload refuses an expired or wrongly issued staged certificate", async () => {
+  const expired = await Effect.runPromise(issuedPair(NOW - 100 * DAY))
+  const h = await Effect.runPromise(
+    harness(() => Effect.die("reload must not touch the CA"), Option.none(), {
+      issuerCommonName: "kanbei-test-root",
+    }),
+  )
+  await Effect.runPromise(Ref.set(h.store.staged, Option.some(expired)))
+  const expiry = await runWith(
+    h,
+    NOW,
+    Effect.gen(function* () {
+      const client = yield* CsrClient
+      return yield* Effect.flip(client.reload)
+    }),
+  )
+  assertEquals(expiry.code, "csr_reload_failed")
+  assertEquals(expiry.detail.includes("expired") || expiry.detail.includes("notAfter"), true)
+
+  const pair = await Effect.runPromise(issuedPair(NOW))
+  const strict = await Effect.runPromise(
+    harness(() => Effect.die("reload must not touch the CA"), Option.none(), {
+      issuerCommonName: "another-intermediate",
+    }),
+  )
+  await Effect.runPromise(Ref.set(strict.store.staged, Option.some(pair)))
+  const issuer = await runWith(
+    strict,
+    NOW,
+    Effect.gen(function* () {
+      const client = yield* CsrClient
+      return yield* Effect.flip(client.reload)
+    }),
+  )
+  assertEquals(issuer.code, "csr_reload_failed")
+  assertEquals(issuer.detail.includes("issuer"), true)
+})
+
+Deno.test("a second renewal inside the floor is rate-limited", async () => {
+  const clock = movableCsrClock(NOW)
+  const h = await Effect.runPromise(
+    harness((csr) => Effect.succeed(defaultResponder(csr, NOW, 90 * DAY)), Option.none(), {
+      minRenewalIntervalMs: 60_000,
+    }),
+  )
+  const outcome = await Effect.runPromise(
+    Effect.gen(function* () {
+      const client = yield* CsrClient
+      yield* client.renew
+      const second = yield* Effect.flip(client.renew)
+      clock.advance(61_000)
+      const third = yield* client.renew.pipe(Effect.flip)
+      return { second, third }
+    }).pipe(Effect.provide(h.layer), Effect.provideService(Clock.Clock, clock.clock)),
+  )
+  assertEquals(outcome.second.code, "csr_rate_limited")
+  // Past the floor the attempt is allowed through, then refused as not due.
+  assertEquals(outcome.third.code, "csr_not_due")
 })

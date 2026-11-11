@@ -21,6 +21,8 @@ import {
   pemEncode,
 } from "../../../src/channels/csr/der.ts"
 import { CSR_COMMON_NAME } from "../../../src/channels/csr/schema.ts"
+import { exportPkcs8, generateSessionKey } from "../../../src/channels/csr/key.ts"
+import type { CsrKeyError } from "../../../src/channels/csr/key.ts"
 import { parseCsrPem } from "../../../src/channels/csr/pkcs10.ts"
 
 const DAY = 24 * 60 * 60 * 1000
@@ -184,3 +186,50 @@ export const runWith = <A, E>(
       Effect.provideService(Clock.Clock, clockAt(now)),
     ),
   )
+
+/** A real key/certificate pair, for staging tests that must pass validation. */
+export const issuedPair = (
+  now: number,
+  validityMs = 90 * DAY,
+): Effect.Effect<InstalledCertificate, CsrKeyError> =>
+  Effect.gen(function* () {
+    const key = yield* generateSessionKey()
+    const leaf = certificateFor(
+      CSR_COMMON_NAME,
+      key.publicKeySpkiDer,
+      now - DAY,
+      now + validityMs,
+    )
+    const privateKeyPkcs8 = yield* exportPkcs8(key)
+    return {
+      chainPem: leaf,
+      leafPem: leaf,
+      privateKeyPkcs8,
+      spki: key.publicKeySpki,
+      notAfter: new Date(now + validityMs).toISOString().replace(/\.\d{3}Z$/u, "Z"),
+      installedAt: new Date(now).toISOString(),
+    }
+  })
+
+export interface MovableCsrClock {
+  readonly clock: Clock.Clock
+  readonly advance: (millis: number) => void
+}
+
+export const movableCsrClock = (start: number): MovableCsrClock => {
+  let current = start
+  return {
+    advance: (millis) => {
+      current += millis
+    },
+    clock: {
+      currentTimeMillisUnsafe: () => current,
+      currentTimeMillis: Effect.sync(() => current),
+      currentTimeNanosUnsafe: () => BigInt(current) * 1_000_000n,
+      currentTimeNanos: Effect.sync(() => BigInt(current) * 1_000_000n),
+      monotonicTimeNanosUnsafe: () => BigInt(current) * 1_000_000n,
+      monotonicTimeNanos: Effect.sync(() => BigInt(current) * 1_000_000n),
+      sleep: () => Effect.void,
+    },
+  }
+}

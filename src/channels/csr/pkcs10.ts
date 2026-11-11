@@ -263,6 +263,8 @@ export interface ParsedCertificate {
   /** DER of the SubjectPublicKeyInfo, tag and length included. */
   readonly spkiDer: Uint8Array
   readonly commonName: string
+  /** Issuer CN; a self-issued leaf is not an ACME certificate. */
+  readonly issuer: string
   readonly sans: ReadonlyArray<string>
   readonly notAfter: string
 }
@@ -334,6 +336,11 @@ export const parseCertificateDer = (der: Uint8Array): ParsedCertificate => {
   }
   const name = parseName(subject.value)
   const cn = name.find(([oid]) => oid === OID_CN)?.[1] ?? ""
+  const issuerField = fields[index + 2]
+  if (issuerField === undefined || issuerField.tag !== 0x30) {
+    throw new CsrPolicyError("TBSCertificate has no issuer")
+  }
+  const issuer = parseName(issuerField.value).find(([oid]) => oid === OID_CN)?.[1] ?? ""
   const times = children(validity.value)
   const end = times[1]
   if (times.length !== 2 || end === undefined) {
@@ -347,6 +354,7 @@ export const parseCertificateDer = (der: Uint8Array): ParsedCertificate => {
     der,
     spkiDer: Uint8Array.from([0x30, spki.value.length, ...spki.value]),
     commonName: cn,
+    issuer,
     sans,
     notAfter: parseTime(end.value, end.tag),
   }
@@ -390,6 +398,9 @@ export const verifyIssuedChain = (
   const actual = Array.from(leaf.spkiDer)
   if (expected.length !== actual.length || expected.some((byte, i) => byte !== actual[i])) {
     throw new CsrPolicyError("certificate public key does not match the CSR")
+  }
+  if (leaf.issuer.trim() === "" || leaf.issuer === leaf.commonName) {
+    throw new CsrPolicyError("certificate is self-issued or has no issuer")
   }
   const notAfter = Date.parse(leaf.notAfter)
   if (!Number.isFinite(notAfter) || notAfter <= now) {
