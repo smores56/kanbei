@@ -3,6 +3,7 @@ import { Clock, Effect, Layer, Option, Ref, Result, Schema } from "effect"
 import { ageDecryptorLayer } from "../../src/adapters/age.ts"
 import { fileBlobSinkLayer } from "../../src/adapters/blob-sink.ts"
 import { fileInboxCheckpointLayer } from "../../src/adapters/inbox-checkpoint.ts"
+import { fileInboxQuarantineLayer } from "../../src/adapters/inbox-quarantine.ts"
 import { fileLedgerStoreLayer } from "../../src/adapters/ledger-file.ts"
 import { contentStoreLayer } from "../../src/kernel/cas.ts"
 import { ledgerLayer } from "../../src/kernel/ledger.ts"
@@ -150,6 +151,7 @@ export const inboxProbes = async (
       Layer.provide(fileLedgerStoreLayer(`${directory}/ledger.jsonl`)),
     )
     const checkpoints = fileInboxCheckpointLayer(`${directory}/checkpoint.json`)
+    const quarantine = fileInboxQuarantineLayer(`${directory}/quarantine.json`)
     const world = await Effect.runPromise(
       Effect.gen(function* () {
         const reader = yield* InboxReader
@@ -162,12 +164,14 @@ export const inboxProbes = async (
               Layer.provide(directoryLayer(directory)),
               Layer.provide(ageDecryptorLayer({ identityPath })),
               Layer.provide(checkpoints),
+              Layer.provide(quarantine),
               Layer.provide(cas),
               Layer.provide(ledger),
             ),
             cas,
             ledger,
             checkpoints,
+            quarantine,
           ),
         ),
         Effect.provideService(

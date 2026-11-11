@@ -1,6 +1,7 @@
 import { Data, Effect, Layer, Schema } from "effect"
 import { fileBlobSinkLayer } from "./adapters/blob-sink.ts"
 import { fileInboxCheckpointLayer } from "./adapters/inbox-checkpoint.ts"
+import { fileInboxQuarantineLayer } from "./adapters/inbox-quarantine.ts"
 import { directoryLayer } from "./adapters/inbox-directory.ts"
 import { fileLedgerStoreLayer } from "./adapters/ledger-file.ts"
 import { ageDecryptorLayer } from "./adapters/age.ts"
@@ -159,10 +160,12 @@ const kernelLayers = (config: BootConfig) => {
     Layer.provide(fileLedgerStoreLayer(`${config.stateDir}/ledger.jsonl`)),
   )
   const checkpoints = fileInboxCheckpointLayer(`${config.stateDir}/inbox-checkpoint.json`)
+  const quarantine = fileInboxQuarantineLayer(`${config.stateDir}/inbox-quarantine.json`)
   const reader = inboxReaderLayer(inboxConfigFor(config)).pipe(
     Layer.provide(directoryLayer(config.inboxDir)),
     Layer.provide(ageDecryptorLayer({ identityPath: config.identityPath })),
     Layer.provide(checkpoints),
+    Layer.provide(quarantine),
     Layer.provide(cas),
     Layer.provide(ledger),
   )

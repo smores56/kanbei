@@ -9,6 +9,7 @@ import { AgeDecryptor } from "./age.ts"
 import { InboxCheckpointStore } from "./checkpoint.ts"
 import type { InboxCheckpoint } from "./checkpoint.ts"
 import { InboxDirectory } from "./directory.ts"
+import { InboxQuarantineStore } from "./quarantine.ts"
 import { IngestBatchEnvelope } from "./schema.ts"
 import type { IngestBatchEnvelope as BatchEnvelope, OriginId, ScanCoverage } from "./schema.ts"
 import { hostEnvelopeToBatch, isHostEnvelope, parseHostEnvelope } from "./wire.ts"
@@ -192,8 +193,8 @@ interface InvalidBatch {
 }
 
 const batchKey = (origin: OriginId, digest: ContentDigest): string => `${origin}|${digest}`
-const itemKey = (origin: OriginId, batch: ContentDigest, digest: ContentDigest): string =>
-  `${origin}|${batch}|${digest}`
+/** Items dedupe by origin and body: the same bytes in a new batch are one item. */
+const itemKey = (origin: OriginId, digest: ContentDigest): string => `${origin}|${digest}`
 
 const decodeBase64 = (value: string): Result.Result<Uint8Array, string> => {
   try {
@@ -205,13 +206,12 @@ const decodeBase64 = (value: string): Result.Result<Uint8Array, string> => {
 
 const invalid = (detail: string): InvalidBatch => ({ reason: "parse_failed", detail })
 
+/** Structural detail only: a parse error message can quote the plaintext. */
 const decodeJson = (plaintext: Uint8Array): Result.Result<unknown, InvalidBatch> => {
   try {
     return Result.succeed(JSON.parse(new TextDecoder().decode(plaintext)))
-  } catch (error) {
-    return Result.fail(
-      invalid(error instanceof Error ? error.message.slice(0, 300) : String(error)),
-    )
+  } catch {
+    return Result.fail(invalid(`plaintext is not JSON ( bytes)`))
   }
 }
 
@@ -243,8 +243,7 @@ export const parseBatch = (
     return Result.try({
       try: () =>
         Schema.decodeUnknownSync(IngestBatchEnvelope, { onExcessProperty: "error" })(json.success),
-      catch: (error) =>
-        invalid(error instanceof Error ? error.message.slice(0, 300) : String(error)),
+      catch: () => invalid(`manifest does not match the schema ( bytes)`),
     })
   })
 
@@ -346,7 +345,12 @@ export const inboxReaderLayer = (
 ): Layer.Layer<
   InboxReader,
   never,
-  InboxDirectory | AgeDecryptor | InboxCheckpointStore | ContentStore | Ledger
+  | InboxDirectory
+  | AgeDecryptor
+  | InboxCheckpointStore
+  | InboxQuarantineStore
+  | ContentStore
+  | Ledger
 > =>
   Layer.effect(
     InboxReader,
@@ -357,9 +361,24 @@ export const inboxReaderLayer = (
       }
       const directory = yield* InboxDirectory
       const decryptor = yield* AgeDecryptor
+      const quarantines = yield* InboxQuarantineStore
       const checkpoints = yield* InboxCheckpointStore
       const checkpoint = yield* checkpoints.load.pipe(Effect.orDie)
-      const state = yield* Ref.make<InboxState>(stateFromCheckpoint(checkpoint))
+      const recorded = yield* quarantines.load.pipe(Effect.orDie)
+      const state = yield* Ref.make<InboxState>({
+        ...stateFromCheckpoint(checkpoint),
+        quarantined: recorded.map((entry) => ({
+          name: entry.name,
+          reason: entry.reason,
+          detail: entry.detail,
+          ...(entry.ciphertextDigest === undefined
+            ? {}
+            : { ciphertextDigest: entry.ciphertextDigest }),
+        })),
+        // A stale checkpoint must not re-admit a name the sidecar already buried.
+        quarantineNames: new Set(recorded.map((entry) => entry.name)),
+        handled: new Set([...checkpoint.handled, ...recorded.map((entry) => entry.name)]),
+      })
 
       const quarantine = (
         name: string,
@@ -367,20 +386,22 @@ export const inboxReaderLayer = (
         detail: string,
         ciphertextDigest?: ContentDigest,
       ): Effect.Effect<void> =>
-        Ref.update(state, (current) => ({
-          ...current,
-          quarantined: [
-            ...current.quarantined,
-            {
-              name,
-              reason,
-              detail,
-              ...(ciphertextDigest === undefined ? {} : { ciphertextDigest }),
-            },
-          ],
-          handled: new Set([...current.handled, name]),
-          quarantineNames: new Set([...current.quarantineNames, name]),
-        }))
+        Effect.gen(function* () {
+          const entry = {
+            name,
+            reason,
+            detail,
+            ...(ciphertextDigest === undefined ? {} : { ciphertextDigest }),
+          }
+          yield* Ref.update(state, (current) => ({
+            ...current,
+            quarantined: [...current.quarantined, entry],
+            handled: new Set([...current.handled, name]),
+            quarantineNames: new Set([...current.quarantineNames, name]),
+          }))
+          // Durable beside the checkpoint: a restarted reader must skip it too.
+          yield* quarantines.record(entry).pipe(Effect.orDie)
+        })
 
       const processFile = (
         name: string,
@@ -516,11 +537,16 @@ export const inboxReaderLayer = (
                   kind: "credential_detected" as const,
                   origin: manifest.origin,
                   name,
-                  detail: findings.join(","),
+                  detail: findings.slice(0, 20).join(","),
                 },
               ],
             }))
-            yield* quarantine(name, "credential_detected", findings.join(","), ciphertextDigest)
+            yield* quarantine(
+              name,
+              "credential_detected",
+              findings.slice(0, 20).join(","),
+              ciphertextDigest,
+            )
             return "quarantined" as const
           }
 
@@ -552,7 +578,7 @@ export const inboxReaderLayer = (
             yield* quarantine(
               name,
               "publish_failed",
-              String(published.failure).slice(0, 300),
+              "publish failed before the ledger append",
               ciphertextDigest,
             )
             return "quarantined" as const
@@ -576,7 +602,7 @@ export const inboxReaderLayer = (
           const batchGaps = [...delta.gaps, ...suppression]
           const seenItems = new Set(current.seenItems)
           const created = manifest.entries.flatMap((entry) => {
-            const item = itemKey(manifest.origin, manifest.batchDigest, entry.body)
+            const item = itemKey(manifest.origin, entry.body)
             if (seenItems.has(item)) return []
             seenItems.add(item)
             const bytes = blobs.get(entry.body)

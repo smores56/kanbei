@@ -2,6 +2,7 @@ import { Clock, Effect, Layer, Option, Ref, Schema } from "effect"
 import { ageDecryptorLayer } from "../adapters/age.ts"
 import { fileBlobSinkLayer } from "../adapters/blob-sink.ts"
 import { fileInboxCheckpointLayer } from "../adapters/inbox-checkpoint.ts"
+import { fileInboxQuarantineLayer } from "../adapters/inbox-quarantine.ts"
 import { fileLedgerStoreLayer } from "../adapters/ledger-file.ts"
 import { directoryLayer } from "../adapters/inbox-directory.ts"
 import type { InboxConfig, PollResult } from "../channels/inbox/reader.ts"
@@ -120,10 +121,12 @@ export const runWorld = async (options: {
         Layer.provide(fileLedgerStoreLayer(`${directory}/ledger.jsonl`)),
       )
       const checkpoints = fileInboxCheckpointLayer(`${directory}/checkpoint.json`)
+      const quarantine = fileInboxQuarantineLayer(`${directory}/quarantine.json`)
       const reader = inboxReaderLayer(config).pipe(
         Layer.provide(directoryLayer(directory)),
         Layer.provide(ageDecryptorLayer({ identityPath })),
         Layer.provide(checkpoints),
+        Layer.provide(quarantine),
         Layer.provide(cas),
         Layer.provide(ledger),
       )
@@ -133,7 +136,16 @@ export const runWorld = async (options: {
         defaultWindowMs: options.fixture.clock.freshnessWindowMs,
         knownOrigins,
       }).pipe(Layer.provide(feed), Layer.provide(sink))
-      const layers = Layer.mergeAll(reader, watcher, sink, blobs, cas, ledger, checkpoints)
+      const layers = Layer.mergeAll(
+        reader,
+        watcher,
+        sink,
+        blobs,
+        cas,
+        ledger,
+        checkpoints,
+        quarantine,
+      )
 
       return yield* Effect.gen(function* () {
         const inbox = yield* InboxReader

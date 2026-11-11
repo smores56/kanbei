@@ -67,6 +67,15 @@ const write = (
   plaintext: string,
 ): Promise<void> => writeBatch(`${directory}/${name}`, plaintext, recipient)
 
+const pollWith = (layers: ReturnType<typeof inboxTestLayers>) =>
+  Effect.runPromise(
+    Effect.gen(function* () {
+      const reader = yield* InboxReaderTag
+      const poll = yield* reader.poll
+      return { poll, state: yield* reader.state }
+    }).pipe(Effect.provide(layers.layer), Effect.orDie),
+  )
+
 Deno.test("a valid batch publishes blobs, observations, one coverage receipt, and a heartbeat", async () => {
   await scenario(async (context) => {
     const body = '{"subject":"hello"}'
@@ -438,7 +447,9 @@ Deno.test("a poll window selects the next unprocessed files, not the first N nam
         }),
       )
       assertEquals(outcome.receipts.length, 3)
-      assertEquals(outcome.observations.length, 3)
+      // Identical bodies across batches are one item per origin.
+      assertEquals(outcome.observations.length, 1)
+      assertEquals(outcome.duplicates, 2)
     },
     { limits: { ...limits, maxBatchesPerPoll: 1 } },
   )
@@ -446,4 +457,72 @@ Deno.test("a poll window selects the next unprocessed files, not the first N nam
 
 Deno.test("the inbox cap is the host's 1 MiB frame cap", () => {
   assertEquals(MAX_BATCH_BYTES, 1_048_576)
+})
+
+Deno.test("a dead file cannot starve later batches even after a checkpoint loss", async () => {
+  await withTempDir("inbox-quarantine", async (directory) => {
+    const key = await makeKey(directory)
+    const config: InboxConfig = {
+      identityPath: key.identityPath,
+      allowedOrigins: ["tuta-mail"],
+      limits: { ...limits, maxBatchesPerPoll: 1 },
+      freshnessWindowMs: 3_600_000,
+    }
+    // A raw file is not age ciphertext: the reader must bury it, not retry it.
+    await Deno.writeTextFile(`${directory}/a-dead.age`, "not age ciphertext")
+    await write(
+      directory,
+      key.recipient,
+      "b-live.age",
+      await buildBatch({
+        recipient: key.recipient,
+      }),
+    )
+    const first = await pollWith(inboxTestLayers(directory, config))
+    assertEquals(first.poll.accepted, 0)
+    assertEquals(first.state.quarantined.map((entry) => entry.name), ["a-dead.age"])
+    // The next window reaches the live batch instead of retrying the dead file.
+    const advanced = await pollWith(inboxTestLayers(directory, config))
+    assertEquals(advanced.poll.accepted, 1)
+    // A lost checkpoint must not re-admit the buried name ahead of the live batch.
+    const restarted = await pollWith(
+      inboxTestLayers(directory, config, {
+        checkpoint: `${directory}/fresh-checkpoint.json`,
+        quarantine: `${directory}/quarantine.json`,
+      }),
+    )
+    assertEquals(restarted.poll.accepted, 1)
+    assertEquals(restarted.state.quarantined.map((entry) => entry.name), ["a-dead.age"])
+    assertEquals(restarted.state.observations.length, 1)
+  })
+})
+
+Deno.test("a quarantine detail never quotes the plaintext", async () => {
+  await withTempDir("inbox-detail", async (directory) => {
+    const key = await makeKey(directory)
+    const marker = "SECRET-MARKER-42"
+    const plaintext = `{"subject":"hello","note":"${marker}"}`
+    await write(directory, key.recipient, "sketchy.age", plaintext)
+    const state = await Effect.runPromise(
+      Effect.gen(function* () {
+        const reader = yield* InboxReaderTag
+        yield* reader.poll
+        return yield* reader.state
+      }).pipe(
+        Effect.provide(
+          inboxTestLayers(directory, {
+            identityPath: key.identityPath,
+            allowedOrigins: ["tuta-mail"],
+            limits,
+            freshnessWindowMs: 3_600_000,
+          }).layer,
+        ),
+        Effect.orDie,
+      ),
+    )
+    assertEquals(state.quarantined.map((entry) => entry.reason), ["parse_failed"])
+    const detail = state.quarantined[0]?.detail ?? ""
+    assertEquals(detail.includes(marker), false)
+    assertEquals(detail.includes("hello"), false)
+  })
 })

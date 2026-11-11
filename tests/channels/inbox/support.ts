@@ -140,6 +140,7 @@ import { Layer } from "effect"
 import { ageDecryptorLayer } from "../../../src/adapters/age.ts"
 import { fileBlobSinkLayer } from "../../../src/adapters/blob-sink.ts"
 import { fileInboxCheckpointLayer } from "../../../src/adapters/inbox-checkpoint.ts"
+import { fileInboxQuarantineLayer } from "../../../src/adapters/inbox-quarantine.ts"
 import { directoryLayer } from "../../../src/adapters/inbox-directory.ts"
 import { fileLedgerStoreLayer } from "../../../src/adapters/ledger-file.ts"
 import type { InboxConfig } from "../../../src/channels/inbox/reader.ts"
@@ -159,22 +160,32 @@ export const testLimits = {
  * The real canonical ingest stack: file CAS, file ledger, file checkpoint, the
  * inbox reader, and the decryptor. Tests never mock the durable path.
  */
-export const inboxTestLayers = (directory: string, config: InboxConfig) => {
+export const inboxTestLayers = (
+  directory: string,
+  config: InboxConfig,
+  paths: { readonly checkpoint?: string; readonly quarantine?: string } = {},
+) => {
   const blobs = fileBlobSinkLayer(`${directory}/cas`)
   const cas = contentStoreLayer.pipe(Layer.provide(blobs))
   const ledger = ledgerLayer("inbox-test").pipe(
     Layer.provide(fileLedgerStoreLayer(`${directory}/ledger.jsonl`)),
   )
-  const checkpoints = fileInboxCheckpointLayer(`${directory}/checkpoint.json`)
+  const checkpoints = fileInboxCheckpointLayer(
+    paths.checkpoint ?? `${directory}/checkpoint.json`,
+  )
+  const quarantine = fileInboxQuarantineLayer(
+    paths.quarantine ?? `${directory}/quarantine.json`,
+  )
   const reader = inboxReaderLayer(config).pipe(
     Layer.provide(directoryLayer(directory)),
     Layer.provide(ageDecryptorLayer({ identityPath: config.identityPath })),
     Layer.provide(checkpoints),
+    Layer.provide(quarantine),
     Layer.provide(cas),
     Layer.provide(ledger),
   )
   return {
-    layer: Layer.mergeAll(reader, blobs, cas, ledger, checkpoints),
+    layer: Layer.mergeAll(reader, blobs, cas, ledger, checkpoints, quarantine),
     reader,
     blobs,
   }
