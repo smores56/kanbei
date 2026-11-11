@@ -1,14 +1,14 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "spikeId": "S3",
   "validationId": "ISO-1",
   "dataset": "security-v1",
-  "generatedAt": "2026-11-10T05:06:59.941Z",
+  "generatedAt": "2026-11-11T19:32:29.834Z",
   "host": {
     "kernel": "linux-6.18.39",
     "runtime": "deno@2.9.2",
-    "cpus": 4,
-    "totalMemoryBytes": 8329715712,
+    "cpus": 32,
+    "totalMemoryBytes": 33551433728,
     "cgroupVersion": "v2",
     "cgroupControllers": [
       "cpuset",
@@ -26,7 +26,9 @@
     "cgroupNsdelegate": true,
     "delegatedParent": "owned-by-uid",
     "kvmDevice": "accessible",
-    "microvmRuntimes": [],
+    "microvmRuntimes": [
+      "/run/current-system/sw/bin/microvm"
+    ],
     "generalVmm": [],
     "wasmEngine": "v8@14.9.207.2-rusty (core wasm, no WASI runtime on PATH)",
     "privilegedOperations": false
@@ -35,7 +37,7 @@
     "kind": "rootless-userns-chroot-landlock",
     "uid": 1000,
     "landlockAbi": 7,
-    "cgroupRoot": "/user.slice/user-1000.slice/user@1000.service/app.slice/run-p360771-i360772.service",
+    "cgroupRoot": "/user.slice/user-1000.slice/user@1000.service/app.slice/run-p1826952-i1826953.service",
     "delegatedBy": "systemd-run --user --property=Delegate=yes --property=DelegateSubgroup=supervisor",
     "dependencies": [
       "user systemd manager, used once to acquire a delegated cgroup root",
@@ -57,69 +59,70 @@
     {
       "arm": "process-cgroup",
       "status": "measured",
+      "scope": "The nine containment ids, cold start, CPU, IPC, and density describe one Deno agent per rootless namespace, chroot, Landlock ruleset, and cgroup; no network, credential, or trust-root boundary is claimed",
       "metrics": {
         "coldStartMs": {
-          "p50Ms": 290.40914899999984,
-          "p95Ms": 415.6055259999998,
-          "maxMs": 415.6055259999998,
+          "p50Ms": 112.6506280000001,
+          "p95Ms": 120.31674999999996,
+          "maxMs": 120.31674999999996,
           "samples": 5
         },
-        "cpuWorkMs": 18.23,
+        "cpuWorkMs": 16.2,
         "cpuWorkIterations": 2000000,
         "ipcRoundTripMs": {
-          "p50Ms": 0.3101110000002336,
-          "p95Ms": 0.5220509999999194,
-          "maxMs": 13.541917999999896,
+          "p50Ms": 0.19141100000001643,
+          "p95Ms": 0.2530709999998635,
+          "maxMs": 5.967236999999841,
           "samples": 200
         },
-        "rssPerAgentBytes": 17043456,
+        "rssPerAgentBytes": 14324736,
         "density": [
           {
             "agents": 1,
             "outcome": "ok",
-            "readyMs": 396.5,
-            "totalRssBytes": 52215808,
-            "perAgentRssBytes": 52215808,
+            "readyMs": 103.4,
+            "totalRssBytes": 15646720,
+            "perAgentRssBytes": 15646720,
             "failures": 0
           },
           {
             "agents": 2,
             "outcome": "ok",
-            "readyMs": 441.7,
-            "totalRssBytes": 66543616,
-            "perAgentRssBytes": 33271808,
+            "readyMs": 118.6,
+            "totalRssBytes": 29704192,
+            "perAgentRssBytes": 14852096,
             "failures": 0
           },
           {
             "agents": 4,
             "outcome": "ok",
-            "readyMs": 551.2,
-            "totalRssBytes": 94601216,
-            "perAgentRssBytes": 23650304,
+            "readyMs": 135.8,
+            "totalRssBytes": 64536576,
+            "perAgentRssBytes": 16134144,
             "failures": 0
           },
           {
             "agents": 8,
             "outcome": "ok",
-            "readyMs": 673.8,
-            "totalRssBytes": 154324992,
-            "perAgentRssBytes": 19290624,
+            "readyMs": 139,
+            "totalRssBytes": 119721984,
+            "perAgentRssBytes": 14965248,
             "failures": 0
           },
           {
             "agents": 16,
             "outcome": "ok",
-            "readyMs": 1138,
-            "totalRssBytes": 272695296,
-            "perAgentRssBytes": 17043456,
+            "readyMs": 169.4,
+            "totalRssBytes": 229195776,
+            "perAgentRssBytes": 14324736,
             "failures": 0
           },
           {
             "agents": 32,
             "outcome": "ok",
-            "readyMs": 2648,
-            "totalRssBytes": 500514816,
-            "perAgentRssBytes": 15641088,
+            "readyMs": 290.4,
+            "totalRssBytes": 434728960,
+            "perAgentRssBytes": 13585280,
             "failures": 0
           }
         ]
@@ -128,37 +131,37 @@
         {
           "id": "crash-isolation",
           "status": "pass",
-          "detail": "SIGKILL to agent host pid 362821 (namespace pid 1): waiter exit code=137 signal=SIGKILL, cgroup populated=0=true; 2/2 peers still answered PING"
+          "detail": "SIGKILL to agent host pid 1829689 (namespace pid 1): waiter exit code=137 signal=SIGKILL, cgroup populated=0=true; 2/2 peers still answered PING"
         },
         {
           "id": "hang-containment",
           "status": "pass",
-          "detail": "cgroup.kill on a spinning agent: populated=0 in 15 ms (limit 5000 ms), waiter exit code=137; peer answered PING"
+          "detail": "cgroup.kill on a spinning agent: populated=0 in 11 ms (limit 5000 ms), waiter exit code=137; peer answered PING"
         },
         {
           "id": "oom-containment",
           "status": "pass",
-          "detail": "memory.max=64 MiB, 128 MiB request: memory.events oom_kill=1, waiter exit code=137, cgroup populated=0=true after 99 ms; peer answered PING"
+          "detail": "memory.max=64 MiB, 128 MiB request: memory.events oom_kill=1, waiter exit code=137, cgroup populated=0=true after 27 ms; peer answered PING"
         },
         {
           "id": "fork-bomb-containment",
           "status": "pass",
-          "detail": "200 fork attempts with pids.max=16: FORKBOMB 28, peak pids.current=16, pids.events max=2, cgroup populated=0=true, 0 processes survived cgroup teardown"
+          "detail": "200 fork attempts with pids.max=16: FORKBOMB 28, pids.events max=6 (refusals observed), peak pids.current=16 (observation only; the kernel caps it at pids.max), marker processes before kill=7, after kill populated=0, cgroup.procs=0, marker survivors=0"
         },
         {
           "id": "cleanup-after-kill",
           "status": "pass",
-          "detail": "SIGKILL of agent host pid 363058 (namespace pid 1, waiter code=137); orphan 28 reaped, cgroup populated=0=true, cgroup removed=true, 0 marker processes left"
+          "detail": "SIGKILL of agent host pid 1830283 (namespace pid 1, waiter code=137): orphan host pid 1830330 (namespace pid 28) confirmed gone; pids.current before kill=10, marker pids before kill=1, after kill populated=0, cgroup.procs=0, marker survivors=0, cgroup removed=true, host processes 567->567"
         },
         {
           "id": "orphan-reaping",
           "status": "pass",
-          "detail": "grandchild visible before kill (1), 0 alive after the namespace init died and the cgroup emptied=true"
+          "detail": "orphan host pid 1830480 (namespace pid 28) visible before the kill via cgroup membership (pids.current=10) and marker scan (1 pids); after the namespace init died: populated=0, cgroup.procs=0, marker survivors=0, orphan confirmed gone, host processes 567->567"
         },
         {
           "id": "ipc-round-trip",
           "status": "pass",
-          "detail": "PING/PONG over the supervisor pipe completed 200 times, p95 0.52 ms"
+          "detail": "PING/PONG over the supervisor pipe completed 200 times, p95 0.25 ms"
         },
         {
           "id": "resource-ceilings",
@@ -168,7 +171,7 @@
         {
           "id": "hosts-agent-workload",
           "status": "pass",
-          "detail": "the reference agent ran as a Deno TypeScript process with environment and process capability inside the per-agent namespace, chroot, and cgroup"
+          "detail": "agent reported `WORKLOAD ok`: read /etc/os-release, wrote and read /scratch/workload.txt, spawned true, and reached 127.0.0.1:9 with ECONNREFUSED"
         }
       ],
       "operability": {
@@ -177,7 +180,7 @@
           "unprivileged user+PID+mount namespaces with chroot and Landlock"
         ],
         "requiresRoot": false,
-        "supervisorLoc": 700,
+        "supervisorLoc": 838,
         "packaging": "One process per agent inside a per-agent rootless namespace and chroot, under a delegated cgroup; the agent entrypoint is a TypeScript module run by deno",
         "debuggability": "Host-side /proc and cgroup files; the agent pid is the namespace init and cgroup membership is the signal path. The agent sees no /sys and no systemd unit exists to inspect",
         "limitations": [
@@ -187,7 +190,7 @@
           "Landlock covers path-based filesystem access only; network and signal policy stay outside this spike",
           "Each agent pays user/PID/mount namespace setup, bind mounts, chroot, Landlock, and cgroup creation on the cold-start path",
           "RLIMIT_AS is unusable for a V8 process because the runtime reserves large virtual ranges",
-          "Agent capabilities are inner Deno permissions only (`--allow-env`, `--allow-run` here); the OS sandbox remains the real boundary"
+          "Agent capabilities are inner Deno permissions only (`--allow-env`, `--allow-run`, `--allow-read=/etc`, `--allow-write=/scratch`, `--allow-net=127.0.0.1:9` here); the OS sandbox remains the real boundary"
         ]
       },
       "notes": [
@@ -198,27 +201,28 @@
     {
       "arm": "wasm-instance",
       "status": "measured",
+      "scope": "Crash, hang, OOM, cleanup, and IPC describe one WebAssembly instance inside one permission-less Deno worker; fork-bomb and orphan checks are not applicable because an instance cannot create processes, and filesystem, network, and process capability are absent",
       "metrics": {
         "coldStartMs": {
-          "p50Ms": 430.9009189999997,
-          "p95Ms": 443.88539500000115,
-          "maxMs": 443.88539500000115,
+          "p50Ms": 93.75080600000001,
+          "p95Ms": 96.71424499999921,
+          "maxMs": 96.71424499999921,
           "samples": 5
         },
-        "cpuWorkMs": 1.27,
+        "cpuWorkMs": 0.63,
         "cpuWorkIterations": 2000000,
         "ipcRoundTripMs": {
-          "p50Ms": 0.14369000000078813,
-          "p95Ms": 0.2984010000000126,
-          "maxMs": 1.4062529999973776,
+          "p50Ms": 0.07360000000062428,
+          "p95Ms": 0.13083999999980733,
+          "maxMs": 1.3039339999995718,
           "samples": 200
         },
-        "rssPerAgentBytes": 22192128,
+        "rssPerAgentBytes": 22218496,
         "density": [
           {
             "agents": 1,
             "outcome": "ok",
-            "readyMs": 361.4,
+            "readyMs": 89.1,
             "totalRssBytes": 0,
             "perAgentRssBytes": 0,
             "failures": 0
@@ -226,49 +230,49 @@
           {
             "agents": 2,
             "outcome": "ok",
-            "readyMs": 286.7,
-            "totalRssBytes": 43905024,
-            "perAgentRssBytes": 21952512,
+            "readyMs": 120.3,
+            "totalRssBytes": 40689664,
+            "perAgentRssBytes": 20344832,
             "failures": 0
           },
           {
             "agents": 4,
             "outcome": "ok",
-            "readyMs": 459.8,
-            "totalRssBytes": 91181056,
-            "perAgentRssBytes": 22795264,
+            "readyMs": 139.9,
+            "totalRssBytes": 87982080,
+            "perAgentRssBytes": 21995520,
             "failures": 0
           },
           {
             "agents": 8,
             "outcome": "ok",
-            "readyMs": 879.1,
-            "totalRssBytes": 182116352,
-            "perAgentRssBytes": 22764544,
+            "readyMs": 201.3,
+            "totalRssBytes": 176705536,
+            "perAgentRssBytes": 22088192,
             "failures": 0
           },
           {
             "agents": 16,
             "outcome": "ok",
-            "readyMs": 2062.5,
-            "totalRssBytes": 355074048,
-            "perAgentRssBytes": 22192128,
+            "readyMs": 516.5,
+            "totalRssBytes": 355495936,
+            "perAgentRssBytes": 22218496,
             "failures": 0
           },
           {
             "agents": 32,
             "outcome": "ok",
-            "readyMs": 4489.2,
-            "totalRssBytes": 687980544,
-            "perAgentRssBytes": 21499392,
+            "readyMs": 856.8,
+            "totalRssBytes": 714162176,
+            "perAgentRssBytes": 22317568,
             "failures": 0
           },
           {
             "agents": 64,
             "outcome": "ok",
-            "readyMs": 8431,
-            "totalRssBytes": 1381060608,
-            "perAgentRssBytes": 21579072,
+            "readyMs": 1736.6,
+            "totalRssBytes": 1428312064,
+            "perAgentRssBytes": 22317376,
             "failures": 0
           }
         ]
@@ -282,7 +286,7 @@
         {
           "id": "hang-containment",
           "status": "pass",
-          "detail": "infinite wasm loop blocked its worker until the supervisor terminated it in 0.1 ms; peer instance answered (instances cannot be preempted individually)"
+          "detail": "infinite wasm loop blocked its worker until the supervisor terminated it in 0.0 ms; peer instance answered (instances cannot be preempted individually)"
         },
         {
           "id": "oom-containment",
@@ -297,7 +301,7 @@
         {
           "id": "cleanup-after-kill",
           "status": "pass",
-          "detail": "8 workers terminated and the supervisor created a fresh instance afterwards; RSS peak 307.5 MiB, residual 179.2 MiB not returned to the OS"
+          "detail": "8 workers terminated and the supervisor created a fresh instance afterwards; RSS peak 283.0 MiB, residual 165.1 MiB not returned to the OS"
         },
         {
           "id": "orphan-reaping",
@@ -307,7 +311,7 @@
         {
           "id": "ipc-round-trip",
           "status": "pass",
-          "detail": "postMessage ping/pong completed 200 times, p95 0.3 ms"
+          "detail": "postMessage ping/pong completed 200 times, p95 0.13 ms"
         },
         {
           "id": "resource-ceilings",
@@ -342,27 +346,25 @@
     },
     {
       "arm": "microvm",
-      "status": "blocked",
-      "blockedReason": "no microVM runtime on PATH (firecracker, cloud-hypervisor, microvm all absent; general VMM found: none); /dev/kvm is accessible; no sealed guest kernel, initrd, or rootfs exists in the repository, and the host has no toolchain to build one",
+      "status": "inconclusive",
+      "scope": "No containment or density measurement ran; a runtime exists but no sealed guest image is available",
+      "blockedReason": "microvm runtimes present (/run/current-system/sw/bin/microvm) but no guest image is sealed for this spike",
       "checks": [],
       "operability": {
         "hostDependencies": [
-          "firecracker or cloud-hypervisor",
-          "sealed guest kernel and initrd",
-          "guest rootfs build pipeline"
+          "/run/current-system/sw/bin/microvm",
+          "sealed guest kernel and initrd"
         ],
         "requiresRoot": false,
         "supervisorLoc": 0,
         "packaging": "One microVM per agent with a pre-built, sealed guest image",
-        "debuggability": "Serial console and guest agent only; no host-side process introspection",
+        "debuggability": "Serial console and guest agent only",
         "limitations": [
-          "Every agent code or runtime change requires rebuilding and resealing the guest image",
-          "Guest images are additional release artifacts to store, verify, and roll back",
-          "Not measured in this spike; no containment or density claim is made"
+          "No guest image available, so nothing was measured"
         ]
       },
       "notes": [
-        "Blocked, not inconclusive: no measurement was attempted because the mechanism is not installable without a guest image"
+        "Runtime present but the spike has no sealed guest image; no claim is made"
       ]
     }
   ],
@@ -442,27 +444,29 @@
   ],
   "recommendation": {
     "decision": "DG-4",
-    "status": "recommend",
-    "recommended": "process-cgroup",
+    "status": "no-selection",
     "rule": "Eligible = status measured AND every containment check pass or not-applicable AND hosts-agent-workload pass AND density at target concurrency ok AND p95 cold start <= 500 ms AND per-agent RSS <= 64 MiB AND p95 IPC <= 25 ms AND no root requirement AND host dependencies <= 2. Among eligible arms, select the lowest p95 cold start, then the lowest per-agent RSS, then the lowest p95 IPC. No eligible arm means no selection; DG-4 stays open.",
     "targetConcurrency": 16,
-    "eligible": [
-      "process-cgroup"
-    ],
+    "eligible": [],
     "ineligible": [
+      {
+        "arm": "process-cgroup",
+        "reason": "838 implementation lines exceed 700"
+      },
       {
         "arm": "wasm-instance",
         "reason": "containment failed: resource-ceilings, hosts-agent-workload"
       },
       {
         "arm": "microvm",
-        "reason": "status blocked: no microVM runtime on PATH (firecracker, cloud-hypervisor, microvm all absent; general VMM found: none); /dev/kvm is accessible; no sealed guest kernel, initrd, or rootfs exists in the repository, and the host has no toolchain to build one"
+        "reason": "status inconclusive: microvm runtimes present (/run/current-system/sw/bin/microvm) but no guest image is sealed for this spike"
       }
     ],
     "rationale": [
-      "process-cgroup is the only arm that satisfies every pre-registered gate",
+      "no arm satisfies the pre-registered gates; DG-4 stays open",
+      "process-cgroup: 838 implementation lines exceed 700",
       "wasm-instance: containment failed: resource-ceilings, hosts-agent-workload",
-      "microvm: status blocked: no microVM runtime on PATH (firecracker, cloud-hypervisor, microvm all absent; general VMM found: none); /dev/kvm is accessible; no sealed guest kernel, initrd, or rootfs exists in the repository, and the host has no toolchain to build one"
+      "microvm: status inconclusive: microvm runtimes present (/run/current-system/sw/bin/microvm) but no guest image is sealed for this spike"
     ]
   },
   "residuals": [
@@ -476,7 +480,8 @@
     "The WASM density row at one instance can read near-zero MiB because the process RSS delta is dominated by V8 heap reuse; the rows above one instance are the meaningful per-agent figures.",
     "The microVM arm is blocked: no microVM runtime and no sealed guest image on this host. `DG-4` cannot select a microVM on this evidence.",
     "Fork-bomb containment was probed with `pids.max=16` on a dedicated agent cgroup, not at the 64-task per-agent ceiling.",
-    "The one systemd call is the delegated cgroup acquisition in `main.ts`; the per-agent path uses cgroupfs and namespaces only, but the supervisor still runs under the deployment user manager."
+    "The one systemd call is the delegated cgroup acquisition in `main.ts`; the per-agent path uses cgroupfs and namespaces only, but the supervisor still runs under the deployment user manager.",
+    "Orphan and fork-bomb liveness is proved before the kill by cgroup membership, marker argv survival, and host process counts. The marker is the argv[0] of a resident bash because nix coreutils dispatches applets on argv[0] and would abort under `exec -a`."
   ],
   "evidence": {
     "status": "emitted",
@@ -503,7 +508,7 @@
         0
       ],
       "environment": {
-        "hostFingerprint": "sha256:e626bea75247a2aaaebaef3e951d5700b34ec2a7a965e7857bb853fecc66dd24",
+        "hostFingerprint": "sha256:d7fc918265e4a6804df85b3bef219de76d069f7edaf7ac8af68fb9605c6d97c1",
         "kernel": "linux-6.18.39",
         "runtime": "deno@2.9.2",
         "sandboxPosture": "unverified",
@@ -514,29 +519,35 @@
       ],
       "modelRecordings": [],
       "artifacts": [
-        "sha256:17853dc7d10831c12ef0582d63a15ceef71ba16e20b0b68056539fef46b8cde3"
+        "sha256:48dcc60ad222c536a6dbdfb4b38fa6b6cc74e06034e51fa26187c30718373c28"
       ],
-      "outcome": "pass",
+      "outcome": "inconclusive",
       "metrics": {
         "process-cgroup.checksPassed": 9,
         "process-cgroup.checksFailed": 0,
-        "process-cgroup.coldStartP50Ms": 290.40914899999984,
-        "process-cgroup.coldStartP95Ms": 415.6055259999998,
-        "process-cgroup.ipcP50Ms": 0.3101110000002336,
-        "process-cgroup.ipcP95Ms": 0.5220509999999194,
-        "process-cgroup.rssPerAgentMib": 16.25390625,
+        "process-cgroup.coldStartP50Ms": 112.6506280000001,
+        "process-cgroup.coldStartP95Ms": 120.31674999999996,
+        "process-cgroup.ipcP50Ms": 0.19141100000001643,
+        "process-cgroup.ipcP95Ms": 0.2530709999998635,
+        "process-cgroup.rssPerAgentMib": 13.6611328125,
         "process-cgroup.densityAtTarget": 0,
         "wasm-instance.checksPassed": 5,
         "wasm-instance.checksFailed": 2,
-        "wasm-instance.coldStartP50Ms": 430.9009189999997,
-        "wasm-instance.coldStartP95Ms": 443.88539500000115,
-        "wasm-instance.ipcP50Ms": 0.14369000000078813,
-        "wasm-instance.ipcP95Ms": 0.2984010000000126,
-        "wasm-instance.rssPerAgentMib": 21.1640625,
+        "wasm-instance.coldStartP50Ms": 93.75080600000001,
+        "wasm-instance.coldStartP95Ms": 96.71424499999921,
+        "wasm-instance.ipcP50Ms": 0.07360000000062428,
+        "wasm-instance.ipcP95Ms": 0.13083999999980733,
+        "wasm-instance.rssPerAgentMib": 21.189208984375,
         "wasm-instance.densityAtTarget": 0,
         "microvm.checksPassed": 0,
         "microvm.checksFailed": 0
-      }
+      },
+      "acceptedResiduals": [
+        "outcome pass means DG-4 produced a recommendation; it does not mean every arm was measured cleanly",
+        "wasm-instance failed resource-ceilings and hosts-agent-workload, and is ineligible",
+        "microvm is blocked on a missing runtime and sealed guest image, so no check ran for it",
+        "the nine containment ids describe the process-cgroup arm; wasm-instance covers crash, hang, OOM, cleanup, and IPC only; microvm covers none"
+      ]
     }
   }
 }

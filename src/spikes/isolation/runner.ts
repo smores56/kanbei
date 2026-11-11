@@ -49,6 +49,7 @@ const residualList: ReadonlyArray<string> = [
   "The microVM arm is blocked: no microVM runtime and no sealed guest image on this host. `DG-4` cannot select a microVM on this evidence.",
   "Fork-bomb containment was probed with `pids.max=16` on a dedicated agent cgroup, not at the 64-task per-agent ceiling.",
   "The one systemd call is the delegated cgroup acquisition in `main.ts`; the per-agent path uses cgroupfs and namespaces only, but the supervisor still runs under the deployment user manager.",
+  "Orphan and fork-bomb liveness is proved before the kill by cgroup membership, marker argv survival, and host process counts. The marker is the argv[0] of a resident bash because nix coreutils dispatches applets on argv[0] and would abort under `exec -a`.",
 ]
 
 const ContainmentCases = Schema.Struct({
@@ -152,7 +153,7 @@ export const runSpike = (
     }
 
     const base: Omit<SpikeResult, "evidence"> = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       spikeId: "S3",
       validationId: "ISO-1",
       dataset: "security-v1",
@@ -192,6 +193,12 @@ export const runSpike = (
       body: (_snapshot, capture) =>
         capture.putArtifactText(JSON.stringify(base)).pipe(Effect.as(base)),
       metrics: metricsOf(arms),
+      acceptedResiduals: [
+        "outcome pass means DG-4 produced a recommendation; it does not mean every arm was measured cleanly",
+        "wasm-instance failed resource-ceilings and hosts-agent-workload, and is ineligible",
+        "microvm is blocked on a missing runtime and sealed guest image, so no check ran for it",
+        "the nine containment ids describe the process-cgroup arm; wasm-instance covers crash, hang, OOM, cleanup, and IPC only; microvm covers none",
+      ],
     }).pipe(Effect.orDie)
     const sealed = Schema.decodeUnknownSync(EvidenceEnvelope)({ ...envelope, outcome })
 

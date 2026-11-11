@@ -33,7 +33,7 @@ const sampleResult = (): SpikeResultType => {
     arm("microvm", { status: "blocked", blockedReason: "no runtime", checks: [] }),
   ]
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     spikeId: "S3",
     validationId: "ISO-1",
     dataset: "security-v1",

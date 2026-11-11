@@ -2,7 +2,7 @@ import { Effect, Scope } from "effect"
 import { nowMs, ProbeError, readTextFile, withTimeout } from "../exec.ts"
 import { makeLineChannel } from "../line-channel.ts"
 import { AGENT_MEMORY_MAX_MIB, AGENT_TASKS_MAX } from "../protocol.ts"
-import { sandboxCommand, sandboxPath } from "../sandbox.ts"
+import { releasePath, sandboxCommand, sandboxPath } from "../sandbox.ts"
 import {
   awaitEmpty,
   cgroupDirectory,
@@ -11,6 +11,7 @@ import {
   killCgroup,
   migratePid,
   parsePpid,
+  parseState,
   removeCgroup,
 } from "../supervisor.ts"
 import type { AgentLimits, Supervisor } from "../supervisor.ts"
@@ -65,40 +66,44 @@ const fail = (operation: string, detail: string): ProbeError =>
 const supervisorCgroup = (config: ProcessArmConfig): string =>
   cgroupDirectory(config.supervisor, "supervisor")
 
-const parentOf = (pid: number): Effect.Effect<number | null> =>
+export interface ProcessStat {
+  readonly pid: number
+  readonly ppid: number
+  readonly state: string
+}
+export interface ProcessStat {
+  readonly pid: number
+  readonly ppid: number
+  readonly state: string
+}
+
+/**
+ * The wrapper is the waiter's child in the supervisor cgroup. It cannot SIGSTOP
+ * itself once it is the PID-namespace init, so discovery targets the child and
+ * the supervisor stops it from the parent namespace.
+ */
+export const sandboxChildPid = (
+  procs: ReadonlyArray<number>,
+  waiterPid: number,
+  stats: ReadonlyArray<ProcessStat>,
+): number | undefined =>
+  stats.find((stat) =>
+    procs.includes(stat.pid) && stat.pid !== waiterPid && stat.ppid === waiterPid
+  )?.pid
+
+const processStat = (pid: number): Effect.Effect<ProcessStat | null> =>
   readTextFile(`/proc/${pid}/stat`).pipe(
-    Effect.map((text) => (text === null ? null : parsePpid(text))),
+    Effect.map((text) => {
+      if (text === null) return null
+      const ppid = parsePpid(text)
+      const state = parseState(text)
+      return ppid === null || state === null ? null : { pid, ppid, state }
+    }),
     Effect.catch(() => Effect.succeed(null)),
   )
 
-/**
- * Moves any child of the waiter that forked before the waiter was migrated out
- * of the supervisor cgroup; later forks inherit the agent cgroup directly.
- */
-const adoptChildren = (
+const awaitSandboxChild = (
   config: ProcessArmConfig,
-  cgroupPath: string,
-  waiterPid: number,
-): Effect.Effect<void, ProbeError> =>
-  Effect.gen(function* () {
-    const procs = yield* cgroupProcs(supervisorCgroup(config))
-    yield* Effect.forEach(
-      procs.filter((pid) => pid !== waiterPid),
-      (pid) =>
-        parentOf(pid).pipe(
-          Effect.flatMap((ppid) =>
-            ppid === waiterPid
-              ? migratePid(cgroupPath, pid).pipe(Effect.catch(() => Effect.void))
-              : Effect.void
-          ),
-        ),
-      { discard: true },
-    )
-  })
-
-const pollAgentPid = (
-  config: ProcessArmConfig,
-  cgroupPath: string,
   waiterPid: number,
   timeoutMs: number,
 ): Effect.Effect<number, ProbeError> =>
@@ -106,24 +111,64 @@ const pollAgentPid = (
     const deadline = Date.now() + timeoutMs
     const loop = (): Effect.Effect<number, ProbeError> =>
       Effect.gen(function* () {
-        yield* adoptChildren(config, cgroupPath, waiterPid)
-        const procs = yield* cgroupProcs(cgroupPath)
-        const agent = procs.find((pid) => pid !== waiterPid)
-        if (agent !== undefined) return agent
+        const procs = yield* cgroupProcs(supervisorCgroup(config))
+        const stats = yield* Effect.forEach(procs, processStat, { concurrency: 1 })
+        const child = sandboxChildPid(
+          procs,
+          waiterPid,
+          stats.filter((stat): stat is ProcessStat => stat !== null),
+        )
+        if (child !== undefined) return child
         if (Date.now() >= deadline) {
           return yield* Effect.fail(
             fail(
-              "discover agent pid",
-              `no agent pid in ${cgroupPath} after ${timeoutMs} ms (waiter ${waiterPid}, cgroup ${
-                procs.join(",") || "<empty>"
-              })`,
+              "discover sandbox child",
+              `no child of waiter ${waiterPid} in ${
+                supervisorCgroup(config)
+              } after ${timeoutMs} ms (procs ${procs.join(",") || "<empty>"})`,
             ),
           )
         }
-        yield* Effect.sleep("5 millis")
+        yield* Effect.sleep("2 millis")
         return yield* loop()
       })
     return yield* loop()
+  })
+
+/**
+ * Ordering is the POINT of this handshake: the wrapper blocks before exec, the
+ * supervisor stops it, migrates the stopped pid into the agent cgroup, resumes
+ * it, and only then writes the release file the barrier waits on. Every Deno or
+ * agent page allocated after this point is charged to agent-N; resuming first
+ * and migrating later leaves the already-touched pages on the supervisor.
+ */
+const handshakeAgentPid = (
+  config: ProcessArmConfig,
+  cgroupPath: string,
+  waiterPid: number,
+  releaseFile: string,
+): Effect.Effect<number, ProbeError> =>
+  Effect.gen(function* () {
+    const sandboxPid = yield* awaitSandboxChild(config, waiterPid, 5_000)
+    yield* Effect.sync(() => Deno.kill(sandboxPid, "SIGSTOP"))
+    yield* migratePid(cgroupPath, sandboxPid)
+    const migrated = yield* cgroupProcs(cgroupPath)
+    if (!migrated.includes(sandboxPid)) {
+      return yield* Effect.fail(
+        fail(
+          "migrate stopped sandbox",
+          `pid ${sandboxPid} is not in ${cgroupPath} after migration (procs ${
+            migrated.join(",") || "<empty>"
+          })`,
+        ),
+      )
+    }
+    yield* Effect.sync(() => Deno.kill(sandboxPid, "SIGCONT"))
+    yield* Effect.tryPromise({
+      try: () => Deno.writeTextFile(releaseFile, "1"),
+      catch: (error) => fail("release sandbox", `${releaseFile}: ${String(error)}`),
+    })
+    return sandboxPid
   })
 
 const workDirectory = (config: ProcessArmConfig, slot: number): string =>
@@ -193,10 +238,12 @@ export const startAgent = (
     const waiterPid = child.pid
     const statusPromise = child.status
     const channel = yield* makeLineChannel(child.stdout, child.stdin)
-    // Migrate before the agent touches memory so all its pages are charged to its
-    // own cgroup; migrating a running V8 heap leaves old charges behind.
-    yield* migratePid(cgroupPath, waiterPid).pipe(Effect.catch(() => Effect.void))
-    const agentPid = yield* pollAgentPid(config, cgroupPath, waiterPid, 5_000)
+    const agentPid = yield* handshakeAgentPid(
+      config,
+      cgroupPath,
+      waiterPid,
+      releasePath(`${work}/scratch`),
+    )
     const readyLine = yield* Effect.race(
       withTimeout(channel.take, 20_000, `agent ${slot} ready`),
       Effect.tryPromise({

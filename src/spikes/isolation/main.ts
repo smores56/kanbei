@@ -4,6 +4,7 @@ import { fileArtifactStoreLayer } from "../../evidence/artifact-store.ts"
 import { liveEnvironmentProbeLayer } from "../../evidence/environment.ts"
 import { fixtureStoreLayer } from "../../evidence/fixture-store.ts"
 import { renderReport } from "./report.ts"
+import { exitVerdict } from "./exit-code.ts"
 import { runSpike } from "./runner.ts"
 import { acquireSupervisor } from "./supervisor.ts"
 import { SpikeResult } from "./types.ts"
@@ -125,6 +126,8 @@ say(
     : `evidence: unavailable (${decoded.evidence.reason})`,
 )
 say(`wrote ${spikeDirectory}/result.json and ${spikeDirectory}/REPORT.md`)
+const verdict = exitVerdict(decoded)
+say(verdict.code === 0 ? "exit 0" : `exit ${verdict.code}: ${verdict.reasons.join("; ")}`)
 // WASM worker teardown leaves a pending event-loop resource in Deno 2.9; the
 // entrypoint is done, so exit explicitly instead of spinning until the unit is killed.
-Deno.exit(0)
+Deno.exit(verdict.code)

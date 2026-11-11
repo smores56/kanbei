@@ -1,6 +1,8 @@
 /**
  * Trusted preload: apply the Landlock ruleset, then replace this image with the
- * agent so it runs with exactly `--allow-env --allow-run`.
+ * agent so it runs with exactly the four LANG-1 capability operations: read the
+ * mounted `/etc`, write `/scratch`, spawn a process, and reach the loopback
+ * endpoint the workload probe uses. Landlock still narrows the paths.
  */
 import { applyLandlock, execveProcess } from "../deployment/rootless/landlock.ts"
 
@@ -31,6 +33,14 @@ try {
 
 execveProcess(
   Deno.execPath(),
-  ["run", "--allow-env", "--allow-run", agent],
+  [
+    "run",
+    "--allow-env",
+    "--allow-run",
+    "--allow-read=/etc,/scratch",
+    "--allow-write=/scratch",
+    "--allow-net=127.0.0.1:9",
+    agent,
+  ],
   Deno.env.toObject(),
 )

@@ -347,6 +347,8 @@ export const measureWasmArm = (supervisorLoc: number): Effect.Effect<ArmResult> 
       return {
         arm: "wasm-instance",
         status: "inconclusive",
+        scope:
+          "A WebAssembly instance per permission-less worker; containment, cold start, CPU, IPC, and density were attempted, but the metric probe failed",
         checks: [...checks],
         operability: operability(supervisorLoc),
         notes: ["metric probe failed; the containment checks above are the recorded evidence"],
@@ -365,6 +367,8 @@ export const measureWasmArm = (supervisorLoc: number): Effect.Effect<ArmResult> 
     return {
       arm: "wasm-instance",
       status: "measured",
+      scope:
+        "Crash, hang, OOM, cleanup, and IPC describe one WebAssembly instance inside one permission-less Deno worker; fork-bomb and orphan checks are not applicable because an instance cannot create processes, and filesystem, network, and process capability are absent",
       metrics,
       checks: [...checks],
       operability: operability(supervisorLoc),

@@ -8,6 +8,8 @@ import {
   parseKeyedNumbers,
   parsePpid,
   parseSelfCgroup,
+  parseStartTime,
+  parseState,
 } from "../../../src/spikes/isolation/supervisor.ts"
 
 Deno.test("parseSelfCgroup returns the v2 path and ignores other hierarchies", () => {
@@ -60,4 +62,37 @@ Deno.test("cgroupMountOptions finds nsdelegate on the cgroup2 superblock", () =>
     "30 1 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:16 - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot\n"
   assertEquals(cgroupMountOptions(mountinfo).includes("nsdelegate"), true)
   assertEquals(cgroupMountOptions("").includes("nsdelegate"), false)
+})
+
+Deno.test("parseState reads the process state after a comm with spaces", () => {
+  assertEquals(parseState("4242 (deno worker (x)) T 100 4242 4242 0 -1"), "T")
+  assertEquals(parseState("4242 (sh) R 1 4242"), "R")
+  assertEquals(parseState("garbage"), null)
+})
+
+Deno.test("parseStartTime reads field 22 for pid-reuse detection", () => {
+  const fields = [
+    "R",
+    "1",
+    "4242",
+    "4242",
+    "0",
+    "-1",
+    "4194304",
+    "100",
+    "0",
+    "0",
+    "0",
+    "5",
+    "6",
+    "0",
+    "0",
+    "20",
+    "0",
+    "1",
+    "0",
+    "123456",
+  ]
+  assertEquals(parseStartTime(`4242 (deno x) ${fields.join(" ")} 999 1`), 123456)
+  assertEquals(parseStartTime("garbage"), null)
 })

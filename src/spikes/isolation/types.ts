@@ -88,6 +88,8 @@ export type Operability = typeof Operability.Type
 export const ArmResult = Schema.Struct({
   arm: ArmId,
   status: ArmStatus,
+  /** What this arm's rows cover; a status alone does not say which checks ran. */
+  scope: Schema.String,
   blockedReason: Schema.optional(Schema.String),
   metrics: Schema.optional(ArmMetrics),
   checks: Schema.Array(ContainmentCheck),
@@ -163,7 +165,7 @@ export const SecurityStatement = Schema.Struct({
 export type SecurityStatement = typeof SecurityStatement.Type
 
 export const SpikeResult = Schema.Struct({
-  schemaVersion: Schema.Literal(2),
+  schemaVersion: Schema.Literal(3),
   spikeId: Schema.Literal("S3"),
   validationId: Schema.Literal("ISO-1"),
   dataset: Schema.Literal("security-v1"),

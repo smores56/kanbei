@@ -21,7 +21,9 @@ const readOnlyMounts: ReadonlyArray<readonly [string, string]> = [
   ["/etc", "etc"],
 ]
 
-const mountLines = (plan: SandboxPlan): ReadonlyArray<string> => [
+const mountLines = (
+  plan: SandboxPlan,
+): ReadonlyArray<string> => [
   ...readOnlyMounts.flatMap(([source, target]) => [
     `mount --bind ${source} "$ROOT/${target}"`,
     `mount -o remount,bind,ro "$ROOT/${target}"`,
@@ -31,6 +33,15 @@ const mountLines = (plan: SandboxPlan): ReadonlyArray<string> => [
   `mount --bind ${plan.scratchDir} "$ROOT/scratch"`,
   `mount -t proc proc "$ROOT/proc"`,
 ]
+
+/** Pre-exec barrier file: the supervisor writes it after migrating the wrapper. */
+export const RELEASE_FILE = ".kanbei-release"
+
+/** Checked before `chroot`, so it must name the path under the future root. */
+const releasePathInRoot = (sandboxRoot: string): string => `${sandboxRoot}/scratch/${RELEASE_FILE}`
+
+/** Host-side path of the same file; `scratchDir` is bind-mounted at `/scratch`. */
+export const releasePath = (scratchDir: string): string => `${scratchDir}/${RELEASE_FILE}`
 
 export const sandboxScript = (plan: SandboxPlan): string =>
   [
@@ -42,6 +53,14 @@ export const sandboxScript = (plan: SandboxPlan): string =>
     "ulimit -c 0",
     "ulimit -n 256",
     "ulimit -f 16384",
+    // Handshake before the runtime exists. The wrapper cannot SIGSTOP itself:
+    // it is PID 1 of the new PID namespace and the kernel drops unhandled
+    // signals for namespace init (verified on this host). It blocks here
+    // instead, so the supervisor can stop it from the parent namespace, migrate
+    // the stopped pid into the agent cgroup, resume it, then write the release
+    // file. Every Deno page is then charged to agent-N; exec'ing first and
+    // migrating later leaves the already-touched pages on the supervisor.
+    `while [ ! -e ${releasePathInRoot(plan.sandboxRoot)} ]; do sleep 0.01; done`,
     `exec chroot "$ROOT" ${plan.denoPath} run --allow-ffi --allow-env ${plan.entryScript} ${plan.agentScript}`,
   ].join("; ")
 

@@ -14,6 +14,8 @@ export const measureMicrovmArm = (
       ? {
         arm: "microvm" as const,
         status: "blocked" as const,
+        scope:
+          "No check, metric, or operability measurement ran; the microVM arm is blocked on a runtime and a sealed guest image",
         blockedReason:
           `no microVM runtime on PATH (firecracker, cloud-hypervisor, microvm all absent; general VMM found: ${
             host.generalVmm.length === 0 ? "none" : host.generalVmm.join(", ")
@@ -42,6 +44,8 @@ export const measureMicrovmArm = (
       : {
         arm: "microvm" as const,
         status: "inconclusive" as const,
+        scope:
+          "No containment or density measurement ran; a runtime exists but no sealed guest image is available",
         blockedReason: `microvm runtimes present (${
           host.microvmRuntimes.join(", ")
         }) but no guest image is sealed for this spike`,

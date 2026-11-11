@@ -1,5 +1,6 @@
 import { assertEquals, assertStringIncludes } from "@std/assert"
 import {
+  releasePath,
   sandboxCommand,
   sandboxPath,
   sandboxScript,
@@ -62,4 +63,17 @@ Deno.test("sandboxPath maps repository files into the chroot and leaves others a
     "/agent/spikes/isolation/agent-process.ts",
   )
   assertEquals(sandboxPath("/repo/src", "/tmp/other.ts"), "/tmp/other.ts")
+})
+
+Deno.test("sandbox script blocks on the release file before exec", () => {
+  const script = sandboxScript(plan)
+  const rlimits = script.indexOf("ulimit -f 16384")
+  const barrier = script.indexOf(`while [ ! -e ${plan.sandboxRoot}/scratch/.kanbei-release ]`)
+  const exec = script.indexOf("exec chroot")
+  assertEquals(rlimits >= 0 && rlimits < barrier, true)
+  assertEquals(barrier < exec, true)
+  assertEquals(
+    releasePath("/repo/tmp/isolation/run/slot-1/scratch"),
+    "/repo/tmp/isolation/run/slot-1/scratch/.kanbei-release",
+  )
 })

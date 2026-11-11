@@ -74,6 +74,20 @@ export const parsePpid = (stat: string): number | null => {
   return close < 0 || !Number.isFinite(ppid) ? null : ppid
 }
 
+/** Process state character (`T` is stopped) from `/proc/<pid>/stat` field 3. */
+export const parseState = (stat: string): string | null => {
+  const close = stat.lastIndexOf(")")
+  const state = stat.slice(close + 1).trim().split(/\s+/u)[0]
+  return close < 0 || state === undefined || state === "" ? null : state
+}
+
+/** Field 22 of `/proc/<pid>/stat`; distinguishes a pid from a later process reusing it. */
+export const parseStartTime = (stat: string): number | null => {
+  const close = stat.lastIndexOf(")")
+  const startTime = Number(stat.slice(close + 1).trim().split(/\s+/u)[19])
+  return close < 0 || !Number.isFinite(startTime) ? null : startTime
+}
+
 /** `nsdelegate` is a cgroup2 superblock option, after the mountinfo ` - ` separator. */
 export const cgroupMountOptions = (mountinfo: string): ReadonlyArray<string> => {
   const line = mountinfo.split("\n").find((entry) => entry.includes(" - cgroup2 "))

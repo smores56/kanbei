@@ -34,6 +34,8 @@ const armSection = (arm: ArmResult): ReadonlyArray<string> => {
     return [
       `### ${arm.arm}`,
       "",
+      `Scope: ${arm.scope}`,
+      "",
       `Status: **${arm.status}**. ${arm.blockedReason ?? "No blocking reason recorded."}`,
       "",
       ...(arm.notes.length === 0 ? [] : [...arm.notes.map((note) => `- ${note}`), ""]),
@@ -41,6 +43,8 @@ const armSection = (arm: ArmResult): ReadonlyArray<string> => {
   }
   return [
     `### ${arm.arm}`,
+    "",
+    `Scope: ${arm.scope}`,
     "",
     table(
       ["metric", "value"],
@@ -167,13 +171,13 @@ export const renderReport = (result: SpikeResult): string => {
     "",
     `The process arm runs one Deno child per agent as the init of its own rootless user+PID+mount namespace, with a minimal chroot root and a Landlock ruleset applied before the agent code runs. Each agent gets a cgroup directory under the one delegated root with \`memory.max\`, \`memory.swap.max=0\`, \`pids.max\`, and \`cpu.max\`, plus rlimits on core size, file size, and file descriptors. The WASM arm runs one WebAssembly instance inside one permission-less Deno worker per agent. The microVM arm is not measurable on this host.`,
     "",
-    "Cold start is measured from supervisor spawn to the first ready signal, after one discarded warm-up run. Per-agent RSS is read from the agent cgroup (`memory.current`) for the process arm and from the process RSS delta for the WASM arm. Density records the time until every agent is ready and the failures at that count.",
+    "Cold start is measured from supervisor spawn to the first ready signal, after one discarded warm-up run, and includes the SIGSTOP/SIGCONT handshake that moves the sandboxed process into its cgroup before Deno allocates. Per-agent RSS is read from the agent cgroup (`memory.current`) for the process arm and from the process RSS delta for the WASM arm. Density records the time until every agent is ready and the failures at that count.",
     "",
-    "Density all-ready is the slowest agent's own ready time, not wall clock from the first spawn, so supervisor bookkeeping does not inflate it. Process-arm density RSS is the mean `memory.current` at all-ready; WASM density RSS is the process RSS delta divided by instance count.",
+    "Density all-ready is the slowest agent's own ready time, not wall clock from the first spawn, so supervisor bookkeeping does not inflate it. Process-arm density RSS is the mean `memory.current` at all-ready; the sandbox stops itself before exec so the supervisor migrates the stopped pid and only then resumes it, which charges every agent page to `agent-N`. WASM density RSS is the process RSS delta divided by instance count.",
     "",
     "Implementation lines count the supervision surface per arm: supervisor glue, the namespace/chroot sandbox plan, the agent entrypoint, and the protocol. Measurement probes and the probe-only WASM binary encoder are excluded, so the number reflects the mechanism rather than this harness.",
     "",
-    "Containment probes are destructive only inside the measured cgroup and sandbox: crash (`SIGKILL` of the agent host pid), hang (`cgroup.kill` on an infinite loop), OOM (request beyond the memory ceiling), fork bomb (200 fork attempts under `pids.max`), orphan reaping (a grandchild that dies with the PID-namespace init), and cleanup after kill (`cgroup.kill`, `cgroup.events populated=0`, `rmdir`). No probe writes outside the delegated cgroup, the per-agent sandbox root, and its scratch directory.",
+    "Containment probes are destructive only inside the measured cgroup and sandbox: crash (`SIGKILL` of the agent host pid), hang (`cgroup.kill` on an infinite loop), OOM (request beyond the memory ceiling), fork bomb (200 fork attempts under `pids.max`), orphan reaping (a grandchild that dies with the PID-namespace init), and cleanup after kill (`cgroup.kill`, `cgroup.events populated=0`, `cgroup.procs` empty, `rmdir`). Orphan and fork-bomb checks prove the child is alive before the kill through the agent cgroup's `pids.current` delta, a marker that survives exec, and the host process count; after the kill they require `cgroup.events populated 0`, an empty `cgroup.procs`, no marker survivors, and the specific orphan pid gone. No probe writes outside the delegated cgroup, the per-agent sandbox root, and its scratch directory.",
     "",
     "## Containment matrix",
     "",

@@ -67,6 +67,7 @@ export const arm = (
 ): ArmResult => ({
   arm: id,
   status: "measured",
+  scope: `${id} test scope`,
   metrics: metrics(),
   checks: checks(),
   operability: {

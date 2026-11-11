@@ -1,6 +1,7 @@
 import { Effect, Result, Scope } from "effect"
 import { nowMs, ProbeError, readTextFile, withTimeout } from "../exec.ts"
 import { memoryAvailableBytes } from "../host.ts"
+import { workloadReplyHolds } from "../agent-contract.ts"
 import {
   AGENT_MEMORY_MAX_MIB,
   AGENT_TASKS_MAX,
@@ -15,12 +16,17 @@ import {
   TARGET_CONCURRENCY,
 } from "../protocol.ts"
 import { round, summarize } from "../stats.ts"
+import { forkBombHolds, orphanContainmentHolds } from "./containment.ts"
+import type { ForkBombEvidence, OrphanEvidence } from "./containment.ts"
 import {
   awaitEmpty,
+  cgroupEvents,
   cgroupExists,
+  cgroupProcs,
   cgroupStats,
   HOST_DEPENDENCIES,
   killCgroup,
+  parseStartTime,
 } from "../supervisor.ts"
 import type {
   ArmMetrics,
@@ -48,6 +54,20 @@ const processMarkerPids = (marker: string): ReadonlyArray<number> =>
       return []
     }
   })
+
+/** Numeric /proc entries; the coarse host-wide signal that nothing was left behind. */
+export const hostProcessCount = (): number =>
+  [...Deno.readDirSync("/proc")].filter((entry) => /^\d+$/u.test(entry.name)).length
+
+const processStartTime = (pid: number): Effect.Effect<number | null> =>
+  readTextFile(`/proc/${pid}/stat`).pipe(
+    Effect.map((text) => (text === null ? null : parseStartTime(text))),
+    Effect.catch(() => Effect.succeed(null)),
+  )
+
+/** Start time guards against a pid that was reused by an unrelated process. */
+const processIsSame = (pid: number, startTime: number): Effect.Effect<boolean> =>
+  processStartTime(pid).pipe(Effect.map((current) => current !== null && current === startTime))
 
 /** Soft value of a `/proc/<pid>/limits` row. */
 const rlimitSoft = (text: string | null, label: string): string => {
@@ -310,6 +330,10 @@ const forkBombProbe = (config: ProcessArmConfig) =>
       )
       yield* agent.send("FORKBOMB")
       const reply = yield* withTimeout(agent.take, 10_000, "fork bomb spawn")
+      // The marker leaves must be resident before the sample; otherwise the
+      // pre-kill liveness signal races the fork storm.
+      yield* Effect.sleep("200 millis")
+      const markerPidsBefore = yield* Effect.sync(() => processMarkerPids(marker))
       const samples = yield* Effect.forEach(
         range(16),
         () =>
@@ -323,17 +347,94 @@ const forkBombProbe = (config: ProcessArmConfig) =>
       const stats = yield* cgroupStats(agent.cgroupPath)
       const peak = samples.reduce((highest, value) => Math.max(highest, value), 0)
       yield* killCgroup(agent.cgroupPath)
-      const empty = yield* awaitEmpty(agent.cgroupPath, CLEANUP_TIMEOUT_MS)
+      yield* awaitEmpty(agent.cgroupPath, CLEANUP_TIMEOUT_MS)
+      const populatedAfter = yield* cgroupEvents(agent.cgroupPath)
+      const procsAfter = yield* cgroupProcs(agent.cgroupPath)
       yield* agent.stop
       yield* Effect.sleep("300 millis")
-      const leftovers = yield* Effect.sync(() => processMarkerPids(marker))
-      const contained = stats.pidsMaxEvents >= 1 && peak <= FORK_BOMB_TASKS_MAX && empty &&
-        leftovers.length === 0
+      const markerPidsAfter = yield* Effect.sync(() => processMarkerPids(marker))
+      const evidence: ForkBombEvidence = {
+        markerPidsBefore: markerPidsBefore.length,
+        pidsMaxEvents: stats.pidsMaxEvents,
+        populatedAfter,
+        procsAfter: procsAfter.length,
+        markerPidsAfter: markerPidsAfter.length,
+      }
+      const contained = forkBombHolds(evidence)
       return {
         id: "fork-bomb-containment" as const,
         status: contained ? ("pass" as const) : ("fail" as const),
         detail:
-          `200 fork attempts with pids.max=${FORK_BOMB_TASKS_MAX}: ${reply}, peak pids.current=${peak}, pids.events max=${stats.pidsMaxEvents}, cgroup populated=0=${empty}, ${leftovers.length} processes survived cgroup teardown`,
+          `200 fork attempts with pids.max=${FORK_BOMB_TASKS_MAX}: ${reply}, pids.events max=${stats.pidsMaxEvents} (refusals observed), peak pids.current=${peak} (observation only; the kernel caps it at pids.max), marker processes before kill=${markerPidsBefore.length}, after kill populated=${populatedAfter}, cgroup.procs=${procsAfter.length}, marker survivors=${markerPidsAfter.length}`,
+      }
+    }),
+  )
+
+interface OrphanObservation {
+  readonly agentPid: number
+  readonly agentNamespacePid: number
+  readonly orphanHostPid: number | null
+  readonly orphanNamespacePid: number
+  readonly waiterCode: number
+  readonly evidence: OrphanEvidence
+}
+
+/**
+ * One scenario for both orphan probes: spawn a marker child, prove it alive in
+ * the agent cgroup, kill the namespace init, then collect every post-kill
+ * signal. Nothing here trusts the cmdline scan on its own.
+ */
+const observeOrphan = (
+  config: ProcessArmConfig,
+  slot: number,
+  marker: string,
+  operation: string,
+): Effect.Effect<OrphanObservation, ProbeError> =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const hostCountBefore = yield* Effect.sync(hostProcessCount)
+      const agent = yield* startAgent(config, slot, defaultLimits, { KANBEI_ISO_MARKER: marker })
+      yield* agent.send("SPAWN")
+      const spawnReply = yield* withTimeout(agent.take, 10_000, `${operation} spawn`)
+      const orphanNamespacePid = Number(spawnReply.split(" ")[1] ?? "0")
+      // Let the marker child exec before sampling; the pre-kill proof is
+      // otherwise a sub-millisecond race that always "passes".
+      yield* Effect.sleep("200 millis")
+      const pidsBefore = yield* cgroupStats(agent.cgroupPath)
+      const procsBefore = yield* cgroupProcs(agent.cgroupPath)
+      const markerPidsBefore = yield* Effect.sync(() => processMarkerPids(marker))
+      const orphanHostPid = procsBefore.find((pid) => pid !== agent.agentPid) ?? null
+      const orphanStartTime = orphanHostPid === null ? null : yield* processStartTime(orphanHostPid)
+      yield* Effect.sync(() => Deno.kill(agent.agentPid, "SIGKILL"))
+      const status = yield* withTimeout(agent.status, CLEANUP_TIMEOUT_MS, `${operation} kill`)
+      yield* awaitEmpty(agent.cgroupPath, CLEANUP_TIMEOUT_MS)
+      const populatedAfter = yield* cgroupEvents(agent.cgroupPath)
+      const procsAfter = yield* cgroupProcs(agent.cgroupPath)
+      yield* agent.stop
+      const cgroupRemoved = !(yield* cgroupExists(agent.cgroupPath))
+      yield* Effect.sleep("400 millis")
+      const markerPidsAfter = yield* Effect.sync(() => processMarkerPids(marker))
+      const orphanAliveAfter = orphanHostPid === null || orphanStartTime === null
+        ? true
+        : yield* processIsSame(orphanHostPid, orphanStartTime)
+      return {
+        agentPid: agent.agentPid,
+        agentNamespacePid: agent.namespacePid,
+        orphanHostPid,
+        orphanNamespacePid,
+        waiterCode: status.code,
+        evidence: {
+          markerPidsBefore: markerPidsBefore.length,
+          pidsCurrentBefore: pidsBefore.pidsCurrent,
+          orphanPidPresent: orphanHostPid !== null,
+          orphanAliveAfter,
+          hostCountBefore,
+          hostCountAfter: yield* Effect.sync(hostProcessCount),
+          populatedAfter,
+          procsAfter: procsAfter.length,
+          markerPidsAfter: markerPidsAfter.length,
+          cgroupRemoved,
+        },
       }
     }),
   )
@@ -341,24 +442,23 @@ const forkBombProbe = (config: ProcessArmConfig) =>
 const cleanupProbe = (config: ProcessArmConfig) =>
   Effect.scoped(
     Effect.gen(function* () {
-      const marker = `${config.runId}-orphan`
-      const agent = yield* startAgent(config, 970, defaultLimits, { KANBEI_ISO_MARKER: marker })
-      yield* agent.send("SPAWN")
-      const spawnReply = yield* withTimeout(agent.take, 10_000, "orphan spawn")
-      const orphanPid = Number(spawnReply.split(" ")[1] ?? "0")
-      yield* Effect.sync(() => Deno.kill(agent.agentPid, "SIGKILL"))
-      const status = yield* withTimeout(agent.status, CLEANUP_TIMEOUT_MS, "orphan kill")
-      const empty = yield* awaitEmpty(agent.cgroupPath, CLEANUP_TIMEOUT_MS)
-      yield* agent.stop
-      const removed = !(yield* cgroupExists(agent.cgroupPath))
-      yield* Effect.sleep("400 millis")
-      const leftovers = yield* Effect.sync(() => processMarkerPids(marker))
-      const contained = empty && removed && leftovers.length === 0
+      const observation = yield* observeOrphan(
+        config,
+        970,
+        `${config.runId}-orphan`,
+        "orphan cleanup",
+      )
+      const evidence = observation.evidence
+      const contained = orphanContainmentHolds(evidence)
       return {
         id: "cleanup-after-kill" as const,
         status: contained ? ("pass" as const) : ("fail" as const),
         detail:
-          `SIGKILL of agent host pid ${agent.agentPid} (namespace pid ${agent.namespacePid}, waiter code=${status.code}); orphan ${orphanPid} reaped, cgroup populated=0=${empty}, cgroup removed=${removed}, ${leftovers.length} marker processes left`,
+          `SIGKILL of agent host pid ${observation.agentPid} (namespace pid ${observation.agentNamespacePid}, waiter code=${observation.waiterCode}): orphan host pid ${
+            observation.orphanHostPid ?? "not found"
+          } (namespace pid ${observation.orphanNamespacePid}) ${
+            evidence.orphanAliveAfter ? "STILL ALIVE" : "confirmed gone"
+          }; pids.current before kill=${evidence.pidsCurrentBefore}, marker pids before kill=${evidence.markerPidsBefore}, after kill populated=${evidence.populatedAfter}, cgroup.procs=${evidence.procsAfter}, marker survivors=${evidence.markerPidsAfter}, cgroup removed=${evidence.cgroupRemoved}, host processes ${evidence.hostCountBefore}->${evidence.hostCountAfter}`,
       }
     }),
   )
@@ -366,23 +466,22 @@ const cleanupProbe = (config: ProcessArmConfig) =>
 const orphanProbe = (config: ProcessArmConfig) =>
   Effect.scoped(
     Effect.gen(function* () {
-      const marker = `${config.runId}-orphan-check`
-      const agent = yield* startAgent(config, 980, defaultLimits, { KANBEI_ISO_MARKER: marker })
-      yield* agent.send("SPAWN")
-      yield* withTimeout(agent.take, 10_000, "orphan spawn")
-      const aliveBefore = yield* Effect.sync(() => processMarkerPids(marker))
-      yield* Effect.sync(() => Deno.kill(agent.agentPid, "SIGKILL"))
-      yield* withTimeout(agent.status, CLEANUP_TIMEOUT_MS, "orphan agent kill")
-      const empty = yield* awaitEmpty(agent.cgroupPath, CLEANUP_TIMEOUT_MS)
-      yield* agent.stop
-      yield* Effect.sleep("400 millis")
-      const aliveAfter = yield* Effect.sync(() => processMarkerPids(marker))
-      const reaped = aliveBefore.length > 0 && aliveAfter.length === 0 && empty
+      const observation = yield* observeOrphan(
+        config,
+        980,
+        `${config.runId}-orphan-check`,
+        "orphan reaping",
+      )
+      const evidence = observation.evidence
+      const reaped = orphanContainmentHolds(evidence)
       return {
         id: "orphan-reaping" as const,
         status: reaped ? ("pass" as const) : ("fail" as const),
-        detail:
-          `grandchild visible before kill (${aliveBefore.length}), ${aliveAfter.length} alive after the namespace init died and the cgroup emptied=${empty}`,
+        detail: `orphan host pid ${
+          observation.orphanHostPid ?? "not found"
+        } (namespace pid ${observation.orphanNamespacePid}) visible before the kill via cgroup membership (pids.current=${evidence.pidsCurrentBefore}) and marker scan (${evidence.markerPidsBefore} pids); after the namespace init died: populated=${evidence.populatedAfter}, cgroup.procs=${evidence.procsAfter}, marker survivors=${evidence.markerPidsAfter}, orphan ${
+          evidence.orphanAliveAfter ? "STILL ALIVE" : "confirmed gone"
+        }, host processes ${evidence.hostCountBefore}->${evidence.hostCountAfter}`,
       }
     }),
   )
@@ -414,6 +513,24 @@ const ceilingsProbe = (config: ProcessArmConfig) =>
         status: configured ? ("pass" as const) : ("fail" as const),
         detail:
           `memory.max=${memoryMax.trim()} pids.max=${pidsMax.trim()} cpu.max=${cpuMax.trim()} nofile=${nofile} fsize=${fsize}`,
+      }
+    }),
+  )
+
+const workloadProbe = (config: ProcessArmConfig) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const agent = yield* startAgent(config, 995, defaultLimits)
+      const { reply } = yield* agent.request("WORKLOAD", "WORKLOAD")
+      yield* agent.send("EXIT")
+      yield* withTimeout(agent.status, 5_000, "workload exit")
+      const holds = workloadReplyHolds(reply)
+      return {
+        id: "hosts-agent-workload" as const,
+        status: holds ? ("pass" as const) : ("fail" as const),
+        detail: holds
+          ? "agent reported `WORKLOAD ok`: read /etc/os-release, wrote and read /scratch/workload.txt, spawned true, and reached 127.0.0.1:9 with ECONNREFUSED"
+          : `agent workload probe did not report WORKLOAD ok: ${reply}`,
       }
     }),
   )
@@ -450,7 +567,7 @@ const operability = (supervisorLoc: number): Operability => ({
     "Landlock covers path-based filesystem access only; network and signal policy stay outside this spike",
     "Each agent pays user/PID/mount namespace setup, bind mounts, chroot, Landlock, and cgroup creation on the cold-start path",
     "RLIMIT_AS is unusable for a V8 process because the runtime reserves large virtual ranges",
-    "Agent capabilities are inner Deno permissions only (`--allow-env`, `--allow-run` here); the OS sandbox remains the real boundary",
+    "Agent capabilities are inner Deno permissions only (`--allow-env`, `--allow-run`, `--allow-read=/etc`, `--allow-write=/scratch`, `--allow-net=127.0.0.1:9` here); the OS sandbox remains the real boundary",
   ],
 })
 
@@ -489,12 +606,7 @@ export const measureProcessArm = (
           : { id: "ipc-round-trip", status: "fail", detail: ipc.failure.detail },
       ),
       guard("resource-ceilings", ceilingsProbe(config), (check) => check),
-      Effect.succeed<ContainmentCheck>({
-        id: "hosts-agent-workload",
-        status: "pass",
-        detail:
-          "the reference agent ran as a Deno TypeScript process with environment and process capability inside the per-agent namespace, chroot, and cgroup",
-      }),
+      guard("hosts-agent-workload", workloadProbe(config), (check) => check),
     ], { concurrency: 1 })
 
     const targetPoint = Result.isSuccess(density)
@@ -508,6 +620,8 @@ export const measureProcessArm = (
       return {
         arm: "process-cgroup",
         status: "inconclusive",
+        scope:
+          "Nine containment checks, cold start, CPU, IPC, and density were attempted for one Deno agent per cgroup; the metric probe failed, so no operability or density conclusion follows",
         checks: [...checks],
         operability: operability(supervisorLoc),
         notes: [
@@ -535,6 +649,8 @@ export const measureProcessArm = (
     return {
       arm: "process-cgroup",
       status: "measured",
+      scope:
+        "The nine containment ids, cold start, CPU, IPC, and density describe one Deno agent per rootless namespace, chroot, Landlock ruleset, and cgroup; no network, credential, or trust-root boundary is claimed",
       metrics,
       checks: [...checks],
       operability: operability(supervisorLoc),
