@@ -25,6 +25,11 @@
       "id": "security-v1",
       "version": "1.0.0",
       "path": "fixtures/security-v1"
+    },
+    {
+      "id": "ingest-v1",
+      "version": "1.0.0",
+      "path": "fixtures/ingest-v1"
     }
   ]
 }

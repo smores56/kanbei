@@ -31,6 +31,28 @@
       "files": {
         "cases.json": "sha256:7ca6cfe54ed9da7bf27dfc5e1744fb96d9554451ae0eab3e230f32049b6d69ba"
       }
+    },
+    "ingest-v1@1.0.0": {
+      "treeHash": "sha256:3d2476beffde8032f9f40375125982d1a38dfaf26b01f5ecc7e86ac34d36ea1b",
+      "files": {
+        "adversarial/brave-over-cap.age": "sha256:798eac21670122e20a18a628e03085bf287704f2e8a1d2190be07c5eca40ba49",
+        "adversarial/finance-truncated.age": "sha256:eb900b3f8236f98b05933ac532575f777bc09d83dd5d312f36694da71fa1ac65",
+        "adversarial/tuta-mail-2-duplicate.age": "sha256:35b2b93d2a9f9cd111264bd2648b1750578a8cefb7267cfd061068b69f4829f0",
+        "adversarial/tuta-mail-2.age": "sha256:6494a4e7a061fc7627ce1fdbec39fc9f71a5070132bf3631b88a511d66c87c0d",
+        "adversarial/tuta-mail-injected-prose.age": "sha256:c2f3aac2371f598f233e353eaf182f9e44955de7eab0bc0ad5f2a795fec40f35",
+        "adversarial/unknown-origin-1.age": "sha256:c882f21e17322183ec82b11617f5ee762ed651f7ffec555cf57901582b5a616f",
+        "batches/brave-1.age": "sha256:e573e2a84ec1e0eee98a186e21b59dde9ce334f221136c73fefe4f46c49d9fdc",
+        "batches/cluster-digest-1.age": "sha256:cb295d9b2b33156dc61163df328232a2d14b2376152e2dd2fbbab3bd0351f1d5",
+        "batches/finance-1.age": "sha256:5d4f2712bfd7e0a2df5677b3a9dc24ce577584d736984095cc5ae05f5de129c1",
+        "batches/git-1.age": "sha256:45ddf673271368f36ffad52b9ec0774d3ddb4117a20e6d1f9791cd30eacd43b3",
+        "batches/immich-1.age": "sha256:fcf6770b86a19a2c3add041751afbedcdf4462dd91e9d2eaa526e02b69fe94ea",
+        "batches/phone-1.age": "sha256:56c31f359ee1dd58637da5f5e0e57f261db309edc1ea703e841f1e44b4d87d8e",
+        "batches/tuta-calendar-1.age": "sha256:4d76f68b0f577cd71a0c3ffbfef86f391599ad389b63bc51036188d8e6374a2f",
+        "batches/tuta-mail-1.age": "sha256:bad0917c8f4a819ba946a54d96e83dacbed0917feab0302a63b6e0fbb1ea738c",
+        "keys/identity.txt": "sha256:b052a683f7ba5b57aabc5a599d659d3c4b2bac8b2dc78b6d9e6e7640611e4795",
+        "keys/recipient.txt": "sha256:55acdedb630b5606f9b21763cb788590581989a7c0b1cd39b124dc3b777fa2ab",
+        "source.json": "sha256:89897305a5e9b17223379188bcfad281d773ae9d3a2e36d3c91639044e934e2d"
+      }
     }
   }
 }
