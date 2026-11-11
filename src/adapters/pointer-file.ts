@@ -1,12 +1,14 @@
-import { Effect, Layer, Option, Schema } from "effect"
+import { Effect, Layer, Option, Ref, Schema, Semaphore } from "effect"
 import { PointerError, PointerStore, ScopePointer } from "../candidates/pointer.ts"
 
 const encoder = new TextEncoder()
 
-const fileName = (scope: string): string => {
-  const encoded = scope.replace(/[^A-Za-z0-9._-]/gu, "_")
-  return encoded === "" ? "_" : encoded
-}
+/**
+ * Injective scope file names. Sanitizing characters would map `a/b` and `a_b`
+ * to the same pointer; base64url of the UTF-8 scope cannot collide.
+ */
+const fileName = (scope: string): string =>
+  encoder.encode(scope).toBase64({ alphabet: "base64url", omitPadding: true }) || "_"
 
 const pathFor = (root: string, scope: string): string => `${root}/${fileName(scope)}.json`
 
@@ -26,8 +28,8 @@ const syncDirectory = (directory: string): void => {
 const publishSync = (root: string, pointer: ScopePointer): void => {
   Deno.mkdirSync(root, { recursive: true })
   const target = pathFor(root, pointer.scope)
-  const temporary = `${target}.tmp`
-  const file = Deno.openSync(temporary, { write: true, create: true, truncate: true })
+  const temporary = `${target}.${crypto.randomUUID()}.tmp`
+  const file = Deno.openSync(temporary, { write: true, createNew: true, mode: 0o600 })
   try {
     file.writeSync(encoder.encode(JSON.stringify(Schema.encodeSync(ScopePointer)(pointer))))
     file.syncSync()
@@ -48,44 +50,65 @@ const readSync = (root: string, scope: string): Option.Option<ScopePointer> => {
   }
 }
 
-/** File-backed pointer store with write-temp, fsync, rename publication. */
-export const pointerFileLayer = (root: string): Layer.Layer<PointerStore> =>
-  Layer.succeed(PointerStore, {
-    read: (scope) =>
-      Effect.try({
-        try: () => readSync(root, scope),
-        catch: (error) =>
-          new PointerError({
-            operation: "read",
-            scope,
-            reason: error instanceof Error ? error.message : String(error),
-          }),
-      }),
-    publish: (pointer) =>
-      Effect.try({
-        try: () => publishSync(root, pointer),
-        catch: (error) =>
-          new PointerError({
-            operation: "publish",
-            scope: pointer.scope,
-            reason: error instanceof Error ? error.message : String(error),
-          }),
-      }),
-    clear: (scope) =>
-      Effect.try({
-        try: () => {
-          try {
-            Deno.removeSync(pathFor(root, scope))
-          } catch (error) {
-            if (!(error instanceof Deno.errors.NotFound)) throw error
-          }
-          syncDirectory(root)
-        },
-        catch: (error) =>
-          new PointerError({
-            operation: "publish",
-            scope,
-            reason: error instanceof Error ? error.message : String(error),
-          }),
-      }),
+const pointerError = (
+  operation: PointerError["operation"],
+  scope: string,
+  error: unknown,
+): PointerError =>
+  new PointerError({
+    operation,
+    scope,
+    reason: error instanceof Error ? error.message : String(error),
   })
+
+/** File-backed pointer store: one writer per scope, write-temp, fsync, rename. */
+export const pointerFileLayer = (root: string): Layer.Layer<PointerStore> =>
+  Layer.effect(
+    PointerStore,
+    Effect.gen(function* () {
+      const locks = yield* Ref.make<ReadonlyMap<string, Semaphore.Semaphore>>(new Map())
+      const lockFor = (scope: string): Effect.Effect<Semaphore.Semaphore> =>
+        Ref.modify(locks, (current) => {
+          const existing = current.get(scope)
+          if (existing !== undefined) return [existing, current]
+          const created = Semaphore.makeUnsafe(1)
+          return [created, new Map([...current, [scope, created]])]
+        })
+      return {
+        read: (scope) =>
+          Effect.try({
+            try: () => readSync(root, scope),
+            catch: (error) => pointerError("read", scope, error),
+          }),
+        publish: (pointer) =>
+          lockFor(pointer.scope).pipe(
+            Effect.flatMap((permit) =>
+              permit.withPermits(1)(
+                Effect.try({
+                  try: () => publishSync(root, pointer),
+                  catch: (error) => pointerError("publish", pointer.scope, error),
+                }),
+              )
+            ),
+          ),
+        clear: (scope) =>
+          lockFor(scope).pipe(
+            Effect.flatMap((permit) =>
+              permit.withPermits(1)(
+                Effect.try({
+                  try: () => {
+                    try {
+                      Deno.removeSync(pathFor(root, scope))
+                    } catch (error) {
+                      if (!(error instanceof Deno.errors.NotFound)) throw error
+                    }
+                    syncDirectory(root)
+                  },
+                  catch: (error) => pointerError("publish", scope, error),
+                }),
+              )
+            ),
+          ),
+      }
+    }),
+  )

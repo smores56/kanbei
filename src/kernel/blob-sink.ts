@@ -13,6 +13,8 @@ export class BlobSinkError extends Data.TaggedError("BlobSinkError")<{
 export interface BlobSink {
   readonly put: (bytes: Uint8Array) => Effect.Effect<ContentDigest, BlobSinkError>
   readonly read: (digest: ContentDigest) => Effect.Effect<Option.Option<Uint8Array>, BlobSinkError>
+  /** Bytes currently stored, so the store can enforce a total cap. */
+  readonly usage: Effect.Effect<number, BlobSinkError>
 }
 
 export const BlobSink = Context.Service<BlobSink>("kanbei/kernel/BlobSink")

@@ -228,3 +228,135 @@ Deno.test("verify refuses a row tampered after the ledger was opened", async () 
     assertEquals(Exit.isFailure(result.verified), true)
   })
 })
+
+Deno.test("concurrent appends serialize into one gap-free chain", async () => {
+  await withTempDir("ledger", async (directory) => {
+    const path = `${directory}/ledger.jsonl`
+    const records = await withLedger(
+      path,
+      Effect.gen(function* () {
+        const ledger = yield* Ledger
+        yield* Effect.forEach(
+          Array.from({ length: 25 }, (_, index) => index),
+          (value) =>
+            ledger.append({
+              components: [{ type: "kb.state/observed@1.0.0", payload: { value } }],
+              appender: "agent",
+              principal: "agent-1",
+              authorityClass: "observation",
+            }),
+          { concurrency: "unbounded" },
+        )
+        return yield* ledger.records
+      }),
+    )
+    assertEquals(records.map((record) => record.seq), Array.from({ length: 25 }, (_, i) => i + 1))
+    assertEquals(
+      records.every((record, index) =>
+        index === 0 || record.prev_hash === records[index - 1]?.record_hash
+      ),
+      true,
+    )
+  })
+})
+
+Deno.test("a torn final line is truncated on load and receipted instead of bricking", async () => {
+  await withTempDir("ledger", async (directory) => {
+    const path = `${directory}/ledger.jsonl`
+    await withLedger(
+      path,
+      Effect.gen(function* () {
+        yield* appendObserved(1)
+        yield* appendObserved(2)
+      }),
+    )
+    const complete = await Deno.readTextFile(path)
+    await Deno.writeTextFile(path, `${complete}{"record_id":"torn","seq":3`)
+    const result = await withLedger(
+      path,
+      Effect.gen(function* () {
+        const ledger = yield* Ledger
+        const head = yield* ledger.head
+        const recovery = yield* ledger.recovery
+        const appended = yield* appendObserved(3)
+        return { head, recovery, appended, headAfter: yield* ledger.head }
+      }),
+    )
+    assertEquals(result.head.seq, 2)
+    assertEquals(result.recovery.length, 1)
+    assertEquals(result.recovery[0]?.kind, "torn_final_line")
+    assertEquals(await Deno.readTextFile(path).then((text) => text.endsWith("\n")), true)
+    assertEquals(result.appended.record.seq, 3)
+    assertEquals(result.headAfter.seq, 3)
+    const receipts = await Deno.readTextFile(`${path}.recovery`)
+    assertEquals(receipts.trim().endsWith("}"), true)
+  })
+})
+
+Deno.test("a restarted ledger resumes the sequence from the durable file", async () => {
+  await withTempDir("ledger", async (directory) => {
+    const path = `${directory}/ledger.jsonl`
+    await withLedger(path, appendObserved(1))
+    const second = await withLedger(
+      path,
+      Effect.gen(function* () {
+        const ledger = yield* Ledger
+        const appended = yield* appendObserved(2)
+        return { appended, head: yield* ledger.head }
+      }),
+    )
+    assertEquals(second.appended.record.seq, 2)
+    assertEquals(second.head.seq, 2)
+  })
+})
+
+Deno.test("a replayed idempotency key with a different payload is refused", async () => {
+  await withTempDir("ledger", async (directory) => {
+    const error = await failure(
+      `${directory}/ledger.jsonl`,
+      Effect.gen(function* () {
+        const ledger = yield* Ledger
+        yield* ledger.append({
+          components: [{ type: "kb.state/observed@1.0.0", payload: { value: 1 } }],
+          appender: "frozen",
+          principal: "ingest",
+          authorityClass: "observation",
+          idempotencyKey: "observation|1",
+        })
+        return yield* ledger.append({
+          components: [{ type: "kb.state/observed@1.0.0", payload: { value: 2 } }],
+          appender: "frozen",
+          principal: "ingest",
+          authorityClass: "observation",
+          idempotencyKey: "observation|1",
+        })
+      }),
+    )
+    assertEquals(error.code, "idempotency_conflict")
+  })
+})
+
+Deno.test("a second ledger on the same file refuses instead of interleaving", async () => {
+  await withTempDir("ledger", async (directory) => {
+    const path = `${directory}/ledger.jsonl`
+    const first = await withLedger(
+      path,
+      Effect.gen(function* () {
+        const ledger = yield* Ledger
+        return yield* ledger.head
+      }),
+    )
+    assertEquals(first.seq, 0)
+    // The lock is scoped to the running ledger layer; a second concurrent layer
+    // must refuse rather than share the file.
+    const refused = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* Layer.build(fileLedgerStoreLayer(path))
+          return yield* Effect.exit(Layer.build(fileLedgerStoreLayer(path)))
+        }),
+      ),
+    )
+    assertEquals(Exit.isFailure(refused), true)
+  })
+})

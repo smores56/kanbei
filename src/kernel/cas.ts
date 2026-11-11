@@ -21,6 +21,7 @@ export type CasErrorCode =
   | "tampered_blob"
   | "manifest_invalid"
   | "store_failed"
+  | "cap_exceeded"
 
 export class CasError extends Data.TaggedError("CasError")<{
   readonly code: CasErrorCode
@@ -90,76 +91,120 @@ const readVerified = (
     ),
   )
 
-export const contentStoreLayer: Layer.Layer<ContentStore, never, BlobSink> = Layer.effect(
-  ContentStore,
-  Effect.gen(function* () {
-    const sink = yield* BlobSink
-    return {
-      publish: (bytes, mediaType) =>
-        Effect.gen(function* () {
-          const digest = yield* sink.put(bytes).pipe(
-            Effect.mapError(
-              (error) => new CasError({ code: "store_failed", digest: "", detail: error.reason }),
-            ),
-          )
-          const manifest: ContentManifest = { digest, size: bytes.length, mediaType }
-          const manifestDigest = yield* sink.put(manifestBytes(manifest)).pipe(
-            Effect.mapError(
-              (error) => new CasError({ code: "store_failed", digest, detail: error.reason }),
-            ),
-          )
-          return { manifest, manifestDigest }
-        }),
-      read: (digest, expectedSize) =>
-        storedBytes(sink.read, digest).pipe(
-          Effect.flatMap((bytes) =>
-            bytes.length < expectedSize
-              ? Effect.fail(
+export interface ContentStoreConfig {
+  readonly maxObjectBytes: number
+  readonly maxTotalBytes: number
+}
+
+/** Per-object and whole-store ceilings; a breach refuses before bytes are visible. */
+export const CONTENT_CAPS: ContentStoreConfig = {
+  maxObjectBytes: 1 << 20,
+  maxTotalBytes: 1 << 30,
+}
+
+export const contentStoreLayerWith = (
+  config: ContentStoreConfig,
+): Layer.Layer<ContentStore, never, BlobSink> =>
+  Layer.effect(
+    ContentStore,
+    Effect.gen(function* () {
+      const sink = yield* BlobSink
+      return {
+        publish: (bytes, mediaType) =>
+          Effect.gen(function* () {
+            if (bytes.length > config.maxObjectBytes) {
+              return yield* Effect.fail(
                 new CasError({
-                  code: "truncated_blob",
+                  code: "cap_exceeded",
+                  digest: "",
+                  detail: `${bytes.length} > per-object cap ${config.maxObjectBytes}`,
+                }),
+              )
+            }
+            const used = yield* sink.usage.pipe(
+              Effect.mapError(
+                (error) => new CasError({ code: "store_failed", digest: "", detail: error.reason }),
+              ),
+            )
+            const digest = yield* sink.put(bytes).pipe(
+              Effect.mapError(
+                (error) => new CasError({ code: "store_failed", digest: "", detail: error.reason }),
+              ),
+            )
+            const manifest: ContentManifest = { digest, size: bytes.length, mediaType }
+            const encoded = manifestBytes(manifest)
+            if (used + bytes.length + encoded.length > config.maxTotalBytes) {
+              return yield* Effect.fail(
+                new CasError({
+                  code: "cap_exceeded",
                   digest,
-                  detail: `${bytes.length} of ${expectedSize} bytes`,
+                  detail: `${
+                    used + bytes.length + encoded.length
+                  } > total cap ${config.maxTotalBytes}`,
                 }),
               )
-              : bytes.length > expectedSize
-              ? Effect.fail(
-                new CasError({
-                  code: "tampered_blob",
-                  digest,
-                  detail: `${bytes.length} bytes exceeds manifest size ${expectedSize}`,
-                }),
-              )
-              : sha256(bytes).pipe(
-                Effect.orDie,
-                Effect.flatMap((actual) =>
-                  actual === digest ? Effect.succeed(bytes) : Effect.fail(
-                    new CasError({
-                      code: "tampered_blob",
-                      digest,
-                      detail: `hashes to ${actual}`,
-                    }),
-                  )
-                ),
-              )
+            }
+            const manifestDigest = yield* sink.put(encoded).pipe(
+              Effect.mapError(
+                (error) => new CasError({ code: "store_failed", digest, detail: error.reason }),
+              ),
+            )
+            return { manifest, manifestDigest }
+          }),
+        read: (digest, expectedSize) =>
+          storedBytes(sink.read, digest).pipe(
+            Effect.flatMap((bytes) =>
+              bytes.length < expectedSize
+                ? Effect.fail(
+                  new CasError({
+                    code: "truncated_blob",
+                    digest,
+                    detail: `${bytes.length} of ${expectedSize} bytes`,
+                  }),
+                )
+                : bytes.length > expectedSize
+                ? Effect.fail(
+                  new CasError({
+                    code: "tampered_blob",
+                    digest,
+                    detail: `${bytes.length} bytes exceeds manifest size ${expectedSize}`,
+                  }),
+                )
+                : sha256(bytes).pipe(
+                  Effect.orDie,
+                  Effect.flatMap((actual) =>
+                    actual === digest ? Effect.succeed(bytes) : Effect.fail(
+                      new CasError({
+                        code: "tampered_blob",
+                        digest,
+                        detail: `hashes to ${actual}`,
+                      }),
+                    )
+                  ),
+                )
+            ),
           ),
-        ),
-      readManifest: (manifestDigest) =>
-        readVerified(sink.read, manifestDigest).pipe(
-          Effect.flatMap((bytes) =>
-            Effect.try({
-              try: () =>
-                Schema.decodeUnknownSync(ContentManifest, { onExcessProperty: "error" })(
-                  JSON.parse(new TextDecoder().decode(bytes)),
-                ),
-              catch: (error) =>
-                new CasError({
-                  code: "manifest_invalid",
-                  digest: manifestDigest,
-                  detail: error instanceof Error ? error.message : String(error),
-                }),
-            })
+        readManifest: (manifestDigest) =>
+          readVerified(sink.read, manifestDigest).pipe(
+            Effect.flatMap((bytes) =>
+              Effect.try({
+                try: () =>
+                  Schema.decodeUnknownSync(ContentManifest, { onExcessProperty: "error" })(
+                    JSON.parse(new TextDecoder().decode(bytes)),
+                  ),
+                catch: (error) =>
+                  new CasError({
+                    code: "manifest_invalid",
+                    digest: manifestDigest,
+                    detail: error instanceof Error ? error.message : String(error),
+                  }),
+              })
+            ),
           ),
-        ),
-    }
-  }),
+      }
+    }),
+  )
+
+export const contentStoreLayer: Layer.Layer<ContentStore, never, BlobSink> = contentStoreLayerWith(
+  CONTENT_CAPS,
 )

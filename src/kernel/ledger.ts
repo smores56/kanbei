@@ -4,7 +4,7 @@
  * canonicalization (`evidence/canonical.ts`) and digest (`evidence/digest.ts`)
  * modules.
  */
-import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema } from "effect"
+import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema, Semaphore } from "effect"
 import { canonicalize } from "../evidence/canonical.ts"
 import type { Json } from "../evidence/canonical.ts"
 import { sha256Labeled } from "../evidence/digest.ts"
@@ -61,6 +61,7 @@ export type LedgerErrorCode =
   | "hash_mismatch"
   | "sequence_gap"
   | "predecessor_mismatch"
+  | "idempotency_conflict"
 
 export class LedgerError extends Data.TaggedError("LedgerError")<{
   readonly code: LedgerErrorCode
@@ -81,6 +82,14 @@ export interface LedgerAppendResult {
   readonly duplicate: boolean
 }
 
+/** A repair the ledger performed at load; durable in `<ledger>.recovery`. */
+export interface RecoveryReceipt {
+  readonly kind: "torn_final_line"
+  readonly droppedBytes: number
+  readonly at: string
+  readonly detail: string
+}
+
 /** The frozen append surface: one sequencer, one chain, one authority matrix. */
 export interface Ledger {
   readonly append: (request: LedgerAppendRequest) => Effect.Effect<LedgerAppendResult, LedgerError>
@@ -88,6 +97,7 @@ export interface Ledger {
   readonly head: Effect.Effect<LedgerHead, LedgerError>
   /** Re-reads and re-verifies every stored row; tampering after boot refuses here. */
   readonly verify: Effect.Effect<LedgerHead, LedgerError>
+  readonly recovery: Effect.Effect<ReadonlyArray<RecoveryReceipt>, LedgerError>
 }
 
 export const Ledger = Context.Service<Ledger>("kanbei/kernel/Ledger")
@@ -188,13 +198,13 @@ interface RecordPreimage {
   readonly recorded_at_us: number
   readonly prev_hash: string
   readonly components: ReadonlyArray<LedgerComponent>
+  readonly idempotency_key?: string
 }
 
-const toJson = (value: RecordPreimage | Readonly<Record<string, unknown>>): Json =>
-  Schema.decodeUnknownSync(Schema.Json)(value)
+const toJson = (value: unknown): Json => Schema.decodeUnknownSync(Schema.Json)(value)
 
 export const hashPreimage = (
-  preimage: RecordPreimage,
+  preimage: unknown,
 ): Effect.Effect<string> =>
   sha256Labeled("kanbei.record.v1", [canonicalize(toJson(preimage))]).pipe(Effect.orDie)
 
@@ -276,7 +286,7 @@ export const verifyChain = (
           new LedgerError({ code: "hash_mismatch", detail: `row ${record.seq} repeats a hash` }),
         )
       }
-      const { record_hash: storedHash, idempotency_key: _key, ...preimage } = record
+      const { record_hash: storedHash, ...preimage } = record
       const recomputed = yield* hashPreimage(preimage)
       if (recomputed !== storedHash) {
         return Result.fail(
@@ -302,6 +312,7 @@ interface LedgerState {
   readonly integrity: Option.Option<LedgerError>
   readonly idempotency: Readonly<Record<string, LedgerRecord>>
   readonly recordedAtUs: number
+  readonly recovery: ReadonlyArray<RecoveryReceipt>
 }
 
 const idempotencyIndex = (
@@ -313,13 +324,52 @@ const idempotencyIndex = (
     ),
   )
 
-const emptyState = (head: LedgerHead): LedgerState => ({
+const emptyState = (
+  head: LedgerHead,
+  recovery: ReadonlyArray<RecoveryReceipt> = [],
+): LedgerState => ({
   records: [],
   head,
   integrity: Option.none(),
   idempotency: {},
   recordedAtUs: 0,
+  recovery,
 })
+
+const iso = (millis: number): string => new Date(millis).toISOString()
+
+const requestDigest = (
+  components: ReadonlyArray<LedgerComponent>,
+): Effect.Effect<string> =>
+  sha256Labeled("kanbei.appendrequest.v1", [canonicalize(toJson({ components }))]).pipe(
+    Effect.orDie,
+  )
+
+/**
+ * A final line without its newline is a writer that died mid-append. Truncate it
+ * to the last committed byte and record a receipt; never refuse the whole chain
+ * for a crash that left no canonical record.
+ */
+const recoverTornTail = (
+  store: LedgerStore,
+): Effect.Effect<ReadonlyArray<RecoveryReceipt>, never, LedgerStore> =>
+  Effect.gen(function* () {
+    const read = yield* Effect.result(store.read)
+    if (Result.isFailure(read) || read.success.tail === "") return []
+    const droppedBytes = new TextEncoder().encode(read.success.tail).length
+    const now = yield* Clock.currentTimeMillis
+    const receipt: RecoveryReceipt = {
+      kind: "torn_final_line",
+      droppedBytes,
+      at: iso(now),
+      detail: `dropped ${droppedBytes} uncommitted bytes at offset ${read.success.tailOffset}`,
+    }
+    const truncated = yield* Effect.result(store.truncate(read.success.tailOffset))
+    if (Result.isFailure(truncated)) return []
+    yield* Effect.ignore(store.receipt(JSON.stringify(receipt)))
+    yield* Effect.logWarning("ledger recovered a torn final line", receipt)
+    return [receipt]
+  })
 
 const loadState = (
   epochId: string,
@@ -327,26 +377,27 @@ const loadState = (
   Effect.gen(function* () {
     const store = yield* LedgerStore
     const genesis = yield* genesisHash(epochId)
+    const recovery = yield* recoverTornTail(store)
     const loaded = yield* Effect.result(store.read)
     if (Result.isFailure(loaded)) {
       return {
-        ...emptyState({ seq: 0, hash: genesis, epochId }),
+        ...emptyState({ seq: 0, hash: genesis, epochId }, recovery),
         integrity: Option.some(
           new LedgerError({ code: "store_failed", detail: loaded.failure.reason }),
         ),
       }
     }
-    const parsed = parseRows(loaded.success)
+    const parsed = parseRows(loaded.success.lines)
     if (Result.isFailure(parsed)) {
       return {
-        ...emptyState({ seq: 0, hash: genesis, epochId }),
+        ...emptyState({ seq: 0, hash: genesis, epochId }, recovery),
         integrity: Option.some(parsed.failure),
       }
     }
     const verified = yield* verifyChain(epochId, parsed.success, genesis)
     if (Result.isFailure(verified)) {
       return {
-        ...emptyState({ seq: 0, hash: genesis, epochId }),
+        ...emptyState({ seq: 0, hash: genesis, epochId }, recovery),
         integrity: Option.some(verified.failure),
       }
     }
@@ -357,6 +408,7 @@ const loadState = (
       integrity: Option.none(),
       idempotency: idempotencyIndex(parsed.success),
       recordedAtUs: last === undefined ? 0 : last.recorded_at_us,
+      recovery,
     }
   })
 
@@ -375,8 +427,11 @@ export const ledgerLayer = (epochId: string): Layer.Layer<Ledger, never, LedgerS
       const store = yield* LedgerStore
       const genesis = yield* genesisHash(epochId)
       const stateRef = yield* Ref.make(yield* loadState(epochId))
+      // One sequencer: every read-modify-append runs under this permit, so two
+      // fibers can never mint the same seq. The file lock keeps a second process out.
+      const sequencer = yield* Semaphore.make(1)
 
-      const append: Ledger["append"] = (request) =>
+      const appendUnlocked: Ledger["append"] = (request) =>
         Effect.gen(function* () {
           const state = yield* Ref.get(stateRef)
           if (Option.isSome(state.integrity)) return yield* Effect.fail(state.integrity.value)
@@ -395,40 +450,48 @@ export const ledgerLayer = (epochId: string): Layer.Layer<Ledger, never, LedgerS
               new LedgerError({ code: "authority_denied", detail: issues.join("; ") }),
             )
           }
-          if (request.idempotencyKey !== undefined) {
-            const duplicate = state.idempotency[request.idempotencyKey]
-            if (duplicate !== undefined) return { record: duplicate, duplicate: true }
-          }
           const components = [
             ...supplied,
             ...(request.authorityClass === undefined
               ? []
               : [authorityComponent(request.authorityClass, request.principal)]),
           ].toSorted((left, right) => compareTypes(left.type, right.type))
+          const digest = yield* requestDigest(components)
+          if (request.idempotencyKey !== undefined) {
+            const duplicate = state.idempotency[request.idempotencyKey]
+            if (duplicate !== undefined) {
+              const stored = yield* requestDigest(duplicate.components)
+              if (stored !== digest) {
+                return yield* Effect.fail(
+                  new LedgerError({
+                    code: "idempotency_conflict",
+                    detail: `key ${request.idempotencyKey} was used for a different request`,
+                  }),
+                )
+              }
+              return { record: duplicate, duplicate: true }
+            }
+          }
           const nowMillis = yield* Clock.currentTimeMillis
           const recordedAtUs = Math.max(state.recordedAtUs, Math.floor(nowMillis * 1000))
           const seq = state.head.seq + 1
           const record_id = yield* recordIdFor(epochId, seq, components)
           const prev_hash = state.head.hash
-          const record_hash = yield* hashPreimage({
+          const preimage: RecordPreimage = {
             record_id,
             seq,
             epoch_id: epochId,
             recorded_at_us: recordedAtUs,
             prev_hash,
-            components,
-          })
-          const record: LedgerRecord = {
-            record_id,
-            seq,
-            epoch_id: epochId,
-            recorded_at_us: recordedAtUs,
-            prev_hash,
-            record_hash,
             components,
             ...(request.idempotencyKey === undefined
               ? {}
               : { idempotency_key: request.idempotencyKey }),
+          }
+          const record_hash = yield* hashPreimage(preimage)
+          const record: LedgerRecord = {
+            ...preimage,
+            record_hash,
           }
           const stored = yield* Effect.result(store.append(JSON.stringify(record)))
           if (Result.isFailure(stored)) {
@@ -444,9 +507,12 @@ export const ledgerLayer = (epochId: string): Layer.Layer<Ledger, never, LedgerS
               ? state.idempotency
               : { ...state.idempotency, [request.idempotencyKey]: record },
             recordedAtUs,
+            recovery: state.recovery,
           })
           return { record, duplicate: false }
         })
+
+      const append: Ledger["append"] = (request) => sequencer.withPermit(appendUnlocked(request))
 
       const verify: Ledger["verify"] = Effect.gen(function* () {
         const loaded = yield* Effect.result(store.read)
@@ -455,7 +521,7 @@ export const ledgerLayer = (epochId: string): Layer.Layer<Ledger, never, LedgerS
             new LedgerError({ code: "store_failed", detail: loaded.failure.reason }),
           )
         }
-        const parsed = parseRows(loaded.success)
+        const parsed = parseRows(loaded.success.lines)
         if (Result.isFailure(parsed)) return yield* Effect.fail(parsed.failure)
         const verified = yield* verifyChain(epochId, parsed.success, genesis)
         if (Result.isFailure(verified)) return yield* Effect.fail(verified.failure)
@@ -474,6 +540,14 @@ export const ledgerLayer = (epochId: string): Layer.Layer<Ledger, never, LedgerS
           ),
         ),
         verify,
+        recovery: Ref.get(stateRef).pipe(
+          Effect.flatMap((state) =>
+            Option.match(state.integrity, {
+              onNone: () => Effect.succeed(state.recovery),
+              onSome: (error) => Effect.fail(error),
+            })
+          ),
+        ),
       }
     }),
   )

@@ -1,11 +1,15 @@
 import { assertEquals } from "@std/assert"
 import { Effect, Layer } from "effect"
 import { fileBlobSinkLayer } from "../../src/adapters/blob-sink.ts"
-import { CasError, ContentStore, contentStoreLayer } from "../../src/kernel/cas.ts"
+import {
+  CasError,
+  ContentStore,
+  contentStoreLayer,
+  contentStoreLayerWith,
+} from "../../src/kernel/cas.ts"
 import { withTempDir } from "../support.ts"
 
-const blobPath = (root: string, digest: string): string =>
-  `${root}/sha256/${digest.slice(7, 9)}/${digest.slice(9)}`
+const blobPath = (root: string, digest: string): string => `${root}/sha256/${digest.slice(7)}`
 
 const withCas = <A, E>(
   root: string,
@@ -122,5 +126,72 @@ Deno.test("identical bytes publish one object and one manifest", async () => {
     )
     assertEquals(result.first.manifest.digest, result.second.manifest.digest)
     assertEquals(result.first.manifestDigest, result.second.manifestDigest)
+  })
+})
+
+Deno.test("publish refuses an object above the per-object cap before storing it", async () => {
+  await withTempDir("cas", async (root) => {
+    const error = await Effect.runPromise(
+      Effect.gen(function* () {
+        const cas = yield* ContentStore
+        return yield* cas.publish(encoder.encode("x".repeat(17)), "text/plain")
+      }).pipe(
+        Effect.provide(
+          contentStoreLayerWith({ maxObjectBytes: 16, maxTotalBytes: 1_000 }).pipe(
+            Layer.provide(fileBlobSinkLayer(root)),
+          ),
+        ),
+        Effect.flip,
+      ),
+    )
+    assertEquals(error.code, "cap_exceeded")
+    const entries = (() => {
+      try {
+        return [...Deno.readDirSync(`/sha256`)]
+      } catch {
+        return []
+      }
+    })()
+    assertEquals(entries.length, 0)
+  })
+})
+
+Deno.test("publish refuses a write that would exceed the total cap", async () => {
+  await withTempDir("cas", async (root) => {
+    const error = await Effect.runPromise(
+      Effect.gen(function* () {
+        const cas = yield* ContentStore
+        yield* cas.publish(encoder.encode("first"), "text/plain")
+        return yield* cas.publish(encoder.encode("second"), "text/plain")
+      }).pipe(
+        Effect.provide(
+          contentStoreLayerWith({ maxObjectBytes: 1_024, maxTotalBytes: 200 }).pipe(
+            Layer.provide(fileBlobSinkLayer(root)),
+          ),
+        ),
+        Effect.flip,
+      ),
+    )
+    assertEquals(error.code, "cap_exceeded")
+  })
+})
+
+Deno.test("concurrent identical publishes converge on one object without temp files", async () => {
+  await withTempDir("cas", async (root) => {
+    await withCas(
+      root,
+      Effect.forEach(
+        Array.from({ length: 8 }, () => "same bytes"),
+        (text) =>
+          Effect.gen(function* () {
+            const cas = yield* ContentStore
+            return yield* cas.publish(encoder.encode(text), "text/plain")
+          }),
+        { concurrency: "unbounded" },
+      ),
+    )
+    const entries = [...Deno.readDirSync(`${root}/sha256`)]
+    assertEquals(entries.length, 2)
+    assertEquals(entries.some((entry) => entry.name.includes("tmp")), false)
   })
 })
