@@ -72,7 +72,8 @@ export interface LedgerAppendRequest {
   readonly components: ReadonlyArray<LedgerComponent>
   readonly appender: AppenderRole
   readonly principal: string
-  readonly authorityClass?: AuthorityClass
+  /** Mandatory: an append without a claimed authority class is unauditable. */
+  readonly authorityClass: AuthorityClass
   readonly idempotencyKey?: string
   readonly epochId?: string
 }
@@ -142,7 +143,7 @@ const componentIssues = (
   const types = components.map((component) => component.type)
   if (new Set(types).size !== types.length) issues.push("duplicate component type")
   for (const component of components) {
-    if (component.type === AUTHORITY_COMPONENT && request.authorityClass !== undefined) {
+    if (component.type === AUTHORITY_COMPONENT) {
       issues.push("the append path materializes the authority component")
     }
     if (!componentGrammar.test(component.type)) {
@@ -153,6 +154,21 @@ const componentIssues = (
     }
     if (component.type.startsWith("kb.work/consent_display") && request.appender !== "frozen") {
       issues.push("the consent display is rendered only by the frozen surface")
+    }
+    if (
+      (component.type.startsWith("kb.state/candidate_manifest") ||
+        component.type.startsWith("kb.work/candidate_validation")) &&
+      request.appender !== "frozen"
+    ) {
+      issues.push("candidate manifests and validations are written only by the frozen surface")
+    }
+    if (component.type.startsWith("kb.work/candidate_approval")) {
+      if (request.appender !== "human_gesture") {
+        issues.push("an approval receipt is appended only by a human gesture")
+      }
+      if (request.authorityClass !== "human_authority") {
+        issues.push("an approval receipt must claim human authority")
+      }
     }
     if (
       (component.type.startsWith("kb.effect/") || component.type.startsWith("kb.activation/")) &&
@@ -178,12 +194,10 @@ const componentIssues = (
   return issues
 }
 
-const authorityIssues = (request: LedgerAppendRequest): ReadonlyArray<string> => {
-  if (request.authorityClass === undefined) return []
-  return allowedClasses[request.appender].includes(request.authorityClass)
+const authorityIssues = (request: LedgerAppendRequest): ReadonlyArray<string> =>
+  allowedClasses[request.appender].includes(request.authorityClass)
     ? []
     : [`${request.appender} cannot append ${request.authorityClass}`]
-}
 
 const compareTypes = (left: string, right: string): number =>
   left < right ? -1 : left > right ? 1 : 0
@@ -452,9 +466,7 @@ export const ledgerLayer = (epochId: string): Layer.Layer<Ledger, never, LedgerS
           }
           const components = [
             ...supplied,
-            ...(request.authorityClass === undefined
-              ? []
-              : [authorityComponent(request.authorityClass, request.principal)]),
+            authorityComponent(request.authorityClass, request.principal),
           ].toSorted((left, right) => compareTypes(left.type, right.type))
           const digest = yield* requestDigest(components)
           if (request.idempotencyKey !== undefined) {

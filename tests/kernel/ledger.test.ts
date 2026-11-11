@@ -129,11 +129,15 @@ Deno.test("unknown components round-trip unchanged", async () => {
           components: [{ type: "kb.plugin.demo/state@1.0.0", payload }],
           appender: "plugin",
           principal: "plugin-demo",
+          authorityClass: "observation",
         })
         return yield* ledger.records
       }),
     )
-    assertEquals(records[0]?.components[0]?.payload, payload)
+    const component = records[0]?.components.find((entry) =>
+      entry.type === "kb.plugin.demo/state@1.0.0"
+    )
+    assertEquals(component?.payload, payload)
   })
 })
 
@@ -358,5 +362,66 @@ Deno.test("a second ledger on the same file refuses instead of interleaving", as
       ),
     )
     assertEquals(Exit.isFailure(refused), true)
+  })
+})
+
+Deno.test("an append without an authority class is not expressible", () => {
+  // The request type makes `authorityClass` mandatory; a runtime omission is a
+  // type error, so this test pins the contract itself.
+  const source = Deno.readTextFileSync(
+    new URL("../../src/kernel/ledger.ts", import.meta.url),
+  )
+  assertEquals(/readonly authorityClass\?: AuthorityClass/u.test(source), false)
+  assertEquals(/readonly authorityClass: AuthorityClass/u.test(source), true)
+})
+
+Deno.test("an agent cannot append a candidate manifest, validation, or approval", async () => {
+  await withTempDir("ledger", async (directory) => {
+    const cases = [
+      { type: "kb.state/candidate_manifest@1.0.0", appender: "agent", class: "coordination" },
+      { type: "kb.work/candidate_validation@1.0.0", appender: "plugin", class: "coordination" },
+      {
+        type: "kb.work/candidate_approval@1.0.0",
+        appender: "agent",
+        class: "human_authority",
+      },
+    ] as const
+    const errors = await Promise.all(
+      cases.map((entry) =>
+        failure(
+          `${directory}/${entry.type.replaceAll("/", "-")}.jsonl`,
+          Effect.gen(function* () {
+            const ledger = yield* Ledger
+            return yield* ledger.append({
+              components: [{ type: entry.type, payload: { forged: true } }],
+              appender: entry.appender,
+              principal: "agent-1",
+              authorityClass: entry.class,
+            })
+          }),
+        )
+      ),
+    )
+    for (const [index, entry] of cases.entries()) {
+      assertEquals(errors[index]?.code, "authority_denied", entry.type)
+    }
+  })
+})
+
+Deno.test("an approval appended by a human gesture must claim human authority", async () => {
+  await withTempDir("ledger", async (directory) => {
+    const error = await failure(
+      `${directory}/ledger.jsonl`,
+      Effect.gen(function* () {
+        const ledger = yield* Ledger
+        return yield* ledger.append({
+          components: [{ type: "kb.work/candidate_approval@1.0.0", payload: { forged: true } }],
+          appender: "human_gesture",
+          principal: "human-1",
+          authorityClass: "coordination",
+        })
+      }),
+    )
+    assertEquals(error.code, "authority_denied")
   })
 })

@@ -1,4 +1,6 @@
-import { Schema } from "effect"
+import { Effect, Schema } from "effect"
+import { canonicalize } from "../evidence/canonical.ts"
+import { sha256Labeled } from "../evidence/digest.ts"
 import type { CandidateManifest, CandidateWorkspace, CapabilityRequest } from "./manifest.ts"
 import { CANDIDATE_CONTRACT_VERSION, capabilityClass } from "./manifest.ts"
 
@@ -18,6 +20,8 @@ export const ValidationStep = Schema.Struct({
   step: ValidationStepName,
   outcome: Schema.Literals(["pass", "fail"]),
   detail: Schema.String,
+  /** Digest of the exact evidence the step ruled on; a report cannot be replayed. */
+  evidenceDigest: Schema.String,
 })
 export type ValidationStep = typeof ValidationStep.Type
 
@@ -26,6 +30,9 @@ export const ValidationReport = Schema.Struct({
   candidateDigest: Schema.String,
   steps: Schema.Array(ValidationStep),
   verdict: Schema.Literals(["validated", "rejected", "quarantined"]),
+  /** Digest over every input the run consumed, so evidence travels with the verdict. */
+  inputsDigest: Schema.String,
+  authorizedSources: Schema.Array(Schema.String),
   quarantineReason: Schema.optional(Schema.String),
 })
 export type ValidationReport = typeof ValidationReport.Type
@@ -45,6 +52,8 @@ export interface ValidationInputs {
     readonly to: number
     readonly mode: "compatible" | "forward-only" | "requires-checkpoint"
   }>
+  /** Source prefixes the declarative view may cite; an empty list authorizes none. */
+  readonly authorizedSources?: ReadonlyArray<string>
 }
 
 export const passingInputs = (
@@ -61,7 +70,25 @@ export const passingInputs = (
 
 const digestPattern = /^sha256:[0-9a-f]{64}$/u
 
-const manifestStep = (manifest: CandidateManifest): ValidationStep => {
+const toJson = (value: unknown): Schema.Json => Schema.decodeUnknownSync(Schema.Json)(value)
+
+const evidenceDigestOf = (
+  step: ValidationStepName,
+  evidence: Schema.Json,
+): Effect.Effect<string> =>
+  sha256Labeled("kanbei.validation.evidence.v1", [canonicalize(toJson({ step, evidence }))]).pipe(
+    Effect.orDie,
+  )
+
+/** The immutable evidence a step ruled on; the digest is computed from exactly this. */
+interface StepDraft {
+  readonly step: ValidationStepName
+  readonly outcome: "pass" | "fail"
+  readonly detail: string
+  readonly evidence: Schema.Json
+}
+
+const manifestStep = (manifest: CandidateManifest): StepDraft => {
   const problems: Array<string> = []
   if (manifest.candidateId.trim() === "") problems.push("candidateId is required")
   if (manifest.scope.trim() === "") problems.push("scope is required")
@@ -92,13 +119,14 @@ const manifestStep = (manifest: CandidateManifest): ValidationStep => {
     step: "manifest_schema",
     outcome: problems.length === 0 ? "pass" : "fail",
     detail: problems.length === 0 ? "manifest parses" : problems.join("; "),
+    evidence: toJson(manifest),
   }
 }
 
 const dependencyStep = (
   workspace: CandidateWorkspace,
   inputs: ValidationInputs,
-): ValidationStep => {
+): StepDraft => {
   const resolved = new Set(inputs.resolvedArtifacts)
   const missing = workspace.dependencies
     .map((dependency) => `${dependency.id}@${dependency.version}`)
@@ -109,10 +137,14 @@ const dependencyStep = (
     detail: missing.length === 0
       ? `${workspace.dependencies.length} dependencies resolve`
       : `missing ${missing.join(", ")}`,
+    evidence: toJson({
+      dependencies: workspace.dependencies,
+      resolvedArtifacts: inputs.resolvedArtifacts.toSorted(),
+    }),
   }
 }
 
-const scanStep = (capabilities: ReadonlyArray<CapabilityRequest>): ValidationStep => {
+const scanStep = (capabilities: ReadonlyArray<CapabilityRequest>): StepDraft => {
   const violations = capabilities.flatMap((entry) => {
     const kind = capabilityClass(entry.capability)
     return kind === "declared" ? [] : [`${entry.capability} is ${kind}`]
@@ -125,88 +157,114 @@ const scanStep = (capabilities: ReadonlyArray<CapabilityRequest>): ValidationSte
       : violations.join(
         "; ",
       ),
+    evidence: toJson(capabilities),
   }
 }
 
 const booleanStep = (
   step: ValidationStepName,
+  evidence: Schema.Json,
   ok: boolean,
   pass: string,
   fail: string,
-): ValidationStep => ({ step, outcome: ok ? "pass" : "fail", detail: ok ? pass : fail })
+): StepDraft => ({ step, outcome: ok ? "pass" : "fail", detail: ok ? pass : fail, evidence })
+
+const payloadDigest = (inputs: ValidationInputs): Effect.Effect<string> =>
+  sha256Labeled("kanbei.validation.inputs.v1", [canonicalize(toJson(inputs))]).pipe(Effect.orDie)
 
 /**
  * The eight ordered validations (`07 §4.8.4`). The first failure stops the run;
  * a trust-root, undeclared, or forbidden capability quarantines the candidate.
+ * Every step commits to the digest of the evidence it ruled on.
  */
 export const runValidation = (
   manifest: CandidateManifest,
   candidateDigest: string,
   workspace: CandidateWorkspace,
   inputs: ValidationInputs,
-): ValidationReport => {
-  const steps: Array<ValidationStep> = []
-  const push = (step: ValidationStep): boolean => {
-    steps.push(step)
-    return step.outcome === "pass"
-  }
-  if (!push(manifestStep(manifest))) {
-    return { candidateId: manifest.candidateId, candidateDigest, steps, verdict: "rejected" }
-  }
-  if (!push(dependencyStep(workspace, inputs))) {
-    return { candidateId: manifest.candidateId, candidateDigest, steps, verdict: "rejected" }
-  }
-  const scan = scanStep(workspace.capabilities)
-  const quarantineReason =
-    workspace.capabilities.find((entry) => capabilityClass(entry.capability) === "trust_root") ===
-        undefined
-      ? workspace.capabilities.find((entry) => capabilityClass(entry.capability) !== "declared")
-      : workspace.capabilities.find((entry) => capabilityClass(entry.capability) === "trust_root")
-  if (!push(scan)) {
-    return {
+): Effect.Effect<ValidationReport> =>
+  Effect.gen(function* () {
+    const inputsDigest = yield* payloadDigest(inputs)
+    const steps: Array<ValidationStep> = []
+    const push = (draft: StepDraft): Effect.Effect<boolean> =>
+      evidenceDigestOf(draft.step, draft.evidence).pipe(
+        Effect.map((evidenceDigest) => {
+          steps.push({
+            step: draft.step,
+            outcome: draft.outcome,
+            detail: draft.detail,
+            evidenceDigest,
+          })
+          return draft.outcome === "pass"
+        }),
+      )
+    const finish = (verdict: ValidationReport["verdict"], reason?: string): ValidationReport => ({
       candidateId: manifest.candidateId,
       candidateDigest,
       steps,
-      verdict: "quarantined",
-      quarantineReason: quarantineReason?.capability ?? "capability scan failed",
+      verdict,
+      inputsDigest,
+      authorizedSources: [...(inputs.authorizedSources ?? [])],
+      ...(reason === undefined ? {} : { quarantineReason: reason }),
+    })
+
+    if (!(yield* push(manifestStep(manifest)))) return finish("rejected")
+    if (!(yield* push(dependencyStep(workspace, inputs)))) return finish("rejected")
+    const scan = scanStep(workspace.capabilities)
+    const quarantineReason = workspace.capabilities.find((entry) =>
+        capabilityClass(entry.capability) === "trust_root"
+      ) ===
+        undefined
+      ? workspace.capabilities.find((entry) => capabilityClass(entry.capability) !== "declared")
+      : workspace.capabilities.find((entry) => capabilityClass(entry.capability) === "trust_root")
+    if (!(yield* push(scan))) {
+      return finish("quarantined", quarantineReason?.capability ?? "capability scan failed")
     }
-  }
-  const rest: ReadonlyArray<ValidationStep> = [
-    booleanStep(
-      "artifact_provenance",
-      inputs.artifactPresent,
-      "artifact digest is present",
-      "artifact digest is absent from the image",
-    ),
-    booleanStep(
-      "dynamic_conformance",
-      inputs.dynamicConformance,
-      "candidate boots with capabilities denied",
-      "dynamic conformance failed",
-    ),
-    booleanStep(
-      "migration_dry_run",
-      inputs.migrationDryRun,
-      "forward migrations ran on shadow state",
-      "migration dry run failed",
-    ),
-    booleanStep(
-      "security_probes",
-      inputs.securityProbes,
-      "trust-root and cross-scope probes denied",
-      "a security probe did not fail closed",
-    ),
-    booleanStep(
-      "health_plan",
-      inputs.healthPlanDeclared,
-      "health plan is executable",
-      "health plan is missing or external",
-    ),
-  ]
-  for (const step of rest) {
-    if (!push(step)) {
-      return { candidateId: manifest.candidateId, candidateDigest, steps, verdict: "rejected" }
+    const rest: ReadonlyArray<StepDraft> = [
+      booleanStep(
+        "artifact_provenance",
+        toJson({ artifactPresent: inputs.artifactPresent, digest: manifest.artifact.digest }),
+        inputs.artifactPresent,
+        "artifact digest is present",
+        "artifact digest is absent from the image",
+      ),
+      booleanStep(
+        "dynamic_conformance",
+        toJson({
+          dynamicConformance: inputs.dynamicConformance,
+          candidateDigest,
+        }),
+        inputs.dynamicConformance,
+        "candidate boots with capabilities denied",
+        "dynamic conformance failed",
+      ),
+      booleanStep(
+        "migration_dry_run",
+        toJson({
+          migrationDryRun: inputs.migrationDryRun,
+          migrations: inputs.migrations ?? [],
+        }),
+        inputs.migrationDryRun,
+        "forward migrations ran on shadow state",
+        "migration dry run failed",
+      ),
+      booleanStep(
+        "security_probes",
+        toJson({ securityProbes: inputs.securityProbes, capabilities: workspace.capabilities }),
+        inputs.securityProbes,
+        "trust-root and cross-scope probes denied",
+        "a security probe did not fail closed",
+      ),
+      booleanStep(
+        "health_plan",
+        toJson({ healthPlanDeclared: inputs.healthPlanDeclared }),
+        inputs.healthPlanDeclared,
+        "health plan is executable",
+        "health plan is missing or external",
+      ),
+    ]
+    for (const step of rest) {
+      if (!(yield* push(step))) return finish("rejected")
     }
-  }
-  return { candidateId: manifest.candidateId, candidateDigest, steps, verdict: "validated" }
-}
+    return finish("validated")
+  })

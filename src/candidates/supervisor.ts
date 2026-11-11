@@ -1,24 +1,25 @@
-import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema } from "effect"
-import { CasError, ContentStore } from "../kernel/cas.ts"
-import { Ledger, LedgerError } from "../kernel/ledger.ts"
-import type { LedgerRecord } from "../kernel/ledger.ts"
-import {
-  CONSENT_RENDERER_VERSION,
-  CONSENT_VIEW_REVISION,
-  consentDigestOf,
-  ConsentDisplay,
-  mintToken,
-  renderCandidateConsent,
-  tokenHashOf,
-  verifyGesture,
-} from "./consent.ts"
 import type {
-  CandidateApprovalReceipt,
   CandidateConsentManifest,
   ConsentGesture,
   FrozenConsentRender,
+  HumanSession,
 } from "./consent.ts"
-import { CandidateConsentManifest as ConsentManifestSchema } from "./consent.ts"
+import type { LedgerRecord } from "../kernel/ledger.ts"
+import type { ValidationInputs } from "./validation.ts"
+import {
+  CandidateApprovalReceipt,
+  CONSENT_RENDERER_VERSION,
+  CONSENT_VIEW_REVISION,
+  ConsentDelivery,
+  consentDigestOf,
+  ConsentDisplay,
+  HumanSessions,
+  mintToken,
+  renderCandidateConsent,
+  rulingCommitmentOf,
+  tokenHashOf,
+  verifyGesture,
+} from "./consent.ts"
 import {
   candidateDigest,
   CandidateManifest,
@@ -28,9 +29,13 @@ import {
   diffDigest,
   digestOfJson,
 } from "./manifest.ts"
+import { CandidateConsentManifest as ConsentManifestSchema } from "./consent.ts"
+import { CasError, ContentStore } from "../kernel/cas.ts"
+import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema } from "effect"
+import { Ledger, LedgerError } from "../kernel/ledger.ts"
 import { PointerError, PointerStore, ScopePointer } from "./pointer.ts"
 import { runValidation, ValidationReport } from "./validation.ts"
-import type { ValidationInputs } from "./validation.ts"
+import { parseViewDocument, validateViewDocument } from "../ui/validation.ts"
 
 export const MANIFEST_COMPONENT = "kb.state/candidate_manifest@1.0.0"
 export const VALIDATION_COMPONENT = "kb.work/candidate_validation@1.0.0"
@@ -69,25 +74,32 @@ export type CandidateErrorCode =
   | "candidate_rejected"
   | "candidate_quarantined"
   | "approval_required"
+  | "approval_expired"
   | "approval_token_invalid"
   | "approval_already_consumed"
   | "approval_session_mismatch"
-  | "approval_expired"
+  | "approval_session_unverified"
   | "approval_digest_mismatch"
   | "digest_mismatch"
   | "scope_mismatch"
+  | "view_invalid"
   | "pointer_missing"
-  | "store_failed"
+  | "pointer_corrupt"
+  | "no_rollback_target"
   | "ledger_failed"
+  | "store_failed"
 
 export class CandidateError extends Data.TaggedError("CandidateError")<{
   readonly code: CandidateErrorCode
   readonly detail: string
 }> {}
 
+/**
+ * `requestApproval` hands the human only the frozen render; the plaintext token
+ * leaves through `ConsentDelivery`, so an agent-reachable caller cannot rule.
+ */
 export interface ApprovalRequestResult {
   readonly display: ConsentDisplay
-  readonly token: string
   readonly render: FrozenConsentRender
 }
 
@@ -105,11 +117,6 @@ export interface ScopeRollback {
   readonly pointer: Option.Option<ScopePointer>
 }
 
-/**
- * The activation supervisor: staging, the eight validations, the capability
- * diff, the frozen consent render and single-use approval, one pointer flip per
- * scope, post-flip health, rollback, and previous-candidate retention.
- */
 export interface CandidateSupervisor {
   readonly stage: (
     workspace: CandidateWorkspace,
@@ -121,16 +128,17 @@ export interface CandidateSupervisor {
   ) => Effect.Effect<CandidateRecord, CandidateError>
   readonly requestApproval: (
     candidateId: string,
-    sessionId: string,
+    session: HumanSession,
     ttlUs: number,
   ) => Effect.Effect<ApprovalRequestResult, CandidateError>
   readonly approve: (
     candidateId: string,
     gesture: ConsentGesture,
   ) => Effect.Effect<CandidateApprovalReceipt, CandidateError>
+  /** Flip, then probe, then receipt: a failed flip never records an activation. */
   readonly activate: (
     candidateId: string,
-    health: "pass" | "fail",
+    probe: Effect.Effect<"pass" | "fail">,
   ) => Effect.Effect<ActivationOutcome, CandidateError>
   readonly rollback: (scope: string, reason: string) => Effect.Effect<ScopeRollback, CandidateError>
   readonly candidate: (candidateId: string) => Effect.Effect<Option.Option<CandidateRecord>>
@@ -147,18 +155,24 @@ const ManifestPayload = Schema.Struct({
   digest: Schema.String,
   workspace: CandidateWorkspace,
 })
+
 const ValidationPayload = Schema.Struct({
   report: ValidationReport,
   diff: CapabilityDiff,
   diffDigest: Schema.String,
 })
+
 const ActivationPayload = Schema.Struct({
   candidateId: Schema.String,
   candidateDigest: Schema.String,
   scope: Schema.String,
   health: Schema.Literal("pass"),
+  activationReceipt: Schema.String,
+  pointerGeneration: Schema.Number,
   previous: Schema.optional(ScopePointer),
 })
+type ActivationPayload = typeof ActivationPayload.Type
+
 const FailurePayload = Schema.Struct({
   candidateId: Schema.String,
   candidateDigest: Schema.String,
@@ -167,22 +181,15 @@ const FailurePayload = Schema.Struct({
   reason: Schema.String,
   restored: Schema.optional(ScopePointer),
 })
+
 const RollbackPayload = Schema.Struct({
   scope: Schema.String,
   from: Schema.String,
-  to: Schema.optional(Schema.String),
+  to: Schema.String,
+  fromGeneration: Schema.Number,
+  fromReceipt: Schema.String,
   reason: Schema.String,
 })
-
-interface ConsentRecord {
-  readonly display: ConsentDisplay
-  readonly consumedAtUs: Option.Option<number>
-}
-
-interface IndexState {
-  readonly candidates: Readonly<Record<string, CandidateRecord>>
-  readonly consents: Readonly<Record<string, ConsentRecord>>
-}
 
 const toJson = (value: unknown): Schema.Json => Schema.decodeUnknownSync(Schema.Json)(value)
 
@@ -250,34 +257,21 @@ const applyRecord = (index: IndexState, record: LedgerRecord): IndexState => {
   }
   const approvalPayload = componentPayload(record, APPROVAL_COMPONENT)
   if (approvalPayload !== undefined) {
-    const receipt = Schema.decodeUnknownSync(
-      Schema.Struct({
-        candidateId: Schema.String,
-        candidateDigest: Schema.String,
-        capabilityDiffDigest: Schema.String,
-        scope: Schema.String,
-        expiresAtUs: Schema.Number,
-        sessionId: Schema.String,
-        consentDigest: Schema.String,
-        ruling: Schema.Literal("approve"),
-        consumedAtUs: Schema.Number,
-      }),
-    )(approvalPayload)
+    const receipt = Schema.decodeUnknownSync(CandidateApprovalReceipt)(approvalPayload)
     const candidate = index.candidates[receipt.candidateId]
+    const consumed = index.consents[receipt.tokenHash]
     return {
       ...index,
       candidates: candidate === undefined ? index.candidates : {
         ...index.candidates,
         [receipt.candidateId]: { ...candidate, state: "approved", approval: Option.some(receipt) },
       },
-      consents: Object.fromEntries(
-        Object.entries(index.consents).map(([hash, entry]) => [
-          hash,
-          entry.display.consentDigest === receipt.consentDigest
-            ? { ...entry, consumedAtUs: Option.some(receipt.consumedAtUs) }
-            : entry,
-        ]),
-      ),
+      // Consumption is per token, not per consent digest: another display for the
+      // same candidate must not be marked used by this receipt.
+      consents: consumed === undefined ? index.consents : {
+        ...index.consents,
+        [receipt.tokenHash]: { ...consumed, consumedAtUs: Option.some(receipt.consumedAtUs) },
+      },
     }
   }
   const activationPayload = componentPayload(record, ACTIVATION_COMPONENT)
@@ -309,7 +303,7 @@ const applyRecord = (index: IndexState, record: LedgerRecord): IndexState => {
   const rollbackPayload = componentPayload(record, ROLLBACK_COMPONENT)
   if (rollbackPayload !== undefined) {
     const payload = Schema.decodeUnknownSync(RollbackPayload)(rollbackPayload)
-    const previous = payload.from === undefined ? undefined : index.candidates[payload.from]
+    const previous = index.candidates[payload.from]
     return previous === undefined ? index : {
       ...index,
       candidates: {
@@ -338,16 +332,96 @@ const mapFailure = (error: LedgerError | CasError | PointerError): CandidateErro
       : error.detail,
   })
 
+interface ConsentRecord {
+  readonly display: ConsentDisplay
+  readonly consumedAtUs: Option.Option<number>
+}
+
+interface IndexState {
+  readonly candidates: Readonly<Record<string, CandidateRecord>>
+  readonly consents: Readonly<Record<string, ConsentRecord>>
+}
+
+const activationKey = (scope: string, candidateId: string, digest: string): string =>
+  `activation:${scope}:${candidateId}:${digest}`
+
+const capabilityNames = (
+  entries: ReadonlyArray<{ readonly capability: string; readonly scope: string }>,
+): string =>
+  entries.map((entry) => `${entry.capability}(${entry.scope})`).toSorted().join(", ") || "none"
+
+const approvalIssues = (
+  candidate: CandidateRecord,
+  atUs: number,
+): Option.Option<CandidateError> => {
+  if (Option.isNone(candidate.approval)) {
+    return Option.some(
+      new CandidateError({ code: "approval_required", detail: candidate.manifest.candidateId }),
+    )
+  }
+  const approval = candidate.approval.value
+  if (approval.candidateDigest !== candidate.digest) {
+    return Option.some(
+      new CandidateError({
+        code: "digest_mismatch",
+        detail: "the approval binds another candidate digest",
+      }),
+    )
+  }
+  if (approval.scope !== candidate.manifest.scope) {
+    return Option.some(
+      new CandidateError({
+        code: "scope_mismatch",
+        detail: `${approval.scope} != ${candidate.manifest.scope}`,
+      }),
+    )
+  }
+  if (
+    Option.isNone(candidate.diffDigest) ||
+    candidate.diffDigest.value !== approval.capabilityDiffDigest
+  ) {
+    return Option.some(
+      new CandidateError({
+        code: "digest_mismatch",
+        detail: "the approval binds another capability diff",
+      }),
+    )
+  }
+  if (atUs >= approval.expiresAtUs) {
+    return Option.some(
+      new CandidateError({ code: "approval_expired", detail: candidate.manifest.candidateId }),
+    )
+  }
+  return Option.none()
+}
+
+/** A receipt's commitment must recompute from its own consent digest and token. */
+const approvalCommitmentIssue = (
+  approval: CandidateApprovalReceipt,
+): Effect.Effect<Option.Option<CandidateError>> =>
+  rulingCommitmentOf(approval.consentDigest, approval.ruling, approval.tokenHash).pipe(
+    Effect.map((commitment) =>
+      commitment === approval.rulingCommitment ? Option.none<CandidateError>() : Option.some(
+        new CandidateError({
+          code: "approval_digest_mismatch",
+          detail: "the approval commitment does not bind its consent",
+        }),
+      )
+    ),
+  )
+
 export const candidateSupervisorLayer: Layer.Layer<
   CandidateSupervisor,
   never,
-  Ledger | ContentStore | PointerStore
+  Ledger | ContentStore | PointerStore | HumanSessions | ConsentDelivery
 > = Layer.effect(
   CandidateSupervisor,
   Effect.gen(function* () {
     const ledger = yield* Ledger
     const cas = yield* ContentStore
     const pointers = yield* PointerStore
+    const sessions = yield* HumanSessions
+    const delivery = yield* ConsentDelivery
     const initial = yield* ledger.records.pipe(Effect.orDie)
     const index = yield* Ref.make(
       initial.reduce<IndexState>(applyRecord, emptyIndex),
@@ -379,18 +453,34 @@ export const candidateSupervisorLayer: Layer.Layer<
       role: "frozen" | "human_gesture",
       principal: string,
       authorityClass: "coordination" | "human_authority" | "activation_receipt",
+      idempotencyKey?: string,
     ) =>
       ledger.append({
         components: [{ type, payload }],
         appender: role,
         principal,
         authorityClass,
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
       }).pipe(
         Effect.mapError((error) => mapFailure(error)),
         Effect.flatMap((result) =>
           Ref.update(index, (current) => applyRecord(current, result.record)).pipe(
             Effect.as(result),
           )
+        ),
+      )
+
+    const verifySession = (sessionId: string, origin: string) =>
+      sessions.verify(sessionId, origin).pipe(
+        Effect.flatMap((verified) =>
+          Option.isNone(verified)
+            ? Effect.fail(
+              new CandidateError({
+                code: "approval_session_unverified",
+                detail: "the ruling session is not a verified human session",
+              }),
+            )
+            : Effect.succeed(verified.value)
         ),
       )
 
@@ -438,6 +528,17 @@ export const candidateSupervisorLayer: Layer.Layer<
     const validate: CandidateSupervisor["validate"] = (candidateId, inputs) =>
       Effect.gen(function* () {
         const candidate = yield* find(candidateId)
+        // Re-validating a refused candidate would launder it into `validated`.
+        if (candidate.state === "rejected" || candidate.state === "quarantined") {
+          return yield* Effect.fail(
+            new CandidateError({
+              code: candidate.state === "quarantined"
+                ? "candidate_quarantined"
+                : "candidate_rejected",
+              detail: `${candidateId} was ${candidate.state}; re-validation is refused`,
+            }),
+          )
+        }
         const base = candidate.manifest.base === undefined
           ? undefined
           : (yield* Ref.get(index)).candidates[candidate.manifest.base]
@@ -449,7 +550,7 @@ export const candidateSupervisorLayer: Layer.Layer<
           inputs.migrations ?? [],
         )
         const digest = yield* diffDigest(diff)
-        const report = runValidation(
+        const report = yield* runValidation(
           candidate.manifest,
           candidate.digest,
           candidate.workspace,
@@ -467,10 +568,11 @@ export const candidateSupervisorLayer: Layer.Layer<
 
     const requestApproval: CandidateSupervisor["requestApproval"] = (
       candidateId,
-      sessionId,
+      session,
       ttlUs,
     ) =>
       Effect.gen(function* () {
+        const verified = yield* verifySession(session.sessionId, session.origin)
         const candidate = yield* find(candidateId)
         if (candidate.state !== "validated") {
           return yield* Effect.fail(
@@ -483,7 +585,7 @@ export const candidateSupervisorLayer: Layer.Layer<
           )
         }
         const diff = candidate.diff.value
-        const token = yield* mintToken()
+        const minted = yield* mintToken()
         const now = yield* Clock.currentTimeMillis
         const expiresAtUs = Math.floor(now * 1000) + ttlUs
         const manifest: CandidateConsentManifest = {
@@ -495,9 +597,15 @@ export const candidateSupervisorLayer: Layer.Layer<
           rendererVersion: CONSENT_RENDERER_VERSION,
           viewRevision: CONSENT_VIEW_REVISION,
           labels: {
-            added: `${diff.added.length} capabilities added`,
-            removed: `${diff.removed.length} capabilities removed`,
-            dependencies: `${diff.dependencyChanges.length} dependency changes`,
+            added: capabilityNames(diff.added),
+            removed: capabilityNames(diff.removed),
+            broadened: capabilityNames(
+              diff.changed.filter((entry) => entry.broadening).map((entry) => entry.after),
+            ),
+            dependencies: diff.dependencyChanges
+              .map((entry) => `${entry.id}@${entry.after}`)
+              .toSorted()
+              .join(", ") || "none",
             scope: candidate.manifest.scope,
           },
         }
@@ -507,9 +615,10 @@ export const candidateSupervisorLayer: Layer.Layer<
         const display: ConsentDisplay = {
           consentDigest,
           manifest,
-          tokenHash: token.tokenHash,
+          tokenHash: minted.tokenHash,
           renderedAtUs: Math.floor(now * 1000),
-          sessionId,
+          sessionId: verified.sessionId,
+          origin: verified.origin,
         }
         yield* append(
           CONSENT_COMPONENT,
@@ -518,11 +627,14 @@ export const candidateSupervisorLayer: Layer.Layer<
           "consent-surface",
           "coordination",
         )
-        return { display, token: token.token, render: renderCandidateConsent(display) }
+        // The token leaves only through the human delivery port.
+        yield* delivery.deliver(verified, minted.token)
+        return { display, render: renderCandidateConsent(display) }
       })
 
     const approve: CandidateSupervisor["approve"] = (candidateId, gesture) =>
       Effect.gen(function* () {
+        const verified = yield* verifySession(gesture.sessionId, gesture.origin)
         const candidate = yield* find(candidateId)
         const tokenHash = yield* tokenHashOf(gesture.token)
         const current = yield* Ref.get(index)
@@ -540,6 +652,17 @@ export const candidateSupervisorLayer: Layer.Layer<
             new CandidateError({
               code: "approval_digest_mismatch",
               detail: "the receipt names another candidate",
+            }),
+          )
+        }
+        if (
+          consent.display.sessionId !== verified.sessionId ||
+          consent.display.origin !== verified.origin
+        ) {
+          return yield* Effect.fail(
+            new CandidateError({
+              code: "approval_session_mismatch",
+              detail: "the display was rendered for another session",
             }),
           )
         }
@@ -570,10 +693,59 @@ export const candidateSupervisorLayer: Layer.Layer<
           APPROVAL_COMPONENT,
           toJson(verdict.success),
           "human_gesture",
-          gesture.sessionId,
+          verified.sessionId,
           "human_authority",
         )
         return verdict.success
+      })
+
+    const viewIssues = (
+      candidate: CandidateRecord,
+    ): Effect.Effect<Option.Option<CandidateError>> =>
+      Effect.gen(function* () {
+        if (candidate.manifest.kind !== "declarative") return Option.none<CandidateError>()
+        const read = yield* Effect.result(
+          cas.read(
+            candidate.manifest.artifact.digest,
+            candidate.manifest.artifact.size,
+          ),
+        )
+        if (Result.isFailure(read)) {
+          return Option.some(mapFailure(read.failure))
+        }
+        const bytes = read.success
+        const decoded = yield* Effect.result(
+          Effect.try(() => JSON.parse(new TextDecoder().decode(bytes))),
+        )
+        if (Result.isFailure(decoded)) return Option.none<CandidateError>()
+        const value = decoded.success
+        if (typeof value !== "object" || value === null) return Option.none<CandidateError>()
+        const record = value as Record<string, unknown>
+        if (!("viewId" in record) && !("schemaVersion" in record)) {
+          return Option.none<CandidateError>()
+        }
+        const parsed = parseViewDocument(value)
+        if (Result.isFailure(parsed)) {
+          return Option.some(
+            new CandidateError({
+              code: "view_invalid",
+              detail: `schema_invalid: ${parsed.failure.detail}`,
+            }),
+          )
+        }
+        const authorizedSources = candidate.report.pipe(
+          Option.map((report) => report.authorizedSources),
+          Option.getOrElse(() => []),
+        )
+        const checked = validateViewDocument(parsed.success, { authorizedSources })
+        return Result.isFailure(checked)
+          ? Option.some(
+            new CandidateError({
+              code: "view_invalid",
+              detail: checked.failure.map((entry) => `${entry.code}: ${entry.detail}`).join("; "),
+            }),
+          )
+          : Option.none<CandidateError>()
       })
 
     const flip = (
@@ -606,7 +778,17 @@ export const candidateSupervisorLayer: Layer.Layer<
         return pointer
       })
 
-    const activate: CandidateSupervisor["activate"] = (candidateId, health) =>
+    const restore = (
+      scope: string,
+      previous: Option.Option<ScopePointer>,
+    ): Effect.Effect<void, CandidateError> =>
+      Option.match(previous, {
+        onNone: () => pointers.clear(scope).pipe(Effect.mapError((error) => mapFailure(error))),
+        onSome: (pointer) =>
+          pointers.publish(pointer).pipe(Effect.mapError((error) => mapFailure(error))),
+      })
+
+    const activate: CandidateSupervisor["activate"] = (candidateId, probe) =>
       Effect.gen(function* () {
         const candidate = yield* find(candidateId)
         if (candidate.state === "rejected" || candidate.state === "quarantined") {
@@ -619,110 +801,146 @@ export const candidateSupervisorLayer: Layer.Layer<
             }),
           )
         }
+        const nowUs = Math.floor((yield* Clock.currentTimeMillis) * 1000)
         if (candidate.manifest.kind === "executable") {
-          if (Option.isNone(candidate.approval)) {
+          if (candidate.state !== "approved") {
+            return yield* Effect.fail(
+              new CandidateError({
+                code: candidate.state === "validated"
+                  ? "approval_required"
+                  : "validation_incomplete",
+                detail: `${candidateId} is ${candidate.state}`,
+              }),
+            )
+          }
+          const issues = approvalIssues(candidate, nowUs)
+          if (Option.isSome(issues)) return yield* Effect.fail(issues.value)
+          const candidateApproval = candidate.approval
+          if (Option.isNone(candidateApproval)) {
             return yield* Effect.fail(
               new CandidateError({ code: "approval_required", detail: candidateId }),
             )
           }
-          const approval = candidate.approval.value
-          if (approval.candidateDigest !== candidate.digest) {
+          const commitment = yield* approvalCommitmentIssue(candidateApproval.value)
+          if (Option.isSome(commitment)) return yield* Effect.fail(commitment.value)
+        } else {
+          if (candidate.state !== "validated") {
             return yield* Effect.fail(
               new CandidateError({
-                code: "digest_mismatch",
-                detail: "the approval binds another candidate digest",
+                code: "validation_incomplete",
+                detail: `declarative ${candidateId} is ${candidate.state}`,
               }),
             )
           }
-          if (approval.scope !== candidate.manifest.scope) {
-            return yield* Effect.fail(
-              new CandidateError({
-                code: "scope_mismatch",
-                detail: `${approval.scope} != ${candidate.manifest.scope}`,
-              }),
-            )
-          }
-          if (
-            Option.isNone(candidate.diffDigest) ||
-            candidate.diffDigest.value !== approval.capabilityDiffDigest
-          ) {
-            return yield* Effect.fail(
-              new CandidateError({
-                code: "digest_mismatch",
-                detail: "the approval binds another capability diff",
-              }),
-            )
-          }
-          const now = yield* Clock.currentTimeMillis
-          if (Math.floor(now * 1000) >= approval.expiresAtUs) {
-            return yield* Effect.fail(
-              new CandidateError({ code: "approval_expired", detail: candidateId }),
-            )
-          }
+          const invalid = yield* viewIssues(candidate)
+          if (Option.isSome(invalid)) return yield* Effect.fail(invalid.value)
         }
         const current = yield* pointers.read(candidate.manifest.scope).pipe(
           Effect.mapError((error) => mapFailure(error)),
         )
-        if (health === "pass") {
-          const receipt = yield* append(
-            ACTIVATION_COMPONENT,
+        const key = activationKey(candidate.manifest.scope, candidateId, candidate.digest)
+        // Flip first: a failed flip leaves the previous candidate live and records nothing.
+        const pointer = yield* flip(candidate.manifest.scope, candidate, key, current)
+        const health = yield* probe
+        if (health === "fail") {
+          yield* restore(candidate.manifest.scope, current)
+          const failure = yield* append(
+            FAILURE_COMPONENT,
             toJson({
               candidateId,
               candidateDigest: candidate.digest,
               scope: candidate.manifest.scope,
-              health: "pass" as const,
-              ...(Option.isSome(current) ? { previous: current.value } : {}),
+              health: "fail" as const,
+              reason: "post-flip health failed",
+              ...(Option.isSome(current) ? { restored: current.value } : {}),
             }),
             "frozen",
             "activation-supervisor",
             "activation_receipt",
-          )
-          const pointer = yield* flip(
-            candidate.manifest.scope,
-            candidate,
-            receipt.record.record_id,
-            current,
+            `failure:${key}`,
           )
           return {
             candidateId,
-            health: "pass" as const,
-            receipt: receipt.record.record_id,
-            pointer: Option.some(pointer),
-            state: "active" as const,
+            health: "fail" as const,
+            receipt: failure.record.record_id,
+            pointer: current,
+            state: "failed_health" as const,
           }
         }
-        const failure = yield* append(
-          FAILURE_COMPONENT,
+        const activation = yield* append(
+          ACTIVATION_COMPONENT,
           toJson({
             candidateId,
             candidateDigest: candidate.digest,
             scope: candidate.manifest.scope,
-            health: "fail" as const,
-            reason: "post-flip health failed",
+            health: "pass" as const,
+            activationReceipt: key,
+            pointerGeneration: pointer.generation,
+            ...(Option.isSome(current) ? { previous: current.value } : {}),
           }),
           "frozen",
           "activation-supervisor",
           "activation_receipt",
+          key,
+        ).pipe(
+          // The pointer is already flipped; if the receipt cannot be recorded,
+          // put the previous candidate back rather than run unrecorded.
+          Effect.tapError(() => restore(candidate.manifest.scope, current)),
         )
-        // The failed candidate briefly holds the pointer, then the previous one is
-        // restored; external effects stay in the ledger either way.
-        yield* flip(candidate.manifest.scope, candidate, failure.record.record_id, current)
-        if (Option.isSome(current)) {
-          yield* pointers.publish(current.value).pipe(
-            Effect.mapError((error) => mapFailure(error)),
-          )
-        } else {
-          yield* pointers.clear(candidate.manifest.scope).pipe(
-            Effect.mapError((error) => mapFailure(error)),
-          )
-        }
         return {
           candidateId,
-          health: "fail" as const,
-          receipt: failure.record.record_id,
-          pointer: current,
-          state: "failed_health" as const,
+          health: "pass" as const,
+          receipt: activation.record.record_id,
+          pointer: Option.some(pointer),
+          state: "active" as const,
         }
+      })
+
+    const activationChain = (
+      scope: string,
+      current: ScopePointer,
+    ): Effect.Effect<Result.Result<ActivationPayload, CandidateError>> =>
+      Effect.gen(function* () {
+        const records = yield* Effect.result(ledger.records)
+        if (Result.isFailure(records)) return Result.fail(mapFailure(records.failure))
+        const activation = records.success.find((record) =>
+          record.idempotency_key === current.activationReceipt
+        )
+        const payload = activation === undefined
+          ? undefined
+          : componentPayload(activation, ACTIVATION_COMPONENT)
+        if (payload === undefined) {
+          return Result.fail(
+            new CandidateError({
+              code: "pointer_corrupt",
+              detail: `${scope} points at an activation that is not in the ledger`,
+            }),
+          )
+        }
+        const parsed = Schema.decodeUnknownSync(ActivationPayload)(payload)
+        const previous = parsed.previous
+        if (current.prev === undefined) {
+          return previous === undefined ? Result.succeed(parsed) : Result.fail(
+            new CandidateError({
+              code: "pointer_corrupt",
+              detail: "the ledger records a predecessor the pointer lost",
+            }),
+          )
+        }
+        if (
+          previous === undefined ||
+          previous.candidateId !== current.prev.candidateId ||
+          previous.stateGeneration !== current.prev.stateGeneration ||
+          previous.generation !== current.generation - 1
+        ) {
+          return Result.fail(
+            new CandidateError({
+              code: "pointer_corrupt",
+              detail: "the pointer predecessor disagrees with the ledger activation",
+            }),
+          )
+        }
+        return Result.succeed(parsed)
       })
 
     const rollback: CandidateSupervisor["rollback"] = (scope, reason) =>
@@ -735,29 +953,72 @@ export const candidateSupervisorLayer: Layer.Layer<
             new CandidateError({ code: "pointer_missing", detail: scope }),
           )
         }
-        const target = current.value.prev
+        const pointer = current.value
+        const target = pointer.prev
+        if (target === undefined) {
+          // Nothing is live before this pointer: a repeated rollback is a no-op.
+          return yield* Effect.fail(
+            new CandidateError({ code: "no_rollback_target", detail: scope }),
+          )
+        }
+        const chain = yield* activationChain(scope, pointer)
+        if (Result.isFailure(chain)) return yield* Effect.fail(chain.failure)
+        const restored = yield* find(target.candidateId)
+        if (restored.state !== "active") {
+          return yield* Effect.fail(
+            new CandidateError({
+              code: "validation_incomplete",
+              detail: `rollback target ${target.candidateId} is ${restored.state}`,
+            }),
+          )
+        }
+        if (restored.manifest.kind === "executable") {
+          const nowUs = Math.floor((yield* Clock.currentTimeMillis) * 1000)
+          const issues = approvalIssues(restored, nowUs)
+          if (Option.isSome(issues)) return yield* Effect.fail(issues.value)
+          const restoredApproval = restored.approval
+          if (Option.isNone(restoredApproval)) {
+            return yield* Effect.fail(
+              new CandidateError({ code: "approval_required", detail: target.candidateId }),
+            )
+          }
+          const commitment = yield* approvalCommitmentIssue(restoredApproval.value)
+          if (Option.isSome(commitment)) return yield* Effect.fail(commitment.value)
+        }
         const receipt = yield* append(
           ROLLBACK_COMPONENT,
           toJson({
             scope,
-            from: current.value.candidateId,
-            ...(target === undefined ? {} : { to: target.candidateId }),
+            from: pointer.candidateId,
+            to: target.candidateId,
+            fromGeneration: pointer.generation,
+            fromReceipt: pointer.activationReceipt,
             reason,
           }),
           "frozen",
           "activation-supervisor",
           "activation_receipt",
+          `rollback:${scope}:${pointer.activationReceipt}`,
         )
-        if (target === undefined) {
+        const previousPointer = chain.success.previous
+        if (previousPointer === undefined) {
           yield* pointers.clear(scope).pipe(Effect.mapError((error) => mapFailure(error)))
           return { scope, receipt: receipt.record.record_id, pointer: Option.none() }
         }
-        const restored = yield* find(target.candidateId).pipe(
-          Effect.flatMap((candidate) =>
-            flip(scope, candidate, receipt.record.record_id, Option.none())
-          ),
+        // Restore the predecessor directly; end its chain so a repeated rollback
+        // cannot walk past the candidate the human asked for.
+        const restoredPointer: ScopePointer = {
+          ...previousPointer,
+          generation: pointer.generation + 1,
+        }
+        yield* pointers.publish(restoredPointer).pipe(
+          Effect.mapError((error) => mapFailure(error)),
         )
-        return { scope, receipt: receipt.record.record_id, pointer: Option.some(restored) }
+        return {
+          scope,
+          receipt: receipt.record.record_id,
+          pointer: Option.some(restoredPointer),
+        }
       })
 
     return {

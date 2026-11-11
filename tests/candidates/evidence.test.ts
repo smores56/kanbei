@@ -4,7 +4,8 @@ import { Effect, Layer, Option } from "effect"
 import { fileBlobSinkLayer } from "../../src/adapters/blob-sink.ts"
 import { fileLedgerStoreLayer } from "../../src/adapters/ledger-file.ts"
 import { pointerFileLayer } from "../../src/adapters/pointer-file.ts"
-import { artifact, inputs, workspace } from "./support.ts"
+import { consentDeliveryLayer, rulingCommitmentOf } from "../../src/candidates/consent.ts"
+import { artifact, humanSessionsLayer, inputs, OWNER_ORIGIN, workspace } from "./support.ts"
 import { CandidateSupervisor, candidateSupervisorLayer } from "../../src/candidates/supervisor.ts"
 import { fileArtifactStoreLayer } from "../../src/evidence/artifact-store.ts"
 import { fixedEnvironmentProbeLayer } from "../../src/evidence/environment.ts"
@@ -32,6 +33,7 @@ const kernel = (directory: string) =>
 Deno.test("candidate approval emits an evidence envelope for ZT-08, ZT-10, and I-14", async () => {
   await withTempDir("candidate-evidence", async (directory) => {
     const kernelLayers = kernel(directory)
+    const delivered: Array<string> = []
     const dependencies = Layer.mergeAll(
       fileArtifactStoreLayer(`${directory}/artifacts`),
       fixtureStoreLayer(Deno.cwd()),
@@ -42,7 +44,13 @@ Deno.test("candidate approval emits an evidence envelope for ZT-08, ZT-10, and I
         sandboxPosture: "test",
         brokerIdentity: "test",
       }),
-      candidateSupervisorLayer.pipe(Layer.provide(kernelLayers)),
+      candidateSupervisorLayer.pipe(
+        Layer.provide(Layer.mergeAll(
+          kernelLayers,
+          humanSessionsLayer,
+          consentDeliveryLayer((_session, token) => delivered.push(token)),
+        )),
+      ),
     ).pipe(Layer.provide(DenoServices.layer))
 
     const envelope = await Effect.runPromise(
@@ -58,14 +66,30 @@ Deno.test("candidate approval emits an evidence envelope for ZT-08, ZT-10, and I
             const supervisor = yield* CandidateSupervisor
             yield* supervisor.stage(workspace(), artifact())
             yield* supervisor.validate("cand-1", inputs)
-            const request = yield* supervisor.requestApproval("cand-1", "human-1", 60_000_000)
+            const session = {
+              sessionId: "human-1",
+              origin: OWNER_ORIGIN,
+              verifiedAtUs: 0,
+            }
+            const request = yield* supervisor.requestApproval("cand-1", session, 60_000_000)
+            const token = delivered.at(-1) ?? ""
             yield* supervisor.approve("cand-1", {
-              token: request.token,
+              token,
               consentDigest: request.display.consentDigest,
               candidateDigest: request.display.manifest.candidateDigest,
               sessionId: "human-1",
+              origin: OWNER_ORIGIN,
+              ruling: "approve",
+              rulingCommitment: yield* rulingCommitmentOf(
+                request.display.consentDigest,
+                "approve",
+                request.display.tokenHash,
+              ),
             })
-            const activated = yield* supervisor.activate("cand-1", "pass")
+            const activated = yield* supervisor.activate(
+              "cand-1",
+              Effect.succeed("pass" as const),
+            )
             const pointer = yield* supervisor.pointer("project/kanbei")
             return {
               activated: activated.state,
