@@ -15,6 +15,8 @@ export interface StartedSandbox {
 export interface RefusalRecord {
   readonly sandboxId: string
   readonly code: StartupRefusal["code"]
+  /** The stable refusal class a host alert and receiver key off (S-12). */
+  readonly receiptCode: "sandbox_posture_failed"
   readonly detail: string
 }
 
@@ -54,7 +56,12 @@ export const supervisorLayer = (): Layer.Layer<Supervisor> =>
           const refusal = verdict.failure
           return Ref.update(refusals, (current) => [
             ...current,
-            { sandboxId: refusal.sandboxId, code: refusal.code, detail: refusal.detail },
+            {
+              sandboxId: refusal.sandboxId,
+              code: refusal.code,
+              receiptCode: "sandbox_posture_failed" as const,
+              detail: refusal.detail,
+            },
           ]).pipe(Effect.flatMap(() => Effect.fail(refusal)))
         }
         return Effect.gen(function* () {
