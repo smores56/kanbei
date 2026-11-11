@@ -9,7 +9,7 @@ import {
   inboxReaderLayer,
 } from "../../../src/channels/inbox/reader.ts"
 import { BlobSink } from "../../../src/kernel/blob-sink.ts"
-import { buildBatch, makeKey, writeBatch } from "./support.ts"
+import { buildBatch, buildBatchFromFixture, makeKey, writeBatch } from "./support.ts"
 import { hash, withTempDir } from "../../support.ts"
 
 const limits: InboxLimits = {
@@ -73,13 +73,12 @@ Deno.test("a valid batch publishes blobs, observations, one coverage receipt, an
   await scenario(async (context) => {
     const body = '{"subject":"hello"}'
     const digest = await hash(body)
+    const fixture = new URL("../../../fixtures/inbox-v1", import.meta.url).pathname
     await write(
       context.directory,
       context.recipient,
       "batch-1.age",
-      await buildBatch({
-        recipient: context.recipient,
-      }),
+      await buildBatchFromFixture(fixture, context.recipient),
     )
 
     const outcome = await withReader(

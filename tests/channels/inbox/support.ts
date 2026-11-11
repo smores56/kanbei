@@ -1,4 +1,4 @@
-import type { Schema } from "effect"
+import { Schema } from "effect"
 import { canonicalize } from "../../../src/evidence/canonical.ts"
 import { hash } from "../../support.ts"
 
@@ -111,4 +111,27 @@ export const writeBatch = async (
   recipient: string,
 ): Promise<void> => {
   await encryptFile(plaintext, recipient, path)
+}
+
+const FixtureSource = Schema.Struct({
+  entries: Schema.Array(
+    Schema.Struct({ resourceKey: Schema.String, bodyFile: Schema.String }),
+  ),
+})
+
+/** Fixtures hold plaintext bodies; the test seals them with an ephemeral key. */
+export const buildBatchFromFixture = async (
+  fixtureDirectory: string,
+  recipient: string,
+): Promise<string> => {
+  const source = Schema.decodeUnknownSync(FixtureSource)(
+    JSON.parse(await Deno.readTextFile(`${fixtureDirectory}/batch-source.json`)),
+  )
+  const bodies = await Promise.all(
+    source.entries.map(async (entry) => ({
+      key: entry.resourceKey,
+      text: await Deno.readTextFile(`${fixtureDirectory}/${entry.bodyFile}`),
+    })),
+  )
+  return buildBatch({ recipient, bodies })
 }
