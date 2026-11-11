@@ -10,7 +10,7 @@ import type { ChatPeer, ChatStream } from "../../../src/channels/chat/stream.ts"
 import { decodeFrame, encodeFrame } from "../../../src/channels/chat/frame.ts"
 import type { ChatOutbound, ChatResponse } from "../../../src/channels/chat/schema.ts"
 import { parseChatOutbound } from "../../../src/channels/chat/schema.ts"
-import { hash } from "../../support.ts"
+import { defaultPasskeySalt, derivePasskeyVerifier } from "../../../src/channels/chat/passkey.ts"
 
 export const PASSKEY = "correct horse battery staple"
 export const IDENTITY = "owner@example.invalid"
@@ -18,7 +18,9 @@ export const ORIGIN = "https://kanbei.sammohr.dev"
 
 export const config = async (overrides: Partial<ChatConfig> = {}): Promise<ChatConfig> => ({
   accessIdentity: IDENTITY,
-  passkeyDigest: await hash(PASSKEY),
+  passkeyVerifier: await Effect.runPromise(
+    derivePasskeyVerifier(PASSKEY, defaultPasskeySalt(IDENTITY), 100_000),
+  ),
   allowedOrigin: ORIGIN,
   maxRequestBytes: 8_192,
   maxResponseBytes: 8_192,
@@ -122,6 +124,7 @@ export const serveAll = async (
   options: {
     readonly settings?: Partial<ChatConfig>
     readonly peer?: ChatPeer
+    readonly peers?: ReadonlyArray<ChatPeer>
   } = {},
 ): Promise<Batch> => {
   const settings = await config(options.settings)
@@ -130,9 +133,12 @@ export const serveAll = async (
       const server = yield* ChatServer
       const served = yield* Effect.forEach(
         frames,
-        (frame) =>
+        (frame, index) =>
           Effect.gen(function* () {
-            const memory = yield* memoryStream([encodeFrame(frame)], options.peer)
+            const memory = yield* memoryStream(
+              [encodeFrame(frame)],
+              options.peers?.[index] ?? options.peer,
+            )
             yield* server.serve(memory.stream)
             const written = yield* Ref.get(memory.written)
             const outbound = written.map((bytes) => {

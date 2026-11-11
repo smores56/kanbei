@@ -208,3 +208,28 @@ Deno.test("a closed stream is closed after one request", async () => {
   const exchange = await serveOne(request())
   assertEquals(exchange.closed, true)
 })
+
+Deno.test("the rate limit runs before authentication and is per peer", async () => {
+  const batch = await serveAll(
+    [
+      request({ passkey: "wrong" }),
+      request({ passkey: "wrong" }),
+      request({ passkey: "wrong" }),
+    ],
+    { settings: { requestsPerHour: 1 }, peers: ["relay", "relay", "loopback"] },
+  )
+  const [first, second, other] = batch.exchanges
+  assertEquals(first === undefined ? undefined : codeOf(first), "chat_unauthenticated")
+  assertEquals(second === undefined ? undefined : codeOf(second), "chat_rate_limited")
+  assertEquals(other === undefined ? undefined : codeOf(other), "chat_unauthenticated")
+})
+
+Deno.test("a receipt digest never covers the passkey", async () => {
+  const batch = await serveAll([
+    request({ passkey: PASSKEY }),
+    request({ passkey: "a different guess" }),
+  ])
+  const [first, second] = batch.receipts
+  assertEquals(first === undefined ? undefined : first.requestDigest, second?.requestDigest)
+  assertEquals(batch.receipts.length, 2)
+})

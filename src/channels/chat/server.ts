@@ -7,6 +7,7 @@ import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema } from
 import { canonicalize } from "../../evidence/canonical.ts"
 import { sha256Text } from "../../evidence/digest.ts"
 import { decodeFrame, encodeFrame } from "./frame.ts"
+import { isPasskeyVerifier, timingSafeEqualBytes, verifyPasskey } from "./passkey.ts"
 import type { ChatErrorCode, ChatEvent, ChatRequest, ChatResponse } from "./schema.ts"
 import {
   ChatStatus,
@@ -21,7 +22,8 @@ import type { ChatTransportError } from "./stream.ts"
 
 export interface ChatConfig {
   readonly accessIdentity: string
-  readonly passkeyDigest: string
+  /** PBKDF2 verifier: the passkey plaintext never reaches this process config. */
+  readonly passkeyVerifier: string
   readonly allowedOrigin: string
   readonly maxRequestBytes: number
   readonly maxResponseBytes: number
@@ -85,21 +87,21 @@ export const ChatServer = Context.Service<ChatServer>("kanbei/channel/chat/Serve
 interface SessionRecord {
   readonly sessionId: string
   readonly accessIdentity: string
-  readonly passkeyDigest: string
+  readonly verifier: string
   readonly origin: string
   readonly expiresAt: number
 }
 
 interface ChatState {
   readonly sessions: Readonly<Record<string, SessionRecord>>
-  readonly requests: ReadonlyArray<number>
+  readonly requests: Readonly<Record<string, ReadonlyArray<number>>>
   readonly receipts: ReadonlyArray<ChatReceipt>
   readonly sessionCounter: number
 }
 
 const emptyState: ChatState = {
   sessions: {},
-  requests: [],
+  requests: {},
   receipts: [],
   sessionCounter: 0,
 }
@@ -107,9 +109,6 @@ const emptyState: ChatState = {
 const fail = (code: ChatErrorCode, detail: string): ChatError => new ChatError({ code, detail })
 
 const now = (): Effect.Effect<number> => Clock.currentTimeMillis
-
-const passkeyDigest = (passkey: string): Effect.Effect<string> =>
-  sha256Text(passkey).pipe(Effect.orDie)
 
 const configIssues = (config: ChatConfig): ReadonlyArray<string> => {
   const issues: Array<string> = []
@@ -126,12 +125,20 @@ const configIssues = (config: ChatConfig): ReadonlyArray<string> => {
     if (!Number.isFinite(value) || value <= 0) issues.push(`${name} must be positive`)
   }
   if (config.accessIdentity.trim() === "") issues.push("accessIdentity is required")
-  if (!config.passkeyDigest.startsWith("sha256:")) issues.push("passkeyDigest must be a digest")
+  if (!isPasskeyVerifier(config.passkeyVerifier)) {
+    issues.push("passkeyVerifier must be a pbkdf2-sha256 verifier")
+  }
   if (config.allowedOrigin !== "https://kanbei.sammohr.dev") {
     issues.push("allowedOrigin must be the owner origin")
   }
   return issues
 }
+
+/** A receipt must never carry the passkey, even hashed. */
+const redacted = (request: ChatRequest): Schema.Json =>
+  Schema.decodeUnknownSync(Schema.Json)(
+    Object.fromEntries(Object.entries(request).filter(([key]) => key !== "passkey")),
+  )
 
 const isStaticRoute = (route: string): boolean =>
   route.startsWith("/") || route.includes(".js") || route.includes(".css") ||
@@ -142,7 +149,12 @@ const prune = (current: ChatState, at: number): ChatState => ({
   sessions: Object.fromEntries(
     Object.entries(current.sessions).filter(([, session]) => session.expiresAt > at),
   ),
-  requests: current.requests.filter((stamp) => at - stamp < 60 * 60 * 1000),
+  requests: Object.fromEntries(
+    Object.entries(current.requests).map(([peer, stamps]) => [
+      peer,
+      stamps.filter((stamp) => at - stamp < 60 * 60 * 1000),
+    ]),
+  ),
 })
 
 const parsePayload = <A>(
@@ -224,7 +236,7 @@ export const chatServerLayer = (
             route: request.route,
             peer,
             requestDigest: yield* sha256Text(
-              canonicalize(Schema.decodeUnknownSync(Schema.Json)(request)),
+              canonicalize(redacted(request)),
             ).pipe(Effect.orDie),
             responseDigest: yield* sha256Text(`${outcome}:${request.route}:${bytesOut}`).pipe(
               Effect.orDie,
@@ -270,8 +282,8 @@ export const chatServerLayer = (
               fail("chat_unauthenticated", "Access identity is missing or foreign"),
             )
           }
-          const digest = yield* passkeyDigest(passkey)
-          if (digest !== config.passkeyDigest) {
+          const matched = yield* verifyPasskey(config.passkeyVerifier, passkey).pipe(Effect.orDie)
+          if (!matched) {
             return yield* Effect.fail(fail("chat_unauthenticated", "passkey does not match"))
           }
           const at = yield* now()
@@ -281,7 +293,7 @@ export const chatServerLayer = (
             const session: SessionRecord = {
               sessionId: id,
               accessIdentity: config.accessIdentity,
-              passkeyDigest: digest,
+              verifier: config.passkeyVerifier,
               origin: config.allowedOrigin,
               expiresAt: at + config.sessionTtlMs,
             }
@@ -298,7 +310,10 @@ export const chatServerLayer = (
             session.expiresAt <= at ||
             session.accessIdentity !== config.accessIdentity ||
             session.origin !== request.origin ||
-            session.passkeyDigest !== digest
+            !timingSafeEqualBytes(
+              new TextEncoder().encode(session.verifier),
+              new TextEncoder().encode(config.passkeyVerifier),
+            )
           ) {
             return yield* Effect.fail(
               fail(
@@ -310,17 +325,23 @@ export const chatServerLayer = (
           return { sessionId }
         })
 
-      const rateLimit = (): Effect.Effect<void, ChatError> =>
+      // Runs before authentication: an unauthenticated flood must not spend a
+      // PBKDF2 derivation or grow the session table. The window is per peer.
+      const rateLimit = (peer: ChatPeer): Effect.Effect<void, ChatError> =>
         Effect.gen(function* () {
           const at = yield* now()
           const current = prune(yield* Ref.get(state), at)
-          if (current.requests.length >= config.requestsPerHour) {
+          const stamps = current.requests[peer] ?? []
+          if (stamps.length >= config.requestsPerHour) {
             yield* Ref.update(state, () => current)
             return yield* Effect.fail(
               fail("chat_rate_limited", `${config.requestsPerHour} requests in the window`),
             )
           }
-          yield* Ref.update(state, () => ({ ...current, requests: [...current.requests, at] }))
+          yield* Ref.update(state, () => ({
+            ...current,
+            requests: { ...current.requests, [peer]: [...stamps, at] },
+          }))
         })
 
       const route = (
@@ -501,8 +522,8 @@ export const chatServerLayer = (
           }
           const request = parsed.success
           const handled = yield* Effect.gen(function* () {
+            yield* rateLimit(stream.peer)
             const session = yield* authenticate(request)
-            yield* rateLimit()
             const routed = yield* route(request, session.sessionId)
             return routed
           }).pipe(Effect.result)

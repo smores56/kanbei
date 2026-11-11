@@ -1,6 +1,6 @@
 import { Data, Effect } from "effect"
 import type { ChatConfig } from "../channels/chat/server.ts"
-import { sha256Text } from "../evidence/digest.ts"
+import { defaultPasskeySalt, derivePasskeyVerifier } from "../channels/chat/passkey.ts"
 
 export interface ChatEnvironment {
   readonly get: (name: string) => string | undefined
@@ -44,7 +44,10 @@ export const chatConfigFromEnv = (
   Effect.gen(function* () {
     const accessIdentity = yield* required(env, "KANBEI_ACCESS_IDENTITY")
     const passkey = yield* required(env, "KANBEI_CHAT_PASSKEY")
-    const passkeyDigest = yield* sha256Text(passkey).pipe(
+    const passkeyVerifier = yield* derivePasskeyVerifier(
+      passkey,
+      defaultPasskeySalt(accessIdentity),
+    ).pipe(
       Effect.mapError((error) =>
         new ChatConfigError({ variable: "KANBEI_CHAT_PASSKEY", reason: error.reason })
       ),
@@ -58,7 +61,7 @@ export const chatConfigFromEnv = (
     const sessionTtlMs = yield* positiveInteger(env, "KANBEI_CHAT_SESSION_TTL_MS")
     return {
       accessIdentity,
-      passkeyDigest,
+      passkeyVerifier,
       allowedOrigin,
       maxRequestBytes,
       maxResponseBytes,

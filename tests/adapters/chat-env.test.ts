@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert"
 import { Effect } from "effect"
 import { chatConfigFromEnv } from "../../src/adapters/chat-env.ts"
-import { hash } from "../support.ts"
+import { verifyPasskey } from "../../src/channels/chat/passkey.ts"
 
 const values = {
   KANBEI_ACCESS_IDENTITY: "owner@example.invalid",
@@ -22,10 +22,19 @@ const env = (overrides: Record<string, string | undefined> = {}) => ({
   },
 })
 
-Deno.test("the guest config comes from the environment and stores a passkey digest", async () => {
+Deno.test("the guest config comes from the environment and stores a PBKDF2 verifier", async () => {
   const config = await Effect.runPromise(chatConfigFromEnv(env()))
   assertEquals(config.accessIdentity, "owner@example.invalid")
-  assertEquals(config.passkeyDigest, await hash("passkey-123"))
+  assertEquals(config.passkeyVerifier.startsWith("pbkdf2-sha256$"), true)
+  assertEquals(config.passkeyVerifier.includes("passkey-123"), false)
+  assertEquals(
+    await Effect.runPromise(verifyPasskey(config.passkeyVerifier, "passkey-123")),
+    true,
+  )
+  assertEquals(
+    await Effect.runPromise(verifyPasskey(config.passkeyVerifier, "passkey-124")),
+    false,
+  )
   assertEquals(config.requestsPerHour, 30)
 })
 
