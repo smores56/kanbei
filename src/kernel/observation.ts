@@ -1,3 +1,7 @@
+/**
+ * The live CAS -> manifest -> ledger -> read path for observations, replacing
+ * the ad-hoc writes in the inbox spike paths.
+ */
 import { Effect, Schema } from "effect"
 import { ContentStore } from "./cas.ts"
 import type { CasError } from "./cas.ts"

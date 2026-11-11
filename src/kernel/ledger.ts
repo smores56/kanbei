@@ -1,3 +1,9 @@
+/**
+ * The one live canonical append path. Replaces the spike-local chain in
+ * `src/spikes/runtime/ledger.ts` (retained as evidence), reusing the single
+ * canonicalization (`evidence/canonical.ts`) and digest (`evidence/digest.ts`)
+ * modules.
+ */
 import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema } from "effect"
 import { canonicalize } from "../evidence/canonical.ts"
 import type { Json } from "../evidence/canonical.ts"

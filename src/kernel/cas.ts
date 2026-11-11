@@ -1,3 +1,8 @@
+/**
+ * Whole-object CAS and manifest publication over the existing `BlobSink`
+ * capability. Spike SQLite experiments remain evidence; this module is the live
+ * content path used by the ledger and the ingest reader.
+ */
 import { Context, Data, Effect, Layer, Option, Schema } from "effect"
 import { canonicalize } from "../evidence/canonical.ts"
 import { sha256 } from "../evidence/digest.ts"
