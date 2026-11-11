@@ -3,10 +3,48 @@
 ## Source of truth
 
 - Requirements: `docs/design/00-requirements.md`
-- Technical specification: `docs/design/07-technical-specification.md`
+- Security, channels, and deployment: `docs/design/04-security-deployment.md`
+- Technical specification and validation authority: `docs/design/07-technical-specification.md`
 - Implementation plan and task graph: `docs/design/08-implementation-plan.md`
 - If this file conflicts with the specification, the specification wins.
 - Every behavior change starts with a failing test. Every task closes with evidence and independent review.
+
+## Architecture boundary
+
+Kanbei runs in one NIC-less microVM. Its only byte paths are six channels:
+
+| Channel  | Access                 | Use                                                       |
+| -------- | ---------------------- | --------------------------------------------------------- |
+| `inbox`  | read-only virtiofs     | age-encrypted ingest batches, written by the host writer  |
+| `vault`  | read-only virtiofs     | `/var/lib/data/vault`                                     |
+| `todo`   | size-capped read-write | `/var/lib/data/todo/todo.txt`                             |
+| `chat`   | vsock, TLS in the VM   | JSON API behind the host relay and the WARP private route |
+| `csr`    | vsock, schema-locked   | fixed-CN ACME renewal                                     |
+| `search` | vsock, schema-capped   | capped queries to the Search VM                           |
+
+- The VM has no NIC, no resolver, and no raw sockets. Any other path is a channel leak
+  and a release-blocking defect (`ZT-15`).
+- The VM holds no provider credential. The only remote key lives in the Search VM.
+- Inference is local `llama.cpp`. There is no remote model, no fallback provider, and
+  no model credential.
+- Agent-authored code runs under Monty with generated host-call stubs and no ambient
+  filesystem, network, or subprocess access. Monty is not the security boundary; the VM
+  and its channel set are.
+- The UI is a static, human-owned bundle. Agents change declarative view data only; they
+  never add code, origins, remote references, or autolinking (`ZT-16`).
+- Declarative changes activate at the next turn. Executable candidates activate only
+  after a human approval receipt binding the candidate digest, capability diff, scope,
+  and expiry.
+
+## Code entry
+
+Kanbei's code enters the VM only through a human-merged commit in this repository,
+pinned in nix-config's `flake.lock` and built by Nix into the image.
+
+- Never add a runtime download, package install, or build step inside the VM.
+- A dependency change is a lockfile change, a dependency diff, and a new image.
+- Never mount a development worktree, editor state, or build cache into the VM.
+- Never add a code path that reaches the host filesystem beyond the declared mounts.
 
 ## Toolchain
 
@@ -62,6 +100,7 @@ export class Ledger extends Context.Service<Ledger, {
 ## Data, schemas, and immutability
 
 - All boundary data is parsed with `Schema`; never cast or trust `unknown`.
+- Ingest batch manifests and channel payloads are boundary data: validate, never assume.
 - Use branded IDs and schema classes for domain values.
 - Use `Readonly`, `readonly` fields, and immutable updates.
 - Use `Option` for meaningful absence and `Either` for data-level branching. `null` and `undefined` are reserved for encoded wire formats.
@@ -90,12 +129,13 @@ export class Ledger extends Context.Service<Ledger, {
 
 ## Capability boundaries
 
-- Domain and kernel code cannot import `node:*`, `Deno.*`, or HTTP clients directly.
-- Filesystem, process, network, model, and secret access go through capability services and adapters.
-- The canonical append path, sandbox supervisor, broker, global ceilings, receipt verification, activation supervisor, audit sink, and consent surface are frozen trust-root code.
+- Domain and kernel code cannot import `node:*`, `Deno.*`, HTTP clients, or socket clients directly.
+- Channel access, lane access, the filesystem mounts, and process control go through capability services and adapters.
+- The canonical append path, channel hosts, Monty host boundary and sandbox supervisor, global ceilings, receipt verification, activation supervisor, audit sink, startup verifier, and consent surface are frozen trust-root code.
 - Agents and plugins never receive a canonical SQLite handle or trust-root write capability.
-- Secrets never enter agent env, argv, logs, model context, CAS, or canonical records.
-- On denied or ambiguous external effects, fail closed and record the outcome. Never blind-retry an `outcome_unknown` non-idempotent effect.
+- No secret is ever placed in agent env, argv, logs, model context, CAS, or canonical records. The VM holds none.
+- Channel operations fail closed: a missing socket, undecryptable batch, schema violation, cap breach, or judge error denies and is receipted.
+- Never blind-retry an `outcome_unknown` non-idempotent effect.
 
 ## Tests and evidence
 
@@ -103,6 +143,9 @@ export class Ledger extends Context.Service<Ledger, {
 - Unit tests cover pure functions and schemas.
 - Property tests cover canonicalization, hash chains, and lifecycle transitions.
 - Conformance tests bind to the validation IDs in `07 §7` and emit an `EvidenceEnvelope`.
+- Channel tests cover cap refusal, closed failure, and the `ZT-15`/`ZT-17` probes.
+- UI tests assert zero remote requests for planted images, links, CSS `url()`, iframes, and autolinks (`ZT-16`).
+- Freshness tests assert that a stale or unknown source is never presented as current (`ZT-18`).
 - Use virtual time (`TestClock`) and synthetic transport. Deterministic tests never call a live model.
 - Every bug fix includes a regression test that failed before the fix.
 - Tests must be deterministic. Flaky tests are defects, not retries.
@@ -111,11 +154,13 @@ export class Ledger extends Context.Service<Ledger, {
 ## Git and delivery
 
 - Conventional Commits: `type(scope): description`.
-- Scopes follow the module or phase: `evidence`, `ledger`, `cas`, `broker`, `ui`.
+- Scopes follow the module or phase: `evidence`, `ledger`, `cas`, `channel`, `monty`, `ui`, `design`.
 - Commits are small and reviewable. Do not mix formatting churn with behavior.
 - Push immediately after committing.
 - Feature work stays in its worktree. Merge to `main` only after review.
 - Never commit generated state, databases, secrets, or local fixture output.
+- `docs/design/09-sdlc-issue.md` binds the SHA-256 of `04`, `07`, and `08`; editing either
+  document requires recomputing and updating the binding in the same commit.
 
 ## Definition of done
 

@@ -2,7 +2,7 @@
 
 ### 0. Plan conventions
 
-Requirements are authoritative. This plan orders implementation work without assuming any existing target code, repository layout, or runtime selection. Runtime, execution language, deployment plane, isolation mechanism, and numeric thresholds remain decision-gated.
+Requirements are authoritative. This plan orders implementation work and is rebased onto the deployed split design in SDLC #509: a NIC-less Kanbei VM, offline `llama.cpp` inference, six closed channels, a static CSP shell, human-approved executable candidates, and Monty for agent-authored code. Runtime, deployment plane, isolation mechanism, and agent-facing language are decided and recorded in `07 §4.9.5` and `04 §8.2`; the remaining numeric thresholds stay decision-gated.
 
 **Task completion contract.** Every task, including spikes, closes only when all of the following are attached:
 
@@ -10,85 +10,75 @@ Requirements are authoritative. This plan orders implementation work without ass
 2. **Review/fix:** an independent reviewer checks scope against `00-requirements.md` and the normative validation section `07 §7`, confirms evidence sufficiency, and records findings. Defects are fixed and the affected checks are rerun before the task closes.
 3. **No silent pass:** `inconclusive` or `blocked` does not become a default choice and does not unblock dependent tasks.
 
-**Validation identifiers.** `07 §7` is the sole normative source for every validation identifier, fixture, protocol, pass criterion, and for `EvidenceEnvelope`; this plan defines none. `spec/06-validation-plan.md` is a superseded early draft and is a source for nothing in this plan.
+**Validation identifiers.** `07 §7` is the sole normative source for every validation identifier, fixture, protocol, pass criterion, and for `EvidenceEnvelope`; this plan defines none. `spec/06-validation-plan.md` is deleted and is a source for nothing.
 
 | Identifier | Normative definition |
 |---|---|
 | `EvidenceEnvelope`, `Outcome`, test classes, spike pre-registration | `07 §7.0` |
-| `ZT-01`–`ZT-14` zero-tolerance gates | `07 §7.1` |
-| `I-01`–`I-19` canonical invariants | `07 §7.2` |
-| `V1`–`V22` mechanical checks | `07 §7.2` |
+| `ZT-01`–`ZT-18` zero-tolerance gates (incl. channel leak, CSP no-request, Todo cap, stale heartbeat) | `07 §7.1` |
+| `I-01`–`I-20` canonical invariants | `07 §7.2` |
+| `V1`–`V23` mechanical checks | `07 §7.2` |
 | `AS-01`–`AS-12` acceptance scenarios | `07 §7.3` |
 | `C-01`–`C-14` concurrency, approval, and override tests | `07 §7.3` |
 | `R-01`–`R-07` replay, undo, and crash tests | `07 §7.3` |
 | `P-01`–`P-10` poisoning, retraction, and quarantine tests | `07 §7.3` |
 | `B-01`–`B-12` CAS, backup, restore, and erasure tests | `07 §7.3` |
 | `U-01`–`U-10` UI structural tests | `07 §7.3` |
-| `journey-v1`, `ui-v1` sealed fixtures | `07 §7.3` |
-| `S1`–`S6` spike protocol aliases (mapped below) | `07 §7.4` |
-| `LANG-1`, `NODE-DENO-1`, `DEP-1`, `ISO-1`, `LIM-1`, `UI-1`, `UI-2`, `ING-1` spike protocols | `07 §7.4` |
+| `journey-v2`, `ingest-v1`, `ui-v1` sealed fixtures | `07 §7.3` |
+| `S3`–`S8` spike protocols | `07 §7.4` |
+| Protocols `LIM-1`, `UI-1`, `UI-2`, `ING-1`, `NET-1`, `LUKS-1`, `FRESH-1`, `JUDGE-1`, `IMG-1`, `D2`–`D8` | `07 §7.4`, `07 §8.1` |
 
-Spike aliases used by this plan follow `07 §7.4` exactly: `S1` = `LANG-1` + `NODE-DENO-1` (`A1`, `A4`), `S2` = `DEP-1` (`A2`), `S3` = `ISO-1` (`A3`), `S4` = `LIM-1` (`A6`, `H4`), `S5` = reconciliation and poisoning measurement (`C9`, `H2`), `S6` = interface comprehension (`H6`). `B5`'s synchronous-versus-asynchronous index-membership measurement has no `07 §7.4` protocol and is a plan-local check: it cites `07 §7.2` `I-16` and `07 §7.3` `C-05`, `R-01`, `B-08`, `ZT-12`, is decided by independent review, and closes `DG-5` without a spike alias. Its pre-registered latency budget is a harness configuration, not a validation identifier.
+`S1` (`LANG-1` + `NODE-DENO-1`) and `S2` (`DEP-1`) are retired with their decisions recorded; `S3` records the Monty containment and resource evidence. `S4` measures lanes, channels, and ceilings; `S5` measures reconciliation; `S6` measures comprehension and the CSP shell; `S7` measures ingest batches and freshness; `S8` measures the search filter.
 
-Further sealed dataset labels used by this plan name fixture versions sealed under `07 §7.0` rule 3. They add no pass criterion of their own; every criterion is the cited `07 §7` table.
+Sealed datasets used by this plan:
 
 | Dataset | Normative definition |
 |---|---|
-| `journey-v1` | `07 §7.3` sealed acceptance fixture for `AS-01`–`AS-12` |
+| `journey-v2` | `07 §7.3` sealed life-admin acceptance fixture for `AS-01`–`AS-12` |
+| `ingest-v1` | `07 §7.4` `S7` batch and freshness workload |
 | `ui-v1` | `07 §7.3` `U-01`–`U-10` comprehension baseline |
-| `memory-v1`, `memory-holdout-v1` | `07 §7.4` reconciliation-quality protocol; holdout sealed and never tuned after labels freeze (`07 §7.0` rule 3) |
+| `memory-v1`, `memory-holdout-v1` | `07 §7.4` reconciliation-quality protocol; holdout sealed and never tuned after labels freeze |
 | `external-v1` | `07 §7.3` `AS-05` and `C-12` external-divergence scenarios |
-| `security-v1` | `07 §7.1` `ZT-01`–`ZT-14` scanned-surface list |
+| `security-v1` | `07 §7.1` `ZT-01`–`ZT-18` scanned-surface list, channel-leak probes, and search-filter suite |
 | `cost-v1` | `07 §7.4` `LIM-1` workload reported against `07 §7.3` `AS-12` |
+| `append-v1` | `07 §7.2` canonicalization and lifecycle corpus |
 
-`DG-1`–`DG-8` are decision gates defined in this plan; they are not validation identifiers and close only on the `07 §7` evidence named in their producing task. A check for which `07 §7` defines no identifier (for example tool-descriptor ordering in `F4`) is a plan-local check: the owning task states it, independent review decides it, and it is never cited as a gate.
+`DG-1`–`DG-8` are decision gates defined in this plan; they are not validation identifiers and close only on the `07 §7` evidence named in their producing task. A check for which `07 §7` defines no identifier is a plan-local check: the owning task states it, independent review decides it, and it is never cited as a gate.
 
 ### Decision gates
 
-| Gate | Decision | Owner | Producing task | Blocks |
-|---|---|---|---|---|
-| `DG-1` | Agent-facing execution language | Human | `A4` | `F4` |
-| `DG-2` | Node versus Deno for the TypeScript control plane | Human | `A1` | `B1` onward |
-| `DG-3` | Deployment plane and broker identity | Human | `A2` | `E1`, `E2`, `H7` |
-| `DG-4` | Lightweight inter-agent isolation mechanism | Human | `A3` | `E1` |
-| `DG-5` | Synchronous versus asynchronous index membership | Human | `B5` | `C1` |
-| `DG-6` | Resource ceilings and quality thresholds | Human | `H4` | `H4A`, `H6`, `I1` |
-| `DG-7` | Reconciliation quality thresholds | Human | `H2` | `I1` |
-| `DG-8` | Final release sign-off | Human | `I5` | release |
+| Gate | Decision | Owner | Producing task | Blocks | Status |
+|---|---|---|---|---|---|
+| `DG-1` | Agent-facing execution language | Human | `A4` (retired) | `F4` | **Closed**: Monty. The model-dependent bake-off is retired because the deployment has one fixed local model; Monty's WASM backend, host-call mediation, ambient-capability denial, and time/memory bounds are recorded in `07 §4.9.5`. |
+| `DG-2` | Node versus Deno for the TypeScript control plane | Human | `A1` | `B1` onward | **Closed**: `deno@2.9.2`; composite within the pre-registered margin, with Node winning append throughput. Domain code stays behind the runtime seam. |
+| `DG-3` | Deployment plane and broker identity | Human | `A2` (retired) | — | **Retired**: the plane is one NIC-less qemu microVM with a root-only host; there is no broker and no host-side agent process (`04 §8.2`, `04 §8.7`). |
+| `DG-4` | Inter-agent isolation mechanism | Human | `A3` | `E1` | **Closed**: Monty plus a cgroup-contained VM process tree; containment only, no OS-per-agent security claim (`04 §3.5`). |
+| `DG-5` | Synchronous versus asynchronous index membership | Human | `B5` | `C1` | Open |
+| `DG-6` | Resource ceilings and quality thresholds | Human | `H4` | `H4A`, `H6`, `I1` | Open |
+| `DG-7` | Reconciliation quality thresholds | Human | `H2` | `I1` | Open |
+| `DG-8` | Final release sign-off | Human | `I5` | release | Open |
 
-Dependency ordering note: non-effectful agent execution foundations precede the security substrate, but effectful execution begins only after capabilities, sandboxing, and broker mediation exist. The plan-local index-membership measurement `B5` follows the ledger/CAS skeleton because it measures those contracts. `S4` and `DG-6` necessarily follow measurable components, and `S6` follows the frozen consent surface and the web shell. The origin-isolated frozen consent surface (`D3A`) precedes mutable approval UI integration (`F1`, `G1`). Effect enforcement is proved twice: `E3` exercises admission plumbing against explicitly synthetic test-scoped limits, and `H4A` re-verifies the same enforcement points against the human-approved values from `DG-6`. `H4` proposes values and the human decides at `DG-6`; no earlier task sets an operator ceiling. Activation is likewise split: `E1A` is a frozen supervisor stub that authorizes `F1`'s declarative activation receipts, and `F3` replaces it with the full candidate gate.
+Dependency ordering note: non-effectful agent-execution foundations precede the security substrate, but effectful execution begins only after the channel hosts, Monty host, and ceiling governor exist. The plan-local index-membership measurement `B5` follows the ledger/CAS skeleton because it measures those contracts. `S4` and `DG-6` necessarily follow measurable components, and `S6` follows the consent surface and the static shell. The origin-isolated frozen consent surface (`D3A`) precedes any human-facing approval flow, including candidate approval (`F3`).
 
 ### Traceability matrix
 
-Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). Validation identifiers, fixtures, protocols, and pass criteria are defined only in `07 §7`. A row is satisfied only when every listed task is closed with that evidence and independent review. Every identifier below is a `07 §7` identifier; no row cites an identifier this plan defines. `07 §7.6` defines no `T` identifiers and owns no implementation-task traceability; this plan owns its `A0`–`I5` tasks, and the gate and scenario identifiers in that table are normative and the task labels are not; `A0`–`I5` is the implementation taxonomy.
+Requirement anchors cite `00-requirements.md` sections, not line numbers. Validation identifiers, fixtures, protocols, and pass criteria are defined only in `07 §7`. A row is satisfied only when every listed task is closed with that evidence and independent review. `07 §7.6` owns the requirement-to-gate mapping; this plan owns its `A0`–`A7`, `B`–`H`, and `I` tasks.
 
-| Requirement | Validation | Owning tasks |
+| Requirement (00 section) | Validation | Owning tasks |
 |---|---|---|
-| req. 7, 9 two projects plus Kanbei, world-state/memory/self-modification at comparable depth | `AS-01`–`AS-12`, `journey-v1` | `C2`, `I1`, `I4` |
-| req. 17 authority records, effect receipts, replay never repeats effects | `I-05`, `I-09`, `I-10`, `ZT-07`, `ZT-11`, `V16` | `D1`, `D3`, `D7`, `H8` |
-| req. 32–40 open components, one sequencer, append-only correction, hash chain | `I-01`–`I-03`, `ZT-02`, `ZT-09`, `V13`, `V17` | `B1`, `B2`, `B4`, `B6` |
-| req. 44–52 semantic projection, retraction, quarantine, disclosure | `I-06`, `I-07`, `AS-06`, `AS-07`, `P-01`–`P-10`, `ZT-05`, `ZT-06`, `V15` | `C4`–`C7`, `C9`, `H2` |
-| req. 56–58 intent anchor, interpretations, chat authority | `I-05`, `I-11`, `AS-02` | `D1` |
-| req. 60–62 autonomy tiers, global queue, approval binding | `I-05`, `I-11`, `AS-03`, `C-06`–`C-09`, `ZT-08`, `ZT-13`, `U-05`, `V5`, `V8` | `D2`, `D3`, `D3A` |
-| req. 64 override receipts versus hard boundaries | `I-12`, `C-10`, `ZT-04`, `V6` | `D2`, `D3`, `E3`, `H4A` |
-| req. 66 nested work and evidence-bound completion | `AS-04`, `I-02`, `I-11`, `V1`, `V2` | `D4` |
-| req. 68 external change recording without clobber | `AS-05`, `C-12`, `ZT-03` | `C3`, `D4` |
-| req. 70–76 durable loops, inbox/outbox, timers, checkpoints | `C-03`, `R-05`, `R-06`, `V11`, `V12` | `D5`, `D8` |
-| req. 72, 78 hard ceilings, at-least-once effects, `outcome_unknown` | `I-09`, `I-12`, `C-14`, `AS-12`, `V3`, `V4` | `D7`, `E3`, `H4`, `H4A` |
-| req. 80, 128 exact post-redaction model and provider I/O | `R-05`, `AS-10` (recorded-I/O basis), `V10` | `D6`, `D8`, `G4` |
-| req. 84–88 replay, undo, branch sets | `I-10`, `I-17`, `R-01`–`R-07`, `ZT-07`, `AS-10`, `V7`, `V9` | `D8`, `H8` |
-| req. 92–104 self-modification, frozen trust root, scoped candidate activation, migrations | `I-13`, `I-14`, `AS-08`, `R-02`, `ZT-10` | `E1A`, `F1`–`F5`, `I1` |
-| req. 108–118 threat model, access boundary, broker, credential authority | `ZT-01`, `ZT-02`, `ZT-04`, `AS-09`, `security-v1` | `E1`, `E2`, `E4`, `E5`, `F5`, `H5` |
-| req. 122–126 tool surface, execution language, control-plane runtime | `S1`, `AS-08` (tool wiring) | `A1`, `A4`, `F4` |
-| req. 132–138 web shell, protocols, curation, multimodal | `U-01`–`U-10`, `ui-v1`, `AS-06`, `AS-10` | `C7`, `G1`–`G3`, `H6` |
-| req. 142–146 state path, SQLite ledger, CAS, ingest | `AS-01`, `B-01`–`B-04`, `I-07`, `I-08` | `B3`, `B4`, `C2` |
-| req. 148–152 operational projections, retention, erasure, backup | `I-08`, `I-15`, `I-16`, `B-01`–`B-12`, `AS-11`, `ZT-12` | `B3`, `B5`, `C1`, `C8`, `H1`, `H3` |
-| req. 154 loopback and tunnel exposure | `security-v1` (host exposure probes) | `H7` |
-| req. 156–158 zero-tolerance gates, evidence-producing validation | `ZT-01`–`ZT-14`, `AS-01`–`AS-12`, `EvidenceEnvelope` | `A0`, `B6`, `C10`, `D3A`, `D9`, `E5`, `G5`, `H5`, `H9`, `I1`–`I5` |
-| req. 160–168 deferred decisions and spike protocols | `S1`–`S6` | `A1`–`A6`, `C9`, `H2`, `H4`, `H6` |
-| req. 72, 158 measured ceilings and thresholds after baseline | `S4`, `AS-12`, `I-12` | `A6`, `H4`, `H4A`, `H6`, `I3` |
-
----
+| Product target; Security and external effects | `ZT-15`, `AS-01`, `AS-11`, `V20`, `V23` | `A7`, `E1`, `E2`, `H7`, `I1` |
+| Architecture and authority | `ZT-02`, `ZT-11`, `I-01`, `I-05`, `V17`, `V22` | `B1`, `B4`, `D1`, `D3`, `E1` |
+| Record and state semantics | `ZT-02`, `ZT-09`, `I-01`–`I-03`, `V13`, `C-01`, `C-02` | `B1`, `B2`, `B4`, `B6` |
+| Semantic memory and reconciliation | `ZT-05`, `ZT-06`, `AS-06`, `AS-07`, `P-01`–`P-10`, `V15` | `C4`–`C7`, `C9`, `H2` |
+| Intent, approval, and work | `ZT-04`, `ZT-08`, `ZT-13`, `AS-02`–`AS-05`, `C-06`–`C-11`, `V5`, `V8` | `D1`–`D4`, `D9` |
+| Agent loops and durability | `ZT-04`, `ZT-12`, `C-03`, `R-05`, `R-06`, `V2`–`V4` | `D5`, `D7`, `D8`, `E3`, `H4` |
+| Replay and undo | `ZT-07`, `AS-10`, `R-01`–`R-07`, `V9` | `D8`, `H8` |
+| Self-modification | `ZT-02`, `ZT-10`, `ZT-14`, `AS-08`, `I-13`, `I-14`, `V7`, `V22` | `E1A`, `F1`–`F5` |
+| Security and external effects | `ZT-01`, `ZT-04`, `ZT-15`, `ZT-16`, `AS-09`, `AS-11`, `V16`, `V20` | `E1`–`E5`, `F5`, `H5` |
+| Tools and providers | `ZT-01`, `ZT-17`, `AS-09`, `AS-12`, `S4`, `S8`, `V10` | `D6`, `F4`, `G4`, `H4` |
+| Interface and multimodal state | `ZT-06`, `ZT-12`, `ZT-13`, `ZT-16`, `U-01`–`U-10`, `S6` | `C7`, `G1`–`G3`, `H6` |
+| Persistence, freshness, and backup | `ZT-09`, `ZT-12`, `ZT-18`, `AS-11`, `AS-12`, `B-01`–`B-12`, `S7` | `B3`–`B5`, `C8`, `H1`, `H3`, `H7` |
+| Validation and deferred decisions | all `ZT-*`, all `AS-*`, `EvidenceEnvelope` | `A0`, `A5`–`A7`, `B6`, `C10`, `D9`, `E5`, `G5`, `H5`, `H9`, `I1`–`I5` |
 
 ## Phase A — Evidence substrate and decision-gated spikes
 
@@ -100,43 +90,43 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 - **Acceptance:** Validation: `EvidenceEnvelope` dry-run journey; `07 §7.0` schema validation; deterministic re-run; fixture hash manifest; failure-class recording. Review/fix: independent review of harness determinism, fixture sealing, and evidence completeness; defects fixed and checks rerun.
 - **Gate:** none.
 
-### A1 — Spike S1: Node versus Deno control-plane bake-off
+### A1 — Spike S1: Node versus Deno control-plane bake-off (closed; retained as evidence)
 
-- **Purpose:** Select the TypeScript control-plane runtime without weakening the OS sandbox.
+- **Purpose:** Select the TypeScript control-plane runtime. **Status: closed** selecting `deno@2.9.2`; this task is retained for its evidence and is not reopened.
 - **Depends on:** `A0`.
-- **Scope:** Node and Deno arms using the same control-plane code where feasible, same OS sandbox, same SQLite ledger, broker, and supervisor. Measure cold/warm start, RSS, event-loop p50/p95 under append/read load, SQLite driver correctness and single-writer behavior, worker/process isolation, signal handling, systemd integration, OpenTelemetry/tracing, packaging size, and permission behavior. Run the security probes against both.
+- **Scope:** Node and Deno arms using the same control-plane code where feasible, the same OS sandbox, the same SQLite ledger, and the same supervisor seam. Measure cold/warm start, RSS, event-loop p50/p95 under append/read load, SQLite driver correctness and single-writer behavior, worker/process isolation, signal handling, systemd integration, OpenTelemetry/tracing, packaging size, and permission behavior. Run the security probes against both.
 - **Acceptance:** Validation: `S1` (`07 §7.4` `LANG-1` + `NODE-DENO-1`) pre-registration for the `NODE-DENO-1` arm, paired comparison, traces, decision matrix, hard-fail list, rejected alternative, and residual risks; the same `S1` protocol is shared with `A4`. Review/fix: independent review of protocol fidelity and resource measurements; decision record corrected before publication.
-- **Gate:** closes `DG-2`; human-signed.
+- **Gate:** closed `DG-2`; human-signed. Re-run the comparison only after the ledger sequencer and worker model exist, as the gate record requires.
 
-### A2 — Spike S2: deployment plane and broker identity
+### A2 — Spike S2: deployment plane and broker identity (retired)
 
-- **Purpose:** Determine whether pure user-space deployment can protect broker secrets and enforce fail-closed boundaries.
+- **Purpose:** ~~Determine whether pure user-space deployment can protect broker secrets~~ **Retired.** The split removes the broker and the host-side agent process; the plane is fixed (`04 §8.2`). The task closes with a retirement record that maps every probe to its replacement control and states which host-security facts remain unmeasured.
 - **Depends on:** `A0`.
-- **Scope:** Host checks for systemd, user namespaces, delegated cgroup controllers, `ProtectSystem`, `ProtectHome`, and writable state. Compare pure user-space against a dedicated-UID broker/sandbox helper. Test same-UID process visibility, ptrace/Yama, `/proc`, secret readability, Landlock, `PrivateTmp`, `PrivateNetwork`, `RestrictAddressFamilies`, `MemoryMax`, `MemoryHigh`, `CPUQuota`, `TasksMax`, broker identity, fail-open behavior, crash recovery, linger/restart, and loopback/tunnel/Access posture.
-- **Acceptance:** Validation: `S2` (`07 §7.4` `DEP-1`) host check matrix, same-UID findings, fail-closed evidence, deployment-plane and broker-identity recommendation, explicit residuals. Review/fix: independent security review; any missing probe added and rerun.
-- **Gate:** closes `DG-3`; human-signed.
+- **Scope:** Retirement record. For each pre-split probe (user namespaces, ptrace/Yama and `/proc` visibility, Landlock ABI, `ProtectHome`/`ProtectSystem`, cgroup delegation, broker identity, secret reachability, loopback exposure) state the fact, the replacement control in the deployed VM (`04 §8.1`–`§8.7`), and what remains unmeasured. Record the rootless-namespace and shared-store evidence as historical, not as a claim about this deployment.
+- **Acceptance:** Validation: retirement record complete, every probe mapped, and the `DG-3` retirement signed; residuals (host root reads the volume, vTPM seal may be nominal) restated. Review/fix: independent security review of the mapping; defects fixed and record reissued.
+- **Gate:** closed `DG-3` as retired; human-signed retirement record.
 
-### A3 — Spike S3: lightweight inter-agent isolation
+### A3 — Spike S3: agent-program containment under Monty
 
-- **Purpose:** Select a crash/resource containment mechanism, not a security boundary.
+- **Purpose:** Record the containment and resource behavior of agent-authored programs under Monty, and state explicitly that no security property is claimed for the interpreter.
 - **Depends on:** `A0`.
-- **Scope:** Compare process with cgroups/rlimits, WASM instance, and microVM. Measure cold start, RSS, CPU, density at increasing agent counts, crash isolation, OOM containment, fork-bomb containment, cleanup after kill, IPC behavior, and operability. Container-per-agent is excluded.
-- **Acceptance:** Validation: `S3` (`07 §7.4` `ISO-1`) containment matrix at target concurrency; explicit statement that no security property is claimed. Review/fix: independent review of containment claims and operability costs; defects fixed and rerun.
+- **Scope:** Monty WASM backend start and execution; async host-call mediation; ambient filesystem, network, and subprocess denial with zero network requests; `while True` and unbounded-allocation bounds with fresh-session recovery; child-timeout reporting; per-sandbox cgroup memory, pids, CPU, wall-clock, and scratch isolation; kill and orphan reaping; process-wide OOM behavior. Container-per-agent stays excluded; a microVM-per-agent is out of scope because the VM is the boundary.
+- **Acceptance:** Validation: `S3` (`07 §7.4`) containment matrix at target concurrency on `security-v1`; explicit statement that no security property is claimed and that engine compromise and process-wide OOM are residual. Review/fix: independent review of containment claims and operability costs; defects fixed and rerun.
 - **Gate:** closes `DG-4`; human-signed.
 
-### A4 — Spike S1: agent-facing execution-language bake-off
+### A4 — Spike S1: agent-facing execution-language bake-off (retired)
 
-- **Purpose:** Select the programmable execution language and runtime pair for the agent-facing surface.
+- **Purpose:** ~~Select the programmable execution language~~ **Retired.** Monty is fixed by the split design (`07 §4.9.5`). The task closes with the recorded decision, the retained local measurements, and an explicit statement that no live model comparison exists.
 - **Depends on:** `A0`.
 - **Scope:** Arms: Monty, TypeScript, Lua/Luau, Bash, full CPython. Use the ten-task workload suite, host-call latency at 10 ms, 100 ms, and 1 s, at least two models per provider including a smaller model, and 30 trials per cell at temperature 0. Measure success and evidence coverage, tokens, turns, tool calls, retries, p50/p95 latency, startup and peak memory, snapshot/restore, progressive disclosure at increasing tool counts, security probes, and integration surface.
 - **Acceptance:** Validation: `S1` (`07 §7.4` `LANG-1` + `NODE-DENO-1`) pre-registered non-inferiority and cost/latency/operability rules for the `LANG-1` arm, traces, failure taxonomy, selected language or explicit “no selection”; the same `S1` protocol is shared with `A1`. Review/fix: independent review of pre-registration and analysis; violations corrected before the gate.
-- **Gate:** closes `DG-1`; human-signed.
+- **Gate:** closed `DG-1` with the design decision; human-signed record.
 
 ### A5 — Gate consolidation and baseline freeze
 
 - **Purpose:** Convert spike outcomes into fixed downstream contracts before implementation.
 - **Depends on:** `A1`, `A2`, `A3`, `A4`.
-- **Scope:** Record `DG-1` through `DG-4`; selected runtime, execution language, deployment plane, broker identity, and isolation mechanism; rejected alternatives; accepted residuals; provisional operator-envelope schema; harness configuration. Prohibit silent defaults.
+- **Scope:** Record `DG-1` through `DG-4` with their status (closed, closed, retired, closed); selected runtime, execution language, deployment plane, and containment; rejected alternatives; accepted residuals (engine compromise, process-wide OOM, search leakage); provisional operator-envelope schema for lanes, ingest, CAS, Todo, chat, and search; harness configuration. Prohibit silent defaults.
 - **Acceptance:** Validation: signed gate records and configuration manifests; cross-check that no dependent task can start on an unrecorded choice. Review/fix: independent review of gate records and dependency implications; inconsistencies fixed and records reissued.
 - **Gate:** consumes `DG-1`–`DG-4`.
 
@@ -149,6 +139,14 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 - **Gate:** prepares `DG-6`; closes no decision yet.
 
 ---
+
+### A7 — Seal `journey-v2` and `ingest-v1` fixtures
+
+- **Purpose:** Give the rebased acceptance journey and the ingest batch contract sealed fixtures before dependent tasks reference them.
+- **Depends on:** `A0`, `A5`.
+- **Scope:** Seal the life-admin `journey-v2` fixture (one batch per origin, a stale source, an external commit batch, a declarative activation, an executable candidate awaiting approval, a Todo cap case, a blocked search query, and a CSP no-request case) and the `ingest-v1` workload (batch sizes and rates, gaps, suppressions, outage backlog). Publish hashes in the fixture registry and record the fixture versions in the harness.
+- **Acceptance:** Validation: fixture manifests hash-verified; `07 §7.0` rule 3 sealing evidence; negative case per fixture (tampered entry, reordered sequence, missing heartbeat) rejects. Review/fix: independent review that no task cites an unsealed fixture; defects fixed and fixtures resealed.
+- **Gate:** prepares `DG-6`, `DG-7`; closes none.
 
 ## Phase B — Walking skeleton
 
@@ -180,9 +178,9 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 
 - **Purpose:** Prove one observation can traverse blob publication, canonical append, synchronous read, and a minimal user-visible surface across restart.
 - **Depends on:** `A5`, `B2`, `B3`.
-- **Scope:** Process topology selected by `DG-2`/`DG-3`; trusted core/sequencer, sandbox supervisor, broker, UI client, watchdog, and backup boundaries; loopback-only API; startup integrity checks; health/readiness. Vertical slice: fixture observation → CAS bytes → manifest → append → operational read → minimal web or CLI view → restart and reread.
+- **Scope:** Process topology under `DG-2` and the fixed VM plane; trusted core/sequencer, channel hosts, Monty host and sandbox supervisor, lane governor, static UI client, consent surface, watchdog; loopback-only API; startup integrity checks including the channel manifest; health/readiness. Vertical slice: fixture observation → CAS bytes → manifest → append → operational read → minimal web or CLI view → restart and reread.
 - **Acceptance:** Validation: end-to-end evidence envelope; `B-01`/`B-02` subset; read-your-writes; restart; loopback binding; integrity-failure refusal. Review/fix: independent review of process boundaries and skeleton evidence; defects fixed and rerun.
-- **Gate:** consumes `DG-2`, `DG-3`; closes none.
+- **Gate:** consumes `DG-2`; closes none.
 
 ### B5 — Index-membership measurement (plan-local; closes `DG-5`)
 
@@ -212,19 +210,19 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 - **Acceptance:** Validation: base `R-01`; `C-05` partial; coverage honesty; restart and rebuild digest equality. Review/fix: independent review of atomic visibility and watermark semantics; defects fixed and rerun.
 - **Gate:** consumes `DG-5`; closes none.
 
-### C2 — Source-adapter contract and HTTP/filesystem/search adapters
+### C2 — Ingest batch contract and ingest-side adapters
 
-- **Purpose:** Capture source content as observations with provenance, not authority.
+- **Purpose:** Consume one-way ingest batches as observations with provenance, not authority, and keep the ingest-side adapter contract closed.
 - **Depends on:** `B3`, `B4`, `B6`.
-- **Scope:** Closed adapter contract; scan request/batch, observation drafts, capture evidence, coverage receipt, checkpoints, idempotency keys, event/full/targeted scans, missing grace, failure mapping. HTTP, filesystem, and search adapters use recorded transport until live providers are integrated. Adapters are producers, never canonical writers.
-- **Acceptance:** Validation: `AS-01`; provenance, coverage, idempotent re-ingest, crash after each publication step, `304` handling with recorded transport. Review/fix: independent review of evidence ordering and absence behavior; defects fixed and rerun.
+- **Scope:** `IngestBatchManifest` and `IngestEntry` validation; age decryption with the in-VM identity; ordered `(origin, sequence)` acceptance with gap detection; CAS publication before observation visibility; one coverage receipt per batch; idempotency by `batchDigest`; suppression accounting; missing grace; failure mapping; per-source freshness heartbeat. The ingest-side `git`/`http`/`search`/`fs` adapters are exercised through recorded batches. Adapters and batch producers are never canonical writers.
+- **Acceptance:** Validation: `AS-01`, `ZT-18`; provenance, coverage, idempotent re-ingest, gap and suppression recording, crash after each publication step, stale and unknown heartbeat behavior. Review/fix: independent review of evidence ordering and absence behavior; defects fixed and rerun.
 - **Gate:** closes none.
 
-### C3 — Git adapter and external divergence
+### C3 — Git material and external divergence
 
 - **Purpose:** Record external commits immediately without clobbering speculative history.
 - **Depends on:** `C2`.
-- **Scope:** Git ref, commit, and rewrite observations; raw commit/blob capture; changed paths; force-push and abandonment; optional worktree observations; remote fetch as a capability-mediated effect; explicit conflict assessment; no-clobber basis checks; external commits are observations, not approvals.
+- **Scope:** Git ref, commit, and rewrite entries inside batches; commit/blob capture; changed paths; force-push and abandonment; explicit conflict assessment; basis checks against recorded refs; external commits as observations, never approvals. There is no working tree in the VM and no write path to a repository, so no-clobber is structural for repositories and remains a gate for Todo and ledger basis.
 - **Acceptance:** Validation: `AS-05`; `C-12`; `ZT-03`; no-clobber evidence; conflict surfacing. Review/fix: independent review of divergence classification and write refusal; defects fixed and zero-tolerance checks rerun.
 - **Gate:** closes none.
 
@@ -264,7 +262,7 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 
 - **Purpose:** Make persistence recoverable and physical erasure exceptional but explicit.
 - **Depends on:** `B2`, `B3`, `C4`.
-- **Scope:** Online SQLite point-in-time snapshot immediately before filesystem backup; CAS copy with GC paused; checkpoint digests; restore reference verification; derived index rebuild; erasure epoch covering online and controlled backup artifacts; retention separation; residual declaration for offline copies.
+- **Scope:** Online SQLite point-in-time snapshot immediately before the host image snapshot; CAS consistency; checkpoint digests; restore reference verification and derived-index rebuild; erasure epoch covering online and controlled backup artifacts; retention separation; residual declaration for offline copies. Host snapshot mechanics are `IMG-1`; the in-VM ordering is not deferred.
 - **Acceptance:** Validation: `AS-11`; `B-05`–`B-12`; tampered snapshot/blob restore; erasure residual report; migration compatibility. Review/fix: independent review of snapshot consistency and erasure boundaries; defects fixed and rerun.
 - **Gate:** closes none.
 
@@ -336,12 +334,12 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 - **Acceptance:** Validation: `C-03`, `V11`, `V12`; duplicate delivery; crash/resume; timer recovery; self-loop no-progress escalation. Review/fix: independent review of idempotency and recovery; defects fixed and rerun.
 - **Gate:** closes none.
 
-### D6 — Provider-neutral model routing and exact I/O capture
+### D6 — Local lane policy and exact model I/O capture
 
-- **Purpose:** Capture exact available model evidence without promising regeneration.
+- **Purpose:** Route task classes to local lanes and capture exact available model evidence without promising regeneration.
 - **Depends on:** `B3`, `D5`.
-- **Scope:** Human-owned task-routing policies; provider-neutral request/response contract; exact post-redaction semantic and wire payload capture of request, response, params, output events, and exposed reasoning artifacts, each carrying its redaction commitment; credential-bearing bytes are neither persisted nor required as evidence; reasoning absence explicit; retries as new model calls; recorded-I/O replay path. Live provider transports come later.
-- **Acceptance:** Validation: `V10`; post-redaction capture digests and redaction-commitment records; zero credential-bearing bytes in any artifact, CAS, or canonical surface (`ZT-01`); `429`/`5xx`/timeout/malformed-output tests with a fake provider; reasoning absence; replay performs no model call. Review/fix: independent review of I/O completeness, redaction commitments, and replay prohibition; defects fixed and rerun.
+- **Scope:** Human-owned task policies mapping task classes to the chat lane or the background pool; lane request/response contract against `llama.cpp`; lane-seconds reservation and accounting; chat starvation protection; exact post-redaction semantic and wire capture of request, response, params, output events, and exposed reasoning artifacts; reasoning absence explicit; retries as new model calls; recorded-I/O replay path. There is no remote provider, no fallback chain, and no credential.
+- **Acceptance:** Validation: `V10`; capture digests; zero credential-bearing bytes in any artifact, CAS, or canonical surface (`ZT-01`); timeout/malformed-output/lane-unavailable tests with a fake lane server; reasoning absence; replay performs no model call; chat lane never preempted by background work. Review/fix: independent review of I/O completeness, redaction commitments, and replay prohibition; defects fixed and rerun.
 - **Gate:** closes none.
 
 ### D7 — Effect journal, idempotency, `outcome_unknown`, and compensation
@@ -370,15 +368,15 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 
 ---
 
-## Phase E — Security, broker, and effectful execution
+## Phase E — Security, channels, and effectful execution
 
-### E1 — Capability contracts, sandbox supervisor, and fail-closed verification
+### E1 — Capability contracts, channel hosts, Monty host, and fail-closed verification
 
-- **Purpose:** Enforce mediated external authority and containment.
-- **Depends on:** `A5` (`DG-3`, `DG-4`), `B2`, `B4`.
-- **Scope:** Mediated filesystem, process, network, model, and secret capabilities; sandbox specification and mount classes; writable roots; enforcement class; post-start verification; fail-closed launch; resource limits; process identities; no canonical database, trust root, or secrets mounted into agent code; inter-agent containment.
-- **Acceptance:** Validation: `ZT-02`, `ZT-04`, `ZT-10`; fail-open test; namespace/Landlock/ptrace probes; resource enforcement; mount inspection. Review/fix: independent security review; defects fixed and zero-tolerance checks rerun.
-- **Gate:** consumes `DG-3`, `DG-4`; closes none.
+- **Purpose:** Enforce the closed channel boundary and contain agent-authored code.
+- **Depends on:** `A5` (`DG-4`), `B2`, `B4`.
+- **Scope:** Channel capability contracts (`channel.inbox`, `vault`, `todo`, `chat`, `csr`, `search`, `lane.invoke`); the six channel hosts and their schemas; mount manifest and cap enforcement; `SandboxSpec.channels`; enforcement class and post-start verification including the interface, mount, and socket set; per-sandbox cgroups; start-token and peer attribution; Monty host-call stubs generated from the manifest; no canonical database, trust-root file, or secret mounted into a sandbox.
+- **Acceptance:** Validation: `ZT-02`, `ZT-04`, `ZT-10`, `ZT-15`, `V20`, `V23`; fail-open test; `ip link` shows `lo` only; mount and socket set equal the manifest; resource enforcement; undeclared-stub denial. Review/fix: independent security review; defects fixed and zero-tolerance checks rerun.
+- **Gate:** consumes `DG-4`; closes none.
 
 ### E1A — Frozen activation-supervisor stub
 
@@ -386,49 +384,47 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 - **Depends on:** `E1`, `B6`.
 - **Scope:** Frozen supervisor process identity and launch contract; append path for activation and activation-receipt components; atomic flip and revert of one pre-registered scope pointer; startup verification that agent and plugin channels cannot append those component classes; append-only activation history. Only a sealed synthetic candidate: no mutable code loading, capability diff, health check, or external-effect rollback. Explicit retirement list for `F3`.
 - **Acceptance:** Validation: `ZT-02`, `ZT-10` stub-scope subset; agent/plugin append attempts denied; pointer flip and revert recorded as supervisor-authored receipts; trust-root mutation refused. Review/fix: independent review of the stub's authority boundary and retirement list; defects fixed and zero-tolerance checks rerun.
-- **Gate:** consumes `DG-3`, `DG-4`; closes none.
+- **Gate:** consumes `DG-4`; closes none.
 
-### E2 — Credential broker
+### E2 — Channel hosts and the closed manifest
 
-- **Purpose:** Inject enrolled credentials without exposing them to agent code.
-- **Depends on:** `E1`, `DG-3`.
-- **Scope:** Human enrollment authority; logical hostname to endpoint mapping; resolve-once or pinned-address policy; TLS verification; credential-header stripping; exactly-once injection; redirects never followed; cross-host refusal; response and log redaction; audit intent before secret use; revocation/rotation; no method/path authorization.
-- **Acceptance:** Validation: `AS-09`; `ZT-01`; DNS rebinding, redirect, SNI/TLS confusion, CONNECT/raw TCP, credential replay, confused deputy, redaction coverage. Review/fix: independent security review of broker ordering and secret boundaries; defects fixed and zero-tolerance checks rerun.
-- **Gate:** consumes `DG-3`; closes none.
+- **Purpose:** Make the six channels the only byte paths, with caps, receipts, and fail-closed behavior.
+- **Depends on:** `E1`.
+- **Scope:** Inbox reader (age decryption, ordered sequences, gap and suppression records, idempotency by batch digest); Vault reader (read-only, symlink refusal); Todo writer (per-write and per-mount cap, `todo_cap_exceeded`, receipts); Chat server (JSON routes, in-VM TLS, passkey plus Access identity, byte cap on responses); CSR handler (one CN, one key algorithm, one SAN set); Search client (`{query, limit}`, no key, no URL control). Audit intent before each channel operation and a receipt after. No broker, no enrollment, no credential, no HTTP client.
+- **Acceptance:** Validation: `AS-09`, `ZT-01`, `ZT-15`, `ZT-17`; channel schema violations, undecryptable batch, cap breach, judge/DLP block, and host-socket failure all deny closed with receipts; no process in the VM holds a provider key. Review/fix: independent security review of channel ordering and cap enforcement; defects fixed and zero-tolerance checks rerun.
+- **Gate:** consumes `DG-4`; closes none.
 
-### E3 — Effectful execution integration
+### E3 — Effectful execution through channels
 
-- **Purpose:** Connect the effect journal to real capabilities and hard-policy plumbing.
+- **Purpose:** Connect the effect journal to real channel capabilities and hard-policy plumbing.
 - **Depends on:** `D7`, `E1`, `E2`.
-- **Scope:** Filesystem, process, broker, model, and search effects; hard policy, budget, tier, and receipt checks before dispatch; idempotency keys; `outcome_unknown`; compensation; receipts; denial records; no effect outside sandbox, broker, global resource, or frozen-root policy. Admission uses explicitly synthetic test-scoped limits from a sealed fixture; this task sets no operator ceiling and asserts no approved value, and effects stay confined to the fixture. Continuous or production dispatch remains disabled until `H4A`. It records the enforcement points that `H4A` must re-verify.
-- **Acceptance:** Validation: `I-09`, `I-12`; `C-14`; `ZT-04` under synthetic limits; crash after attempt; compensation as new effect; policy denial evidence; enforcement-point inventory for `H4A`. Review/fix: independent review of admission ordering and receipt completeness; defects fixed and zero-tolerance checks rerun.
-- **Gate:** consumes `DG-3`; closes none.
+- **Scope:** Inbox, Vault, Todo, Chat, CSR, Search, and lane effects; hard ceiling, budget, tier, and receipt checks before dispatch; idempotency keys; `outcome_unknown`; compensation; receipts; denial records; no effect outside the sandbox, channel manifest, global ceiling, or frozen-root policy. Admission uses explicitly synthetic test-scoped limits from a sealed fixture; this task sets no operator ceiling and asserts no approved value, and effects stay confined to the fixture.
+- **Acceptance:** Validation: `I-09`, `I-12`, `C-14`, `ZT-04` under synthetic limits; crash after attempt; compensation as new effect; policy denial evidence; enforcement-point inventory for `H4A`. Review/fix: independent review of admission ordering and receipt completeness; defects fixed and zero-tolerance checks rerun.
+- **Gate:** closes none.
 
 ### E4 — Security red-team core
 
 - **Purpose:** Demonstrate the hostile-agent threat model against the implemented boundary.
 - **Depends on:** `E1`, `E2`, `E3`.
-- **Scope:** Hostile agent/tool code, hostile dependencies, prompt injection, filesystem theft, canonical DB write, sandbox escape, arbitrary egress, DNS rebinding, redirect bypass, TLS/SNI confusion, opaque tunnels, credential exfiltration/replay, confused deputy, approval bypass, audit forgery, persistence, fail-open, and trust-root mutation.
-- **Acceptance:** Validation: `ZT-01`, `ZT-02`, `ZT-04`, `ZT-10`; `security-v1`; accepted residuals recorded, especially project-data exfiltration and provider-wide credential authority. Review/fix: independent red-team review; every finding fixed or explicitly accepted with evidence before phase close.
+- **Scope:** Hostile agent/tool code, hostile dependencies, prompt injection through batches and search results, vault theft, canonical DB write, Monty escape attempts, channel leaks (NIC, undeclared share, undeclared vsock port), Todo cap abuse, CSP remote-request and autolink attempts, consent forgery, approval bypass, audit forgery, persistence, fail-open, and trust-root mutation.
+- **Acceptance:** Validation: `ZT-01`, `ZT-02`, `ZT-04`, `ZT-10`, `ZT-15`, `ZT-16`, `ZT-17`; `security-v1`; accepted residuals recorded, especially search leakage, approved-code reach, and Monty engine compromise. Review/fix: independent red-team review; every finding fixed or explicitly accepted with evidence before phase close.
 - **Gate:** closes none.
 
 ### E5 — Effectful agent-execution conformance review
 
-- **Purpose:** Verify real effects do not bypass approval, broker, sandbox, or receipt contracts.
+- **Purpose:** Verify real effects do not bypass approval, channel, or receipt contracts.
 - **Depends on:** `D9`, `E3`, `E4`.
-- **Scope:** Run `AS-04`, `AS-05`, `AS-09`, `C-12`, and `C-14` with real capabilities and broker. Check approval scope coverage, external conflict recording, no-clobber behavior, and effect receipts.
+- **Scope:** Run `AS-04`, `AS-05`, `AS-09`, `AS-12`, `C-12`, and `C-14` with real channel hosts. Check approval scope coverage, external-change recording, no-clobber behavior for Todo, and effect receipts.
 - **Acceptance:** Validation: conformance evidence bundle; zero-tolerance checks never retried. Review/fix: independent review record; defects fixed; affected evidence rerun before phase close.
 - **Gate:** closes none.
 
----
-
 ## Phase F — Self-modification
 
-### F1 — Declarative self-modification
+### F1 — Declarative self-modification (live)
 
-- **Purpose:** Allow safe live mutation of declarative context, UI, settings, keybinds, themes, and tool wiring.
+- **Purpose:** Allow safe live mutation of context lenses, view catalogs, themes, keybinds, settings, and disclosure rules.
 - **Depends on:** `D1`, `D3A`, `D4`, `C7`, `E1`, `E1A`.
-- **Scope:** Versioned declarative documents; schema and budget validation; scope restriction; ordered and total disclosure rules; explicit fallback; next-turn activation with the current turn pinned; rollback to the previous candidate; activation receipt authored only by the `E1A` supervisor stub and visibility/hidden diff. Human decision views remain outside agent context scope.
+- **Scope:** Versioned declarative documents; schema and budget validation; authorized-source and component-version checks; ordered and total disclosure rules; no remote reference, no code, no new origin; rejection of anchor, decision-affordance, or consent-link removal; next-turn activation with the current turn pinned; rollback to the previous candidate; activation receipt authored only by the `E1A` supervisor stub; visibility/hidden diff. Human decision views remain outside agent context scope.
 - **Acceptance:** Validation: `AS-08` declarative lane; invalid-document rejection; next-turn pinning; previous-candidate retention; coverage honesty; activation and revert receipts carry only the `E1A` authority path. Review/fix: independent review of declarative validation and hidden-evidence effects; defects fixed and rerun.
 - **Gate:** closes none.
 
@@ -436,79 +432,75 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 
 - **Purpose:** Isolate arbitrary plugin code and its mutable state from the canonical ledger.
 - **Depends on:** `F1`, `E1`.
-- **Scope:** Scope graph; plugin manifest; `PluginContext`; required/optional dependencies; separate scoped stores; rebuildable and checkpointed durability; canonical append/query handles bound to scope; no direct SQLite handle; sandboxed plugin host; co-location only within the same scope and trust class.
-- **Acceptance:** Validation: `I-13`; manifest rejection for undeclared capabilities/state; plugin-state rebuild; direct-SQLite denial. Review/fix: independent review of scope isolation and state durability; defects fixed and zero-tolerance checks rerun.
+- **Scope:** Scope graph; plugin manifest; `PluginContext`; required/optional dependencies; separate scoped stores; rebuildable and checkpointed durability; canonical append/query handles bound to scope; no direct SQLite handle; plugin host inside the Monty host process boundary; co-location only within the same scope and trust class.
+- **Acceptance:** Validation: `I-13`; manifest rejection for undeclared capabilities or state; plugin-state rebuild; direct-SQLite denial; undeclared channel stub denial. Review/fix: independent review of scope isolation and state durability; defects fixed and zero-tolerance checks rerun.
 - **Gate:** closes none.
 
-### F3 — Candidate staging, validation, capability diff, activation, and rollback
+### F3 — Candidate staging, validation, capability diff, human approval, and rollback
 
-- **Purpose:** Activate mutable code through scoped candidates rather than live edits.
-- **Depends on:** `F2`, `E3`, `E1A`.
-- **Scope:** Candidate generations; dependency lock; manifest/schema validation; static capability scan; sandboxed dynamic conformance; migration dry-run; security probes; capability and dependency diff; shadow state; standby boot; drain; atomic scope-pointer flip; post-flip health; rollback; previous-candidate retention; frozen trust root. Retire the `E1A` synthetic-scope stub and carry out its retirement list, leaving one activation authority path.
-- **Acceptance:** Validation: `AS-08` code lane; `I-14`; `ZT-10`; activation crash matrix; external effects not rolled back by pointer flip; forward-only rollback refusal; `E1A` retirement evidence with no residual synthetic-scope append path. Review/fix: independent review of activation ordering and trust-root exclusion; defects fixed and zero-tolerance checks rerun.
-- **Gate:** closes none.
+- **Purpose:** Let executable code activate only through a human approval receipt, with diffs, health checks, and rollback.
+- **Depends on:** `F2`, `E3`, `E1A`, `D3A`.
+- **Scope:** Candidate generations; dependency lock against image artifacts; manifest/schema validation; static capability scan; sandboxed dynamic conformance under Monty with channels denied; migration dry-run on shadow state; security probes; capability and dependency diff; candidate approval request in the decision queue rendered by the frozen consent surface; approval receipt binding candidate digest, diff, scope, and expiry; consumption on flip; shadow state; standby boot with effects gated; drain; atomic pointer flip; post-flip health; rollback; previous-candidate retention; frozen trust root untouched. Retire the `E1A` stub and carry out its retirement list.
+- **Acceptance:** Validation: `AS-08` executable lane; `I-14`, `ZT-10`, `ZT-08`; activation crash matrix; a candidate cannot activate without a matching approval receipt, and a changed digest invalidates one; an agent-authored approval is rejected with `AUTHORITY_DENIED`; external effects not rolled back by pointer flip; forward-only rollback refusal; `E1A` retirement evidence. Review/fix: independent review of approval binding and activation ordering; defects fixed and zero-tolerance checks rerun.
+- **Gate:** consumes `DG-5` where indexes are involved; closes none.
 
-### F4 — Agent-visible programmable tool surface and execution runtime
+### F4 — Agent-visible programmable tool surface on Monty
 
 - **Purpose:** Expose one discovery-and-execution surface instead of per-tool schemas.
 - **Depends on:** `DG-1`, `F3`.
-- **Scope:** `search`, `list`, `describe`, and `execute`; versioned tool descriptors; `call` and `program` modes; typed host-call stubs; result envelope; structured errors; streaming and cancellation; host-call budgets; runtime adapter selected by `DG-1`; capability denial.
-- **Acceptance:** Validation: discovery conformance; deterministic ordering and pagination; host-call behavior; capability denial; runtime-specific conformance. Review/fix: independent review of descriptor versioning and host-call accounting; defects fixed and rerun.
+- **Scope:** `search`, `list`, `describe`, and `execute`; versioned tool descriptors; `call` mode; `program` mode under Monty with generated typed host-call stubs; result envelope; structured errors; streaming and cancellation; host-call budgets; conflict, transcript, and terminate support; capability denial. `RuntimeId` has exactly one value.
+- **Acceptance:** Validation: discovery conformance; deterministic ordering and pagination; host-call behavior; ambient-capability denial inside a program; capability denial; `V10` host-call accounting. Review/fix: independent review of descriptor versioning and host-call accounting; defects fixed and rerun.
 - **Gate:** consumes `DG-1`; closes none.
 
 ### F5 — Self-modification crash, trust-root, and external-effect tests
 
 - **Purpose:** Prove activation failure cannot corrupt authority or silently undo external effects.
 - **Depends on:** `F3`, `F4`.
-- **Scope:** Crash before and after pointer flip; health failure and rollback; rollback blocked by forward-only migration; trust-root write attempts; candidate quarantine; external-effect residual after rollback; agent editing its own context lens without affecting human decision views.
-- **Acceptance:** Validation: `ZT-10`; full `AS-08`; activation crash matrix; external-effect residual report. Review/fix: independent review of rollback and residual semantics; defects fixed and zero-tolerance checks rerun.
+- **Scope:** Crash before and after pointer flip; health failure and rollback; rollback blocked by forward-only migration; trust-root write attempts; approval replay and digest mismatch; candidate quarantine; external-effect residual after rollback; agent editing its own lens without affecting human decision views; declarative attempt to remove an anchor or the consent link.
+- **Acceptance:** Validation: `ZT-10`, `ZT-08`, full `AS-08`; activation crash matrix; external-effect residual report. Review/fix: independent review of rollback and residual semantics; defects fixed and zero-tolerance checks rerun.
 - **Gate:** closes none.
 
----
+## Phase G — Static UI, local lanes, and multimodal state
 
-## Phase G — UI, live providers, and multimodal state
+### G1 — Static CSP shell and core graph, timeline, and decision views
 
-### G1 — Web shell and core graph, timeline, and decision views
-
-- **Purpose:** Provide the stable human interface over renderer-neutral state.
+- **Purpose:** Provide the stable human interface over renderer-neutral state without giving injected content a network path.
 - **Depends on:** `D3`, `D3A`, `D4`, `C7`, `F1`.
-- **Scope:** Stable web shell; coordinated graph, delta timeline, and global decision queue; coverage watermarks; contested, retracted, suspect, stale, and current distinctions; approval comprehension; undo visibility; accessibility tree and text fallback.
-- **Acceptance:** Validation: `U-01`–`U-10` structural assertions; presentation-replay subset; renderer-neutral catalogs; accessibility checks. Review/fix: independent UI review against comprehension invariants; defects fixed and rerun.
+- **Scope:** Static human-owned bundle built from the pinned commit; the CSP of `07 §4.11.7`; JSON-only API; coordinated graph, delta timeline, and global decision queue; coverage watermarks; contested, retracted, suspect, stale, and current distinctions; approval comprehension; undo visibility; accessibility tree and text fallback; model text rendered as text nodes with no HTML injection and no auto-linking.
+- **Acceptance:** Validation: `U-01`–`U-10` structural assertions; `ZT-16` planted image/link/CSS/iframe/autolink cases produce zero requests and zero navigations; presentation-replay subset; renderer-neutral catalogs. Review/fix: independent UI review against comprehension invariants; defects fixed and rerun.
 - **Gate:** closes none.
 
-### G2 — AG-UI adapter, A2UI catalogs, graph components, and MCP Apps boundary
+### G2 — AG-UI adapter, A2UI catalogs, graph components, and artifact boundary
 
 - **Purpose:** Keep canonical semantics internal while interoperating with presentation protocols.
 - **Depends on:** `G1`.
-- **Scope:** AG-UI run/state/interrupt adaptation; ordinary A2UI catalog rendering; custom graph components; MCP Apps-compatible sandboxed artifact boundary; no canonical UI state; stale-delta rejection; interrupt batching as a graph constraint.
-- **Acceptance:** Validation: `U-09`; protocol conformance; artifact sandbox isolation; stale-delta rejection; batched interrupt resume. Review/fix: independent protocol review; defects fixed and rerun.
+- **Scope:** AG-UI run/state/interrupt adaptation; ordinary A2UI catalog rendering; custom graph components; CSP-locked artifact region with no remote references and no credentials; no canonical UI state; stale-delta rejection; interrupt batching as a graph constraint.
+- **Acceptance:** Validation: `U-09`; protocol conformance; artifact isolation; stale-delta rejection; batched interrupt resume; no catalog can introduce an origin or script. Review/fix: independent protocol review; defects fixed and rerun.
 - **Gate:** closes none.
 
 ### G3 — Multimodal ingestion, previews, and derived-artifact separation
 
 - **Purpose:** Content-address arbitrary files while keeping raw objects distinct from derivations.
 - **Depends on:** `C2`, `B3`, `G1`.
-- **Scope:** Text, code, images, screenshots, and PDFs; provenance and previews; OCR, text, and metadata derivations; audio/video stored without full semantic indexing; canonical raw objects distinct from transcripts, OCR, embeddings, and thumbnails; retraction-aware derived artifacts.
-- **Acceptance:** Validation: provenance drill-down; derived-versus-raw distinction; preview correctness; stale derived artifacts after retraction. Review/fix: independent review of provenance and derivation invalidation; defects fixed and rerun.
+- **Scope:** Text, code, images, screenshots, and PDFs arriving in batches; provenance and previews served as local bytes; OCR, text, and metadata derivations; audio/video stored without full semantic indexing; canonical raw objects distinct from transcripts, OCR, embeddings, and thumbnails; retraction-aware derived artifacts.
+- **Acceptance:** Validation: provenance drill-down; derived-versus-raw distinction; preview correctness; stale derived artifacts after retraction; previews never load a remote resource. Review/fix: independent review of provenance and derivation invalidation; defects fixed and rerun.
 - **Gate:** closes none.
 
-### G4 — Live provider integrations: model routing and TinyFish search/fetch
+### G4 — Local lanes and search channel integration
 
-- **Purpose:** Connect real providers behind neutral contracts without assuming equivalent capabilities.
+- **Purpose:** Connect the real inference path and the capped search path behind the frozen contracts.
 - **Depends on:** `D6`, `E2`, `E3`, `C2`.
-- **Scope:** TinyFish search and fetch behind the provider-neutral contract; conditional fetch; documented rate limits and backpressure; `402`, `403`, `429`, `5xx`, timeout, and malformed-output mapping; exact post-redaction semantic and wire provider envelopes with recorded redaction commitments; live model providers behind routing; post-redaction I/O capture; quota accounting.
-- **Acceptance:** Validation: recorded live runs; `429`/`5xx`/timeout/malformed tests; conditional `304`; post-redaction evidence preservation with redaction-commitment records; `ZT-01`; no content-bearing observation on failure. Review/fix: independent provider review; defects fixed and rerun.
+- **Scope:** `llama.cpp` serving the owner's model with one 128k chat lane and three 32k background lanes from a shared q8_0 KV pool, MTP off; lane availability and KV health; CPU embeddings and reranker; the Search VM behind the Search channel with DLP, judge, provider limits, stripping, and root-only query logging; typed failure mapping; quota accounting; freshness of the search budget.
+- **Acceptance:** Validation: recorded lane runs; `AS-09`; `ZT-01`; `ZT-17` search budget; DLP/judge block evidence; timeout and lane-unavailable tests; no content-bearing observation on failure; query log root-only. Review/fix: independent review of lane policy and search filtering; defects fixed and rerun.
 - **Gate:** closes none.
 
 ### G5 — UI and provider phase review
 
-- **Purpose:** Verify presentation neutrality, provider provenance, multimodal separation, and accessibility before hardening.
+- **Purpose:** Verify presentation neutrality, channel provenance, multimodal separation, and accessibility before hardening.
 - **Depends on:** `G1`–`G4`.
-- **Scope:** Cross-review of renderer neutrality, protocol adaptation, artifact sandboxing, provider evidence, derived-artifact invalidation, and comprehension invariants.
-- **Acceptance:** Validation: conformance rerun of `U-*` and provider tests; no open provenance findings. Review/fix: independent review record; defects fixed; affected evidence rerun before phase close.
+- **Scope:** Cross-review of renderer neutrality, protocol adaptation, artifact isolation, channel provenance, derived-artifact invalidation, CSP assertions, and comprehension invariants.
+- **Acceptance:** Validation: conformance rerun of `U-*` and channel tests; no open provenance findings; `ZT-16` rerun. Review/fix: independent review record; defects fixed; affected evidence rerun before phase close.
 - **Gate:** closes none.
-
----
 
 ## Phase H — Hardening and operational readiness
 
@@ -516,7 +508,7 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 
 - **Purpose:** Prove recovery behavior across ledger, CAS, loops, effects, activation, and backup.
 - **Depends on:** `B2`, `B3`, `C8`, `D5`, `D7`, `E3`, `F3`.
-- **Scope:** `SIGKILL`, `ENOSPC`, `EIO`, fsync failure, SQLite busy/corruption detection, OOM, fork bomb, clock jump, duplicate and out-of-order inbox delivery, provider failures, broker reset, CAS GC concurrent with read, and structured-contract violations. Cover every crash-matrix row.
+- **Scope:** `SIGKILL`, `ENOSPC`, `EIO`, fsync failure, SQLite busy/corruption detection, OOM, fork bomb, clock jump, duplicate and out-of-order inbox delivery, channel-host failure and restart, lane failure, search budget exhaustion, CAS GC concurrent with read, and structured-contract violations. Cover every crash-matrix row.
 - **Acceptance:** Validation: chaos matrix; error classes recorded; no blind retry of unknown non-idempotent effects; recovery evidence. Review/fix: independent review of recovery claims and fault coverage; defects fixed and rerun.
 - **Gate:** closes none.
 
@@ -540,7 +532,7 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 
 - **Purpose:** Convert measured headroom into enforced operator configuration.
 - **Depends on:** `H1`, `E3`, `C6`, `G4`, `A6`.
-- **Scope:** Run `cost-v1`: full journey, idle period, fan-out burst, reconciliation backlog, external conflict, and backup/restore. Measure CPU, RSS, pids, IO, disk growth, CAS growth, tokens, spend, provider rate usage, concurrency, and latency. Set global spend/token/rate/concurrency ceilings; per-loop soft budgets and override rules; memory, CPU, task, IO, disk, and CAS admission limits; sandbox and broker concurrency; freshness objectives; quality thresholds for reconciliation and UI comprehension.
+- **Scope:** Run `cost-v1`: full journey, idle period, fan-out burst, reconciliation backlog, external conflict, and backup/restore. Measure CPU, RSS, pids, IO, disk growth, CAS growth, lane seconds and lane latency, chat rate, search queries and budget, ingest bytes and batches per source, concurrency, and latency. Set GPU-lane, lane-second, ingest, CAS, state, Todo, chat, and search ceilings; per-loop soft budgets and override rules; memory, CPU, task, IO, and admission limits; sandbox and channel concurrency; freshness objectives; quality thresholds for reconciliation and UI comprehension.
 - **Acceptance:** Validation: `S4` (`07 §7.4` `LIM-1`) pre-registered workload and repetitions; bootstrap confidence intervals; enforcement evidence; hard fail if a ceiling cannot be observed or enforced. Review/fix: independent review of headroom calculation and enforcement; defects fixed and benchmark rerun.
 - **Gate:** closes `DG-6`; human-signed.
 
@@ -548,7 +540,7 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 
 - **Purpose:** Verify the `E3` admission path against the human-approved values from `DG-6` without choosing any value.
 - **Depends on:** `H4`, `E3`.
-- **Scope:** Load the approved operator configuration record; replay the `E3` enforcement-point inventory with the real ceilings; confirm every configured spend, token, rate, concurrency, resource, CAS, sandbox, and broker limit denies before dispatch and is observable; record the synthetic-to-approved mapping. Changing a value requires a new human decision, not this task.
+- **Scope:** Load the approved operator configuration record; replay the `E3` enforcement-point inventory with the real ceilings; confirm every configured lane, lane-second, ingest, CAS, state, Todo, chat, search, token, concurrency, resource, sandbox, and channel limit denies before dispatch and is observable; record the synthetic-to-approved mapping.
 - **Acceptance:** Validation: `I-12`, `ZT-04`, `C-14` under approved ceilings; `AS-12` hard-ceiling and soft-override subset; enforcement and observation evidence for each `DG-6` ceiling; any unenforceable ceiling blocks release and returns to the human. Review/fix: independent review of the approved-value mapping and denial evidence; defects fixed and checks rerun.
 - **Gate:** consumes `DG-6`; closes none.
 
@@ -564,17 +556,17 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 
 - **Purpose:** Verify the system is operable and comprehensible under configured thresholds.
 - **Depends on:** `A6`, `H2`, `H4`, `G1`, `G2`.
-- **Scope:** Cost metrics; coverage lag, external-ingest lag, queue age, decision-to-effect, reconciliation catch-up, index lag, and stale retracted reads; UI comprehension protocol with ten scripted questions against a raw-ledger baseline; presentation replay; accessibility.
+- **Scope:** Lane and channel cost metrics; batch freshness, ingest lag, gap and suppression rates, queue age, decision-to-effect, reconciliation catch-up, index lag, and stale retracted reads; UI comprehension protocol with ten scripted questions against a raw-ledger baseline; CSP no-request assertions; presentation replay; accessibility.
 - **Acceptance:** Validation: `S6` (`07 §7.4` `UI-1`, `UI-2`, `ING-1`) pre-registered protocol; distributions and confidence intervals; thresholds from `DG-6` and `DG-7`; zero stale retracted reads. Review/fix: independent review of benchmark protocol and comprehension analysis; defects fixed and rerun.
 - **Gate:** consumes `DG-6`, `DG-7`; closes none.
 
 ### H7 — Deployment packaging and operational readiness
 
 - **Purpose:** Package the selected deployment plane for reproducible operation, backup, and rollback.
-- **Depends on:** `A5` (`DG-3`), `E1`, `E2`, `C8`.
-- **Scope:** Unit or generation packaging; state path; backup registration; loopback binding; Cloudflare Tunnel and Access posture; watchdog and alerting; restart and linger behavior; rollback path; packaged host checks; no fail-open launch.
+- **Depends on:** `A5` (`DG-4`), `E1`, `E2`, `C8`.
+- **Scope:** Image packaging from the flake-pinned commit; guest module (no NIC, VFIO, swtpm, LUKS, virtiofs shares); host plumbing (relay, vsock, root-only artifacts); state path; image backup registration; loopback binding; WARP private route, in-VM TLS, and passkey posture; watchdog and freshness alerting; restart and rollback path; packaged host and guest checks; no fail-open launch; the image build refuses an unpinned or dirty pin.
 - **Acceptance:** Validation: packaged host-check rerun; restore from backup; rollback evidence; fail-open refusal. Review/fix: independent operations review; defects fixed and checks rerun.
-- **Gate:** consumes `DG-3`; closes none.
+- **Gate:** consumes `DG-4`; closes none.
 
 ### H8 — Replay, undo, and presentation-replay full suite
 
@@ -596,35 +588,35 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 
 ## Phase I — Final end-to-end acceptance and review
 
-### I1 — Full canonical journey acceptance
+### I1 — Life-admin journey acceptance
 
 - **Purpose:** Run the approved-in-principle journey end to end.
 - **Depends on:** `H9`, `DG-6`, `DG-7`.
-- **Scope:** `AS-01`–`AS-12` on the sealed `journey-v1` fixture over two selected projects plus Kanbei: ingest both projects and Kanbei, explore intent, approve structural goal, execute nested deltas, reconcile external commits, reconcile memory, retract/quarantine, self-modify through scoped live candidate activation of one declarative change and one tool/plugin change with capability diff and rollback (frozen trust root untouched), make one credentialed call through the broker, replay/undo, backup/restore/erasure, and measure cost/freshness.
-- **Acceptance:** Validation: every scenario executes; two-project plus Kanbei scope exercised, including cross-project scope isolation; self-modification passes the `AS-08` code lane through scoped live candidate activation with capability diff, one pointer flip, health check, and rollback, while any frozen-kernel change remains generation-gated and denied to agents (`ZT-10`); all assertions recorded; evidence envelope bound to canonical head, fixture version, and post-redaction recordings. Review/fix: independent end-to-end review; failures fixed and full scenario rerun.
+- **Scope:** `AS-01`–`AS-12` on the sealed `journey-v2` fixture: one batch per source plus a Git batch with coverage and heartbeats; a stale source labelled and alerted; intent exploration and one structural approval through the frozen consent surface; nested deltas with evidence-gated completion; an external commit from a later batch; memory reconciliation, retraction, and quarantine; one declarative change live and one executable candidate held for human approval then activated with rollback; Todo read/write with a cap refusal; one chat turn over the WARP route with in-VM TLS and a CSP no-request assertion; one capped search query and one blocked query; replay and undo; image restore with the recovery key.
+- **Acceptance:** Validation: every scenario executes; all assertions recorded; evidence envelope bound to canonical head, fixture version, and post-redaction recordings. The executable lane passes through a human approval receipt with a capability diff, one pointer flip, a health check, and rollback, while any frozen-kernel change remains generation-gated and denied to agents (`ZT-10`). Review/fix: independent end-to-end review; defects fixed and the affected scenarios rerun.
 - **Gate:** consumes `DG-6`, `DG-7`; closes none.
 
 ### I2 — Release zero-tolerance and red-team rerun
 
 - **Purpose:** Confirm the release candidate still passes all release-blocking gates after final fixes.
 - **Depends on:** `H5`, `I1`.
-- **Scope:** Rerun `ZT-01`–`ZT-14`, including `ZT-13` consent replay/clickjack/CSRF and `ZT-14` transition validation, and `security-v1` on the exact release candidate. No retries, no waivers.
-- **Acceptance:** Validation: every `ZT-01`–`ZT-14` gate is `pass` or release is `blocked`; incident report for any failure. Review/fix: independent release-security review; any fix restarts the affected gate.
+- **Scope:** Rerun `ZT-01`–`ZT-18` on the exact release candidate, including channel leak, CSP no-request, Todo cap, stale heartbeat, consent replay, clickjack, CSRF, and lifecycle-transition validation, with `security-v1`. No retries, no waivers.
+- **Acceptance:** Validation: every `ZT-01`–`ZT-18` gate is `pass` or release is `blocked`; incident report for any failure. Review/fix: independent release-security review; any fix restarts the affected gate.
 - **Gate:** closes none.
 
-### I3 — Release cost, freshness, and UI-comprehension rerun
+### I3 — Release ceiling, freshness, and comprehension rerun
 
 - **Purpose:** Confirm operational and comprehension thresholds hold on the release candidate.
 - **Depends on:** `H6`, `I1`.
-- **Scope:** Rerun `cost-v1`, freshness metrics, and the UI comprehension protocol with release thresholds and residual acceptance.
-- **Acceptance:** Validation: metrics within `DG-6`/`DG-7` gates; comprehension results reported as distributions; no stale-retracted reads. Review/fix: independent review of release benchmark evidence; defects fixed and affected benchmarks rerun.
+- **Scope:** Rerun `cost-v1`, `ingest-v1` freshness metrics, and the UI comprehension protocol with release thresholds and residual acceptance.
+- **Acceptance:** Validation: metrics within `DG-6`/`DG-7` gates; comprehension results reported as distributions; zero stale sources presented as current. Review/fix: independent review of release benchmark evidence; defects fixed and affected benchmarks rerun.
 - **Gate:** consumes `DG-6`, `DG-7`; closes none.
 
 ### I4 — Final evidence package and residual register
 
 - **Purpose:** Make every release claim traceable and every accepted residual explicit.
 - **Depends on:** `I1`, `I2`, `I3`.
-- **Scope:** Consolidate evidence envelopes, fixture hashes, post-redaction model/search recordings with redaction commitments, operator configuration, accepted residuals, unresolved gates, reproducibility instructions, and release recommendation. Include project-data exfiltration, provider-wide credential authority, hidden provider reasoning, external effects not undone by rollback, offline backup copies, and same-UID interference if applicable.
+- **Scope:** Consolidate evidence envelopes, fixture hashes, post-redaction lane and search recordings, operator configuration, accepted residuals, unresolved gates, reproducibility instructions, and release recommendation. Include search leakage, approved-code reach, Monty engine compromise and OOM, Chat/Todo reach, hidden reasoning, external effects not undone by rollback, offline backup copies, and the nominal vTPM seal.
 - **Acceptance:** Validation: evidence package validates; each acceptance claim maps to evidence; residual register complete. Review/fix: independent evidence audit; missing or inconsistent artifacts fixed and package regenerated.
 - **Gate:** closes none.
 
@@ -635,3 +627,30 @@ Requirement anchors cite `00-requirements.md` line numbers (`req. N` = line N). 
 - **Scope:** Human reviews the evidence package, residual register, unresolved gates, and release recommendation; signs release, requires fixes, or blocks with named defects. Any fix triggers the narrowest affected validation and review loop.
 - **Acceptance:** Validation: signed decision record; final review/fix closure; release/no-release outcome and rationale. Review/fix: all named defects resolved or explicitly carried as unresolved with human acceptance.
 - **Gate:** closes `DG-8`; human-signed.
+
+---
+
+## Phase 4 registry tasks
+
+The rebased build is registered under SDLC #509 as T24–T39. Each registry task maps onto the plan tasks above; it does not restate them.
+
+| Registry | Title | Plan tasks |
+|---|---|---|
+| #598 (T24) | Control plane, ledger, and Monty session host | `A0`, `B1`–`B4`, `E1` |
+| #599 (T31) | Capability mediation: manifest, stubs, mounts, fail-closed start | `E1`, `E1A` |
+| #600 (T25) | Inbox channel: age batch reader, ordering, coverage, heartbeat | `C2`, `E2` |
+| #601 (T26) | Vault channel: read-only citation path | `E2`, `G3` |
+| #602 (T27) | Todo channel: capped writer with receipts | `E2` |
+| #603 (T28) | Chat channel: JSON API, in-VM TLS, route schema | `E2`, `H7` |
+| #604 (T29) | CSR channel: schema-locked renewal and install | `E2`, `H7` |
+| #605 (T30) | Search client and search-channel contract | `E2`, `G4` |
+| #606 (T32) | Freshness watcher and staleness surfacing | `C2`, `H6` |
+| #607 (T33) | Declarative views and the static CSP renderer | `F1`, `G1` |
+| #608 (T34) | Executable-candidate approval and rollback | `F3`, `F5` |
+| #609 (T35) | CAS and ledger reconciliation on the existing implementation | `B1`–`B3` |
+| #610 (T36) | Ingest batch contract fixtures | `A7`, `C2` |
+| #611 (T37) | Journey-v2 life-admin fixtures and benchmarks | `A7`, `H6`, `I1` |
+| #612 (T38) | Packaging, image build, and flake pin | `E1`, `H7` |
+| #613 (T39) | Adversarial channel-leak and CSP suite | `E4`, `H5`, `I2` |
+
+Registry tasks marked `Part of #509` close under the same task completion contract as plan tasks; T37–T39 are tracked in the plan body rather than as native sub-issues because #509 is at GitHub's 100-sub-issue limit.

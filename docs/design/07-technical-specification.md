@@ -1,6 +1,6 @@
 # Kanbei Technical Specification
 
-Status: consolidated design specification derived from the requirements baseline, the state/memory, agent-execution, plugin-runtime, security/deployment, and interface/ingestion drafts, the research synthesis, and the architecture recommendation. It is the implementation contract to be refined by the deferred spikes named below.
+Status: consolidated design specification, rebased onto the deployed split design (SDLC #509), derived from the requirements baseline, the state/memory, agent-execution, plugin-runtime, security/deployment, and interface/ingestion drafts, the research synthesis, and the architecture recommendation. It is the implementation contract to be refined by the deferred spikes named below.
 
 Normative language: **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** are used as defined by RFC 2119. A **spike** is an explicit experiment whose result selects an option; this document does not silently choose among spike options.
 
@@ -8,9 +8,11 @@ Normative language: **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MA
 
 ## 1. Summary
 
-Kanbei is a self-hosted, single-user, single-always-on-host agentic assistant. Its first vertical slice covers two selected projects plus Kanbei itself. Managed LLM and search APIs are allowed; canonical state, orchestration, interface, and broker remain on the user's infrastructure. The canonical journey is research-to-feature push: ingest a project, explore intent, approve a structural goal where required, execute nested deltas, reconcile external commits, add a useful tool or UI projection through self-modification, and preserve enough evidence for internal-state and presentation replay.
+Kanbei is a self-hosted, single-user, always-thinking ledger agent. It runs offline in one NIC-less microVM on the owner's host, owns the RTX 3090, and serves the owner's own model through llama.cpp. There is no managed model API, no remote model provider, and no network interface inside the VM. The world reaches Kanbei only through six channels: a read-only age-encrypted Inbox, a read-only Vault, a size-capped read-write Todo mount, a Chat API over vsock with TLS terminated in the VM, a schema-locked CSR channel for certificate renewal, and a capped Search channel.
 
-Kanbei uses a truth-first canonical ledger with convergence, attention, Git, and security as supporting planes. It does not build a universal truth engine. Human intent, approvals, amendments, vetoes, curation, and promotion are canonical authority records. Observations are canonical records of what a source appeared to contain, not automatically true statements about the world. Semantic memory is a rebuildable projection of canonical inputs and curation. Effect and activation receipts record attempted and observed effects; replay never repeats external effects.
+The vertical slice is life admin: ingest mail, calendar, finance, browser, photo metadata, phone data, and project changes from per-source ingest VMs; reconcile them into one inspectable ledger; advise on what needs attention; and maintain the owner's todo list. World-state control, memory reconciliation, and self-modification are demonstrated at comparable depth on that journey, with declarative changes going live at the next turn and executable changes waiting for a human approval receipt.
+
+Kanbei uses a truth-first canonical ledger with convergence, attention, Git, and security as supporting planes. It does not build a universal truth engine. Human intent, approvals, amendments, vetoes, curation, and promotion are canonical authority records. Observations are canonical records of what a source appeared to contain, not automatically true statements about the world. Semantic memory is a rebuildable projection of canonical inputs and curation. Effect and activation receipts record attempted and observed effects at the channel and activation boundaries; replay never repeats an external effect.
 
 The architecture is organized around six kernel contracts: **Record**, **Effect**, **Projection**, **Capability**, **Loop**, and **View**. Records are canonical at rest, loops are actor-like at runtime, effects own resources but not authority, projections own derived state, capabilities own external authority, and views own presentation without owning canonical domain state.
 
@@ -19,12 +21,13 @@ The design deliberately preserves these human decisions:
 - Open, namespaced, independently versioned ECS-like components, with only record identity, recording time, and integrity mandatory.
 - One global recording sequence plus explicit causal links; no global causal total order and no distributed clocks.
 - Semantic memory is derived, versioned, rebuildable, and non-authoritative.
-- Agents have discretion to override failed approval **constraints** with a recorded rationale, while sandbox, broker, and global resource ceilings remain hard human-owned boundaries.
-- Arbitrary tools and plugins may be activated live outside the frozen trust root as an experiment, to be tightened if practice shows unacceptable risk.
-- Outbound network is unrestricted; the resulting exfiltration residual is accepted and explicit.
-- Any credential may be enrolled, with documented least-privilege guidance; agents can exercise the credential's full provider-side authority.
+- Agents have discretion to override failed approval **constraints** with a recorded rationale, while the VM boundary, the channel policy, and global resource ceilings remain hard human-owned boundaries.
+- Declarative changes activate live at the next turn boundary; executable changes require a human approval receipt before the activation supervisor flips a scope pointer.
+- The VM has no NIC and the six-channel set is closed. The Search channel is an accepted, capped exfiltration path; every other path out of the VM is a defect.
+- Agent-authored code runs under Monty; the control plane is TypeScript on Deno. Neither is the security boundary: the VM and its channel set are.
 - Durability is native to the ledger; there is no second workflow authority such as Temporal or Restate.
-- Canonical storage is local SQLite; blobs use a local OCI-layout whole-object content-addressed store.
+- Canonical storage is local SQLite on the in-guest LUKS volume; blobs use a local OCI-layout whole-object content-addressed store; backup is an encrypted image snapshot.
+- Kanbei's code enters the VM only through a human-merged `smores56/kanbei` commit pinned in nix-config's `flake.lock` and built by Nix into the image.
 
 ### 1.1 Terms
 
@@ -49,39 +52,44 @@ The design deliberately preserves these human decisions:
 | **Approval receipt** | A human-authority record binding a ruling to an intent anchor, interpretation hash, plan hash, subject, server-issued evidence-set hash, scope, effect class, constraints, and expiry. |
 | **Domain scope** | The canonical `DomainScope` value describing project, path, effect-class, and data-class extent, with the containment relation defined in §4.2.1. "Scope" without qualification means `DomainScope`. |
 | **Isolation scope** | The canonical `IsolationScope` identifier for a process/state partition (`agent:<id>`, `plugin:<id>@<instance>`, `project:<id>`). It is not a domain scope and has no containment relation. |
-| **Lifecycle projection** | An operational projection that exposes the current state of a canonical subject (work item, interpretation, approval request, receipt, divergence, override, loop, wakeup, timer, enrollment) from appended lifecycle records. It is derived and rebuildable; no canonical payload carries `state`. |
+| **Lifecycle projection** | An operational projection that exposes the current state of a canonical subject (work item, interpretation, approval request, receipt, divergence, override, loop, wakeup, timer) from appended lifecycle records. It is derived and rebuildable; no canonical payload carries `state`. |
 | **Append intent** | A typed request to the frozen append API: `append`, `link`, `transition`, `retract`, or `quarantine`. Each carries an authenticated actor and cause/parent references. |
 | **Effect receipt** | The single canonical envelope for an attempted or observed external effect. `Effect`, `EffectReceipt`, and `EffectOutcome` shapes in this document are views over it (§4.7.5). |
 | **Evidence envelope** | An immutable validation artifact binding a test outcome to the canonical head, fixtures, environment, seeds, and model recordings (§7.0). |
 | **Constraint override** | An agent record that relaxes a failed approval constraint inside a declared constraint lattice, without changing binding hashes, scope, effect class, tier, or hard boundaries. |
 | **Divergence** | A recorded difference between an external change and a work basis, classified for autonomous reconciliation or human decision. |
-| **Trust root** | The frozen, Nix-built components agents cannot live-edit: canonical append/integrity path and sequencer, sandbox supervisor, secret broker, global resource ceilings, receipt verification, activation/rollback supervisor, and audit sink. **Receipt verification** means the whole frozen admission-verification path: canonical effect-receipt verification, approval-binding verification (including server-issued evidence hashes), autonomy-tier resolution, and receipt-coverage evaluation. This is a clarification of the frozen role, not an expansion of the trust root. |
+| **Trust root** | The frozen, Nix-built components agents cannot live-edit: canonical append/integrity path and sequencer, the six-channel host surface and its code, the Monty host-call boundary and sandbox supervisor, global resource ceilings and their governor, receipt verification, activation/rollback supervisor, audit sink, startup verifier, and the minimal consent surface. **Receipt verification** means the whole frozen admission-verification path: canonical effect-receipt verification, approval-binding verification (including server-issued evidence hashes), autonomy-tier resolution, and receipt-coverage evaluation. This is a clarification of the frozen role, not an expansion of the trust root. |
 | **Source / observation / coverage** | A configured external resource; a canonical capture or status record about that source; and a receipt describing what a scan covered and what it did not. |
 | **Blob / CAS** | Immutable content-addressed bytes stored in the local OCI-layout content-addressed store and referenced by digest. |
 | **Working claim / contested / suspect / quarantine** | A resolver-selected claim for action; a claim with visible alternatives; a projection row excluded from current reads because an input was retracted; and a security-scoped exclusion of an affected subgraph after suspected poisoning. |
 | **Human / agent / plugin / system principal** | An authenticated human; an agent loop or tool actor; mutable plugin code; or a frozen kernel component. |
 | **Spike** | An explicit experiment; its result selects a deferred option. This document specifies provisional behavior until the spike reports. |
+| **Channel** | One of exactly six byte paths across the VM boundary: `inbox`, `vault`, `todo`, `chat`, `csr`, `search`. Any other path is a channel leak. |
+| **Ingest batch** | One immutable age-encrypted file written by the host writer containing one source scan's observations, manifest, and coverage. |
+| **Agent message inbox** | The ledger-backed `agent_inbox_item` queue that delivers coordination messages to a loop. It is not the ingest Inbox channel. |
+| **Source heartbeat** | The recorded last batch sequence, batch time, and coverage for one source; staleness is derived from it and alerted. |
+| **Candidate approval** | A human authority receipt binding a candidate digest, capability diff, scope, and expiry; the only path by which executable code activates. |
+| **Lane** | One `llama.cpp` slot: one 128k chat lane plus three 32k background lanes over a shared q8_0 KV pool. |
+| **Monty** | The Python-subset interpreter with an in-process WASM backend that runs agent-authored programs with no ambient filesystem, network, or subprocess access. |
 
 ---
 
 ## 2. Problem
 
-One person needs an inspectable, continuously reconciled model of what is true, what should change, and what agents are doing, while allowing the harness to reshape itself within explicit external-effect boundaries.
+One person needs an inspectable, continuously reconciled model of what is true, what should change, and what is being done, while allowing the harness to reshape itself within explicit boundaries.
 
-The system must ingest heterogeneous project and web state, preserve exact human intent and evidence, let agents explore and execute nested work, reconcile external commits without clobbering speculative history, maintain useful derived memory without pretending that memory is truth, and allow live self-modification without letting agents manufacture consent or edit the enforcement boundary.
+The system must ingest heterogeneous personal and project state, preserve exact human intent and evidence, let agents explore and execute nested work, reconcile external commits without clobbering speculative history, maintain useful derived memory without pretending that memory is truth, and allow self-modification without letting agents manufacture consent or edit the enforcement boundary.
 
 The operating environment is hostile to naive agent designs:
 
-- Prompt-injected agents may run arbitrary code, invoke hostile dependencies, attempt exfiltration, attempt sandbox escape, and act as confused deputies.
-- Provider APIs and the network are semi-trusted and reached with real credentials.
-- Agents may write files, spawn processes, open sockets, and mutate their own context, UI, tools, and plugins.
+- Prompt-injected agents run arbitrary code, invoke hostile dependencies, and act as confused deputies; every ingest batch, vault file, and search result is hostile input.
+- The single always-on host is shared with other work; a private-data assistant on that host would be one sudo hijack or one misconfiguration away from exposure.
+- Local inference on one consumer GPU forces a tight lane and KV budget, so background work cannot be allowed to starve the owner's chat turn.
 - Human attention is scarce; every approval mechanism must avoid fatigue without weakening hard boundaries.
 - External projects change independently of Kanbei, including force-pushes and history rewrites.
 - Semantic reconciliation is error-prone; entity merges and claims must remain inspectable and reversible.
 
-The host kernel, the frozen trust root, the human, and the audit sink are trusted. The agent process itself is the adversary.
-
----
+The host kernel, the root-only host artifacts, the Nix-built image and its frozen trust root, the human, and the audit sink are trusted. Inside the VM, the agent process is the adversary; the VM and its six channels are the boundary it cannot cross.
 
 ## 3. Goals / Non-goals
 
@@ -90,63 +98,57 @@ The host kernel, the frozen trust root, the human, and the audit sink are truste
 1. **Canonical evidence with narrow authority.** Preserve human intent, observations, proposals, effects, and derivations so the system can answer why it believes something, who decided it, and what changed.
 2. **Rebuildable semantic memory.** Provide useful derived entities, claims, conflicts, and disclosure projections while keeping every source identity stable and every reconciliation operation reversible by projection version.
 3. **Intent-to-work execution.** Turn exact human intent into versioned interpretations, scoped approvals, nested work, evidence-gated completion, and autonomous reconciliation of external changes.
-4. **Durable agent loops.** Run persistent, event- and timer-driven loops with idle backoff, policy concurrency, hard global ceilings, soft per-loop budgets, journaled model I/O, and deterministic recovery.
-5. **Safe-enough external effects.** Use at-least-once attempts, idempotency keys, durable journals, `outcome_unknown`, and explicit compensation rather than claiming exactly-once delivery.
-6. **Live self-modification outside the trust root.** Allow agents to stage and activate declarative context, UI, keybinds, themes, settings, tool wiring, arbitrary tools, and executable plugins through versioned candidates, capability diffs, atomic scope flips, health checks, and rollback.
-7. **Hard security boundaries.** Keep credentials out of agent address spaces, canonical writes behind the frozen append API, writable roots constrained, and global ceilings human-owned.
-8. **Stable presentation.** Provide a stable web shell with coordinated graph, delta timeline, and global decision views; keep projections renderer-neutral; adapt to AG-UI, A2UI, and MCP Apps without making them domain authorities.
-9. **Operational durability.** Store canonical state in local SQLite, blobs in a local OCI-layout CAS, back up consistently, restore verifiably, and retain the ledger by default.
-10. **Measured quality.** Gate on zero-tolerance failures and measure reconciliation quality, task success, cost, latency, and UI usefulness after baseline spikes.
+4. **Durable agent loops.** Run persistent, event- and timer-driven loops with idle backoff, policy concurrency, hard lane and ingest ceilings, soft per-loop budgets, journaled model I/O, and deterministic recovery.
+5. **Safe-enough effects.** Use at-least-once attempts, idempotency keys, durable journals, `outcome_unknown`, and explicit compensation for mediated effects rather than claiming exactly-once delivery.
+6. **Bounded self-modification.** Allow declarative lenses, views, and settings to activate live, and require a human approval receipt before any executable tool, plugin, or projection activates — always with capability diffs, atomic scope flips, health checks, and rollback.
+7. **A closed boundary.** No NIC, no credential, no resolver, and exactly six channels; canonical writes behind the frozen append API; writable roots limited to the declared mounts; ceilings human-owned.
+8. **Stable, exfiltration-proof presentation.** Serve a static, CSP-locked shell that returns JSON only and renders model text with no remote resources or auto-linking.
+9. **Operational durability.** Canonical SQLite and CAS on an encrypted in-guest volume, image backup, verifiable restore, and indefinite retention by default.
+10. **Measured quality.** Gate on zero-tolerance failures and measure reconciliation quality, life-admin task success, lane latency, ingest freshness, and UI usefulness after baseline spikes.
 
 ### 3.2 Non-goals
 
 - Multi-user authority, multi-host canon, offline sync, or tenancy.
-- Universal domain modeling or arbitrary source onboarding in the first slice. The source adapter set is closed: Git, HTTP resource, web search, and local filesystem.
+- Universal domain modeling or arbitrary source onboarding. Ingest adapters are closed to Git, HTTP resource, web search, and local filesystem, and they run in their own VMs, not in Kanbei.
+- Any network path into or out of Kanbei beyond the six channels, including a cloud model API, a generic search API from the VM, or a Kanbei-to-nanobot channel.
 - A universal theorem prover, adversarial court, category-theoretic delta algebra, attention market, or CRDT-based truth model.
 - Full deterministic LLM regeneration or replay of external side effects.
 - TUI parity in the vertical slice. Projections and catalogs SHOULD remain renderer-neutral where practical.
 - Autonomous irreversible external effects such as payments, public posting, or force-push.
-- Agent editability of the approval verifier, activation gate, broker policy, sandbox supervisor, global ceilings, audit sink, receipt verifier, or replay evaluator.
+- Agent editability of the approval verifier, activation gate, channel manifest, sandbox supervisor, global ceilings, audit sink, receipt verifier, or replay evaluator.
 - Exactly-once external delivery.
-- Guaranteed confidentiality of project data against malicious readable code, given unrestricted outbound network.
+- Confidentiality of Search query strings beyond the cap, filters, and judge, or prevention of a VM escape.
 - Chunk-level blob deduplication, mandatory signatures, fixed retention schedules, or concrete numeric ceilings in this document. These are deferred or optional as stated below.
-
----
 
 ## 4. Proposed design
 
 ### 4.1 Overview
 
-Kanbei is a set of cooperating planes over one canonical ledger:
-
 ```text
-Human browser
-    |
-    | loopback + Cloudflare Tunnel/Access
-    v
-kanbei-ui (mutable presentation)  <--- View contracts ---  plugins
-    |
-    v
-kanbei-core / frozen append API / query / projection host
-    |
-    +-- ledger.sqlite  (canonical records, operational projections)
-    +-- projections/<name>.sqlite  (semantic projections, rebuildable)
-    +-- cas/  (OCI-layout whole-object CAS)
-    |
-    +-- loop scheduler / wakeups / timers / checkpoints
-    |       |
-    |       v
-    |   agent sandbox (untrusted code; OS sandbox)
-    |       |
-    |       +-- capability broker / secret broker / provider adapters
-    |
-    +-- activation supervisor / scope pointers / candidate store
-    +-- audit sink
-    +-- watchdog (external)
-    +-- backup (external)
+owner browser --WARP--> kanbei.sammohr.dev (private route, no edge TLS decryption)
+                             |
+                             v
+host: relay (own UID, TCP pipe) --vsock--> chat server (TLS terminated in VM)
+host: ACME writer <--vsock-- CSR handler
+host: search forwarder <--vsock--> search client  ==> search VM (TinyFish key)
+host writer (ingest VMs) --virtiofs ro--> /inbox
+host vault      --virtiofs ro--> /vault
+host todo       --virtiofs capped rw--> /todo
+
+kanbei VM (qemu, 8 GB, no NIC, 3090 VFIO, in-guest LUKS)
+  +-- kanbei-ui (static CSP bundle) -> JSON API
+  +-- kanbei-core / frozen append API / query / projection host
+  |     +-- ledger.sqlite, projections/<name>.sqlite, cas/    (on /var/lib/kanbei)
+  |     +-- loop scheduler / wakeups / timers / checkpoints
+  |     +-- lane governor -> llama.cpp -> 3090 (1x128k chat + 3x32k background)
+  |     +-- monty host (agent-authored programs; channel stubs only)
+  |     +-- channel hosts: inbox, vault, todo, chat, csr, search
+  |     +-- activation supervisor / candidate store / human approval receipts
+  |     +-- audit sink
+  +-- watchdog (in-VM) + host-side liveness and freshness probe
 ```
 
-The ledger is the evidence plane. Convergence is a projection and controller concern: desired and observed state, generation cursors, divergence, and reconciliation work are derived from records. Attention is a projection and interaction concern: one global decision queue groups requests by intent and deadline, binds rulings to exact hashes, and supports individual or batch rulings. Git is an adapter and review surface, not the world database. Security is a cross-cutting boundary implemented by the sandbox supervisor, broker, capability checks, ceilings, and frozen append path.
+The ledger is the evidence plane. Convergence is a projection and controller concern: desired and observed state, generation cursors, divergence, and reconciliation work are derived from records. Attention is a projection and interaction concern: one global decision queue groups requests by intent and deadline, binds rulings to exact hashes, and supports individual or batch rulings. Git is an ingest origin and a review surface, not the world database. Security is a cross-cutting boundary implemented by the VM and its six channels, the frozen append path, the activation supervisor, and the ceiling governor.
 
 #### 4.1.1 Six kernel contracts
 
@@ -155,7 +157,7 @@ The ledger is the evidence plane. Convergence is a projection and controller con
 | **Record** | Append-only typed components, identity, sequence, integrity | Canonical at rest | Every canonical byte passes through the frozen append API. |
 | **Effect** | Scoped runtime activation, disposal, compensation | Receipts canonical; external action not replayable | Effects own resources and produce receipts, never authority. |
 | **Projection** | Deterministic or explicitly asynchronous derived state | Derived; operational projections synchronous, semantic pending | Coverage and provenance are explicit; no projection pretends to be current. |
-| **Capability** | Mediated filesystem, process, network, model, secret, and append operations | Grants, not truth | Capabilities are checked before external calls; broker and supervisor enforce. |
+| **Capability** | Mediated filesystem, process, network, model, secret, and append operations | Grants, not truth | Capabilities are checked before external calls; channel hosts and the supervisor enforce. |
 | **Loop** | Durable agent execution, subscriptions, branches | Actor-like at runtime; durable records canonical | Loops are the only contract that schedules work. |
 | **View** | Renderer-neutral catalogs, artifacts, curation gestures | Presentation only | Views append gestures; they never write domain state directly. |
 
@@ -164,8 +166,8 @@ The ledger is the evidence plane. Convergence is a projection and controller con
 The **frozen trust root** MUST contain:
 
 - the canonical append/integrity path and single sequencer;
-- the sandbox supervisor;
-- the secret broker;
+- the six-channel host surface and its code: the Inbox reader, Vault reader, Todo writer, Chat server, CSR handler, and Search client, plus the mount manifest they enforce;
+- the Monty host-call boundary and the sandbox supervisor;
 - global resource ceilings and the ceiling governor;
 - receipt verification, defined as the whole admission-verification path: effect-receipt verification, approval-binding and evidence-hash verification, autonomy-tier resolution, and receipt-coverage evaluation (`covers`), together with the frozen startup verifier that records `kernel_generation`;
 - the activation/rollback supervisor;
@@ -174,9 +176,9 @@ The **frozen trust root** MUST contain:
 
 Receipt verification is frozen as one role. The approval-binding, tier-resolution, and coverage functions are internal to it and are reachable only through the frozen append/admission path; no mutable candidate may supply, replace, or observe a mutable copy of them.
 
-The **minimal consent surface** is a frozen, read-only renderer plus its gesture endpoint. It MUST be origin-isolated from the mutable world UI: it serves from a separate host and origin behind the same verified human identity, issues a host-only `SameSite=Strict` session cookie, and shares no DOM, script context, or browser storage with `kanbei-ui`. It renders approval evidence, completion subject, granted tier, max effect class, reversibility, subject, scope, constraints, expiry, interpretation/plan/evidence hashes, and a `consentDigest` directly from canonical projections; it accepts no template, markup, evidence payload, styling, or session cookie from the mutable world UI. A mutable UI may deep-link to it by `requestId` only. At each render the surface mints a cryptographically random single-use short-lived consent token, stores only its hash bound to the human session, `requestId`, the full displayed-manifest digest, and expiry, and the mutable UI cannot read, mint, or recompute that token. This implements `req. 94` and `req. 132`; the consent surface is the only display authority for rulings (§4.5.5).
+The **minimal consent surface** is a frozen, read-only renderer plus its gesture endpoint. It MUST be origin-isolated from the agent-influenced views: it serves from a separate origin inside the VM behind the same verified human identity, issues a host-only `SameSite=Strict` session cookie, and shares no DOM, script context, or browser storage with the data views. It renders approval evidence, the candidate digest and capability diff for executable approvals, completion subject, granted tier, max effect class, reversibility, subject, scope, constraints, exit...
 
-Mutable agents, plugins, tools, context projections, views, settings, themes, keybinds, declarative wiring, and arbitrary executable plugins live outside that set. Agents MAY create candidates for all mutable surface and MAY activate them through the candidate protocol. Agents MUST NOT live-edit the trust root. Trust-root changes require a human-approved Nix generation.
+Mutable agents, plugins, tools, context lenses, view catalogs, themes, keybinds, and declarative wiring live outside that set. Agents MAY create declarative candidates and MAY activate them at the next turn boundary. Agents MAY stage executable candidates but MUST NOT activate them; a human approval receipt is required (`§4.8.5`). Agents MUST NOT live-edit the trust root. Trust-root changes require a human-merged commit built into a new image through a human-approved Nix generation.
 
 #### 4.1.3 Contract reconciliation rules
 
@@ -189,7 +191,8 @@ Earlier drafts used different names for the same concepts. This specification us
 | `SeqTime` and `Hash` aliases in agent drafts. | `SeqTime` is an alias for `UtcUs`; `Hash` is an alias for `Digest`; both denote canonical recording time and SHA-256 digest unless a domain explicitly says otherwise. |
 | Agent drafts listing a short work-state set versus the execution draft's detailed state machine. | The detailed work state machine in §4.4.3 is normative; the short list was an abbreviation. |
 | Approval requests described as "mixed authority" versus receipts being human authority. | Requests are non-authority coordination records that any authorized principal may create. Only a human principal may append an approval receipt. |
-| `net.direct` described as audit-only while the broker is a credential path. | Outbound network is unrestricted and audit-only for mediated operations; the broker is not an egress choke point. Both statements are true and are specified together in §4.10. |
+| `net.direct` and `broker` described as separate paths while the VM has no network. | The VM has no NIC and no credential. The six channels are the only paths; the Search channel is the only outbound one and is capped, filtered, and logged (§4.10.4, §4.10.6). The broker is removed. |
+| The ingest Inbox and the ledger `inbox_item` queue share a name. | The ledger table is renamed `agent_inbox_item` (agent messages); the ingest Inbox is a read-only virtiofs mount of age-encrypted batches and never appears in the schema (§4.2.6). |
 | A2UI version claims and AG-UI interrupt semantics. | Interface adapters pin exact versions and declare them; AG-UI runs use one interrupt group at a time; exact pins and multi-decision grouping are spikes. See §4.11. |
 
 The design does not silently reverse the unusual human decisions listed in §1. Where a draft implied a stronger guarantee than the requirements allow—such as exactly-once delivery, complete exfiltration prevention, or agent-editability of the approval verifier—this specification states the weaker guarantee and the residual.
@@ -353,7 +356,7 @@ Only one semantic clock is mandatory: `recordedAtUs`. Valid time, observed time,
 | `kb.memory/claim*`, `kb.memory/proposal*`, `kb.memory/derivation*` | `observation`, `candidate_claim`, `derived_proposal` | Agent, plugin, or system within scope. |
 | `kb.memory/promotion@*`, `kb.memory/attestation@*` | `human_authority` | Human only. |
 | `kb.observation/*` | `observation` | Agent, plugin, or system within capability scope. |
-| `kb.effect/*`, `kb.activation/*` | `effect_receipt`, `activation_receipt` | Frozen effect journal, broker, supervisor, or activation supervisor only. |
+| `kb.effect/*`, `kb.activation/*` | `effect_receipt`, `activation_receipt` | Frozen effect journal, channel host, supervisor, or activation supervisor only. |
 | `kb.security/*`, `kb.audit/*` | `security_action`, `coordination` | Frozen security component, human, or frozen audit path. |
 
 An agent or plugin therefore MAY append stable-domain observations, candidate claims, derived reconciliation proposals, and policy-approved desired state when the row permits it. It MUST NOT append promotions, attestations, effect or activation receipts, security actions, kernel generations, or any stable-domain component whose permitted classes exclude its authenticated class.
@@ -418,11 +421,11 @@ Authority is optional. A record without a `kb.core/authority` component makes no
 | `observation` | Agent, plugin, or system within capability scope | Captured source content or an external change. It is evidence of what was captured, not a truth assertion. |
 | `candidate_claim` | Agent or plugin | A proposed claim, interpretation, classification, or inference. It cannot create approval or authority. |
 | `derived_proposal` | Agent or plugin | A proposed merge, split, alias, contradiction, or other reconciliation operation. |
-| `effect_receipt` | Frozen effect journal, broker, or supervisor only. Agents and plugins MAY request an effect but cannot append its receipt. | An attempted or observed external effect. |
+| `effect_receipt` | Frozen effect journal, channel host, or supervisor only. Agents and plugins MAY request an effect but cannot append its receipt. | An attempted or observed external effect. |
 | `activation_receipt` | Frozen activation supervisor only | Activation, rollback, or health result. |
 | `security_action` | Frozen security component | Quarantine, security control, or a system-authored revocation. A human-authored revocation is `human_authority`. |
 | `coordination` | Any authorized agent, plugin, human, or system principal | Non-authority coordination: approval requests, messages, inbox/outbox items, wakeups, subscriptions, and timers. |
-| `lifecycle` | Frozen append path, derived from a validated typed `transition` intent | State transitions for work, interpretations, requests, receipts, divergences, loops, wakeups, timers, overrides, candidates, and enrollments. Agents and plugins may request transitions allowed by their authority; they cannot write arbitrary lifecycle payloads. |
+| `lifecycle` | Frozen append path, derived from a validated typed `transition` intent | State transitions for work, interpretations, requests, receipts, divergences, loops, wakeups, timers, overrides, and candidates. Agents and plugins may request transitions allowed by their authority; they cannot write arbitrary lifecycle payloads. |
 | `kernel_generation` | Frozen startup verifier | The Nix generation actually running at boot. |
 
 Untrusted content creates observations and candidate claims, never authority records. Human promotion appends a linked human-attested assertion; it does not certify objective truth. The append API enforces principal-to-class rules; autonomy-tier decisions remain domain policy, not an envelope concern.
@@ -608,7 +611,7 @@ CREATE TABLE lifecycle_projection (
                                           -- approval_receipt | divergence | tier_proposal |
                                           -- tier_exception | constraint_override | loop |
                                           -- wakeup | timer | inbox | outbox | effect | candidate |
-                                          -- reconciliation | branch | undo | enrollment
+                                          -- reconciliation | branch | undo
   subject_id         TEXT NOT NULL,       -- RecordId of the immutable payload record
   state              TEXT NOT NULL,
   actor_id           TEXT NOT NULL,
@@ -734,7 +737,7 @@ CREATE TABLE quarantine_scope (
   lifted_by_seq INTEGER
 );
 
-CREATE TABLE inbox_item (
+CREATE TABLE agent_inbox_item (
   id                   TEXT PRIMARY KEY,
   consumer_id          TEXT NOT NULL,
   message_id           TEXT NOT NULL,
@@ -743,7 +746,7 @@ CREATE TABLE inbox_item (
   lease_expires_at_us  INTEGER,
   dedupe_key           TEXT NOT NULL
 );
-CREATE UNIQUE INDEX inbox_dedupe ON inbox_item(consumer_id, message_id);
+CREATE UNIQUE INDEX inbox_dedupe ON agent_inbox_item(consumer_id, message_id);
 
 CREATE TABLE outbox_item (
   id                   TEXT PRIMARY KEY,
@@ -756,6 +759,8 @@ CREATE TABLE outbox_item (
 );
 CREATE UNIQUE INDEX outbox_dedupe ON outbox_item(producer_id, idempotency_key);
 ```
+
+`agent_inbox_item` (formerly `inbox_item`) is the **agent message inbox**: the durable queue that delivers coordination messages to a loop (§4.7.4). It is unrelated to the read-only ingest **Inbox** channel, which is a virtiofs mount of age-encrypted source batches and never appears in the ledger schema. The `inbox` lifecycle family name and the `inbox` lease kind keep their meaning (agent message delivery). `credential_enrollment` is removed in the rebase: the VM holds no provider credential (§4.10.6).
 
 `work_projection.state` is deliberately absent: work state is read from `lifecycle_projection` by `(family='work', subject_id)`. `work_projection.current_work_generation_id` selects the immutable `WorkGeneration` record; its `completion_subject_hash` is derived from the accepted interpretation hash, `generation`, and `acceptance_digest`, and `WorkItem` carries neither field. The selected `WorkGeneration.completion_subject_hash` is the only legal completion subject referent for `EvidenceRef.subject_hash`. Completion evidence is not stored on `WorkItem`: the frozen append path writes one `kb.work/completion_claim@1.0.0` payload with the `submit` transition and projects it in `completion_projection`. `work_review` records the window start and deadline; `review_overdue` carries the promote-with-flag outcome. `loop_runtime_projection` holds per-step mutable loop data (§4.7.1), so no loop payload is re-appended for heartbeats, budgets, or branch heads.
 
@@ -799,7 +804,7 @@ type AppendIntent =
       family: "work" | "interpretation" | "approval_request" | "approval_receipt"
             | "divergence" | "tier_proposal" | "tier_exception" | "constraint_override"
             | "loop" | "wakeup" | "timer"
-            | "enrollment" | "candidate" | "reconciliation" | "branch" | "undo"
+            | "candidate" | "reconciliation" | "branch" | "undo"
             | "effect" | "inbox" | "outbox";
       subjectId: RecordId;
       event: string;
@@ -897,11 +902,10 @@ The append protocol MUST be:
 | `wakeup` | `Wakeup` record | §4.7.2 | Table actor column; CAS and fencing required. |
 | `timer` | `Timer` record | §4.7.2 | Frozen scheduler or human; CAS and fencing required. |
 | `inbox` / `outbox` | item record | §4.7.4 | Consumer/producer or frozen transport. |
-| `effect` | effect journal record | §4.7.5 | Frozen journal/broker/supervisor. |
-| `candidate` | `CandidateManifest` record | §4.8.4 | Frozen activation supervisor; human for policy-pending approval. |
+| `effect` | effect journal record | §4.7.5 | Frozen journal/channel host/supervisor. |
+| `candidate` | `CandidateManifest` record | §4.8.4 | Frozen activation supervisor after a human approval receipt binds its digest, diff, scope, and expiry. |
 | `reconciliation` | proposal record | §4.6.3 | Table actor column. |
 | `branch` / `undo` | `Branch` / `UndoRequest` record | §4.7.7 | Table actor column. |
-| `enrollment` | `CredentialEnrollment` record | §4.10.6 | Human, or frozen append path for injector status. |
 
 A transition that is not listed for its family is rejected even when the target string is a valid state name. Caller-supplied `guard` data is not trusted as a predicate: the append path re-derives every guard from canonical records and commits the result as `guard_digest`.
 
@@ -938,10 +942,10 @@ Any failure leaves `ledger_head` unchanged. A committed record is visible to a s
 
 #### 4.3.1 State locations
 
-All mutable Kanbei state MUST live under `~/.local/state/kanbei/`. Trusted Nix configuration and secret material MUST remain outside it.
+All mutable Kanbei state MUST live on the in-guest LUKS volume under `/var/lib/kanbei/`. The image, the frozen trust root, the static UI, and the model weights are read-only image content under `/nix/store`. No secret material is stored in the VM.
 
 ```text
-~/.local/state/kanbei/
+/var/lib/kanbei/                      # in-guest LUKS volume
   ledger.sqlite
   projections/<name>.sqlite
   cas/
@@ -950,12 +954,17 @@ All mutable Kanbei state MUST live under `~/.local/state/kanbei/`. Trusted Nix c
   scratch/<sandboxId>/
   mutable/candidates/<scopeId>/<candidateId>/
   mutable/scopes/<scopeId>/current -> ../candidates/<scopeId>/<candidateId>
-  backups/
+  spool/channels/<channel>/
+  tls/                                # in-VM chat certificate and key from the CSR channel
+
+/inbox     virtiofs ro   age-encrypted source batches and the Syncthing-encrypted phone folder
+/vault     virtiofs ro   /var/lib/data/vault
+/todo      virtiofs rw   /var/lib/data/todo, size-capped
 ```
 
-The active mutable-code pointer is core-owned and read-only to agents. Scratch is deleted on sandbox termination. The canonical database, trust-root control files, broker configuration, secret material, and other agents' state are never mounted into an agent sandbox.
+Nothing outside the LUKS volume persists across a restart. The active mutable-code pointer is core-owned and read-only to agents. Scratch is deleted on sandbox termination. The canonical database, trust-root control files, other agents' state, and the audit sink are never mounted into an agent sandbox. Backup is an encrypted image snapshot of the LUKS volume plus the host-side image ciphertext (§4.10.8); there is no in-VM backup process and no in-VM secret.
 
-`ledger.sqlite` uses one sequenced writer, JSON component payloads, and transactional metadata. Semantic projection stores hold rebuildable SQL, FTS, and graph indexes; they are not authority. Operational projections include the work DAG, approvals, raw observation metadata, active configuration pointer, ledger status, retraction closure, quarantine scope, and blob references, and commit atomically with the ledger. Cheap indexes MAY join that class after measurement.
+`ledger.sqlite` uses one sequenced writer, JSON component payloads, and transactional metadata. Semantic projection stores hold rebuildable SQL, FTS, and graph indexes; they are not authority. Operational projections include the work DAG, approvals, raw observation metadata, source heartbeats, active configuration pointer, ledger status, retraction closure, quarantine scope, and blob references, and commit atomically with the ledger. Cheap indexes MAY join that class after measurement.
 
 #### 4.3.2 Blob store contract
 
@@ -1023,7 +1032,7 @@ Backup MUST use this protocol:
 6. Write a backup manifest containing the SQLite snapshot identity, the ledger checkpoint digest, and the blob catalog.
 7. On restore, verify every ledger reference, every blob digest, the checkpoint digest, and then rebuild derived indexes before serving reads.
 
-Exclusions: scratch, sockets, live WAL files, broker memory, and all secret material. The exact backup hook mechanism is `[SPIKE: BAK-1]`; the required ordering is not deferred. The watchdog MUST alert when the last successful backup exceeds its threshold.
+Exclusions: scratch, sockets, live WAL files, and any channel spool that is not part of the snapshot. The exact backup hook mechanism is `[SPIKE: BAK-1]`; the required ordering is not deferred. The watchdog MUST alert when the last successful backup exceeds its threshold.
 
 ---
 
@@ -1181,7 +1190,7 @@ interface EffectCitation {
   effect_id: EffectId;                  // journal-assigned effect identity, not a RecordId
   attempt: number;
   fencing_token: number;
-  request_id: string;                   // broker/supervisor-minted, never caller-supplied
+  request_id: string;                   // channel-host/supervisor-minted, never caller-supplied
 }
 
 interface EvidenceRef {
@@ -1227,12 +1236,12 @@ Every evidence kind has a verification rule, and `EvidenceRef.result` MUST equal
 | `diff` | The cited record is a canonical diff artifact; its base/head digests match the work basis; any applied write has a matching `effect_receipt` with `succeeded` or `reconciled_effective`; its declared paths are inside `work.scope` and the ruling's `granted_scope`. |
 | `observation` | The cited observation has required provenance and a verified capture; it may pass only a criterion whose `evidenceKinds` includes `observation`. |
 | `human_attestation` | The cited record is `human_authority` authored by a human principal and bound to the same `subject_hash`. |
-| `effect_receipt` | The frozen receipt verifier confirms the cited record is an `effect_receipt` appended by the frozen journal/broker/supervisor; the cited `effect_id`, `attempt`, `fencing_token`, and broker `request_id` all match; the authenticated producer class matches `producer_authority`; `subject_kind = "completion"` and `subject_hash` matches; and the receipt outcome is `succeeded` or `reconciled_effective`. |
+| `effect_receipt` | The frozen receipt verifier confirms the cited record is an `effect_receipt` appended by the frozen journal/channel host/supervisor; the cited `effect_id`, `attempt`, `fencing_token`, and broker `request_id` all match; the authenticated producer class matches `producer_authority`; `subject_kind = "completion"` and `subject_hash` matches; and the receipt outcome is `succeeded` or `reconciled_effective`. |
 | `replay_digest` | The cited record is a frozen replay-harness result whose recomputed digest equals the recorded `state_digest` at the same basis; a mismatch is `fail`, not `inconclusive`. |
 
 A `failed`, `denied`, `failed_terminal`, `outcome_unknown`, or `reconciled_not_effective` receipt cited with `result="pass"` is an `EVIDENCE_OUTCOME_MISMATCH` and fails `ZT-05`. A retracted or suspect citation is rejected. A `reconciled_not_effective` effect blocks promotion for its bound criterion and permits a new effect under a new effect id and idempotency key; a `reconciled_effective` effect satisfies an `effect_receipt` criterion when its receipt verifies.
 
-`effect_receipt` evidence is accepted only if the frozen receipt verifier confirms: the cited record is an `effect_receipt` appended by the frozen journal/broker/supervisor; the cited effect id, attempt, fencing token, and broker `requestId` all match the canonical receipt; the receipt's authenticated producer class matches `producer_authority`; and the receipt's `subject_hash` matches. `test_run` evidence is accepted only from the frozen validation harness or a canonical effect receipt naming a test execution with a verified runner identity; an agent- or plugin-authored claim of a passing test or receipt is a `candidate_claim`, never completion evidence. Promotion appends a `CompletionClaim` plus a lifecycle record; it never mutates the item row.
+`effect_receipt` evidence is accepted only if the frozen receipt verifier confirms: the cited record is an `effect_receipt` appended by the frozen journal/channel host/supervisor; the cited effect id, attempt, fencing token, and broker `requestId` all match the canonical receipt; the receipt's authenticated producer class matches `producer_authority`; and the receipt's `subject_hash` matches. `test_run` evidence is accepted only from the frozen validation harness or a canonical effect receipt naming a test execution with a verified runner identity; an agent- or plugin-authored claim of a passing test or receipt is a `candidate_claim`, never completion evidence. Promotion appends a `CompletionClaim` plus a lifecycle record; it never mutates the item row.
 
 #### 4.4.5 External divergence
 
@@ -1615,7 +1624,7 @@ No row reactivates a receipt. Any `reactivate`/`reinstate`-shaped event is rejec
 ```ts
 interface Revocation {
   id: RecordId;
-  subject_kind: "approval_receipt" | "constraint_override" | "enrollment" | "tier_exception" | "quarantine";
+  subject_kind: "approval_receipt" | "constraint_override" | "tier_exception" | "quarantine";
   subject_id: RecordId;
   reason: string;
   author_id: HumanId | SystemPrincipalId;
@@ -1624,7 +1633,7 @@ interface Revocation {
 ```
 
 
-A revocation is a new record, never a mutation. Its `authority_class` is `human_authority` for a human actor and `security_action` for the frozen security component; the append path updates the revoked subject's projection in the same transaction (`approval_receipt`; `constraint_override` for a constraint override or override escalation; `tier_exception` for a tier exception; `enrollment`; `quarantine_scope` for a quarantine lift). `covers` observes it through that projection at `minSeq`; an effect admitted after that basis sees an inactive receipt.
+A revocation is a new record, never a mutation. Its `authority_class` is `human_authority` for a human actor and `security_action` for the frozen security component; the append path updates the revoked subject's projection in the same transaction (`approval_receipt`; `constraint_override` for a constraint override or override escalation; `tier_exception` for a tier exception; `quarantine_scope` for a quarantine lift). `covers` observes it through that projection at `minSeq`; an effect admitted after that basis sees an inactive receipt.
 
 ```text
 covers(receipt, work, effect, minSeq) :=
@@ -1772,7 +1781,7 @@ Overrides MUST satisfy all of these guards:
 
 1. Only constraints that evaluated false may be overridden. A `reject` ruling is not a failed constraint and cannot be overridden.
 2. An override cannot change `granted_scope`, `accepted_interpretation_hash`, `max_effect_class`, `envelope`, or the effective tier.
-3. An override cannot touch `forbidden`, hard global ceilings, broker or sandbox policy, secret-exposure gates, or the `outcome_unknown` no-retry rule.
+3. An override cannot touch `forbidden`, hard ceilings, channel policy, secret-exposure gates, or the `outcome_unknown` no-retry rule.
 4. Unknown constraint IDs and undeclared lattice edges are non-overridable; the replacement MUST be proven weaker-or-equal by §4.5.5.
 5. An active override is surfaced in the decision queue as a `review_after` item. Human revocation blocks future effects; it does not erase completed effects.
 6. Override use is rate-limited by counting active overrides in the policy window: `count_active_overrides(receipt) ≤ policy.override_limits.per_receipt_per_window` and `count_active_overrides(loop) ≤ policy.override_limits.per_loop_per_window`. Exceeding either appends an `OverrideEscalation` (family `constraint_override`, event `escalate`) covering that receipt or loop; the frozen tier resolver then raises every subsequent admission and promotion under that scope to at least `on_exceed`, and no further override is accepted there until the window advances or a human clears the escalation. No work state is changed and no tier is stored on a work item.
@@ -1786,7 +1795,7 @@ interface OverrideLimits {
 }
 ```
 
-`Overrides` are advisory delegated-intent relaxations; the count is computed from canonical override records plus `lifecycle_projection`, never from a mutable counter that could drift. Sandbox, broker, and global resource policies are separate hard human-owned boundaries.
+`Overrides` are advisory delegated-intent relaxations; the count is computed from canonical override records plus `lifecycle_projection`, never from a mutable counter that could drift. The VM boundary, the channel policy, and global resource ceilings are separate hard human-owned boundaries.
 
 ---
 
@@ -2071,17 +2080,24 @@ A wakeup's `pending/claimed/completed/failed/superseded` state is a lifecycle pr
 interface HardCeilings {                 // operator configuration; frozen trust root; ONE definition
   generation: NixGenerationId;
   window: "rolling_1h" | "calendar_day" | "calendar_month";
-  spendUsd: number;
+  gpuLanes: { chat: 1; background: 3 };    // 128k + 3x32k from one KV pool
+  laneSeconds: number;                     // total per window
   tokensIn: number;
   tokensOut: number;
   modelRequestsPerWindow: number;
-  brokerRequestsPerWindow: number;
+  ingestBytesPerSourcePerDay: number;
+  ingestBatchesPerSourcePerHour: number;
+  casBytesTotal: number;
+  stateBytesTotal: number;
+  todoBytes: number;
+  chatRequestsPerWindow: number;
+  searchQueriesPerWindow: number;
   concurrentLoops: number;
 }
 
 interface LoopBudget {                   // soft
   tokens: number;
-  spend_usd: number;
+  lane_seconds: number;
   wall_clock: Duration;
   model_calls: number;
   effect_calls: number;
@@ -2094,7 +2110,7 @@ interface BudgetOverride {
   id: RecordId;
   loop_id: RecordId;
   rationale: string;
-  delta: { tokens?: number; spend_usd?: number; wall_clock?: Duration; effect_calls?: number };
+  delta: { tokens?: number; lane_seconds?: number; wall_clock?: Duration; effect_calls?: number };
   expires_at_us: UtcUs;
   author: AgentId;
   authority_class: "candidate_claim";
@@ -2204,13 +2220,13 @@ interface EffectReceiptRecord {
   subject_kind: EffectSubjectKind;      // completion | work | exploration | system
   work_item_id: RecordId | null;        // required when subject_kind = "completion" or "work"
   attempt: number;
-  request_id: string;                   // broker/supervisor-minted at ingress
+  request_id: string;                   // channel-host/supervisor-minted at ingress
   fencing_token: number;                // lease token in force at dispatch
   idempotency_key: Digest;
   capability: string;
   target: string;
   producer: Principal;
-  producer_class: "journal" | "broker" | "supervisor" | "system";
+  producer_class: "journal" | "channel" | "supervisor" | "system";
   outcome: "succeeded" | "failed" | "failed_terminal" | "denied" | "outcome_unknown"
          | "reconciled_effective" | "reconciled_not_effective";
   reconciles_receipt_id?: RecordId;    // present when a read-only probe resolves an earlier outcome_unknown receipt
@@ -2229,20 +2245,20 @@ interface EffectReceiptRecord {
 }
 ```
 
-`EffectReceiptRecord` is the only canonical receipt shape. The `EffectReceipt` type in §4.10.7 is an alias for it, and `EffectOutcome` is an API result carrying its `EffectId` and canonical `RecordId`. It participates in the ledger hash chain and carries no separate `auditSeq` or `predecessorHash`; the ledger sequence and chain already provide those. Only the frozen journal, broker, supervisor, or system appender may write it. Receipt `outcome` is the canonical observation for one attempt and maps to the effect lifecycle: `succeeded`, `failed` (`failed_retryable`), `failed_terminal`, `denied`, `outcome_unknown`, `reconciled_effective`, and `reconciled_not_effective`. A read-only probe after `outcome_unknown` appends a new `EffectReceiptRecord` for the same `effect_id`, attempt, fencing token, and original `request_id` with `outcome` `reconciled_effective` or `reconciled_not_effective` and `reconciles_receipt_id` naming the superseded `outcome_unknown` receipt; the effect lifecycle and the probe receipt transition in one transaction. A `reconciled_effective` receipt is canonical completion evidence for an `effect_receipt` criterion; `reconciled_not_effective` is not.
+`EffectReceiptRecord` is the only canonical receipt shape. The `EffectReceipt` type in §4.10.7 is an alias for it, and `EffectOutcome` is an API result carrying its `EffectId` and canonical `RecordId`. It participates in the ledger hash chain and carries no separate `auditSeq` or `predecessorHash`; the ledger sequence and chain already provide those. Only the frozen journal, channel host, supervisor, or system appender may write it. Receipt `outcome` is the canonical observation for one attempt and maps to the effect lifecycle: `succeeded`, `failed` (`failed_retryable`), `failed_terminal`, `denied`, `outcome_unknown`, `reconciled_effective`, and `reconciled_not_effective`. A read-only probe after `outcome_unknown` appends a new `EffectReceiptRecord` for the same `effect_id`, attempt, fencing token, and original `request_id` with `outcome` `reconciled_effective` or `reconciled_not_effective` and `reconciles_receipt_id` naming the superseded `outcome_unknown` receipt; the effect lifecycle and the probe receipt transition in one transaction. A `reconciled_effective` receipt is canonical completion evidence for an `effect_receipt` criterion; `reconciled_not_effective` is not.
 
 `effect_id` is journal-assigned at admission and is not a `RecordId`; the sequencer still assigns the receipt's `RecordId`. `subject_kind` selects the semantics of `subject_hash`: `completion` requires a non-null `work_item_id` and `subject_hash` equal to that generation's `CompletionClaim.completion_subject_hash`; `work` requires `work_item_id` and a null `subject_hash`; `exploration` and `system` require a null `subject_hash` and may have a null `work_item_id`. Only a `completion` receipt can be cited as completion evidence; a model, search, read-only, or speculative effect records `exploration` and is audited without pretending to serve a completion subject.
 
 | From | Event | Actor | Guard | To |
 |---|---|---|---|---|
-| `intended` | `admit` | Frozen journal or broker | Tier, receipt coverage, hard policy, budget, precondition, and lease fencing pass | `admitted` |
-| `intended` | `deny` | Frozen journal or broker | Any hard guard fails | `denied` |
-| `admitted` | `dispatch` | Frozen journal or broker | Effect journal row durable; fencing token current | `in_flight` |
-| `in_flight` | `result_ok` | Frozen journal or broker | | `succeeded` |
-| `in_flight` | `result_err_retryable` | Frozen journal or broker | `attempt < max` and declared idempotent or provider key supported | `failed_retryable` |
-| `failed_retryable` | `retry` | Frozen journal or broker | Same `idempotency_key` | `admitted` (`attempt + 1`) |
-| `in_flight` | `result_err_terminal` | Frozen journal or broker | | `failed_terminal` |
-| `in_flight` | `crash` / `timeout` / `no_result` | Frozen journal or broker | Ambiguous termination | `outcome_unknown` |
+| `intended` | `admit` | Frozen journal or channel host | Tier, receipt coverage, hard policy, budget, precondition, and lease fencing pass | `admitted` |
+| `intended` | `deny` | Frozen journal or channel host | Any hard guard fails | `denied` |
+| `admitted` | `dispatch` | Frozen journal or channel host | Effect journal row durable; fencing token current | `in_flight` |
+| `in_flight` | `result_ok` | Frozen journal or channel host | | `succeeded` |
+| `in_flight` | `result_err_retryable` | Frozen journal or channel host | `attempt < max` and declared idempotent or provider key supported | `failed_retryable` |
+| `failed_retryable` | `retry` | Frozen journal or channel host | Same `idempotency_key` | `admitted` (`attempt + 1`) |
+| `in_flight` | `result_err_terminal` | Frozen journal or channel host | | `failed_terminal` |
+| `in_flight` | `crash` / `timeout` / `no_result` | Frozen journal or channel host | Ambiguous termination | `outcome_unknown` |
 | `outcome_unknown` | `probe_effective` | Frozen journal or human | Read-only external evidence | `reconciled_effective` (terminal for automation) |
 | `outcome_unknown` | `probe_not_effective` | Frozen journal or human | Read-only external evidence | `reconciled_not_effective` (terminal for automation) |
 | `outcome_unknown` | `human_authorized_new_attempt` | Human | New `EffectId`, new key, explicit receipt | `admitted` (new effect) |
@@ -2286,11 +2302,11 @@ A checkpoint is a replay basis, not a full state copy. It MUST be created after 
 
 ```ts
 interface CaptureRedaction {
-  policy: "redact_enrolled_secrets";
+  policy: "redact_none";                 // the VM holds no credential; search text is stripped upstream
   redaction: "full" | "partial" | "none"; // full = all known values redacted
   redactedClasses: string[];            // e.g. "authorization", "cookie", "api_key"
   originalCommitment?: Digest;          // commitment over pre-redaction bytes; default omitted
-  originalRetained: boolean;            // false unless a human enables broker-only retention
+  originalRetained: boolean;            // false; the VM holds no credential to retain
 }
 
 interface ModelCall {
@@ -2323,9 +2339,9 @@ interface ModelCall {
 }
 ```
 
-**Capture point and exactness.** Capture happens in the broker/router boundary after credential redaction and before any agent-visible surface. The canonical store holds the exact *post-redaction* semantic payload and the exact post-redaction wire payload; those are the replay inputs. Credential-bearing bytes are not persisted by default. The record carries `redaction` metadata and, when the broker computes one, an `originalCommitment` digest over the pre-redaction bytes so verification can prove the redaction step ran without retaining the secret. Retaining unredacted provider bytes requires an explicit human-configured broker-only store; the ledger records only its digest, and agent-adjacent code never mounts it. A redacted payload is marked `redacted_for_agent` and MUST NOT be presented as byte-exact provider evidence.
+**Capture point and exactness.** Capture happens at the lane boundary before any agent-visible surface. The canonical store holds the exact *post-redaction* semantic payload and the exact post-redaction wire payload; those are the replay inputs. Credential-bearing bytes are not persisted by default. The record carries `redaction` metadata and, when the broker computes one, an `originalCommitment` digest over the pre-redaction bytes so verification can prove the redaction step ran without retaining the secret. There is no credential to redact in the VM and no unredacted store to enable; search text is stripped upstream by the Search VM. A redacted payload is marked `redacted_for_agent` and MUST NOT be presented as byte-exact provider evidence.
 
-"Exact available" now means the exact post-redaction payloads Kanbei sent and received, parameters, normalized output, output events, and any reasoning artifact the provider exposes. If reasoning is hidden, the record MUST say `availability="absent"`; hidden provider chain-of-thought MUST NOT be synthesized or summarized into the record. A retry is a new `ModelCall` linked by `retry_of`; existing records are immutable. Execution replay injects `response.semantic_ref` and `output_events_ref`; it never re-invokes the provider. calls the model for a past decision. "What would the model do now" is a new speculative branch, not replay.
+"Exact available" now means the exact post-redaction payloads Kanbei sent and received, parameters, normalized output, output events, and any reasoning artifact the provider exposes. If reasoning is hidden, the record MUST say `availability="absent"`; hidden provider chain-of-thought MUST NOT be synthesized or summarized into the record. A retry is a new `ModelCall` linked by `retry_of`; existing records are immutable. Execution replay injects `response.semantic_ref` and `output_events_ref`; it never re-invokes the model for a past decision. "What would the model do now" is a new speculative branch, not replay.
 
 #### 4.7.7 Undo forests and dependency-aware branch sets
 
@@ -2524,10 +2540,9 @@ The Capability contract owns external authority:
 type CapabilityName =
   | "fs.read" | "fs.write"
   | "process.spawn"
-  | "net.direct"              // audit-only under the accepted egress policy
-  | "broker.http"             // credential injection for enrolled logical hosts
-  | "model.invoke"
-  | "search.query"
+  | "channel.inbox" | "channel.vault" | "channel.todo"
+  | "channel.chat" | "channel.csr" | "channel.search"
+  | "lane.invoke"
   | "secret.use"
   | "canonical.append" | "canonical.query"
   | "plugin.state"
@@ -2549,13 +2564,13 @@ interface CapabilityGrant {
   revokedBy?: RecordId;
 }
 
-interface CapabilityBroker {
+interface CapabilityGate {
   decide(grant: CapabilityGrant, request: CapabilityRequest): Promise<Decision>;
   invoke<T>(grant: CapabilityGrant, request: CapabilityRequest): Promise<CapabilityResult<T>>;
 }
 ```
 
-Capability constraints are capability-specific. Filesystem grants name roots and modes; process grants name executables and concurrency; model grants name task classes and per-call token ceilings; secret grants name logical secret identifiers; canonical grants name component namespaces and maximum records per interval. `net.direct` records destination and attribution but MUST NOT deny by host or port. `broker.http` names an enrolled logical host and is subject to the broker contract in §4.10.6.
+Capability constraints are capability-specific. Channel grants name the allowed channel set and its caps; filesystem grants name mount classes and modes; process grants name executables and concurrency; model grants name task classes, lanes, and per-call token ceilings; canonical grants name component namespaces and maximum records per interval. There is no `net.direct` grant and no `broker.http` grant: the VM has no network and no credential (§4.10.6).
 
 The Loop contract exposes runtime handles over durable loop records:
 
@@ -2700,7 +2715,7 @@ interface StateCheckpoint {
 }
 ```
 
-Storage lives under `~/.local/state/kanbei/plugin-state/<scope>/<store>/`, outside the canonical ledger. The plugin never receives a filesystem path or SQLite handle for this store; it receives the `ScopedStore` RPC handle through the `plugin.state` capability. The store uses its own transactional metadata and enforces per-store size and rate ceilings.
+Storage lives under `/var/lib/kanbei/plugin-state/<scope>/<store>/`, outside the canonical ledger. The plugin never receives a filesystem path or SQLite handle for this store; it receives the `ScopedStore` RPC handle through the `plugin.state` capability. The store uses its own transactional metadata and enforces per-store size and rate ceilings.
 
 Durability modes:
 
@@ -2809,11 +2824,11 @@ Validation MUST run in this order and append a `CandidateValidated` or `Candidat
 
 1. **Manifest and schema validation.** Contract versions, dependency ranges, state-store declarations, tool/view names, and migration descriptors.
 2. **Dependency resolution.** The full closure is available at compatible versions. Missing or ambiguous dependencies reject.
-3. **Static capability scan.** Declared imports and host calls are compared with `capabilityRequests`. An undeclared `fs.write`, `process.spawn`, `broker.http`, `model.invoke`, `secret.use`, `canonical.append`, or `canonical.query` rejects.
-4. **Artifact build.** The code bundle is built in a sandbox with a pinned toolchain and lockfile. Build output is content-addressed; activation uses the immutable output, not a fresh build.
+3. **Static capability scan.** Declared imports and host calls are compared with `capabilityRequests`. An undeclared `channel.chat`, `channel.todo`, `channel.search`, `fs.write`, `process.spawn`, `model.invoke`, `secret.use`, `canonical.append`, or `canonical.query` rejects.
+4. **Artifact provenance.** The bundle is built before the VM: a human merges it into `smores56/kanbei`, Nix pins it, and the image carries the content-addressed output. The VM never builds or fetches; a lockfile change is a dependency diff and a new image. Activation uses the immutable image artifact.
 5. **Dynamic conformance.** The candidate runs in a quarantine scope with all external capabilities denied. It must boot, register its declared projections/tools/views, pass contract conformance tests, and fail closed on denied calls.
 6. **State migration dry-run.** Forward migrations run against a shadow copy of the scope state. Live state is untouched.
-7. **Security probes.** Attempts to open canonical SQLite, read the trust root, read another scope's state, read broker configuration, or write the Nix store MUST fail closed and produce an auditable error.
+7. **Security probes.** Attempts to open canonical SQLite, read the trust root, read another scope's state, read channel-host configuration, construct a channel socket outside the manifest, or write the image store MUST fail closed and produce an auditable error.
 8. **Health-plan validation.** Declared health checks must be executable without unresolvable external dependencies; any external probe must name its effect class and idempotency behavior.
 
 ```ts
@@ -2839,11 +2854,10 @@ interface CapabilityDiff {
 Diff policy:
 
 - `trustRootAccess: true` MUST reject unconditionally.
-- Added or broadened `secret.use`, `model.invoke`, `broker.http`, `process.spawn`, `fs.write`, or `canonical.append` requires human approval under the autonomy tier unless human-owned policy explicitly delegates it.
+- Any added or broadened grant requires a human approval receipt (§4.8.5). No autonomy policy, plan, or constraint override lets an agent approve its own executable candidate.
 - Removed or narrowed grants MAY activate automatically after health passes.
 - A `forward-only` migration activates only with an explicit `roll_forward_only` decision; rollback is unavailable.
 - `requires-checkpoint` requires a verified state checkpoint before preparation.
-- `net.direct` changes are recorded in the diff but are not denied, because accepted egress policy makes it audit-only. This is a deliberate exception, not a claim that `net.direct` is a containment control.
 
 Each scope has a trust-root-owned activation pointer, separate from plugin-writable state:
 
@@ -2892,27 +2906,30 @@ Crash recovery reads the intent record:
 - Crash after pointer flip and before health: the activation supervisor re-runs health on boot. If health fails, it rolls back; if health cannot be determined, it quarantines the scope and leaves the pointer on the last known-good candidate.
 - Crash during rollback: the supervisor retries rollback idempotently; if the state generation was migrated forward-only, it does not attempt a down migration and instead reports `rollback_blocked_forward_only`.
 
-Rollback is resource rollback, not effect rollback. A broker call, model call, file write, or process effect that occurred under the failed candidate remains an external fact. Rollback appends effect-outcome records; where the kernel cannot determine whether an effect applied, it records `outcome_unknown` and requires a separate compensation decision.
+Rollback is resource rollback, not effect rollback. A channel call, lane call, file write, or process effect that occurred under the failed candidate remains an external fact. Rollback appends effect-outcome records; where the kernel cannot determine whether an effect applied, it records `outcome_unknown` and requires a separate compensation decision.
 
-#### 4.8.5 Live arbitrary plugins outside the frozen trust root
+#### 4.8.5 Declarative live changes and human-approved executable candidates
 
-"Live" means a candidate can become active without rebuilding or restarting the kernel. It does not mean plugin code runs in the kernel process.
+Self-modification has two lanes with different authority. Both are versioned, receipted, and reversible; only one can activate without a human.
 
-Plugin code is arbitrary and untrusted. It MUST load as a content-addressed artifact into a separate OS-sandboxed process or worker. The kernel communicates over a framed RPC protocol exposing only `PluginContext` handles. The OS sandbox is the outer boundary; the language runtime is an inner runtime. No in-process interpreter is the outer security boundary.
+**Declarative lane (live).** Context lenses, view catalogs, themes, keybinds, settings, disclosure rules, budgets, filters, and summaries are versioned declarative documents. They activate at the next turn boundary: the executing loop turn pins the version it started with and the new version applies at the next turn. Validation rejects schema or budget violations, unauthorized sources, unknown component versions, rules that present suspect or retracted records as current, non-total disclosure rules, implicit fallbacks, remote references, and code. Activation appends a receipt and a visibility/hidden diff. A document cannot remove a route anchor, the decision affordance, or the consent link; a candidate that tries fails validation.
 
-The sandbox supervisor:
+**Executable lane (human-approved).** Tools, plugins, and executable projection code never activate on an agent's authority. The path is:
 
-- bind-mounts only selected project roots, scratch space, the agent-mutable Kanbei paths for that scope, and read-only runtime inputs;
-- withholds the canonical database, trust-root directory, Nix store, broker configuration, and secret material;
-- applies process, memory, CPU, file-descriptor, and wall-clock ceilings;
-- kills the process group on cancellation or ceiling breach;
-- records a sandbox violation as a canonical audit record and quarantines the candidate.
+1. The agent stages an immutable `CandidateManifest` with a dependency lock into `mutable/candidates/<scopeId>/<candidateId>/`.
+2. The frozen validator runs the ordered checks: manifest and schema, dependency resolution against locked artifacts present in the image or the candidate store, static capability scan, sandboxed dynamic conformance under Monty with external capabilities and channel calls denied, state-migration dry run on shadow state, security probes, and health-plan validation.
+3. The supervisor produces a capability and dependency diff: added, removed, and broadened grants, with the exact channel stubs and mounts the candidate would gain.
+4. The candidate enters the decision queue as a **candidate approval** request. The frozen consent surface renders the candidate digest, the diff, the scope, and the expiry. The human ruling binds all four. An agent cannot append this receipt, cannot bind it, and cannot approve its own work.
+5. On approval, the supervisor prepares shadow state, boots a standby instance with effects gated, drains, and flips one scope pointer atomically. Post-flip health runs; failure rolls back to the retained previous candidate.
+6. Every step appends a receipt. The approval is consumed once; a changed candidate digest invalidates it.
 
-Build and activation are separated. Building a plugin MAY use a build capability, including network if human policy allows it, and produces immutable artifacts plus a build receipt. Activation uses the built artifact and never runs package install scripts. Dependencies are locked and content-addressed; a lockfile change is a dependency diff and follows candidate policy.
+There is no path from staging to activation that bypasses step 4. A candidate that references a trust-root path, attempts to write the activation pointer, asks the append API for `human_authority` or `activation_receipt`, or tries to widen a ceiling is rejected and quarantined.
 
-Live mutation is intentionally broad: arbitrary tools, plugins, declarative context projections, UI, keybinds, themes, settings, and tool wiring MAY be activated as candidates. This is an experiment to be tightened if practice demonstrates unacceptable risk. The trust root remains frozen. A candidate that references a trust-root path, attempts to write the activation pointer, or asks the append API for `human_authority` or `activation_receipt` MUST be rejected.
+**Where code lives.** Plugin code is a content-addressed artifact. It loads into the Monty host as a separate in-VM process, not into the kernel process, and communicates over a framed RPC protocol exposing only `PluginContext` handles. The host bind-mounts only the mounts admitted for that scope, withholds the canonical database, trust-root control files, and other agents' state, applies process, memory, CPU, file-descriptor, and wall-clock ceilings, kills the process group on cancellation or breach, and records a violation as a canonical security record that quarantines the candidate.
 
-The accepted residual is explicit: because outbound network is unrestricted, a malicious plugin can exfiltrate any project data it can read. The broker protects enrolled credentials from disclosure to agent code, but it does not stop a plugin from reaching the real endpoint directly or from using an enrolled credential against any method, path, or payload the provider permits. Capability diffs and audit records provide attribution, not confidentiality.
+**Build separation.** Code is built before it reaches the VM: a human merges it into `smores56/kanbei`, Nix pins it, and the image carries it. The VM never runs a package install, never fetches a dependency, and never builds. A lockfile change is a dependency diff and a new image. This is what makes "code enters only through a human-merged commit" true at the artifact layer, not just at review time.
+
+**Residual.** An approved candidate runs with the VM's reach. It can read the Inbox, Vault, and state, write Todo within the cap, send Chat, and issue capped search queries. The capability diff and the receipts give attribution, not confinement. Approval is the gate, and the frozen trust root remains uneditable.
 
 #### 4.8.6 Context-projection mutation
 
@@ -2951,7 +2968,7 @@ Agents MAY edit the lens, including filters that hide evidence from their own co
 
 #### 4.8.7 Trusted Nix updates and migration compatibility
 
-The kernel, sandbox supervisor, broker, append API, activation supervisor, receipt verifier, consent surface and gesture endpoint, and audit sink are Nix-built artifacts. They change only through a human-approved Nix generation. The runtime MUST NOT download or hot-patch trust-root code.
+The kernel, sandbox supervisor, channel hosts, append API, activation supervisor, receipt verifier, consent surface and gesture endpoint, and audit sink are image artifacts built by Nix from the flake-pinned commit. They change only through a human-approved Nix generation. The runtime MUST NOT download or hot-patch trust-root code; with no network in the VM, the build is the only path.
 
 ```ts
 interface KernelManifest {
@@ -2980,7 +2997,7 @@ Migration rules:
 - No automatic destructive down migration is ever executed.
 - Human-approved Nix rollback is allowed only when the data remains readable by the older kernel. Otherwise the supervisor refuses with `rollback_blocked_data_incompatible` and offers roll-forward or checkpoint-branch recovery.
 
-A Nix switch restarts the kernel and re-runs the compatibility gate. Isolation-scope activation pointers and plugin-state generations live under `~/.local/state/kanbei/`, outside the Nix store, so they survive a kernel generation change. A Nix update that changes contract versions may quarantine old plugins; the human sees the compatibility report before or at switch time.
+A Nix switch restarts the kernel and re-runs the compatibility gate. Isolation-scope activation pointers and plugin-state generations live under `/var/lib/kanbei/`, outside the Nix store, so they survive a kernel generation change. A Nix update that changes contract versions may quarantine old plugins; the human sees the compatibility report before or at switch time.
 
 ---
 
@@ -3051,7 +3068,7 @@ Contracts:
 - `execute` resolves to an exact descriptor digest, and that digest is recorded.
 
 ```ts
-type RuntimeId = "monty" | "node" | "deno" | "lua" | "bash" | "cpython";
+type RuntimeId = "monty";   // fixed; a second runtime is a design change (§4.9.5)
 
 type ExecuteRequest =
   | {
@@ -3092,7 +3109,7 @@ type HostCallResult =
 
 In `call` mode, the kernel dispatches one versioned function with structured arguments. In `program` mode, code runs in the selected runtime inside the OS sandbox. Host functions are generated as typed stubs from the visible tool catalog; each stub call carries the exact name, version, and digest.
 
-Host calls are effects. They are recorded, cancellable, rate-limited, and counted against `maxHostCalls`. Stub calls are the only *attributable* host path: the runtime can still open a raw socket under the accepted unrestricted-egress policy, but that path carries no host capability, no broker credential, and no audit attribution. This is attribution, not containment; Kanbei does not claim the runtime cannot bypass the stubs. The runtime is selected by the bake-off and remains replaceable behind `RuntimeId`.
+Host calls are effects. They are recorded, cancellable, rate-limited, and counted against `maxHostCalls`. Stub calls are the only host path: Monty has no ambient filesystem, network, or subprocess access, so a program cannot construct a socket, resolve a name, or spawn a process outside the stub set. The stub set is generated from the channel manifest and is closed. Monty remains a language-level boundary inside the VM, replaceable only by a design change; the VM and its channels carry the security claim.
 
 #### 4.9.2 Results, structured errors, streaming, and cancellation
 
@@ -3169,9 +3186,26 @@ Stream events are ordered per execution, backpressured, and bounded by `maxOutpu
 
 Cancellation is idempotent and returns a report naming which host calls were cancelled, which completed, and which are unknown.
 
-#### 4.9.3 Provider-neutral search and fetch
+#### 4.9.3 Search channel client and the provider-neutral search contract
 
-Search and fetch sit behind a provider-neutral contract. TinyFish is one adapter, not the contract.
+Kanbei's search client is a schema-capped vsock client. It sends a query string and a limit; it receives stripped text plus provenance. It holds no credential, no endpoint, and no URL, and it cannot shape a provider request. The Search VM holds the TinyFish key, applies DLP regexes, a Granite Guardian judge, and provider rate limits before the call, strips the response to text, and logs every query to a root-only host log.
+
+```ts
+interface SearchChannelRequest {
+  query: string;                 // length-capped; must pass DLP and the judge
+  limit: number;                 // operator-configured maximum
+}
+
+interface SearchChannelResponse {
+  receiptId: ReceiptId;
+  hits: SearchHit[];
+  stripped: boolean;             // always true in the initial contract
+  blocked?: "dlp" | "judge" | "budget" | "rate" | "schema" | "error";
+  providerRequestId?: string;
+}
+```
+
+Behind the channel, search and fetch sit behind a provider-neutral contract. TinyFish is one adapter in the Search VM, not the contract.
 
 ```ts
 interface SearchQuery {
@@ -3193,33 +3227,6 @@ interface SearchHit {
   providerScore?: number;      // opaque; never compared across providers
   sourceTime?: { value: Iso; precision: "instant" | "day" | "estimate" };
   native: unknown;
-}
-
-type SearchRequest = SearchQuery;
-
-interface SearchResult {
-  hits: SearchHit[];
-  providerRequestId?: string;
-  rawEnvelope: Digest;
-  cost?: unknown;
-}
-
-interface FetchRequest {
-  url: string;
-  acceptMediaTypes: string[];
-  conditional?: { etag?: string; lastModified?: string };
-}
-
-interface FetchResult {
-  status: "ok" | "not-modified" | "not-found" | "forbidden" | "error";
-  finalUrl: string;
-  mediaType?: string;
-  body?: Digest;
-  rawEnvelope?: Digest;
-  etag?: string;
-  lastModified?: string;
-  providerRequestId?: string;
-  errors: ProviderError[];
 }
 
 interface ProviderError {
@@ -3246,142 +3253,115 @@ interface SearchProvider {
     units: string;                      // e.g. "requests/min", "urls/min", "credits/10 results"
     limits: Record<string, number>;
   };
-  search(req: SearchRequest, ctx: CapabilityContext): Promise<SearchResult>;
-  fetch(req: FetchRequest, ctx: CapabilityContext): Promise<FetchResult>;
+  search(req: SearchQuery, ctx: ProviderContext): Promise<SearchHit[]>;
+  fetch(req: { url: string; acceptMediaTypes: string[] }, ctx: ProviderContext): Promise<{ body: Uint8Array; mediaType?: string }>;
 }
 ```
 
 Rules:
 
-1. **A search hit is a candidate locator, not a capture.** Only a fetch produces a capture observation. A snippet is a provider-generated derivative and MUST NOT be cited as source content.
-2. **Preserve provider-native fields.** Normalization adds the core fields; `native` and the raw envelope remain evidence. Grouped result shapes are flattened without discarding grouping.
-3. **Do not assume content co-location or scores.** Search may inline fetch content, may return no body, and may return ranks or scores with incompatible meanings. Provider scores MUST NOT be compared across providers.
-4. **Use conditional fetch where supported.** A `304` advances validators and produces coverage, not a duplicate capture.
-5. **Respect documented ceilings.** TinyFish Search is 30 requests/minute and 12,000/day, with page index at most 10. Backpressure is applied before the provider call; global ceilings remain hard.
-6. **Typed failure mapping.** `402` is `quota`; `403` may be `upstream_forbidden`; `429` is `rate_limit`; `5xx` is `transient`; an unsupported image fetch is `unsupported_media`. No failure produces a content-bearing observation.
-7. **Transport is part of provenance.** If an image or PDF is fetched by a different transport than search, `evidence.request.method` and the transport identity MUST record that choice. Transport selection for non-TinyFish media is `[SPIKE: NET-1]`.
+1. **A search hit is a candidate locator, not a capture.** A snippet is a provider-generated derivative and MUST NOT be cited as source content. Content arrives through an ingest batch, never through search.
+2. **Preserve provider-native fields.** Normalization adds the core fields; `native` and the raw envelope remain evidence in the Search VM and are logged with the query.
+3. **Do not assume content co-location or scores.** Provider scores MUST NOT be compared across providers.
+4. **Respect documented ceilings in the Search VM.** TinyFish Search is 30 requests/minute and 12,000/day with page index at most 10; backpressure is applied before the provider call and the Kanbei-side daily budget is a hard ceiling (§4.10.5).
+5. **Typed failure mapping.** `402` is `quota`; `403` may be `upstream_forbidden`; `429` is `rate_limit`; `5xx` is `transient`. No failure produces a content-bearing observation, and no failure silently degrades to an unfiltered query.
+6. **The channel strips.** Only text, locators, ranks, and times cross back. Binary fetch, if ever added, is a new channel and a new human decision.
+7. **Every query is evidence.** The receipt records query digest, length, DLP verdict, judge verdict, result digest, and provider id. The root-only host log keeps the query text for human review through a touch.
 
-Every call records the provider, exact parameters, request id, response time, and raw request/response in the CAS. Normalization produces a common result shape without claiming capability equivalence.
+#### 4.9.4 Local lanes and exact model I/O
 
-#### 4.9.4 Provider-neutral model routing and exact I/O
-
-Model routing is policy-driven, not plugin-discovered. Human-owned task policies are canonical authority records; agents may propose policy changes but cannot grant their own routing authority.
+Model routing is human-owned policy over local lanes, not plugin discovery. One `llama.cpp` server serves the owner's model on the 3090 from a shared q8_0 KV pool: one 128k chat lane and three 32k background lanes. MTP stays off while parallel slots are on. Weights, tokenizer, chat template, and the llama.cpp build are image content.
 
 ```ts
-type TaskClass = string;               // e.g. "plan", "code.edit", "memory.reconcile"
+type LaneId = "chat" | "background-1" | "background-2" | "background-3";
 
 interface TaskPolicy {
-  task: TaskClass;
-  primary: ModelRef;
-  fallback: ModelRef[];
+  task: TaskClass;               // e.g. "chat", "plan", "code.edit", "memory.reconcile"
+  lane: LaneId | "background_pool";
   maxInputTokens: number;
   maxOutputTokens: number;
-  maxCostUsd?: number;
   timeoutMs: number;
   retry: { maxAttempts: number; retryOn: string[] };
-  allowProviderTools: boolean;
 }
 
-interface ModelRouter {
-  route(task: TaskClass, constraints: RouteConstraints): Promise<RouteDecision>;
-  invoke(
-    decision: RouteDecision,
-    request: ModelRequest,
-    ctx: ModelCallContext
-  ): Promise<ModelResponse>;
+interface LaneRequest {
+  lane: LaneId;
+  messages: ChatMessage[];
+  tools?: ToolCallSpec[];
+  temperature: number;
+  maxOutputTokens: number;
+  stop?: string[];
+  idempotencyKey?: string;
 }
 
-interface RouteDecision {
-  task: TaskClass;
-  provider: string;
-  model: string;
-  policyRecord: RecordId;
-  fallback: ModelRef[];
-  limits: { maxInputTokens: number; maxOutputTokens: number; timeoutMs: number };
+interface LaneResponse {
+  text: string;
+  toolCalls?: ToolCall[];
+  usage: { promptTokens: number; completionTokens: number };
+  finishReason: "stop" | "length" | "tool" | "error";
+  lane: LaneId;
+  slotIndex: number;
+  latencyMs: number;
 }
 ```
 
-Exact I/O capture is mandatory:
+Rules:
 
-1. Before the call, append `ModelCallRequested` with the task class, policy record, route decision, provider, model, normalized request digest, post-redaction request digest, and idempotency key.
-2. After the call, append `ModelCallCompleted` with the normalized response, output events, usage, finish reason, post-redaction response digest, latency, and provider request id.
-3. On provider error or timeout, append `ModelCallFailed` with the structured error and whether an external effect is `not_applied`, `applied`, or `outcome_unknown`.
-4. Store the exact post-redaction semantic payload and post-redaction wire bytes in the CAS and reference them from the records. The normalized form is an evidence convenience, not a replacement. Unredacted credential-bearing bytes are not persisted by default; the record carries redaction metadata and an optional original-bytes commitment (§4.7.6).
-5. Record exposed reasoning artifacts only. Hidden provider chain-of-thought is not promised or reconstructed.
+1. **Chat is not starved.** The chat lane holds its 128k share; background lanes share the remainder. A background task that cannot get a slot waits; it never preempts a chat turn.
+2. **Retrieval before width.** SQLite FTS5 plus vector retrieval, CPU embeddings, and a CPU reranker keep loop contexts small. A loop that widens context instead of retrieving records why.
+3. **Exact I/O capture is mandatory.** Before the call, append `ModelCallRequested` with task class, policy record, lane, normalized request digest, and idempotency key. After, append `ModelCallCompleted` with normalized response, output events, usage, finish reason, latency, and post-redaction digests; or `ModelCallFailed` with the structured error and whether an effect is `not_applied`, `applied`, or `outcome_unknown`. Store the post-redaction semantic payload and wire bytes in the CAS.
+4. **No credential, no fallback provider.** A lane failure is a failed call. There is no remote retry and no second provider.
+5. **Reasoning exposure is explicit.** Only artifacts the runtime exposes are recorded; hidden reasoning is not promised or reconstructed.
+6. **Lane seconds are a hard ceiling.** Each call reserves lane-seconds before dispatch and commits actual usage after (§4.10.5). Global ceilings are hard; per-loop budgets are soft with a recorded rationale.
+7. **Model output is untrusted content.** It becomes a candidate claim or an observation draft under the normal poisoning path; it never becomes authority.
 
-Provider-neutral normalization covers messages, tool calls, output events, usage, and finish reason. Provider-specific fields remain in `providerOptions` and the raw payload; the router MUST NOT assume two providers expose equivalent tools, reasoning, caching, or structured output. A route decision may fall back only within the human-owned policy chain. Global spend, token, rate, and concurrency ceilings are hard; per-loop budgets are soft and require a recorded rationale for override.
+#### 4.9.5 Runtime selection record
 
-#### 4.9.5 Agent-facing execution-language bake-off
+The agent-facing execution language and the control-plane runtime are fixed, not deferred. This section records the decision and retires the bake-off.
 
-The agent-facing execution language and Node-versus-Deno are deferred spikes. This section defines a fair comparison; it does not choose a winner.
-
-Before any trial:
-
-- freeze runtime versions, image digests, compiler/interpreter versions, model IDs, prompts, tool catalog, tool descriptions, seeds, OS-sandbox profile, hardware, and timeouts;
-- state hypotheses and non-inferiority margins;
-- separate the runtime factor from the interaction pattern, so a code-mode effect is not attributed to the language;
-- publish raw traces, prompts, tool schemas, and failure taxonomy.
-
-| Candidate | Role | Required controls |
+| Decision | Value | Basis |
 |---|---|---|
-| Monty | Python-subset language-level sandbox | Same OS sandbox; type stubs/docs; host-call facade; explicit subset traps |
-| TypeScript on Node | Full TS/JS runtime | Same OS sandbox; same lockfile policy; Node permissions not treated as outer boundary |
-| TypeScript on Deno | Full TS/JS runtime with permission flags | Same OS sandbox; Deno permissions as inner boundary only; no Deno Sandbox dependency |
-| Lua / Luau | Small embeddable runtime | Same host-injected globals; no `io`/`os.execute`/`package` unless granted; same sandbox |
-| Bash | Shell plus OS sandbox | Same filesystem/process policy; structured result wrapper; quoting/injection probes |
-| Full CPython | Full language and package ecosystem | Same OS sandbox; pinned wheels; package provenance recorded |
+| Agent-facing language | Monty | Fixed by the split design: agent-authored code runs under one interpreter with generated host-call stubs, no ambient filesystem, network, or subprocess access, an in-process WASM backend, execution time and memory bounds, and a fresh session after a crash. Evidence: `spikes/single-process/monty-probe.ts` on `smores56/kanbei`. |
+| Control-plane runtime | Deno 2.9.2 | Runtime spike: composite within the pre-registered margin, peak RSS and cold start favour Deno, Node wins append throughput; recorded as a near-tie. Deno permissions are an inner layer only. |
 
-Node versus Deno is a separate sub-factor using the same TypeScript workload and the same OS sandbox. Deno Sandbox is excluded from the candidate set because it is closed to new customers as of the current evidence; `deno run` permissions are measured as an inner policy layer, not as the outer boundary.
+The pre-split `LANG-1` and `NODE-DENO-1` protocols are retired. With one fixed local model, one fixed deployment, and no provider choice, a model-dependent language comparison cannot select anything the design has not already fixed. Reopening either choice is a design change reviewed against `00-requirements.md`, not a runtime toggle. The retained evidence artifacts are `spikes/language/`, `spikes/runtime/`, `spikes/deployment/`, `spikes/isolation/`, and `spikes/single-process/`.
 
-Each candidate runs inside the same OS-sandbox profile: same filesystem bindings, process limits, egress policy, and cgroup/rlimit/wall-clock ceilings. If a candidate cannot run under that profile, that is a recorded capability failure, not a relaxed control.
+Residual: no live model comparison of Monty against another language exists, and Monty's snapshot support was probed locally only. This is accepted because the VM boundary, not the interpreter, carries the security claim.
 
-The workload suite MUST include at least ten equivalent tasks, each with a gold output and a structured rubric:
-
-1. Fan-out read: 50 independent lookups, filter/aggregate, return top-k.
-2. Conditional multi-step: branch on intermediate results; early exit.
-3. Large-output reduction: fetch 10 MB, return a 2 KB summary.
-4. File transformation: parse CSV/JSON, write a derived file.
-5. Error recovery: one transient tool failure with backoff; one permanent failure.
-6. Approval gate: pause before a side-effecting call; resume after approval.
-7. Fork/branch: duplicate state and explore two paths.
-8. Streaming progress: emit progress during a long loop.
-9. Dependency-heavy task: pandas/requests or npm equivalents where the runtime supports them.
-10. Adversarial task: prompt-injected tool output attempts to exfiltrate a secret.
-
-Run each task at host-call latencies of 10 ms, 100 ms, and 1 s. Record success, token use, latency, host-call behavior, snapshot availability and trust, and operability inside the OS sandbox. The bake-off MUST also record capability failures rather than relaxing the sandbox. `[SPIKE: LANG-1]` selects the agent-facing language; `[SPIKE: NODE-DENO-1]` selects the TypeScript runtime. TypeScript remains the main control-plane language regardless, and the OS sandbox remains mandatory unless the threat model changes.
-
----
-
-### 4.10 Security, broker, and deployment
+### 4.10 Security, channels, and deployment
 
 #### 4.10.1 Security invariants and adversary
 
 | ID | Invariant |
 |---|---|
-| S-1 | The host kernel, the Nix-built frozen trust root, the human, and the audit sink are trusted. All agent, plugin, tool, and ingested-content-derived code is untrusted. |
-| S-2 | Mutable code never executes inside a process that holds canonical-ledger write authority, broker secret material, or frozen-root control. |
-| S-3 | Credential bytes never enter an agent address space. The broker injects them after authenticating the caller and selecting an active enrollment. |
-| S-4 | Credential injection is not action authorization. The broker does not decide whether a method, path, or payload is appropriate. |
-| S-5 | Agent-visible data access is limited to human-selected project roots, per-sandbox scratch, and agent-mutable Kanbei paths. Toolchain paths are read-only and not project data. |
+| S-1 | The host kernel, root-only host artifacts, the Nix-built image and its frozen trust root, the human, and the audit sink are trusted. All agent, plugin, tool, and ingested-content-derived code is untrusted. |
+| S-2 | Mutable code never executes inside a process that holds canonical-ledger write authority or frozen-root control. |
+| S-3 | The Kanbei VM holds no provider credential. The TinyFish key lives only in the Search VM; ingest credentials live only in their own ingest VMs. |
+| S-4 | No process in the VM can open an outbound connection. The VM has no NIC and its device surface is exactly the six channels. |
+| S-5 | Agent-visible data access is limited to the Inbox and Vault mounts (read-only), the Todo mount (read-write within its cap), per-sandbox scratch, and agent-mutable Kanbei paths. Image content is read-only. |
 | S-6 | All canonical writes pass through the frozen append API. No agent or mutable plugin opens the canonical SQLite file. |
-| S-7 | Outbound network destination policy is unrestricted. Kanbei does not protect project-data confidentiality from malicious readable code. |
-| S-8 | Global spend, token, rate, concurrency, writable-root, secret-access, broker-enrollment, canonical-append, audit, and activation boundaries are hard human-owned limits. Approvals never override them. |
-| S-9 | Every mediated external effect produces an attempt and a receipt through the frozen append path. Replay never repeats an external effect. |
-| S-10 | The broker fails closed on authenticated, audited, credentialed requests. There is no credential fallback, environment-variable fallback, or direct-connection fallback. |
-| S-11 | The frozen trust root changes only by a human-approved Nix generation. Agents may propose but cannot live-edit it. |
-| S-12 | A sandbox starts only after the supervisor verifies the declared enforcement class. A weaker-than-declared posture is a start failure, not a silent downgrade. |
-| S-13 | Inter-agent isolation is fault and resource containment only. It is not a security boundary for credentials, canonical state, or approvals. |
-| S-14 | The UI binds loopback only and is exposed through the existing Cloudflare Tunnel and Access conventions. |
-| S-15 | All mutable Kanbei state lives under `~/.local/state/kanbei/`; trusted Nix configuration and secret material remain outside it and are covered by backup integration separately. |
+| S-7 | The six channels are the only byte paths into, out of, or across the VM. Any other path is a channel leak. |
+| S-8 | GPU lanes, ingest volume, CAS growth, Todo bytes, chat rate, search budget, writable roots, canonical append, audit, and activation are hard human-owned limits. Approvals never override them. |
+| S-9 | Every mediated effect produces an attempt and a receipt through the frozen append path. Replay never repeats an external effect. |
+| S-10 | Channel operations fail closed. There is no fallback path, environment credential, host share, or undeclared port. |
+| S-11 | The frozen trust root changes only through a human-merged commit built into a new image by a human-approved Nix generation. |
+| S-12 | A sandbox starts only after the supervisor verifies the declared enforcement class and channel set. A weaker posture or an extra channel is a start failure. |
+| S-13 | Inter-agent isolation inside the VM is fault and resource containment only. The VM is the security boundary. |
+| S-14 | The UI is a static, human-owned bundle with a strict CSP; it binds loopback in the VM and is reached only through the host relay and the WARP private route. |
+| S-15 | All mutable state lives on the in-guest LUKS volume under `/var/lib/kanbei/`; image content and secret material are outside it. |
+| S-16 | Agent-authored code runs only under Monty with no ambient filesystem, network, or subprocess access; host calls are effects. |
+| S-17 | Ingest output enters only as age-encrypted batches written by the host writer. The VM cannot write the Inbox and holds no plaintext source credential. |
 
-The adversary is the agent process itself: prompt-injected or fully compromised, with arbitrary code execution inside its sandbox. It controls argv, environment, written files, DNS queries, and every byte sent to a socket. It can read any file its OS identity can read, signal or trace same-identity processes unless deployment blocks that, and attempt kernel or supervisor exploits. Upstream APIs and the network are hostile or semi-trusted; they are reached with real credentials. The host and human remain trusted.
+The adversary is the agent process inside Kanbei: prompt-injected or fully compromised, with arbitrary code execution under Monty and arbitrary code in the VM if Monty or the harness is broken. It controls its program, the files it writes in the writable mounts, and every byte it sends to a channel. It can read what its OS identity can read inside the VM. Ingest batches, vault content, and search results are hostile input. The host, the human, the image, and the frozen trust root are trusted.
 
-#### 4.10.2 Process identities and broker caller authentication
+The adversary cannot open a socket, resolve a name, or reach a host path outside the mounts, because no interface exists. Its residual reach is the Search channel, the Chat channel, the Todo channel, and a VM escape. The full contract, including per-channel rules and start verification, is `04-security-deployment.md`; this section states the invariants and the enforcement points the kernel implements.
+
+#### 4.10.2 Process identities and channel caller authentication
 
 ```ts
 type ComponentKind =
-  | "core" | "sequencer" | "broker" | "sandbox_supervisor"
-  | "agent" | "plugin_host" | "ui" | "watchdog" | "backup";
+  | "core" | "sequencer" | "llm" | "monty_host"
+  | "channel" | "agent" | "plugin_host" | "ui" | "consent" | "watchdog";
 
 type ProcessIdentity = {
   component: ComponentKind;
@@ -3389,6 +3369,7 @@ type ProcessIdentity = {
   osUid: number;
   generation: NixGenerationId;
   cgroupPath: string;
+  channels: ChannelId[];         // exactly the manifest for this role
   sandboxId?: SandboxId;         // agent and plugin hosts only
   agentId?: AgentId;
   loopId?: LoopId;
@@ -3397,40 +3378,42 @@ type ProcessIdentity = {
 };
 ```
 
-The broker accepts a caller only after all of the following:
+A channel host accepts a caller only after all of the following:
 
-1. Unix-socket peer credentials identify the expected OS user.
+1. Unix-socket peer credentials identify the expected in-VM user for that channel.
 2. The presented `startToken` matches a live sandbox issued by the supervisor.
 3. The peer's cgroup path matches the sandbox record.
 4. The sandbox generation matches the running generation.
+5. The operation is in the channel's schema.
 
-Under a pure same-UID user-space deployment, steps 1–3 are attribution, not a boundary: a same-UID agent can read, trace, or signal a sibling unless the host security spike proves otherwise. S-13 therefore applies to broker caller identity as well.
+Inside one VM these checks are attribution and accident prevention, not a security boundary between agents; every process shares the VM, and S-13 applies. The boundary is the VM and its channel set. A same-VM process that breaks Monty and the supervisor reads what the VM reads and still cannot leave except through the channels.
 
 | Component | Trust | Loads mutable code | Holds secrets | Writable state |
 |---|---|---|---|---|
 | `kanbei-core` | trusted | no | no | canonical ledger and scoped-state metadata through frozen APIs |
 | `kanbei-sequencer` | trusted | no | no | ledger write-ahead state |
-| `kanbei-broker` | trusted | no | yes, in memory only | redacted audit spool, enrollment metadata |
-| `kanbei-sandbox-supervisor` | trusted | no | no | sandbox records, cgroup/process control |
-| `kanbei-agent-<sandbox>` | untrusted | yes | no | selected project roots, scratch, own agent state |
+| `llama.cpp` (`kanbei-llm`) | trusted image code; model output untrusted | no | no | KV cache and lane state |
+| `kanbei-monty-host` | trusted | hosts untrusted programs | no | per-sandbox scratch |
+| `kanbei-channel-<name>` | trusted | no | no | channel spool and redacted audit spool |
+| `kanbei-agent-<sandbox>` | untrusted | yes | no | own agent state and scratch |
 | `kanbei-plugin-<scope>` | untrusted | yes | no | own scoped store and candidate directory |
-| `kanbei-ui` | mutable presentation | yes | no | none canonical; read-only API client |
+| `kanbei-ui` | frozen static bundle | no; declarative data only | no | none canonical; read-only API client |
 | `kanbei-consent` | trusted, frozen | no | no | none; origin-isolated renderer that mints the single-use consent token and `consentDigest` |
-| `kanbei-watchdog` | trusted, external | no | alert credential only through broker or dedicated alert unit | none agent-writable |
-| `kanbei-backup` | trusted, external | no | no | backup media |
+| `kanbei-watchdog` | trusted, in-VM plus a host counterpart | no | no | none agent-writable |
 
-`kanbei-core` is trusted but does not hold provider credentials. Model calls and search calls are brokered like any other credentialed external effect. `kanbei-ui` is allowed to be live-mutable under self-modification rules, so it MUST NOT be treated as a trusted enforcement component. `kanbei-consent` is a frozen component in the trust root: it serves from a separate host and origin behind the same verified human identity, holds a host-only `SameSite=Strict` session with no shared DOM or storage with `kanbei-ui`, alone renders ruling evidence and mints the single-use consent token and `consentDigest`, and accepts no content, session, or token from `kanbei-ui`.
+`kanbei-core` holds no provider credential and no channel secret. Model calls are local lane calls. `kanbei-ui` is a static bundle: agents may change the declarative data it renders, never its code. `kanbei-consent` serves from a separate origin inside the VM behind the same verified human identity and holds a host-only `SameSite=Strict` session with no shared DOM or storage.
 
 #### 4.10.3 Sandbox, writable roots, and fault isolation
 
 ```ts
 type AbsolutePath = string;
-type EnforcementClass = "kernel_isolated" | "same_uid_dac" | "none";
+type EnforcementClass = "monty_wasm" | "process_cgroup" | "none";
+type ChannelId = "inbox" | "vault" | "todo" | "chat" | "csr" | "search";
 
 type SandboxMount = {
   path: AbsolutePath;
   access: "ro" | "rw";
-  class: "toolchain" | "project" | "scratch" | "agent_state" | "mutable_code" | "runtime";
+  class: "image" | "inbox" | "vault" | "todo" | "scratch" | "agent_state" | "mutable_code" | "runtime";
 };
 
 type SandboxSpec = {
@@ -3441,79 +3424,67 @@ type SandboxSpec = {
   enforcementRequired: EnforcementClass;
   mounts: SandboxMount[];
   writableRoots: AbsolutePath[];
-  network: {
-    egressDestinations: "any";     // no allowlist, no destination policy
-    inboundListeners: "none";      // may be best-effort under same-UID DAC
-    rawSockets: "permitted";
+  channels: {
+    allowed: ChannelId[];        // the only host-call surface; no network member exists
+    network: "absent";
+    dns: "absent";
+    rawSockets: "impossible";
   };
-  limits: { wallMs: number; memoryBytes: number; pidsMax: number; cpuQuota: number; openFiles: number };
-  capabilitySockets: { broker: AbsolutePath; supervisor: AbsolutePath };
-  credentialAccess: "broker_only";
+  limits: { wallMs: number; memoryBytes: number; pidsMax: number; cpuQuota: number; openFiles: number; todoBytes: number };
+  capabilitySockets: { channels: AbsolutePath[]; supervisor: AbsolutePath };
+  credentialAccess: "none";
 };
 ```
 
 | Mount class | Default access | Contents | Backup |
 |---|---|---|---|
-| `toolchain` | `ro` | Nix store, system libraries, runtimes, read-only binaries | no |
-| `project` | `rw` | Human-selected project roots, recorded as project-root authority records | via the project's own repository backup |
-| `scratch` | `rw` | `~/.local/state/kanbei/scratch/<sandboxId>/`, unique per sandbox | no; deleted on termination |
-| `agent_state` | `rw` | `~/.local/state/kanbei/agents/<agentId>/` | yes |
-| `mutable_code` | `ro` except own candidate | `~/.local/state/kanbei/mutable/`; agents write candidates, never the active pointer | yes |
-| `runtime` | `ro` socket access | supervisor socket and broker socket only | no |
+| `image` | `ro` | Nix store, static UI bundle, model weights, fixtures | part of the image |
+| `inbox` | `ro` | age-encrypted source batches and the Syncthing-encrypted phone folder | host writer owns the source |
+| `vault` | `ro` | `/var/lib/data/vault` | via the vault's own backup |
+| `todo` | capped `rw` | `/var/lib/data/todo` | via the vault Syncthing set |
+| `scratch` | `rw` | `/var/lib/kanbei/scratch/<sandboxId>/`, unique per sandbox | no; deleted on termination |
+| `agent_state` | `rw` | `/var/lib/kanbei/agents/<agentId>/` | yes, in the image |
+| `mutable_code` | `ro` except own candidate | `/var/lib/kanbei/mutable/`; agents write candidates, never the active pointer | yes, in the image |
+| `runtime` | `ro` socket access | supervisor socket and the allowed channel sockets only | no |
 
-Project roots MUST be added by a human authority record; agents may propose but cannot activate a new root. The canonical ledger, secrets, frozen-root control files, other agents' state, and the audit sink MUST NOT be mounted into the sandbox. The broker socket is mounted only as a socket path; its credential material is not.
+There is no `project` mount class: Kanbei does not hold a writable project root. Project and repository material arrives as observations inside ingest batches, so a write outside the Todo mount has no path to an external repository at all.
 
-The sandbox supervisor records the actual `EnforcementClass` and compares it with `enforcementRequired`. If the actual class is weaker, the sandbox MUST NOT start; the refusal is an effect receipt with `sandbox_posture_failed`. Verification after start, before handing control to agent code, MUST confirm:
+The canonical ledger, trust-root control files, other agents' state, and the audit sink MUST NOT be mounted into the sandbox. Channel sockets are mounted only as socket paths. The supervisor records the actual `EnforcementClass` and compares it with `enforcementRequired`; if it is weaker, the sandbox MUST NOT start and the refusal is a receipt with `sandbox_posture_failed`. Verification after start, before handing control to agent code, MUST confirm:
 
-- the mount namespace exists and contains exactly the admitted mounts;
-- the cgroup exists with the requested memory, pids, and CPU limits;
-- the broker and supervisor sockets are reachable and no other capability socket is;
+- the mount namespace contains exactly the admitted mounts, with Inbox and Vault read-only and Todo capped;
+- the cgroup exists with the requested memory, pids, CPU, and open-file limits;
+- exactly the allowed channel sockets are reachable and no other capability socket is;
 - the process cannot see forbidden paths by DAC or Landlock;
-- the network namespace or posture matches the declared network mode;
+- the sandbox has no network interface (`ip link` shows only `lo`), no resolver configuration, and no reachable host path outside the mounts;
 - the sandbox's `startToken` is registered with the supervisor.
 
 If any check fails, kill the cgroup and emit `sandbox_posture_failed`. Do not run with a claimed stronger posture.
 
-Known limits carry into the contract:
+One sandbox instance exists per loop execution attempt. The supervisor owns the instance cgroup, process group, and termination. An agent crash, hang, OOM, or fork bomb MUST NOT stop core, the channel hosts, the supervisor, `llama.cpp`, or the UI; each sandbox has separate memory, pids, CPU, scratch, Todo-write, and wall-clock limits; termination is `SIGTERM`, grace, then cgroup `SIGKILL`; no scratch directory is shared; supervisor restart reaps all surviving sandboxes and re-launches only from ledger checkpoints; a hung sandbox is killed by the supervisor's deadline. Monty bounds one program's execution time and memory; the containment evidence and its residuals are recorded in `04 §3.5`.
 
-- Landlock network rules are port-only, not address or hostname.
-- Landlock does not revoke file descriptors opened before enforcement and cannot express a hostname-and-port destination policy.
-- `ProtectHome=true` is incompatible with a service that needs writable `$HOME` state; only `read-only` plus explicit writable paths is viable.
-- Namespacing options in a user unit imply `PrivateUsers`; if user namespaces are unavailable, the unit fails to start rather than degrading.
+#### 4.10.4 Absent network and the channel residual
 
-One sandbox instance exists per loop execution attempt, not one per long-lived agent concept. The supervisor owns the instance cgroup, process group, and termination. An agent crash, hang, OOM, or fork bomb MUST NOT stop core, broker, supervisor, or UI; each sandbox has separate memory, pids, CPU, scratch, and wall-clock limits; termination is `SIGTERM`, grace period, then cgroup `SIGKILL`; no scratch directory is shared between sandboxes; supervisor restart reaps all surviving sandboxes and re-launches only from ledger checkpoints; a hung sandbox is killed by the supervisor's deadline, not by a cooperative agent callback.
+The VM has no network interface, no user-mode networking, no resolver, and no raw-socket capability. This is structural, not a policy: there is no device and no configuration path, and a probe that finds one is a release defect.
 
-Mechanism is deferred: `[SPIKE: ISO-1]` lightweight process, WASM instance, or microVM. A container per agent is excluded by requirement. A mechanism SHOULD be selected only when operationally cheap. The selected mechanism may improve fault isolation but MUST NOT be described as a security boundary for credentials or approvals.
+The accepted residual is the Search channel: capped, filtered, judged queries still leak a few dozen bits per query to TinyFish. The Chat channel delivers text to the owner and the Todo channel writes text the owner reads. Everything else that would have been exfiltration in the pre-split design has no path.
 
-#### 4.10.4 Network posture and the exfiltration residual
-
-The sandbox network capability permits arbitrary outbound destinations, including raw sockets. There is no destination allowlist, no egress-proxy requirement, no DNS policy, and no attempt to prevent project-data exfiltration. The broker is a credential-injection path, not an egress choke point.
-
-> **Accepted residual:** malicious readable code can exfiltrate anything it can read. Kanbei accepts this residual.
-
-The readable set includes selected project roots, per-sandbox scratch, the agent's own state, mutable code it can read, ingested observations, model context, and any other file its OS identity can read. Secret material is outside the policy-granted set, but:
-
-- the broker can be induced to use an enrolled credential against its enrolled host;
-- a same-UID agent may read broker memory or another process's memory if deployment does not block ptrace/process inspection;
-- a provider may reflect a credential in a response, and response redaction is best-effort;
-- an agent can exfiltrate non-secret project data directly.
-
-Kanbei does not claim host-integrity or confidentiality protection against arbitrary code. The host and human remain trusted; the sandbox's job is resource and fault containment, not secrecy of project data.
-
-Effect audit covers mediated effects: broker requests, model calls, capability-mediated filesystem and process operations, activation, enrollment, revocation, and ceiling events. Direct raw network traffic and direct syscalls inside the sandbox are not fully attributable. This narrows the universal effect-audit claim and is recorded as residual R-1 in §6.
+The effect-audit consequence is favourable. Every mediated effect is a channel call, a lane call, a process spawn, or an activation, and each is receipted. A direct syscall inside the VM cannot leave the VM, so the pre-split "unattributable raw network" gap disappears. What remains unattributable is content meaning: a Todo write or a search query is attributable, its intent is not.
 
 #### 4.10.5 Hard ceilings, reservations, and approval separation
 
 | Boundary | Owner | Enforcement point | Agent override | Approval override |
 |---|---|---|---|---|
-| Writable roots | human | supervisor / mount policy | no | no |
-| Secret access | human | broker | no | no |
-| Global spend, token, rate, concurrency | human | frozen ceiling governor | no | no |
-| Broker enrollment and mapping | human | broker | no | no |
+| Writable roots and mounts | human | supervisor / mount manifest | no | no |
+| Channel set | human | image manifest and supervisor | no | no |
+| GPU lanes and model pool | human | frozen lane governor | no | no |
+| Ingest volume per source | human | host writer quota and reader admission | no | no |
+| CAS and state growth | human | frozen admission and ceiling governor | no | no |
+| Todo bytes | human | mount cap and Todo writer | no | no |
+| Chat rate and Search budget | human | channel host | no | no |
 | Canonical append | frozen kernel | append API | no | no |
 | Audit sink | frozen kernel | append/audit path | no | no |
 | Activation and rollback | frozen kernel | activation supervisor | no | no |
-| Ingress | human | tunnel/Access and loopback bind | no | no |
+| Ingress | human | WARP route, relay, in-VM TLS, passkey | no | no |
 | Autonomy tier | human | policy / decision queue | no self-grant | can tighten, not widen hard limits |
 | Per-loop budget | soft, agent-owned | loop scheduler | yes, with rationale | n/a |
 | Tool choice, plan interpretation | agent | loop | yes | n/a |
@@ -3522,8 +3493,8 @@ Effect audit covers mediated effects: broker requests, model calls, capability-m
 type Reservation = {
   reservationId: ReservationId;
   loopId: LoopId;
-  effectClass: "model" | "broker" | "sandbox";
-  amount: number;              // max expected units; provider-specific
+  effectClass: "lane" | "ingest" | "search" | "chat" | "sandbox";
+  amount: number;              // lane-seconds, bytes, or query units
   state: "held" | "committed" | "released" | "expired";
   createdAt: UtcUs;
   expiresAt: UtcUs;
@@ -3535,180 +3506,72 @@ type Reservation = {
 Invariants:
 
 - `sum(held + committed)` MUST NEVER exceed the configured ceiling.
-- A model request reserves the maximum expected cost before the call; the response commits actual usage and releases the remainder.
+- A model call reserves lane-seconds before dispatch; the response commits actual usage and releases the remainder.
 - An interrupted effect with unknown usage leaves the reservation `held` until the audit path reconciles it or `expiresAt` passes.
-- A broker request reserves its request count before dialing.
+- A search query reserves one query unit and its character budget before the channel call.
+- An inbox batch reserves its bytes and batch count before the reader decrypts it; an over-quota batch is left in place and alerted, never partially applied.
+- CAS and state admission reserve expected bytes before a blob write or a record append.
 - A ceiling exhaustion produces `ceiling_blocked` and suspends the loop; it does not queue unbounded work.
 - A concurrency ceiling queues by loop priority and deadline; no busy waiting.
-- Human changes only by a new Nix generation or an approved operator configuration artifact. Agents cannot read or modify the ceiling object.
-- Approvals do not override hard limits. If an approved action would exceed a hard ceiling, violate a writable root, use a non-enrolled logical host, or lack audit, it fails. The agent may request a human configuration change; it MUST NOT reinterpret the ceiling as a soft budget.
-- Approval constraints can be overridden by the agent with a recorded rationale because they express delegated intent. Hard limits never use that override path.
+- Human changes only by a new image generation. Agents cannot read or modify the ceiling object.
+- Approvals do not override hard limits. If an approved action would exceed a hard ceiling, violate a writable root, use a non-manifest channel, or lack audit, it fails. The agent may request a human configuration change; it MUST NOT reinterpret the ceiling as a soft budget.
+- Approval constraints can be overridden by the agent with a recorded rationale because they express delegated intent. Hard limits never use that override path. Candidate approval never widens a hard limit.
 
 Failure behavior:
 
 | Condition | Behavior |
 |---|---|
-| Ceiling governor unavailable | Fail closed for new model/broker/sandbox effects; record `ceiling_unavailable` |
+| Ceiling governor unavailable | Fail closed for new lane, search, ingest, and sandbox effects; record `ceiling_unavailable` |
 | Ceiling exhausted | `ceiling_blocked`; suspend loop; alert; no new calls |
 | Reservation stuck | Expiry releases; audit reconciler resolves actual usage |
 | Soft budget exhausted | `soft_budget_exceeded`; agent may append an override with rationale; hard ceiling still checked |
 | Approval expired | New approval required for the bound plan hash |
+| Todo cap exceeded | `todo_cap_exceeded`; write denied; no partial write |
 
 Concrete values are mandatory operator configuration but remain deferred to `[SPIKE: LIM-1]`.
 
-#### 4.10.6 Credential broker
+#### 4.10.6 Channel policy and mediation
 
-The broker maps an enrolled logical hostname to a real endpoint, injects an enrolled credential, removes agent-supplied credential headers, and records a receipt. It is not an egress proxy, not a destination allowlist for general traffic, not an action-authorization layer, and not a provider-scope enforcer.
+The channel set is closed: adding a channel, port, or share is an image change through a human-merged commit, a Nix generation, and a new deployment.
 
-```ts
-type SecureEndpoint = {
-  scheme: "https";
-  host: string;
-  port: number;
-  addressPolicy:
-    | { mode: "resolve_once" }
-    | { mode: "pinned"; addresses: IpAddress[] };
-  allowPrivateAddresses: boolean;   // human enrollment decision
-  tls: { verify: true; serverName: string; minVersion: "1.2" };
-};
-
-type CredentialInjection =
-  | { kind: "header"; name: string; valueTemplate: string }   // e.g. "Bearer ${secret}"
-  | { kind: "query"; name: string; valueTemplate: string }    // redacted in logs
-  | { kind: "signer"; signerId: string };                     // frozen broker code
-
-type CredentialEnrollment = {
-  enrollmentId: EnrollmentId;
-  logicalHost: LogicalHost;
-  endpoint: SecureEndpoint;
-  secretRef: SecretRef;             // host secret path or system credential name, outside Kanbei state
-  injection: CredentialInjection;
-  providerScopes?: string[];        // human attestation / guidance, not enforced by broker
-  enrolledBy: HumanId;
-  authorityRecordId: RecordId;
-  enrolledAt: UtcUs;
-  notes?: string;                   // least-privilege guidance shown at enrollment
-};
-```
-
-`CredentialEnrollment` is immutable and carries no `status`. `pending/active/revoked` is `lifecycle_projection(family='enrollment', subject_id=enrollmentId)`. The broker looks up the projected state at its request basis; it never reads a stored status. A `Revocation` with `subject_kind="enrollment"` appends the `revoked` transition and takes effect for the next request in the same transaction.
-
-| From | Event | Actor | Guard | To |
+| Channel | Transport | Direction | Content | Enforcement |
 |---|---|---|---|---|
-| (none) | `enroll` | Human | HTTPS endpoint; secret resolvable; injection supported | `pending` or `active` |
-| `pending` | `activate` | Frozen append path | A supported injector now exists | `active` |
-| `pending` / `active` | `revoke` | Human or frozen security component | `Revocation` record; no in-flight rollback | `revoked` |
+| Inbox | virtiofs ro | in | age-encrypted source batches; Syncthing-encrypted phone folder | host writer owns the directory; reader decrypts in-VM and records batch, source, sequence, coverage |
+| Vault | virtiofs ro | in | `/var/lib/data/vault` | read-only; symlink refusal; observations only |
+| Todo | virtiofs capped rw | both | `/var/lib/data/todo/todo.txt` | per-write and per-mount byte cap; write receipts; no symlinks; human-only at rest |
+| Chat | vsock, in-VM TLS | both | JSON API | TLS in the VM; host relay is a TCP pipe under its own UID; schema per route |
+| CSR | vsock, schema-locked | out | fixed-CN CSR; certificate returns | one CN, one key algorithm, one SAN set |
+| Search | vsock, schema-capped | out/in | capped query JSON; stripped text back | length cap, rate limit, daily budget, DLP, judge; key lives in the Search VM |
+
+There is no credential broker in Kanbei. The pre-split broker existed to inject enrolled credentials into outbound requests; the VM has neither credentials nor outbound requests, so the broker has no work. Surviving mediation moved to where the credential already lives:
+
+- **Ingest VMs** hold one source's credentials on a read-only block device, parse that source's hostile input, and emit one age-encrypted batch per scan over vsock to the host writer. The writer validates shape, writes the batch atomically into the Inbox directory, never decrypts, and refuses over-quota writes with an alert.
+- **The Search VM** holds the only remote key, applies DLP and the judge before the call, applies provider limits as backpressure, strips the response to text, and logs every query root-only on the host. The Kanbei-side client cannot vary the request shape beyond `{query, limit}` and never holds the key.
+- **The host relay** forwards Chat bytes under its own UID and terminates nothing. TLS terminates in the VM.
 
 Rules:
 
-- Any credential MAY be enrolled; there is no provider allowlist.
-- Enrollment is a one-time human action and a canonical authority record. Agents MUST NOT create, modify, or revoke enrollments.
-- `secretRef` resolves outside `~/.local/state/kanbei/`; the broker reads it through the host secret mechanism. Secrets MUST NOT be placed in process environment or the Nix store.
-- HTTPS is required for credential injection. Credentialed plaintext HTTP is rejected at activation.
-- If no supported injector exists for the credential, enrollment remains `pending` with `unsupported_injection`; the broker MUST NOT silently pass the request without a credential.
-- `providerScopes` is guidance only. The broker cannot verify provider-side scope, and the enrollment UI MUST state that the agent can exercise the credential's full provider authority.
-- Least-privilege guidance is normative documentation: prefer dedicated non-admin provider credentials, minimal scopes, separate credentials per logical service, and a documented revocation path. It is not enforced.
-
-```ts
-type BrokerRequest = {
-  logicalHost: LogicalHost;
-  method: string;
-  path: string;                     // relative path only
-  headers: Array<[string, string]>; // agent-supplied; credential headers stripped
-  body?: Uint8Array;
-  idempotencyKey?: string;
-};
-
-type BrokerResponse = {
-  receiptId: ReceiptId;
-  status: number;
-  headers: Array<[string, string]>;
-  body: Uint8Array;
-  redaction: "full" | "partial" | "none";
-  truncated: boolean;
-};
-
-type BrokerOutcome =
-  | { kind: "response"; response: BrokerResponse }
-  | { kind: "denied"; reason: BrokerDenyReason }
-  | { kind: "outcome_unknown"; reason: BrokerDenyReason; receiptId: ReceiptId };
-```
-
-Processing order is part of the contract:
-
-1. Authenticate caller and generation.
-2. Reject absolute-form targets, mismatched `Host`, or ambiguous paths.
-3. Look up the `CredentialEnrollment` for `logicalHost` and require its lifecycle projection to be `active` at the current basis; a `pending` or `revoked` projection denies.
-4. Reserve broker rate/ceiling units.
-5. Ensure the audit sink is writable; append the attempt intent.
-6. Resolve the endpoint once, apply the pinned-address policy, reject disallowed private space unless explicitly enrolled, and connect to the checked address.
-7. Verify TLS with the enrolled `serverName`.
-8. Remove every client-supplied credential header (`authorization`, `proxy-authorization`, `cookie`, `x-api-key`, and spelling variants).
-9. Inject the enrolled credential exactly once.
-10. Send the request with redirects disabled.
-11. Buffer or stream the response through redaction.
-12. Append the receipt with observed status, byte counts, redaction coverage, and outcome.
-
-Steps 5 and 6 are fail-closed ordering: no secret is used before the audit intent exists, and no credential is sent before target verification.
-
-The agent never supplies a real hostname, IP address, SNI, or `Host` header. The broker owns all three. Name-to-address policy is `resolve_once` with the checked address dialed, or a human-pinned address set; this is the only verified rebinding pattern. DNS failure, a filtered address, a private address without `allowPrivateAddresses`, or a TLS verification failure is a denial, not a fallback to another address.
-
-TLS termination is the broker's price for header injection and response redaction. Upstreams requiring mTLS or certificate pinning cannot be mediated without forfeiting inspection; enrollment MUST mark them unsupported rather than silently bypassing injection.
-
-The broker does not inspect method, path, or payload for allow/deny. It records them for audit. A request to an enrolled host with a destructive provider method is injected if it is otherwise a valid HTTP request. The enrolled credential is effectively a credential oracle for that host, limited only by provider-side authorization. The broker still enforces target integrity: `Host`, SNI, and the enrolled endpoint must agree; agent-supplied `Host` is rejected or replaced; absolute URLs and ambiguous targets are refused. Those are not action policies.
-
-Redirect rules:
-
-- The broker never follows redirects. It returns the 3xx response to the caller.
-- A redirect to another host never receives the credential. The agent must issue a new broker request naming a logical host; that request is a fresh enrollment lookup and a fresh injection.
-- If the agent follows the redirect itself with a direct connection, that connection carries no broker credential and is not broker-audited.
-- A source configured with `capture.followRedirects=true` follows redirects only on the direct, uncredentialed transport path; it MUST NOT ask the broker to follow. The transport records the full chain and final locator in `CaptureEvidence.response.redirects`/`finalLocator`. A credential never travels on a redirect hop.
-- `Location` is redacted like any other response field; a `Location` containing an enrolled credential value never reaches the agent.
-
-Redaction applies to response headers and body; `Location` and other URL-bearing headers; error strings, stack traces, and denial reasons; broker logs and audit excerpts. The matcher replaces exact known credential values and common encodings (JSON-escaped, URL-encoded, percent-encoded, base64 where identifiable, HTML-escaped) with `[REDACTED:<enrollmentId>]`. Responses are buffered up to a configured byte cap. Beyond the cap, `redaction` is `partial` and `truncated: true`. If the redaction engine is unavailable, the broker returns status and headers only and records `redaction_unavailable`; it MUST NOT return an unredacted body.
-
-Redaction precedes canonical capture. The broker writes the post-redaction body and envelope to the CAS, records `redaction` and the optional pre-redaction commitment on the receipt, and only then returns redacted bytes to the caller. A `partial` redaction is not exact evidence and is marked as such.
-
-Logs never contain `authorization`, `proxy-authorization`, `cookie`, or `x-api-key` values. Request and response bodies are not logged by default; the audit record stores metadata and SHA-256 digests. Debug body logging, if enabled by a human, runs after redaction and still carries the partial-coverage residual. Response redaction cannot recover transformed, encrypted, compressed, or provider-echoed-in-a-new-encoding secrets. This is an explicit residual, not a guarantee.
-
-Broker failure behavior:
-
-| Condition | Behavior | Receipt |
-|---|---|---|
-| Caller unauthenticated / stale `startToken` | Deny before lookup | `denied: caller_unauthenticated` |
-| Unknown or inactive logical host | Deny; no DNS, no secret read | `denied: logical_host_unknown` / `enrollment_inactive` |
-| Secret unavailable | Deny; never fall back to env/file/passthrough | `denied: secret_unavailable` |
-| Audit sink unavailable | Deny before dialing | `denied: audit_unavailable` |
-| Ceiling/rate exhausted | Deny or queue per ceiling contract | `denied: ceiling_blocked` |
-| Endpoint resolution fails | Deny; no alternate resolver | `denied: endpoint_resolution_failed` |
-| Private address not enrolled | Deny | `denied: address_not_enrolled` |
-| TLS verification fails | Deny; do not downgrade | `denied: tls_verification_failed` |
-| Absolute-form or Host/SNI mismatch | Deny | `denied: ambiguous_request_target` |
-| Upstream returns 3xx | Return response; never follow | `response` with redacted body |
-| Broker crashes mid-dial | In-flight outcome unknown | `outcome_unknown` after restart |
-| Redaction engine unavailable | Return metadata only | `denied: redaction_unavailable` |
-| Broker process unavailable | Credentialed path fails; direct uncredentialed network unaffected | `denied: broker_unavailable` |
-
-No retry of an unknown non-idempotent effect. A retry is allowed only with the original idempotency key and a fresh reservation.
-
-Revocation and rotation:
-
-- Human revocation appends a `Revocation` and the enrollment's lifecycle projection becomes `revoked`; new requests are denied immediately. In-flight TCP may complete.
-- Secret rotation updates the secret source and reloads the broker; in-flight requests use the old value until drained.
-- Per-request revocation does not exist for static provider credentials. Revocation granularity is the enrollment or the provider token TTL. If a provider supports short-lived tokens, the human may enroll a short-TTL credential; the broker does not mint one.
-- The broker no longer holds a credential after revocation reload; memory zeroization is best-effort and not claimed against same-UID inspection.
+1. Inbox is one-way, immutable, and idempotent by digest; re-reading a batch never duplicates observations.
+2. Vault is read-only; Kanbei may cite it and may propose todo items, never write the vault.
+3. Todo writes fail at the cap with `todo_cap_exceeded` and are receipted; the mount never holds agent state, scratch, or bulk data.
+4. Chat is a JSON API with a fixed route list; there is no static file serving, no proxy route, and no upgrade to arbitrary bytes.
+5. CSR carries one fixed common name, one key algorithm, and one SAN set; anything else is refused before the CA is asked.
+6. Search queries are length-capped (~100 characters), rate-limited, budgeted daily, DLP-scanned (digit runs, emails, base64/hex, high-entropy tokens), and judged by a CPU Granite Guardian model against a smuggled-data criterion; any failure blocks the query.
+7. Search results are hostile input: observations, never authority, subject to the poisoning path.
+8. Failure is closed: a missing socket, undecryptable batch, schema violation, cap breach, or judge error denies and records. There is no fallback channel.
 
 #### 4.10.7 Effect audit
 
 ```ts
 type EffectAttempt = {
   effectId: EffectId;
-  requestId: RequestId;          // minted by the broker/supervisor, not the agent
-  kind: "broker_request" | "model_call" | "fs_write" | "process_spawn"
-      | "activation" | "enrollment" | "revocation" | "ceiling";
+  requestId: RequestId;          // minted by the channel host or supervisor, not the agent
+  kind: "inbox_batch" | "vault_read" | "todo_write" | "chat_request"
+      | "csr_request" | "search_query" | "model_call" | "process_spawn"
+      | "activation" | "ceiling";
   actor: ProcessIdentity;
   loopId?: LoopId;
-  subject: string;               // logical host, path, unit, enrollment
+  subject: string;               // batch digest, path, route, lane, candidate
   startedAt: UtcUs;
   idempotencyKey?: string;
   requestDigest: Sha256;
@@ -3720,107 +3583,74 @@ type EffectReceipt = EffectReceiptRecord;  // one canonical envelope (§4.7.5)
 interface EffectReceiptMetadata {
   bytesIn?: number;
   bytesOut?: number;
-  originalCommitment?: Digest;          // pre-redaction commitment; no secret retained by default
+  originalCommitment?: Digest;          // pre-redaction commitment; no secret retained
   redactionClasses?: string[];
 }
 ```
 
-`requestId` originates at authenticated ingress; client-supplied ids are ignored. `EffectReceipt` is the canonical `EffectReceiptRecord` from §4.7.5; it is appended through the frozen append API and participates in the ledger hash chain. It carries no separate `auditSeq` or `predecessorHash`; `seq` and the chain supply both. `observedAt` is the canonical `recorded_at_us`. Byte/redaction metadata is carried in the record's typed component.
+`requestId` originates at the channel host or supervisor; client-supplied ids are ignored. `EffectReceipt` is the canonical `EffectReceiptRecord` from §4.7.5, appended through the frozen append API and participating in the ledger hash chain.
 
 | Effect | Audited | Notes |
 |---|---|---|
-| Broker request/response | yes | attempt before dial; receipt after |
-| Model request/response | yes | exact available I/O, usage, cost |
-| Capability-mediated filesystem write | yes | path, digest, bytes |
+| Inbox batch read | yes | batch digest, source, sequence, bytes, coverage |
+| Vault read | yes | path class, digest, bytes |
+| Todo write | yes | path, digest, bytes, cap remaining |
+| Chat request/response | yes | route, request digest, response digest, bytes |
+| CSR request | yes | CN, key algorithm, SAN set, issuance result |
+| Search query/result | yes | query digest, length, DLP verdict, judge verdict, result digest |
+| Local model call | yes | lane, exact post-redaction I/O, usage, latency |
 | Capability-mediated process spawn | yes | argv class, exit, duration |
-| Activation/rollback | yes | candidate, capability diff, pointer flip |
-| Enrollment/revocation | yes | authority record link |
+| Activation/rollback | yes | candidate, capability diff, pointer flip, approval receipt |
 | Ceiling block/reset | yes | ceiling generation and reason |
-| Direct raw socket / direct syscall | no | residual R-1 |
-| Hidden provider chain-of-thought | no | not promised |
+| Direct syscall inside the VM | no | cannot leave the VM; §4.10.4 |
+| Hidden model reasoning | no | not promised |
 
 The audit sink is outside agent-writable roots and is append-only from the frozen process's perspective. If the sink cannot record an audited effect, the effect MUST be denied. This follows the blocking-audit pattern and the zero-tolerance gate for missing required provenance.
 
 Verification points:
 
-- An agent cannot mint or alter a `requestId` that the broker accepts.
-- A denied request produces an attempt and a denial receipt, not only a log line.
-- A broker crash leaves `outcome_unknown`, not a fabricated success.
-- Replaying a recorded effect never opens a new socket.
-- Redaction coverage is recorded per receipt; unredacted bodies are never returned when the redaction engine is down.
+- An agent cannot mint or alter a `requestId` that a channel host accepts.
+- A denied operation produces an attempt and a denial receipt, not only a log line.
+- A channel host crash leaves `outcome_unknown`, not a fabricated success.
+- Replaying a recorded effect never opens a socket and never re-reads a batch for effect.
+- The VM's interface list, resolver configuration, and mount table match the manifest at start and on every watchdog probe.
 
 #### 4.10.8 Deployment, ingress, watchdog, and backup
 
 | ID | Deployment invariant |
 |---|---|
-| D-1 | Trusted code and the frozen trust root are Nix-built and immutable at runtime. |
-| D-2 | Mutable code lives under `~/.local/state/kanbei/` and is activated by pointer flip, never by editing the Nix store. |
-| D-3 | Secret material lives outside `~/.local/state/kanbei/` and is readable only by the broker identity the deployment actually provides. |
+| D-1 | The image, including the frozen trust root, static UI, and model weights, is Nix-built from the flake-pinned `smores56/kanbei` commit and immutable at runtime. |
+| D-2 | Mutable code lives under `/var/lib/kanbei/` and is activated by pointer flip; executable candidates require a human approval receipt. |
+| D-3 | The VM holds no secret material. Host artifacts are root-only. |
 | D-4 | The audit sink and canonical ledger are not agent-writable. |
-| D-5 | The watchdog is outside the agent process tree and cannot be disabled by mutable code. |
-| D-6 | The UI binds `127.0.0.1` only and is exposed through the existing tunnel/Access conventions. |
-| D-7 | Backup covers `~/.local/state/kanbei/` and verifies the ledger hash checkpoint and CAS references on restore. |
-| D-8 | A Nix generation is recorded as a `kernel_generation` receipt appended by the frozen startup verifier; version drift is alerted. |
+| D-5 | The watchdog has an in-VM probe and a host-side liveness and freshness probe; neither is mutable. |
+| D-6 | The UI binds loopback in the VM and is reached only through the host relay and the WARP private hostname route. |
+| D-7 | Backup is an encrypted image snapshot; restore verifies the ledger checkpoint, every CAS reference, and the derived-index rebuild. |
+| D-8 | The kernel generation is recorded as a `kernel_generation` receipt by the frozen startup verifier; host and image drift is alerted. |
+| D-9 | The guest disk is LUKS sealed to a per-VM swtpm vTPM; the seal's binding is recorded by `[SPIKE: LUKS-1]`; the recovery key is offline. |
 
-The deployment plane is deferred to `[SPIKE: DEP-1]`. The spike must decide between pure user-space and a dedicated-UID broker/sandbox helper; this specification does not. A pure user-space model is desirable but cannot be assumed to protect broker secrets from same-UID malicious code.
+The plane is fixed: one qemu microVM under microvm.nix, 8 GB, no NIC, 3090 by VFIO, in-guest LUKS. The host runs no NVIDIA driver, and every Kanbei-side host artifact is root-only. The pre-split deployment alternatives and the broker-identity matrix are retired (`04 §8.7`).
 
-| Alternative | Process identities | Update / restart | Alerting | Secret protection | Status |
-|---|---|---|---|---|---|
-| A. Home-manager user unit, pure user-space | All components under the deployment user in a lingering user manager | Only home-manager switch updates/restarts the unit; a system rebuild alone does not | Journal-only unless a user-side notifier is built | Same-UID agents may inspect broker memory | Candidate |
-| B. NixOS-plane user unit | Units in the system user manager, still one UID | System rebuild can restart user units | Still user-manager alerting limits | Same one-UID exposure | Candidate |
-| C. Dedicated system unit(s) | Trusted components as dedicated system users | Manual switch; no automatic upgrade | System failure alerting and documented start-limit discipline | Broker UID distinct from agent UID; kernel-enforced peer identity possible | Strongest identity separation; not user-controlled |
-| D. Hybrid user-space core plus dedicated-UID broker/sandbox helper | Core and agents under the user; broker and/or supervisor as a dedicated system user | Mixed user and system update paths | Helper can use system alerting; core remains journal-only unless a notifier is built | Broker secrets protected from user agents if helper UID and secret path are correct | Candidate |
+Code entry and updates:
 
-The spike must also test whether the sandbox runs as the dedicated helper's UID, a separate sandbox UID, or the user with only the broker separated. Those have different file-ownership consequences for project roots and `~/.local/state/kanbei/`.
-
-Nix-owned trusted updates:
-
-- Trusted code is delivered by the Nix generation. No automatic system upgrade is assumed; deployment is manual.
-- A home-manager-managed user unit is updated or restarted only by a home-manager switch; a system rebuild performs only a daemon-reload for running user services.
-- Rollback is a home-manager or system switch rollback; the rollback horizon is bounded by the Nix garbage-collection window.
-- The frozen trust root changes only by a human-approved Nix generation. Agents may propose a candidate; the activation supervisor cannot activate a frozen-root change from mutable state.
-- Roll back code only when existing data remains readable. Otherwise roll forward or branch from a verified checkpoint. No destructive automatic down migration.
-- Startup records the Nix generation as a `kernel_generation` authority record appended by the frozen startup verifier (not the activation supervisor, which owns `activation_receipt`), and verifies that core, broker, and supervisor are running from expected store paths. Mutable-code activation records a separate `activation_receipt`.
-- The watchdog alerts on generation drift between the unit definition, the running core, and the recorded generation.
+- Code enters only through a human-merged commit pinned in nix-config's `flake.lock`; the image build fails if the pin is missing or dirty. No development worktree is mounted.
+- No automatic upgrade exists; deployment is a human host rebuild that rebuilds the image and restarts the VM.
+- Rollback is a host generation rollback to a previous pinned commit, allowed only when the data remains readable. No destructive automatic down migration.
+- Startup records the pinned commit, image digest, and Nix generation as a `kernel_generation` receipt and verifies the running components come from the image.
 
 Ingress:
 
-- The UI binds `127.0.0.1:<port>`. A shared port needs an explicit port allocation.
-- Public ingress is the existing Cloudflare Tunnel convention; there is no additional nginx/caddy/traefik system service.
-- TLS terminates at the Cloudflare edge; DNS and Access policies are OpenTofu-owned.
-- Adding Kanbei to Access requires the subdomain in the protected list, a matching application, and a manual-step anchor. Evaluation fails otherwise; this is enforced, not advisory.
-- Access is a human identity gate, not agent authentication. Unattended clients needing service-auth tokens are unresolved: `[SPIKE: ING-1]`.
-- Authority endpoints MUST require a verified Cloudflare Access identity or an explicitly spiked local equivalent, even on loopback. A request that appears on loopback is not human consent.
-- Approval evidence and rulings are rendered and submitted only by the frozen consent surface and its gesture endpoint (§4.1.2); the mutable world UI may deep-link to it and MUST NOT supply evidence, scope text, or `consentDigest`.
-- The UI remains a mutable presentation component behind Access; it does not gain broker secrets or ledger write authority by being exposed.
+- The static UI binds `127.0.0.1:<port>`; the host relay forwards the API and serves nothing else.
+- `kanbei.sammohr.dev` is a Cloudflare private hostname route reachable only from WARP clients; Gateway TLS decryption stays off and the Cloudflare root CA is never installed.
+- TLS terminates in the VM; the relay is a TCP pipe under its own UID; the host tunnel is human-owned and separate from the cluster tunnel.
+- Kanbei authenticates with the Access identity and posture plus an in-VM passkey; `[SPIKE: ING-1]` confirms Access still gates the route without TLS decryption.
+- Authority endpoints require the verified Access identity and the passkey even on loopback; loopback is not consent.
+- Approval evidence and rulings are rendered and submitted only by the frozen consent surface; the static shell cannot supply evidence, scope text, or `consentDigest`.
+- A CAA record with `accounturi` limits issuance; the CSR channel is the only renewal path.
 
-The watchdog is a separate process or unit outside the agent process tree. It probes core append/sequencer liveness; broker availability and audit-sink writability; sandbox supervisor liveness and active-sandbox count; UI loopback response; disk free space and inode headroom for ledger/CAS; age of the last successful backup; and generation drift. It restarts failed components with bounded start limits, kills orphaned sandboxes and records receipts, suppresses duplicate alerts, and never includes credential values, request bodies, or unredacted response data in alerts. A user unit is journal-only unless a user-side notifier is built; only a system unit can use the existing system alerting path. That is part of `[SPIKE: DEP-1]`, not silently assumed.
+Watchdog and freshness: the in-VM watchdog probes core and sequencer liveness, channel hosts and audit writability, supervisor and sandbox count, lane availability and KV health, UI response and CSP headers, Todo headroom and CAS/state growth, and the last successful snapshot. The host probe covers VM liveness, the relay, vsock sockets, swtpm, and source freshness. A source past its window is labelled stale in the UI and raises a host alert. The watchdog restarts failed components with bounded limits, kills orphaned sandboxes, suppresses duplicate alerts, and never includes content or query text.
 
-Backup integration:
-
-- All mutable Kanbei state is under `~/.local/state/kanbei/`; trusted Nix configuration and secret material remain outside it.
-- The existing backup configuration MUST add the Kanbei path when implementation lands.
-- The backup process may read the user-owned state tree without moving it to a system data directory.
-- The backup protocol in §4.3.4 is normative.
-- Exclude scratch, sockets, live WAL, broker memory, and all secret material.
-- The exact backup hook wiring is `[SPIKE: BAK-1]`; the snapshot/CAS/GC ordering is not deferred.
-- The watchdog alerts when the last successful backup exceeds its threshold.
-
-Host security spike `[SPIKE: DEP-1]` MUST run on the target host, read-only where possible, and produce an enforcement matrix, not a preference statement:
-
-| Probe | Method | Pass / decision evidence |
-|---|---|---|
-| User namespaces | `sysctl user.max_user_namespaces`, the NixOS option, start a namespaced user unit | If unavailable, namespaced user units fail to start; pure user-space cannot claim filesystem/network isolation |
-| Same-UID process inspection | Can an agent `PTRACE_ATTACH`, read `/proc/<pid>/mem`, `/proc/<pid>/environ`, fds, and signal core/broker/sibling? | If yes, broker secrets and hard ceilings are not protected against same-UID code; pure user-space residual must be accepted or a helper chosen |
-| Landlock | Filesystem restrictions, pre-opened fds, port-only network rules, ABI availability | Record which paths and ports are actually enforced |
-| systemd user-manager directives | `ProtectHome=read-only` plus writable `$HOME` state and `$XDG_RUNTIME_DIR`; `PrivateNetwork=` fail-open behavior; `MemoryMax`, `CPUQuota`, `TasksMax`; `IOWeight` absence | Record the exact working set; detect "proceeding without" and fail closed |
-| Broker identity | Unix-socket peer credentials under same UID versus dedicated UID; token theft; socket file permissions; cgroup check | Determines whether S-3/S-6 are kernel-enforced or conventional |
-| Resource controls | cgroup v2 memory/pids/CPU limits, OOM victim, kill semantics, nested delegations | Hard ceilings are only "hard" if cgroup controls are enforceable |
-| Recovery | Core crash, broker crash, supervisor crash, host reboot, orphan sandbox, ledger writer recovery, backup/restore | No orphan survives; interrupted effects become `outcome_unknown`; restore verifies references |
-| Network and audit | Raw sockets, UDP/QUIC, loopback reachability to UI/ledger/broker, audit-sink write attempts | Records the actual audit gap and loopback exposure |
-| Secret reachability | Can the agent read sops secrets, credential directories, broker memory, or `/proc`? | Determines whether secret isolation is kernel-enforced or residual |
-
----
+Backup: the core produces an online SQLite snapshot and verifies its checkpoint; the host snapshots the frozen image, copies the ciphertext to `/var/backup` and R2, and records the image digest and checkpoint in the manifest. swtpm state is excluded. Restore reimages, unlocks with the vTPM or the recovery key, verifies every reference, and rebuilds derived indexes before serving reads. A checkpoint mismatch refuses; an overdue backup alerts. The exact quiesce mechanics are `[SPIKE: IMG-1]`; the ordering is not deferred.
 
 ### 4.11 Ingestion, interface, and multimodal state
 
@@ -3835,11 +3665,67 @@ Host security spike `[SPIKE: DEP-1]` MUST run on the target host, read-only wher
 7. **Retracted content is never presented as current.** Stale, pending, unknown, and conflicted state is visible next to the value, not hidden behind an unqualified "last updated" label.
 8. **Canonical events and graph semantics stay internal.** AG-UI, A2UI, and MCP Apps are adapters and transport surfaces, not domain authorities.
 9. **Plugin artifacts are untrusted.** They receive no credentials, no canonical append access, and no ambient network beyond their declared sandbox policy.
-10. **Human authority is authenticated human authority.** A request that appears on loopback is not human consent. Authority endpoints require a verified Cloudflare Access identity or an explicitly spiked local equivalent.
+10. **Human authority is authenticated human authority.** A request that appears on loopback is not human consent. Authority endpoints require the verified Access identity plus the in-VM passkey.
+11. **Ingest is one-way.** Batches are written by the host writer into a read-only mount; the VM cannot write the Inbox, and no source credential is present in the VM.
+12. **Every source has a freshness heartbeat.** A source with no recent batch is labelled stale and alerted; absence is never presented as current.
+13. **Kanbei writes nothing outside Todo.** No repository, vault, or host path is writable from the VM, so external clobber has no path.
 
-#### 4.11.2 Closed source model and adapters
+#### 4.11.2 Ingest batch contract, freshness, and Git as material
 
-The vertical slice has a closed adapter set: Git, HTTP resource, web search, and local filesystem. There is no arbitrary source onboarding. A source is configured by a human and has a stable identity.
+Kanbei does not fetch. Each origin has an ingest VM that holds that origin's credentials, parses its hostile input first, and writes one immutable age-encrypted batch. The batch contract is the whole adapter surface Kanbei sees; the adapter code lives in the ingest VM.
+
+```ts
+type OriginId = "tuta-mail" | "tuta-calendar" | "finance" | "brave" | "immich"
+              | "phone" | "cluster-digest" | "git";
+
+type IngestEntry = {
+  resourceKey: string;           // stable logical key within the origin
+  kind: "capture" | "missing" | "git.ref" | "git.commit" | "git.rewrite";
+  locator: string;               // URL, path, ref, or commit locator
+  capturedAt: Iso;
+  sourceTime?: { value: Iso; precision: "instant" | "day" | "estimate" };
+  mediaType?: string;
+  body: Digest;                  // content-addressed object inside the batch envelope
+  native?: Digest;               // provider-native payload, preserved opaquely
+  evidence: CaptureEvidence;
+};
+
+type IngestBatchManifest = {
+  origin: OriginId;
+  sequence: number;              // strictly increasing per origin, no gaps
+  producedAt: Iso;
+  scan: { mode: "event" | "full" | "targeted"; scopeHash: Sha256; startedAt: Iso; completedAt: Iso };
+  entries: IngestEntry[];
+  coverage: ScanCoverage;
+  suppressed: number;            // entries dropped by DLP or a source limit; never silent
+  encryption: { scheme: "age"; recipient: string };   // Kanbei's public key
+  batchDigest: Digest;           // over the canonical manifest and entry digests
+};
+```
+
+Rules:
+
+1. **One-way, immutable, idempotent.** The host writer writes each batch atomically under an immutable name into the Inbox directory, which the VM mounts read-only. Re-reading a batch is idempotent by `batchDigest`; a duplicate never produces a second observation.
+2. **Ordered per origin with gap detection.** The reader accepts `(origin, sequence)` in order. A gap is recorded as a coverage gap and alerted; it never silently skips.
+3. **Coverage before observations.** The reader validates the manifest, decrypts with the in-VM age identity (sealed on the LUKS volume), publishes entry bodies to the CAS, appends one coverage receipt, and only then makes observations visible.
+4. **Suppression is visible.** `suppressed > 0` records a coverage gap with the reason class, so a filtered entry is never mistaken for absence.
+5. **No credential crosses.** A batch contains no credential, no session token, and no source-side secret. A batch that does is rejected and alerted as a security event.
+6. **Freshness heartbeat.** Each accepted batch appends a `SourceHeartbeat` with `origin`, last `sequence`, `producedAt`, `receivedAt`, and coverage. Staleness is derived from the heartbeat against the operator window (`[SPIKE: FRESH-1]`), labelled in the UI, and alerted by the host probe when expired. A source with no heartbeat is `unknown`, never `current`.
+
+```ts
+type SourceHeartbeat = {
+  origin: OriginId;
+  sequence: number;
+  producedAt: Iso;
+  receivedAt: Iso;
+  coverage: { complete: boolean; gaps: number; suppressed: number };
+  state: "current" | "stale" | "unknown";
+};
+```
+
+**Git as material.** A Git origin's batch carries `git.ref`, `git.commit`, and `git.rewrite` entries plus content digests for changed blobs. The checkout, the fetch, and the credential live in the Git ingest VM; Kanbei receives material and records it as observations. Because no repository is mounted read-write in Kanbei and no capability can write one, a silent external clobber is structurally impossible: divergence is computed against recorded refs, and the no-clobber gate remains for Todo writes and for ledger-level basis checks. External commits are observations, never approvals.
+
+The ingest VM's own adapter contract stays closed: `git`, `http`, `search`, and `fs`, with the source definition below. Each adapter returns drafts and evidence; the ingest VM encrypts them into a batch and never writes canonical storage.
 
 ```ts
 type SourceId = string; // stable, human-assigned
@@ -3852,45 +3738,28 @@ type SourceScope =
 
 type SourceDefinition = {
   sourceId: SourceId;
+  origin: OriginId;
   adapter: SourceScope["kind"];
   scope: SourceScope;
   triggers: Array<"event" | "full" | "manual">;
-  fullScanIntervalSec: number; // operator configuration
-  missingGraceScans: number;   // default 2; tuning deferred
-  capture: {
-    maxBytes: number;
-    mediaTypes: string[];
-    followRedirects: boolean;
-    renderDynamicPages: boolean;
-    screenshot: boolean;
-    accessibilityTree: boolean;
-    ocr: boolean;
-    pdf: boolean;
-    audioVideo: boolean;
-  };
-  services: string[]; // broker logical-service names, never raw credentials
+  fullScanIntervalSec: number;   // operator configuration
+  missingGraceScans: number;     // default 2; tuning deferred
+  capture: { maxBytes: number; mediaTypes: string[]; followRedirects: boolean; renderDynamicPages: boolean; screenshot: boolean; accessibilityTree: boolean; ocr: boolean; pdf: boolean; audioVideo: boolean };
+  egressAllowlist: string[];     // this VM's only egress; enforced by the host proxy and resolver
   enabled: boolean;
 };
 
 interface SourceAdapter {
   readonly kind: SourceScope["kind"];
   readonly version: string;
-
-  capabilities(scope: SourceScope): {
-    eventDriven: boolean;
-    conditionalFetch: boolean;
-    fullEnumeration: boolean;
-    pagination?: { maxPage?: number; maxItems?: number };
-    mediaTypes: string[];
-  };
-
+  capabilities(scope: SourceScope): { eventDriven: boolean; conditionalFetch: boolean; fullEnumeration: boolean; pagination?: { maxPage?: number; maxItems?: number }; mediaTypes: string[] };
   scan(request: ScanRequest): Promise<ScanBatch>;
 }
 ```
 
-Adapters are producers, not writers. They return drafts and evidence. The host publishes blobs, appends observations, appends one coverage receipt, and only then advances the checkpoint. Adapters never open canonical storage.
-
 #### 4.11.3 Observation, coverage, and scan state
+
+These shapes are produced inside the ingest VM and carried verbatim in the batch; the reader validates them and never re-scans.
 
 ```ts
 type ObservationKind =
@@ -4009,7 +3878,7 @@ type SourceCheckpoint = {
 };
 ```
 
-Checkpoints are host-owned operational state, not canonical truth. Losing a checkpoint forces a full scan; it does not lose observations.
+Checkpoints are ingest-VM operational state, not canonical truth, and they live with the source rather than in Kanbei. Losing one forces a full scan; it does not lose observations. Kanbei-side re-ingest is idempotent by `batchDigest` and by the observation keys below.
 
 Idempotency keys:
 
@@ -4050,12 +3919,12 @@ type ScanError = {
 - A permanently unsupported resource is marked `unsupported` in coverage and the scan advances with a gap, so one bad resource cannot wedge a source.
 - Provider quota exhaustion pauses the source and preserves the cursor. The UI displays `pending` and the last successful coverage, never a fabricated "current" state.
 - An unavailable source is `unknown`, not empty. `unknown` is rendered distinctly from zero and from stale.
-- Redirects are captured with the chain and final locator. Broker-mediated requests never forward credentials across hosts or redirects. Non-HTTP(S) schemes are rejected by the shared scanner.
+- Redirects are captured with the chain and final locator. A credential never travels on a redirect: each ingest VM holds only its own source's credential and never forwards one. Non-HTTP(S) schemes are rejected by the shared scanner.
 - Source-supplied times are preserved separately. Clock skew never reorders canonical recording or rewrites capture time.
 
 #### 4.11.6 Git and external commit handling
 
-Git is an adapter and review surface, not the world database.
+Git material arrives as batch entries and is a review surface, not the world database. Kanbei never holds a working tree and never fetches.
 
 ```ts
 type GitCheckpoint = {
@@ -4091,22 +3960,37 @@ Behavior:
 1. **New commits are captured individually.** A push is not one opaque event. Each commit records parents, tree, author/committer times, message digest, changed paths, and changed blob digests. Raw commit and blob bytes are captured; a range bundle MAY be captured as a supplementary artifact. The exact bundle format is deferred.
 2. **Ref changes are observations.** `forced` is true when `oldSha` is not an ancestor of `newSha`. A force-push or history rewrite appends `git.rewrite` and retains every prior commit observation. Prior observations are never deleted or declared invalid merely because the ref moved.
 3. **Local worktree changes are optional observations.** If enabled, dirty files and their digests are captured. The scanner never stages, commits, rebases, or resets. Agent writes are effects with receipts; external human edits are observations. Neither implies the other.
-4. **Remote changes require a fetch effect.** A configured remote fetch is a capability-mediated external read with its own receipt. The adapter observes the resulting refs; it does not assume a network push notification exists.
+4. **Remote changes require a fetch inside the Git ingest VM.** A configured remote fetch is an effect in that VM with its own receipt; Kanbei observes the resulting refs in a later batch and does not assume a push notification exists.
 5. **Conflict assessment is explicit.** `decision-required` applies when an external change touches a path cited by an interpretation, plan, approval scope, acceptance criterion, or in-flight speculative branch, or when a rewrite abandons a commit cited by an approval. Otherwise the change is reconciled autonomously: update the observed base, mark dependent projections stale, and schedule re-derivation. An approval whose basis hash no longer matches is marked `basis-stale`; it is not silently re-bound. The human may re-approve.
 6. **No silent clobber.** Any write through a capability to a project path checks the observed digest or commit against the expected basis. A mismatch refuses the write and appends a `clobber_refused` receipt. If the mismatch is consequential, it also creates a conflict decision. This is a zero-tolerance gate.
 7. **External commits are not approvals.** Commit authorship, messages, and merge actions are observations. They never amend intent or authorize a previously approval-required branch.
 
-#### 4.11.7 Stable web shell and interface adapters
+#### 4.11.7 Static CSP shell and interface adapters
 
-The interface is a stable web shell with coordinated graph, delta timeline, and global decision views. Agents choose or generate contextual visualizations and chat inside that shell. No TUI is built in the vertical slice; projections and catalogs remain renderer-neutral.
+The human interface is a static, human-owned bundle built by Nix from the flake-pinned commit. It is not mutable code: agents cannot add script, styles from a remote origin, frames, or new network origins. Agents may change the declarative data it renders — view catalogs, graph selections, timeline filters, chat, themes, and settings — none of which can introduce an origin or an executable.
+
+The CSP is a contract, enforced by response header and by an asserted test:
+
+```
+default-src 'none';
+script-src 'self';
+style-src 'self';
+img-src 'self' data:;
+connect-src 'self';
+form-action 'self';
+frame-ancestors 'none';
+base-uri 'none';
+```
 
 Stability is a contract, not an implementation accident:
 
 - fixed routes for graph, delta timeline, and decision queue;
 - fixed anchors that let agents and renderers address the same objects;
 - a fixed action vocabulary for curation gestures and decisions;
-- presentation, themes, and contextual components MAY change through candidate activation;
-- removing an anchor or a decision affordance fails candidate health checks.
+- view data, themes, and contextual components MAY change through declarative activation;
+- removing an anchor, a decision affordance, or the consent link fails validation.
+
+`ZT-16` proves the shell makes no request: a planted `![](https://example.invalid/x.png)`, a planted `<a href>`, a CSS `url()`, an injected iframe, and a markdown autolink in model text produce zero network requests and zero navigations. Model text renders as text nodes; there is no HTML injection path and no auto-linking. A `data:` image is the only embedded resource.
 
 The canonical event and graph semantics stay internal. The presentation stack has four layers:
 
@@ -4114,24 +3998,23 @@ The canonical event and graph semantics stay internal. The presentation stack ha
 |---|---|---|
 | Event/run protocol | AG-UI | Adapt runs to AG-UI; canonical events remain internal. |
 | Declarative UI payload | A2UI catalog | Render ordinary catalogs; graph topology lives in the A2UI data model consumed by custom `kanbei.graph` components. |
-| Renderer registry | Host-owned catalog and component registry | Resolve only declared components; no arbitrary code in a catalog. |
-| Sandboxed artifact | MCP Apps-compatible boundary | Isolate arbitrary plugin artifacts; no credentials, no canonical access. |
+| Renderer registry | Host-owned catalog and component registry | Resolve only image-declared components; no arbitrary code in a catalog. |
+| Artifact view | CSP-locked sandboxed region | Arbitrary artifacts render inside the shell with no remote references and no credentials. |
 
 Interface contract resolutions:
 
 | Issue | Resolution |
 |---|---|
-| A2UI specification site says v1.0 is current while the repository describes v1.0 as a release candidate. | Pin the exact A2UI specification commit and catalog version. The adapter declares the version it emits and never silently downgrades. Exact pin is `[SPIKE: UI-1]`. |
+| A2UI specification site says v1.0 is current while the repository describes v1.0 as a release candidate. | Pin the exact A2UI specification commit and catalog version in the image. The adapter declares the version it emits and never silently downgrades. Exact pin is `[SPIKE: UI-1]`. |
 | A2UI is a tree of components while Kanbei's primary object is an arbitrary graph. | Graph topology lives in the A2UI data model consumed by custom `kanbei.graph` components. The component tree is not the graph model. |
 | AG-UI requires one `resume` to cover every open interrupt and forbids partial resumes, while the product needs individual rulings. | Canonical rulings are independent records. A run opens at most one interrupt group; individual rulings inside the group leave the run interrupted until the group is terminal. Multi-decision groups are `[SPIKE: UI-2]`. |
-| The web shell must be stable while UI is live-mutable. | Stability is the fixed-route/anchor/action contract; themes and contextual components activate through candidates; health checks reject anchor removal. |
+| The web shell must be stable while view data is live-mutable. | Stability is the fixed-route/anchor/action contract; themes and catalogs activate declaratively; validation rejects anchor removal. |
 | Views own presentation but human interactions become records. | Judgment gestures append canonical human-authority records. Passive navigation, expansion, and filtering append presentation events only, usable for replay but not authority. |
-| TinyFish Fetch rejects images. | Search/fetch is capability-based. TinyFish is the search provider and a fetch transport; image, PDF, audio, video, and screenshot capture may use another broker-mediated transport, recorded explicitly. Transport selection is `[SPIKE: NET-1]`. |
-| MCP Apps defers state persistence and cross-view communication. | MCP App view state is ephemeral. Durable plugin state uses a scoped store behind host-mediated tools. Live server push into an open view is not assumed; polling or tool-result delivery is the baseline. |
-| The UI binds loopback, but Cloudflare Access only gates ingress. | Authority endpoints require a verified Access JWT even on loopback. Local access without an Access session is read-only unless a local human-auth mechanism is spiked. |
-| External changes in a code-generation host are sometimes handled by "do not push during generation." | Kanbei records external commits immediately and reconciles concurrently; conflicts that change interpretation, acceptance, or prior decisions surface as decisions. |
+| Search returns text and locators only. | There is no image or PDF fetch channel. Content arrives through an ingest batch; the shell never loads a remote resource. |
+| The UI binds loopback inside the VM behind the relay and the WARP route. | Authority endpoints require the verified Access identity plus the in-VM passkey even on loopback; loopback is not consent. |
+| External changes arrive as batch material. | Kanbei has no working tree and cannot push. It records commits and refs as observations, reconciles non-conflicting ones, and escalates interpretation, acceptance, or decision changes. |
 
-Human graph edits are curation gestures that append merge, split, link, scope, correction, retraction, and promotion records. The mutable UI renders the graph and timeline; approval evidence and rulings are displayed and submitted only by the frozen minimal consent surface, which is independent of the world UI. Agents receive the same versioned structured view specifications as renderers, plus derived screenshots and accessibility trees when useful. A screenshot or accessibility tree MUST be tied to the exact view revision it depicts and MUST NOT substitute for the specification.
+Human graph edits are curation gestures that append merge, split, link, scope, correction, retraction, and promotion records. The shell renders the graph and timeline; approval evidence and rulings are displayed and submitted only by the frozen consent surface, which is independent of the shell's data views. Agents receive the same versioned structured view specifications as renderers. A screenshot or accessibility tree MUST be tied to the exact view revision, catalog version, and basis it was derived from.
 
 #### 4.11.8 Multimodal artifacts
 
@@ -4156,7 +4039,7 @@ Human graph edits are curation gestures that append merge, split, link, scope, c
 | Change-first world repository | Git/JJ commits, branches, merges, generation diffs | Review, external changes, nested work, and self-modification use one familiar mechanism | VCS is not a temporal, query, or memory engine; progress noise can destroy reviewability | Coding would be easier, but semantic memory is weighted equally and cannot become thin. Git remains an adapter. |
 | Convergence-first desired-state reconciler | Accepted desired state plus observed state and generation cursors | Directly automates movement from current world to intended world | Free-form intent does not naturally become contracts; green probes can certify the wrong goal | Desired/observed is a supporting projection. Formal contracts are not required for every goal. |
 | Attention-first decision console | Decision requests, rulings, precedents, review scheduling | Optimizes the scarce human resource and concurrent steering | World state and memory become supporting views; self-modification lacks an authority model | The interface cannot be optimized before its rulings have meaning. Attention is a projection. |
-| Boundary-first observation plane | Raw captures, capability warrants, effect budgets, broker receipts | Strongest answer to prompt-injected arbitrary code and secret containment | Custom broker/cache/sandbox work can become the product; intent and judgment remain under-specified | Security is cross-cutting and must be strong, but it is not the product's organizing center. |
+| Boundary-first observation plane | Raw captures, capability warrants, effect budgets, channel receipts | Strongest answer to prompt-injected arbitrary code and secret containment | Custom channel host per VM is heavy; the split adopts the VM-plus-channels form without the full observation-plane architecture |
 
 ### 5.2 State substrate
 
@@ -4217,7 +4100,7 @@ No surveyed system provides calibrated confidence or reversible entity split. Ka
 - **Pyodide, RestrictedPython, `node:vm`, `isolated-vm`, `rbash` as security boundaries.** Explicitly disclaimed by their own documentation; usable only as speed bumps.
 - **WASM determinism.** Only fuel-based interruption is deterministic; epoch-based interruption is not.
 
-The language and Node-versus-Deno choices are deferred to the fair bake-off in §4.9.5.
+Both language and runtime are fixed (§4.9.5): Monty for agent-authored code and Deno for the control plane. The bake-off is retired because one fixed model and one fixed deployment leave nothing for it to select.
 
 ### 5.7 Interface and blob storage
 
@@ -4231,12 +4114,13 @@ The language and Node-versus-Deno choices are deferred to the fair bake-off in �
 ### 5.8 Security and deployment
 
 - **bwrap + Landlock + seccomp + netns, gVisor, Firecracker, WASM/WASI, systemd hardening.** Confinement families differ materially. Kanbei requires an OS sandbox and defers the lightweight inter-agent mechanism; a container per agent is excluded.
-- **Egress proxies and allowlists.** They cannot prevent exfiltration when outbound network is deliberately unrestricted. The broker is a credential-injection path, not an egress choke point.
+- **Egress proxies and allowlists.** They cannot prevent exfiltration when a network path exists. Kanbei's answer is the absence of a NIC and a closed channel set, not a filter.
 - **Vault/OpenBao dynamic leases, SPIFFE/SPIRE, systemd credentials, SOPS, Sigstore.** Useful components, but no surveyed OSS component provides per-request revocation or approval quorum bound to one effect. Kanbei uses a custom logical-host broker and documents the residual.
-- **Policy engines (OPA/Cedar/OpenFGA).** They decide but do not enforce. Kanbei keeps enforcement in the frozen append, broker, supervisor, and ceiling paths.
+- **Policy engines (OPA/Cedar/OpenFGA).** They decide but do not enforce. Kanbei keeps enforcement in the frozen append, channel host, supervisor, and ceiling paths.
 - **Prompt-on-every-action.** Contradicts the YOLO-with-boundaries requirement and causes approval fatigue.
 
 ---
+
 
 ## 6. Risks and accepted residuals
 
@@ -4244,37 +4128,45 @@ The language and Node-versus-Deno choices are deferred to the fair bake-off in �
 
 | Risk | Impact | Mitigation | Residual |
 |---|---|---|---|
-| Malicious readable code exfiltrates project data | Confidentiality loss | Accepted unrestricted egress; audit and attribution only | **Accepted and explicit.** No confidentiality guarantee. |
-| Same-UID agent inspects broker memory, ceilings, or sibling processes | Secret and boundary compromise under pure user-space deployment | `[SPIKE: DEP-1]` tests ptrace/process isolation and dedicated-UID helper; fail closed on weaker posture | Pure user-space cannot claim kernel-enforced secret isolation. |
-| Enrolled credential is used as a credential oracle | Provider-side damage within the credential's authority | Least-privilege guidance, one-time human enrollment, revocation, short-TTL credentials where available | Broker does not authorize methods, paths, or payloads. |
-| Prompt injection causes harmful tool composition | Unintended effects within granted capabilities | OS sandbox, capability scopes, approval tiers, effect receipts, hard ceilings | Agent has discretion within its grants. |
-| Semantic reconciliation is wrong, over-merges, or under-splits | Misleading derived memory | Non-destructive merge/split, stable identities, projection versioning, contested alternatives, audits | No calibrated confidence or proven split correctness. |
-| Poisoning through ingested content | Contaminated memory | Observations and candidate claims only; read-time scope; quarantine; rebuild | Detection is best-effort. |
-| Approval fatigue or unreadable contested state | Unsafe auto-approval or ignored decisions | Global deduped queue, batch rulings without scope union, review-after, deadline grouping | Human attention remains the limiting resource. |
-| Checkpoint and replay volume grows without bound | Storage and recovery cost | Native ledger durability, checkpoint cadence, non-destructive compaction, indefinite retention default | Long-loop replay cost is a build risk. |
-| CAS orphan or dangling reference | Storage leak or missing evidence | Bytes → manifest → ledger ordering; pins; safe reclamation; restore verification | Crash between byte and manifest leaves an orphan. |
-| Live arbitrary plugin breaks or is malicious | Service disruption or data loss | Candidate validation, shadow state, health checks, rollback, quarantine | External effects are not rolled back. |
-| Nix rollback after forward-only migration | Old kernel cannot read new state | Compatibility gate, `roll_forward_only`, checkpoint-branch recovery | Rollback may be blocked. |
-| UI or loopback request mistaken for human consent | Unauthorized authority record | Frozen consent surface mints `consentDigest`; gesture endpoint recomputes it; Access-verified endpoints; loopback is not consent | Local auth without Access is unresolved (`[SPIKE: ING-1]`). |
-| Ambiguous external effect | Duplicate or unknown side effect | Idempotency keys, journal, `outcome_unknown`, read-only probe, human-authorized new attempt | Exactly-once is never claimed. |
-| AG-UI multi-decision interrupt grouping | UI cannot express all concurrent rulings | One interrupt group per run; individual rulings; `[SPIKE: UI-2]` | Multi-decision groups are deferred. |
-| Agent edits its own context to hide evidence | Self-deception or audit evasion | Canonical ledger and human views read outside the context scope; activation diff records visibility changes | Agent context can differ from full evidence. |
-| Concrete ceilings or thresholds are set poorly | Cost overrun or excessive restriction | Must be operator configuration; baseline spikes inform values | Values are deferred. |
+| Channel leak: a NIC, undeclared share, host mount, or vsock port | The boundary is gone | Closed manifest, start verification incl. `ip link`, watchdog probe, `ZT-15` | A VM escape or a manifest defect remains |
+| Search query leaks content | Few dozen bits per query to TinyFish | Length cap, DLP, judge, rate limit, daily budget, root-only host log | Accepted, capped, and logged |
+| Injected model text exfiltrates through the browser | Owner's session used as a channel | Static CSP shell, JSON only, no remote resources, no auto-linking, `ZT-16` | None within the shell |
+| Todo abuse | Polluted list, bulk write | Size cap, per-write receipts, visible diff | Accepted within the cap |
+| Chat abuse | Unwanted text to the owner | Static shell, owner-only route, receipts | Accepted |
+| Monty engine compromise | VM-level code execution | VM boundary, host watchdog, ledger recovery | Containment, not secrecy |
+| Process-wide OOM in the Monty host | VM restart | Host watchdog, ledger-based recovery | Availability loss |
+| An approved executable candidate turns malicious | VM-level reach | Human approval receipt, capability diff, quarantine, rollback, `ZT-10` | Approval is the gate; no inner sandbox claim |
+| Stale source silently trusted | Advice from old data | Heartbeats, UI stale label, host alert, `ZT-18` | Detection depends on the window |
+| Lane starvation | Chat latency | Lane governor, hard lane ceilings | Accepted |
+| Semantic reconciliation is wrong, over-merges, or under-splits | Misleading derived memory | Non-destructive merge/split, stable identities, projection versioning, contested alternatives, audits | No calibrated confidence or proven split correctness |
+| Poisoning through ingested content | Contaminated memory | Observations and candidate claims only; read-time scope; quarantine; rebuild | Detection is best-effort |
+| Approval fatigue or unreadable contested state | Unsafe auto-approval or ignored decisions | Global deduped queue, batch rulings without scope union, review-after, deadline grouping | Human attention remains the limiting resource |
+| Checkpoint and replay volume grows without bound | Storage and recovery cost | Native ledger durability, checkpoint cadence, non-destructive compaction, indefinite retention default | Long-loop replay cost is a build risk |
+| CAS or state growth | Disk exhaustion on the LUKS volume | Admission ceilings, GC, watchdog alert | Accepted within the ceiling |
+| Live executable candidate breaks or is malicious | Service disruption or data loss | Candidate validation, shadow state, health checks, rollback, quarantine, human approval | External effects are not rolled back |
+| Nix rollback after forward-only migration | Old kernel cannot read new state | Compatibility gate, `roll_forward_only`, checkpoint-branch recovery | Rollback may be blocked |
+| vTPM seal is nominal under direct kernel boot | Disk protection rests on the recovery key and host root | Recovery key offline, host artifacts root-only, `[SPIKE: LUKS-1]` | Host root can read the volume |
+| Image backup fails or is stale | Data loss on hardware failure | Snapshot manifest, off-host copy, watchdog alert | Accepted between snapshots |
+| UI or loopback request mistaken for human consent | Unauthorized authority record | Frozen consent surface mints `consentDigest`; gesture endpoint recomputes it; Access + passkey even on loopback | `[SPIKE: ING-1]` confirms Access without edge TLS decryption |
+| Ambiguous mediated effect | Duplicate or unknown side effect | Idempotency keys, journal, `outcome_unknown`, read-only probe, human-authorized new attempt | Exactly-once is never claimed |
+| Agent edits its own lens to hide evidence | Self-deception or audit evasion | Ledger and human views read outside the context scope; activation diff records visibility changes | Agent context can differ from full evidence |
+| Concrete ceilings or thresholds are set poorly | Starvation or overrun | Operator configuration informed by burst measurement | Values are deferred to `LIM-1` |
 
 ### 6.2 Accepted residuals
 
-1. **Exfiltration.** Malicious readable code can exfiltrate anything it can read. Unrestricted outbound network is a deliberate requirement, not an implementation gap.
-2. **Same-UID inspection.** Under a pure user-space deployment, same-UID agents may inspect broker memory or signal siblings unless the host security spike proves otherwise. Broker caller checks are attribution, not a boundary, in that mode.
-3. **Credential authority.** Any credential may be enrolled; agents can exercise its full provider-side authority. The broker does not constrain method, path, or payload.
-4. **Response redaction.** Redaction is best-effort and cannot recover transformed, encrypted, compressed, or re-encoded secrets.
-5. **External effects.** There is no exactly-once delivery and no replay of effects. Ambiguous termination yields `outcome_unknown`.
-6. **LLM fidelity.** Hidden chain-of-thought is not promised; replay uses recorded I/O and never promises bit-identical regeneration.
-7. **Semantic truth.** Derived memory can be wrong. Human promotion records human attestation, not objective truth.
-8. **Poisoning.** Quarantine and rebuild reduce blast radius but cannot guarantee detection or complete removal from derived artifacts.
-9. **Erasure.** Physical erasure creates an epoch and covers derived artifacts and backups as far as possible; copies outside Kanbei's control cannot be guaranteed removed.
-10. **Experimental plugin posture.** Live arbitrary plugins are allowed outside the trust root as an experiment. This MAY be tightened if practice shows unacceptable risk.
-
----
+1. **Search leakage.** Capped, filtered, judged queries still leak a few dozen bits per query to TinyFish.
+2. **VM escape and host root.** A VM escape, a kernel bug, or host root reads everything; physical separation is the upgrade path.
+3. **Approved-code reach.** A human-approved candidate runs with the VM's reach over the mounts and channels.
+4. **Monty engine compromise and OOM.** A broken interpreter gives the VM and can take the VM down; both are contained, not prevented.
+5. **Chat and Todo reach.** A compromised Kanbei can send the owner text and write Todo text within the cap.
+6. **Semantic truth.** Derived memory can be wrong. Human promotion records human attestation, not objective truth.
+7. **Poisoning.** Quarantine and rebuild reduce blast radius but cannot guarantee detection or complete removal from derived artifacts.
+8. **Erasure.** Physical erasure creates an epoch and covers derived artifacts and backups as far as possible; copies outside Kanbei's control cannot be guaranteed removed.
+9. **External effects.** There is no exactly-once delivery and no replay of effects. Ambiguous termination yields `outcome_unknown`.
+10. **LLM fidelity.** Hidden reasoning is not promised; replay uses recorded post-redaction I/O and never promises bit-identical regeneration.
+11. **vTPM seal.** Under direct kernel boot the seal may bind to no measured state; the offline recovery key is the durable path.
+12. **No calibrated confidence.** Confidence metadata is uncalibrated and never affects authority.
+13. **Snippets are not sources.** A search snippet is a provider derivative and is never cited as captured content.
 
 ## 7. Validation
 
@@ -4298,7 +4190,8 @@ interface EvidenceEnvelope {
     kernel: string;
     runtime: string;
     sandboxPosture: string;
-    brokerIdentity: string;
+    vmProfile: string;
+    channelManifestDigest: string;
   };
   seeds: number[];
   modelRecordings: string[];            // post-redaction CAS content digests
@@ -4310,17 +4203,18 @@ interface EvidenceEnvelope {
 }
 ```
 
-**Datasets.** `fixtureVersion` MUST be `<dataset-id>@<semver>` from this registry; an unregistered value is not a result. `journey-v1` is the sealed end-to-end fixture covering two human-selected projects plus Kanbei itself.
+**Datasets.** `fixtureVersion` MUST be `<dataset-id>@<semver>` from this registry; an unregistered value is not a result. `journey-v2` is the sealed life-admin end-to-end fixture; `journey-v1` is retired.
 
 | Dataset | Contents | Split / use |
 |---|---|---|
-| `journey-v1` | Sealed multi-project slice: two project repositories plus Kanbei, a structural approval, nested deltas, an external commit, a scoped live candidate, and memory events. | Acceptance only. |
+| `journey-v2` | Sealed life-admin slice: one ingest batch per source, one structural approval, nested deltas, an external commit observed through a batch, a declarative change going live, a human-approved executable candidate, and memory events. | Acceptance only. |
 | `append-v1` | Canonicalization, unknown-component, hash-chain, and lifecycle-transition corpus. | `unit`/`property` and `V13`. |
 | `memory-v1` | Labelled claim, contradiction, merge, split, and retraction stream. | Development and tuning. |
 | `memory-holdout-v1` | Sealed holdout split of `memory-v1`; labels frozen before tuning. | Final reconciliation metrics only. |
 | `external-v1` | Git ref moves, rewrites, external commits, HTTP captures, and conflict cases. | Acceptance and conflict tests. |
-| `security-v1` | Hostile code, prompt injection, broker abuse, trust-root probes, and credential canaries. | Red team and zero-tolerance gates. |
-| `cost-v1` | Model, broker, and host-call workload with usage traces. | Ceilings and quality thresholds. |
+| `ingest-v1` | Batch sizes and rates per origin, gaps, suppressions, an outage backlog, a duplicate batch, and a negative corpus (bad digest, reordered sequence, credential in payload, unknown field, missing coverage). | `S7` and `AS-01`. |
+| `security-v1` | Hostile code, prompt injection, channel-leak probes, trust-root probes, and credential canaries. | Red team and zero-tolerance gates. |
+| `cost-v1` | Lane, channel, and host-call workload with usage and freshness traces. | Ceilings and quality thresholds. |
 | `ui-v1` | Ruling comprehension, contested state, stale state, and presentation-replay corpus. | UI tests and comprehension thresholds. |
 
 Test classes:
@@ -4330,7 +4224,7 @@ Test classes:
 | `unit` / `property` | schema, hash chain, lifecycle transitions, parser and canonicalization | blocks merge on failure |
 | `conformance` | acceptance scenarios and cross-contract behavior | blocks merge on failure |
 | `chaos` | crash, fault injection, recovery | nightly and release |
-| `redteam` | hostile code, prompt injection, broker, trust root | release-blocking and nightly |
+| `redteam` | hostile code, prompt injection, channel leaks, trust root | release-blocking and nightly |
 | `spike` | deferred-decision measurements | produces gate input; never a silent choice |
 | `bench` | cost, latency, freshness, UI comprehension | release-blocking against configured ceilings; quality thresholds set at gate |
 
@@ -4347,10 +4241,10 @@ Rules:
 
 | ID | Gate | Failure condition | Pass criterion | Required failure behavior |
 |---|---|---|---|---|
-| `ZT-01` | Secret exposure | Enrolled credential, broker secret, or trust-root secret appears in agent env, argv, files, model context, tool output, UI, logs, CAS, or canonical store; or a known enrolled value crosses to a non-enrolled host or redirect | Zero canary hits in every scanned surface; broker redirect and cross-host tests deny without secret | Fail closed; request rejected; evidence records location and class |
+| `ZT-01` | Secret exposure | A provider credential exists anywhere in the VM, or a trust-root secret appears in agent env, argv, files, model context, tool output, UI, logs, CAS, or canonical store | Zero credentials present; zero canary hits in every scanned surface | Fail closed; start refused or request rejected; evidence records location and class |
 | `ZT-02` | Ledger bypass | Mutable agent/plugin writes canonical SQLite or bypasses the frozen append API | Every bypass attempt denied; no unauthorized record visible | Deny and record attempt; sandbox/supervisor alarm |
 | `ZT-03` | Silent external clobber | External change overwrites speculative history or is not recorded immediately | External commit recorded; speculative branch preserved; conflict surfaced | External commit recorded; conflict escalated |
-| `ZT-04` | Effects outside hard policy | Effect occurs outside sandbox, broker, global resource, frozen-root, or autonomy-tier policy | Every probe denied before effect; denial receipt present | Deny before effect; receipt records policy and decision |
+| `ZT-04` | Effects outside hard policy | Effect occurs outside the sandbox, channel manifest, global ceiling, frozen-root, or autonomy-tier policy | Every probe denied before effect; denial receipt present | Deny before effect; receipt records policy and decision |
 | `ZT-05` | Missing required provenance | Claim or completion materializes without required source/derivation/scope/effect citation | Injected dangling claims rejected from materialization; completion without verified citation denied | Reject from materialization; defect surfaced |
 | `ZT-06` | Retracted claim presented as current | Read returns a retracted or quarantined claim as current, even during rebuild | Zero stale-current reads across retract-then-read races | Return suspect/absent with coverage watermark |
 | `ZT-07` | Replay repeats external effects | Replay invokes any external effect | Zero capability dispatches during replay | Effect blocked and recorded; replay aborts |
@@ -4361,8 +4255,12 @@ Rules:
 | `ZT-12` | Coverage dishonesty | Projection claims currency outside its watermark or hides pending work | Every read outside coverage reports `stale`/`building` and pending counts | Return coverage, staleness, and pending counts |
 | `ZT-13` | Consent display, token, and origin | A ruling is minted for evidence, scope, or hashes the human did not see; gesture `consentDigest` differs from the frozen surface's rendering; a ruling commitment does not recompute from the persisted `ConsentDisplayManifest` preimage over `consentDigest`, ruling, and token hash; one token is used for more than one ruling; or a token is reused, expired, replayed from the mutable-UI origin, or submitted through a clickjacked frame | Every decoy-render, manifest, ruling-mismatch, cross-origin, replay, reused-token, and clickjack case rejects with `APPROVAL_DISPLAY_MISMATCH` or `APPROVAL_TOKEN_INVALID`; mutable UI cannot read, mint, or recompute a token or digest | Deny; append blocked-display record; no receipt |
 | `ZT-14` | Unvalidated lifecycle transition | A transition outside its family table, with a forbidden actor, a stale `expect.from`, or a stale fencing token is applied | Every fabricated `reactivate`/promotion/claim case rejects | Deny with `TRANSITION_REJECTED`/`STATE_CONFLICT`/`FENCING_STALE` |
+| `ZT-15` | Channel leak | A NIC, user-mode network, DNS lookup, host mount outside the declared classes, virtiofs share not in the manifest, or vsock port not in the manifest exists or is reachable from the sandbox | Zero extra interfaces; `ip link` shows `lo` only; the mount table and socket set equal the manifest at start and on every probe | Start refused; channel host denied; release blocked |
+| `ZT-16` | Remote request from the UI | The shell or rendered model text issues a request or navigation to any origin, or renders injected HTML or an autolink | Zero requests and zero navigations for planted images, links, CSS `url()`, iframes, and autolinks; model text renders as text nodes | Request blocked by CSP; test fails the build |
+| `ZT-17` | Todo cap violation | A Todo write exceeds the per-write or per-mount cap, partially applies, follows a symlink, or is written outside the mount | Every over-cap write denies with `todo_cap_exceeded`; no partial content; no symlink traversal | Deny; receipt; alert |
+| `ZT-18` | Stale source presented as current | A source past its freshness window is presented as current, or a missing heartbeat is treated as healthy | Every read of stale or unknown source data carries `stale`/`unknown` and the heartbeat; the host alert fires on expiry | Return stale or unknown with the heartbeat; alert |
 
-`ZT-01`–`ZT-06` are the six required gates from `req. 158`; `ZT-07`–`ZT-14` are derived prerequisites without which the six cannot be enforced. The secret-exposure scope is enrolled credentials, broker state, and trust-root secrets; project-data exfiltration by readable code is the accepted residual, not a `ZT-01` failure.
+`ZT-01`–`ZT-06` are the six required gates from the requirements baseline; `ZT-07`–`ZT-14` are derived prerequisites without which the six cannot be enforced; `ZT-15`–`ZT-18` are the split-specific gates for the channel boundary, the CSP shell, the Todo cap, and freshness. The secret-exposure scope is any provider credential or trust-root secret inside the VM; channel leakage is its own gate because the VM, not a broker, is the boundary. Content reach through Search, Chat, and Todo is the accepted residual, not a `ZT-01` failure.
 
 ### 7.2 Invariants and mechanical checks
 
@@ -4381,14 +4279,15 @@ Canonical invariants. Each is asserted by its listed gates or scenario families 
 | `I-09` | External effects are attempted at least once with idempotency keys where supported; ambiguous interruption yields `outcome_unknown` and no blind retry. | `C-14`, `R-07`, effect-state tests |
 | `I-10` | Replay never performs an external effect. | `ZT-07`, `R-04` |
 | `I-11` | Approval binds exact anchor, interpretation hash, resolved plan hash, ruling work-item ids and current WorkGeneration ids, completion subject, authority evidence-set hash, granted tier, max effect class, authorized scope, constraints, expiry, and single-use consent display digest/token. | `ZT-08`, `ZT-13`, `AS-03`, `C-08` |
-| `I-12` | Sandbox, broker, and global resource policies are hard boundaries; delegated-intent constraints are not. | `ZT-04`, `C-10`, `C-11` |
+| `I-12` | The VM boundary, the channel manifest, and global ceilings are hard boundaries; delegated-intent constraints are not. | `ZT-04`, `C-10`, `C-11` |
 | `I-13` | Mutable agents and plugins cannot write canonical storage or the frozen trust root. | `ZT-02`, `ZT-10`, `AS-08` |
 | `I-14` | Activation stages, validates, flips one scope pointer atomically, health-checks, and retains the previous candidate; external effects remain. | `AS-08`, activation crash matrix |
 | `I-15` | Backup captures a consistent ledger snapshot and manifest set with GC paused; restore verifies every reference and rebuilds derived indexes. | `B-05`–`B-09`, `AS-11` |
 | `I-16` | Projections expose exact coverage and pending work; "current" is never claimed outside the watermark. | `ZT-12`, `AS-12`, `U-07` |
 | `I-17` | Undo creates a new branch from a checkpoint and preserves exact available LLM I/O and all descendants. | `R-05`, `R-06`, `AS-10` |
 | `I-18` | Every lifecycle transition is validated by the frozen append path against its per-family actor/event/guard table, with state CAS and fencing where the family defines a lease. | `ZT-14`, `V18`, `C-01`, `C-14` |
-| `I-19` | Stable-domain writes are authorized by (authority class, appender role, component type); agents and plugins cannot append effect/activation receipts, promotions, or attestations, and enrollment revocation is a projection-visible transition. | `ZT-11`, `ZT-14`, `V19`, `V22`, `AS-08`, `AS-09` |
+| `I-19` | Stable-domain writes are authorized by (authority class, appender role, component type); agents and plugins cannot append effect/activation receipts, promotions, or attestations. | `ZT-11`, `ZT-14`, `V19`, `V22`, `AS-08`, `AS-09` |
+| `I-20` | The VM exposes exactly the six channels: no NIC, no resolver, no raw sockets, no host mount outside the declared classes, and no undeclared vsock port. | `ZT-15`, `V20`, `V23` |
 
 Mechanical checks run in CI and at startup:
 
@@ -4413,28 +4312,29 @@ Mechanical checks run in CI and at startup:
 | V17 | No stale `state` field exists on a canonical payload type | Schema conformance fails |
 | V18 | Every transition matches its family table, actor predicate, `expect.from`, and fencing token; no reactivation row exists for a receipt or override | Append rejected with `TRANSITION_REJECTED` / `STATE_CONFLICT` / `FENCING_STALE` |
 | V19 | Every cited evidence outcome matches the cited record; `pass` requires `succeeded` or `reconciled_effective` and a matching completion subject | Promotion denied |
-| V20 | `credential_enrollment` has no stored status; the broker reads only the `enrollment` lifecycle projection, and revocation changes that projection in the same transaction | Request denied; incident |
+| V20 | The channel manifest is closed: exactly six channels exist, Inbox and Vault are read-only, Todo is capped, and the VM has no interface but `lo` | Start refused; incident |
 | V21 | Retraction closure uses the reverse indexes; no closure query performs a full scan, and a read that exceeds its closure budget returns suspect rather than current | Query rejected; incident |
 | V22 | No agent or plugin appends `effect_receipt`, `activation_receipt`, `human_authority`, `delegated_authority`, `security_action`, `kernel_generation`, promotion, or attestation | Append rejected with `AUTHORITY_DENIED` |
+| V23 | Every watchdog probe recomputes the interface list, mount table, and channel socket set and compares them with the manifest | Incident; sandbox kill |
 
 ### 7.3 Scenario tests
 
-Acceptance scenarios (`AS-*`). Each passes only when its assertions hold against the sealed `journey-v1` fixture and the listed invariants.
+Acceptance scenarios (`AS-*`). Each passes only when its assertions hold against the sealed `journey-v2` fixture and the listed invariants.
 
 | ID | Scenario | Pass criterion | Invariants |
 |---|---|---|---|
-| `AS-01` | Ingest | Pinned commits ingested; raw observations carry commit/tree/blob provenance; derived text is separate; coverage is per source; re-ingest is idempotent. | I-02, I-07, I-08, I-16 |
+| `AS-01` | Ingest | One batch per source is read from the read-only Inbox; manifests validate; observations carry batch, origin, sequence, and coverage provenance; a duplicate batch is idempotent; a gap is recorded and alerted. | I-02, I-07, I-08, I-16 |
 | `AS-02` | Explore intent | Anchor immutable; each interpretation cites spans and assumptions; a consequential branch is blocked without an accepted interpretation or autonomy policy. | I-05, I-11 |
 | `AS-03` | Approve structural goal | Agent cannot grant its own tier; queue groups by intent and deadline; dedupe never merges different evidence sets; the frozen consent surface displays the exact evidence/scope/hashes and the ruling binds plan hash, work-item ids, completion subject, evidence-set hash, consent digest, scope, constraints, and expiry. | I-05, I-11, I-12 |
 | `AS-04` | Execute nested deltas | Each delta has one ownership parent plus causal links; completion requires verified evidence and cleared blockers; compliant children proceed; out-of-scope children escalate. | I-02, I-11, I-12 |
 | `AS-05` | Reconcile external commit | External commit recorded immediately; speculative history preserved; decision-required conflict surfaced. | I-01, I-06, `ZT-03` |
 | `AS-06` | Reconcile memory | Contradicting and undercutting evidence distinct; human promotion binds canonical source ids; confidence metadata cannot affect authority. | I-05, I-07 |
 | `AS-07` | Retract and quarantine | Reads immediately exclude affected claims through both stores; subgraph quarantined; rebuild async; prior history inspectable. | I-01, I-06, I-07, I-16 |
-| `AS-08` | Self-modify | Across two selected projects plus Kanbei: declarative lane uses versioned documents with next-turn activation; code lane stages a scoped live plugin/tool candidate, emits capability/dependency diffs, flips one dependency-scope pointer, health-checks, retains the previous candidate for rollback, and exercises the new tool in a scoped live run without a Nix generation; frozen root untouched. | I-13, I-14, I-19 |
-| `AS-09` | Credentialed external call | Broker maps logical name to endpoint, injects per request, never forwards credentials across hosts or redirects, and redacts the response before canonical capture. | `ZT-01` |
+| `AS-08` | Self-modify | A declarative view or lens activates at the next turn with a receipt and visibility diff; an executable candidate stages, validates, shows a capability diff, stays inactive without a human approval receipt, activates on approval with one pointer flip and a health check, and rolls back to the retained previous candidate; the frozen root is untouched. | I-13, I-14, I-19, `ZT-10` |
+| `AS-09` | Search channel | A capped query passes DLP and the judge, returns stripped text with a receipt; a planted exfiltration query is blocked; the VM holds no provider key at any point. | `ZT-01`, `ZT-17` |
 | `AS-10` | Replay and undo | Declared projection classes rebuild to equal digests; presentation replay reproduces the timeline; no effect repeats; undo branches from a checkpoint preserving descendants. | I-09, I-10, I-17 |
-| `AS-11` | Backup, restore, erasure | Every reference verifies; derived indexes rebuild; coverage honest; erasure epoch removes covered online and backup artifacts and records residuals. | I-08, I-15, I-16 |
-| `AS-12` | Cost and freshness | Hard ceilings hold; soft overrides carry rationale; freshness reports coverage lag rather than implying current state. | I-12, I-16 |
+| `AS-11` | Image backup and restore | The image snapshot matches a verified ledger checkpoint; restore unlocks with the recovery key, verifies every reference, rebuilds derived indexes, and reports erasure epochs as conflicts. | I-08, I-15, I-16 |
+| `AS-12` | Ceilings and freshness | Lane, ingest, CAS, Todo, chat, and search ceilings hold; soft overrides carry rationale; a stale source is labelled and alerted rather than presented as current. | I-12, I-16, `ZT-18` |
 
 Concurrency, merge, approval, and override tests (`C-*`):
 
@@ -4516,58 +4416,58 @@ UI structural tests (`U-*`); comprehension thresholds are set from the `ui-v1` b
 
 ### 7.4 Spikes and measurements
 
-Validation spike protocols are `S1`–`S6` (distinct from the security invariants `S-1`–`S-15`). Every spike run cites one `S` id, one dataset id, and a pre-registered decision rule; an `inconclusive` result blocks the dependent decision and never becomes a default.
-
-| ID | Protocol | Decision(s) | Dataset |
+| ID | Protocol | Decision | Dataset |
 |---|---|---|---|
-| `S1` | Paired language and TypeScript-runtime bake-off: ten equivalent tasks at 10 ms/100 ms/1 s host-call latency, frozen runtime/model/prompt/tool-catalog/sandbox, recorded success, tokens, latency, host-call behavior, snapshot trust, and operability. | `LANG-1`, `NODE-DENO-1` | `cost-v1`, `security-v1` |
-| `S2` | Host-security enforcement matrix on the target host: user namespaces, same-UID ptrace/`/proc` access, Landlock, systemd directives, broker identity, cgroup controls, recovery, network/audit gaps, and secret reachability. | `DEP-1` | `security-v1` |
-| `S3` | Inter-agent isolation and fault containment: crash, hang, OOM, fork bomb, orphan reaping, and resource ceilings; no claim of a security boundary. | `ISO-1` | `security-v1` |
-| `S4` | Ceiling and quality measurement: model/broker/host-call cost and latency, reservation behavior, and provisional numeric ceilings and thresholds. | `LIM-1`, `D2` | `cost-v1` |
+| `S3` | Containment and resource measurement for agent-authored programs: crash, hang, OOM, fork bomb, wall-clock and memory bounds, orphan reaping, per-sandbox ceilings. | `ISO-1` retired; Monty containment record | `security-v1` |
+| `S4` | Ceiling and quality measurement: lane latency and occupancy, channel byte rates, ingest volume, reservation behavior, provisional numeric ceilings and thresholds. | `LIM-1`, `D2` | `cost-v1` |
 | `S5` | Reconciliation and poisoning measurement: invalidation precision, retraction propagation, split/merge safety, contested readability, quarantine precision, and compaction evidence/size frontier, with `memory-v1` for tuning and `memory-holdout-v1` for final metrics. | quality thresholds, `D7` | `memory-v1`, `memory-holdout-v1` |
-| `S6` | Interface comprehension and interrupt grouping: contested/historical/stale-state comprehension, presentation replay, and multi-decision AG-UI grouping. | `UI-1`, `UI-2`, `ING-1` | `ui-v1` |
+| `S6` | Interface comprehension and interrupt grouping: contested/historical/stale-state comprehension, presentation replay, multi-decision AG-UI grouping, and CSP no-request comprehension. | `UI-1`, `UI-2`, `ING-1` | `ui-v1` |
+| `S7` | Ingest batch and freshness measurement: batch size and rate per source, gap frequency, suppression rate, staleness detection latency, and backlog recovery after a source outage. | `FRESH-1` | `ingest-v1` |
+| `S8` | Search-channel filter measurement: DLP false-negative and false-positive rate, judge block rate on a planted exfiltration suite, and the estimated leakage per capped query. | `JUDGE-1` | `security-v1` |
 
-Additional measurements that do not select a deferred decision: broker identity, redirect handling, redaction coverage, revocation, and outage on `security-v1`; backup/restore on `journey-v1`; tool-runtime comparison within `S1`.
+Retired protocols: `S1` (`LANG-1` + `NODE-DENO-1`; both decided and recorded in §4.9.5) and `S2` (`DEP-1`; the plane is fixed by the split, `04 §8.7`).
+
+Additional measurements that do not select a deferred decision: channel-leak probes, CSP no-request probes, Todo cap behavior, and channel-host outage on `security-v1`; image backup and restore on `journey-v2`; Monty bounds and host-call mediation on the Monty evidence suite.
 
 ### 7.5 Acceptance journey
 
-The vertical slice MUST demonstrate world-state control, memory reconciliation, and self-modification at comparable depth across two human-selected projects plus Kanbei itself. It MUST show:
+The vertical slice MUST demonstrate life admin end to end on the sealed `journey-v2` fixture:
 
-1. ingest both selected projects and Kanbei, with per-source coverage;
-2. explore intent with an immutable anchor and a versioned interpretation;
-3. approve a structural goal through the frozen consent surface where required, including one stale-evidence ruling;
-4. execute nested deltas with evidence-gated completion and a cross-project child delta;
-5. reconcile at least one external conflicting commit in one project without clobbering speculative history in either;
-6. add one agent-authored declarative perception/UI change and one scoped live plugin/tool candidate activation, each with a capability diff and rollback, without a Nix generation or kernel restart;
-7. demonstrate memory contradiction, correction, retraction, progressive disclosure, and quarantine behavior;
-8. demonstrate concurrent decision requests with approval, deferral, amendment, and stale-evidence handling;
-9. replay presentation, rebuild projections, and execute an internal-state replay from checkpoint and recorded model/effect results without repeating external effects;
-10. perform secretless credentialed access to one external service through the broker, then revoke the enrollment and show the next request denied.
+1. ingest one batch per source (mail, calendar, finance, browser, photo metadata, phone) plus one Git batch, each with coverage and a freshness heartbeat;
+2. label one source stale, raise the alert, and exclude its old data from "current" advice;
+3. explore intent with an immutable anchor and a versioned interpretation over ingested material;
+4. approve a structural goal through the frozen consent surface, including one stale-evidence ruling;
+5. execute nested deltas with evidence-gated completion, including one child delta that cites an ingest observation;
+6. record an external commit from a later Git batch and reconcile it without clobbering speculative history;
+7. reconcile memory: contradiction, correction, retraction, progressive disclosure, and quarantine;
+8. add one declarative change (a view catalog or context lens) that goes live at the next turn, and stage one executable candidate that stays inactive until a human approval receipt flips its pointer; then show rollback to the previous candidate;
+9. maintain the todo list: read it, add and complete items through the Todo channel, and show the cap refusing an over-size write;
+10. answer one chat turn over the WARP route with in-VM TLS, and show the CSP shell making no request for a planted remote image, link, CSS `url()`, or iframe;
+11. issue one capped search query through the Search channel and show a blocked query (DLP or judge) with its receipt, while the VM holds no provider key;
+12. replay presentation, rebuild projections, and execute an internal-state replay from checkpoint and recorded lane I/O without re-reading a batch or re-invoking the model;
+13. restore from the image backup with the recovery key and verify the ledger checkpoint, every CAS reference, and the rebuilt indexes.
 
 ### 7.6 Requirements-to-gate traceability
 
-Every release gate maps to requirements and to this section's gates and checks. Implementation-task traceability is owned by `spec/08-implementation-plan.md` (`A0`–`I5`) and is not reproduced here; no `T` identifiers are defined. A phase exit that cites an identifier is decidable only through this table and the gate tables above.
+Every release gate maps to a requirement section in `00-requirements.md` and to this section's gates and checks. Implementation-task traceability is owned by `08-implementation-plan.md` and is not reproduced here; no `T` identifiers are defined. Section references are stable anchors, not line numbers.
 
-| Requirement cluster | Gates | Scenarios / checks |
+| `00-requirements.md` section | Gates | Scenarios / checks |
 |---|---|---|
-| `req. 15–28` ledger, authority, records | `ZT-02`, `ZT-05`, `ZT-09`, `ZT-11`, `ZT-14` | `I-01`–`I-07`, `I-18`, `AS-01`–`AS-03`, `V1`, `V14`, `V17`, `V22` |
-| `req. 30–40` components, ordering, time | `ZT-09` | `I-02`, `I-03`, `V13`, `C-01`, `C-02` |
-| `req. 42–52` memory, retraction, scope | `ZT-05`, `ZT-06`, `ZT-11` | `I-06`, `I-07`, `I-16`, `AS-06`, `AS-07`, `P-01`–`P-10`, `V15`, `V21` |
-| `req. 54–64` intent, approval, overrides | `ZT-04`, `ZT-08`, `ZT-11`, `ZT-13` | `I-05`, `I-11`, `I-12`, `AS-02`–`AS-04`, `C-06`–`C-11`, `V5`, `V6`, `V8` |
-| `req. 66–72` loops, budgets, durability | `ZT-04`, `ZT-12`, `ZT-14` | `I-09`, `I-10`, `AS-12`, `C-01`–`C-03`, `R-01`, `R-05`–`R-07`, `V2`–`V4`, `V11`, `V12`, `V18` |
-| `req. 74–80` effects, model I/O, providers | `ZT-01`, `ZT-05`, `ZT-07` | `I-08`, `I-09`, `AS-09`, `R-02`–`R-04`, `V3`, `V10`, `V16`, `V19` |
-| `req. 80–88` replay and undo | `ZT-07` | `I-10`, `I-17`, `AS-10`, `R-01`–`R-07`, `V9` |
-| `req. 90–104` self-modification, plugins | `ZT-02`, `ZT-10`, `ZT-14` | `I-13`, `I-14`, `I-19`, `AS-08`, `U-06`, `V7`, `V22` |
-| `req. 106–118` security, broker, credentials | `ZT-01`, `ZT-02`, `ZT-04`, `ZT-10`, `ZT-14` | `AS-09`, `B-01`, `B-02`, `V16`, `V20` |
-| `req. 120–128` tools, runtimes, providers | `ZT-04`, `ZT-01` | `AS-09`, `C-14`, `S1` |
-| `req. 130–138` interface and multimodal | `ZT-06`, `ZT-12`, `ZT-13` | `AS-10`, `P-07`, `U-01`–`U-10`, `S6` |
-| `req. 140–154` persistence, backup, erasure | `ZT-09`, `ZT-12` | `I-08`, `I-15`, `AS-11`, `B-01`–`B-12` |
-| `req. 156–158` validation and gates | all `ZT-*`, `AS-*` | `AS-01`–`AS-12`, `S1`–`S6`, complete `EvidenceEnvelope` bundle |
+| Product target; Architecture and authority | `ZT-01`, `ZT-15` | `AS-01`, `AS-11`, `V20`, `V23` |
+| Architecture and authority | `ZT-02`, `ZT-11` | `I-01`–`I-05`, `V17`, `V22` |
+| Record and state semantics | `ZT-02`, `ZT-09` | `I-01`–`I-03`, `V13`, `C-01`, `C-02` |
+| Semantic memory and reconciliation | `ZT-05`, `ZT-06` | `AS-06`, `AS-07`, `P-01`–`P-10`, `V15`, `V21` |
+| Intent, approval, and work | `ZT-04`, `ZT-08`, `ZT-11`, `ZT-13` | `AS-02`–`AS-05`, `C-06`–`C-11`, `V5`, `V6`, `V8` |
+| Agent loops and durability | `ZT-04`, `ZT-12`, `ZT-14` | `AS-12`, `C-01`–`C-03`, `R-01`, `R-05`–`R-07`, `V2`–`V4`, `V18` |
+| Replay and undo | `ZT-07` | `I-10`, `I-17`, `AS-10`, `R-01`–`R-07`, `V9` |
+| Self-modification | `ZT-02`, `ZT-10`, `ZT-14` | `I-13`, `I-14`, `I-19`, `AS-08`, `U-06`, `V7`, `V22` |
+| Security and external effects | `ZT-01`, `ZT-04`, `ZT-15`, `ZT-16` | `AS-09`, `AS-11`, `V16`, `V20` |
+| Tools and providers | `ZT-01`, `ZT-17` | `AS-09`, `AS-12`, `S4`, `S8`, `V10` |
+| Interface and multimodal state | `ZT-06`, `ZT-12`, `ZT-13`, `ZT-16` | `AS-10`, `P-07`, `U-01`–`U-10`, `S6` |
+| Persistence, freshness, and backup | `ZT-09`, `ZT-12`, `ZT-18` | `I-08`, `I-15`, `AS-11`, `AS-12`, `B-01`–`B-12`, `S7` |
+| Validation and deferred decisions | all `ZT-*`, all `AS-*` | complete `EvidenceEnvelope` bundle, `S3`–`S8` |
 
 Phase exits: a gate is met only when every listed identifier has an `EvidenceEnvelope` with `outcome="pass"`, or a documented accepted residual recorded in `acceptedResiduals`. `inconclusive` blocks the dependent decision gate; `blocked` is a defect, not a pass.
-
-
----
 
 ## 8. Open questions
 
@@ -4575,20 +4475,19 @@ Phase exits: a gate is met only when every listed identifier has an `EvidenceEnv
 
 | ID | Decision | Provisional behavior required now |
 |---|---|---|
-| `LANG-1` | Agent-facing execution language among Monty, TypeScript, Lua, Bash, full CPython | `RuntimeId` is replaceable; OS sandbox is mandatory; bake-off protocol fixed |
-| `NODE-DENO-1` | TypeScript runtime | TypeScript control plane fixed; Node/Deno both run under the OS sandbox; Deno permissions are inner only |
-| `DEP-1` | Pure user-space versus dedicated-UID broker/sandbox helper | Security invariants and process contract apply; fail closed if enforcement is weaker than declared |
-| `ISO-1` | Lightweight inter-agent isolation mechanism | Crash/resource containment only; container per agent excluded |
 | `LIM-1` | Concrete global ceilings and per-loop limits | Schema and enforcement points fixed; values are operator configuration |
 | `UI-1` | Exact A2UI specification commit and catalog version | Adapter declares emitted version; no silent downgrade |
 | `UI-2` | Multi-decision AG-UI interrupt groups | One interrupt group per run; individual canonical rulings; resume complete for its group |
-| `NET-1` | Non-TinyFish media transport and provider composition | Transport recorded in provenance; no capability equivalence assumed |
-| `ING-1` | Unattended service-auth and local human-auth equivalent | Authority endpoints require verified Access identity; local access read-only by default |
-| `BAK-1` | Exact backup hook wiring | Snapshot/CAS/GC ordering and restore verification are fixed |
+| `NET-1` | Search-VM-internal fetch transport and provider composition | Transport recorded in the search receipt; no capability equivalence assumed; no binary leaves the Search VM |
+| `ING-1` | Access gating of the WARP private route without edge TLS decryption | Authority endpoints require the verified Access identity plus the in-VM passkey; loopback is not consent |
+| `LUKS-1` | What the vTPM seal binds to under microvm.nix direct kernel boot | Recovery key offline; boot must not depend on measured state to unlock |
+| `FRESH-1` | Freshness window per source and alert threshold | Heartbeat recorded per batch; stale labelled and alerted; no silent current |
+| `JUDGE-1` | DLP pattern set and the judge's block rate for the Search channel | Automation blocked at any failure; thresholds set from `S8` |
+| `IMG-1` | Image snapshot quiesce mechanics | Snapshot after an online SQLite checkpoint; restore verifies references |
 | `D2` | `review_after` window expiry: promote-with-flag versus hold | Promote with `review_overdue` and a revocation path; spike confirms |
-| `D3` | `outcome_unknown` probe cadence and provider capability matrix | Probe is read-only, manual or scheduled; automatic retry forbidden |
+| `D3` | `outcome_unknown` probe cadence and capability matrix | Probe is read-only, manual or scheduled; automatic retry forbidden |
 | `D4` | Checkpoint cadence and replay-cost target | Checkpoint after every wakeup and before every effect; numeric budget deferred |
-| `D5` | Whether a standing chat-directive policy may ever cover `approval_required` scopes | Not permitted by this specification; confirmation belongs to autonomy-policy spike |
+| `D5` | Whether a standing chat-directive policy may ever cover `approval_required` scopes | Not permitted by this specification; confirmation belongs to the autonomy-policy spike |
 | `D7` | Retention and compaction of checkpoints, model I/O blobs, and replay artifacts | Ledger retained indefinitely by default; physical erasure exceptional and epoch-producing |
 | `D8` | Automatic `loop_stalled` intervention policy | Escalate to decision queue; pause only on human ruling |
 
@@ -4612,7 +4511,7 @@ These cannot be resolved by further public-source reading alone:
 - a large-scale evidence/size frontier for compaction;
 - a portable, signed, semantically versioned execution-snapshot format;
 - per-model, per-language programmatic tool-use success rates;
-- independent security audit of the chosen sandbox and broker composition;
+- independent security audit of the chosen VM and channel composition;
 - portable UI-state artifact standards and A2UI/AG-UI catalog parity;
 - the long-term support and pricing of runtime and provider options.
 
@@ -4624,13 +4523,12 @@ These cannot be resolved by further public-source reading alone:
 
 | Source | Role in this specification |
 |---|---|
-| `spec/00-requirements.md` | Normative requirements baseline. All conflicts are reconciled in its favor. Sections 5–11 define the product target, authority, records, memory, intent/approval, loops, replay, self-modification, security, tools/providers, interface, persistence, and validation; lines 156–168 define the deferred spikes. |
-| `spec/01-state-memory.md` | Record envelope, component versioning, canonicalization, authority classes, SQLite schema, append transaction, sequence/hash chain, desired/observed components, and work links. Key ranges: invariants 7–21; envelope 29–52; versioning 56–71; canonical bytes 72–93; authority 144–160; schema and append 163–375; chain 379–402; desired/work 406–470. |
-| `spec/02-agent-execution.md` | Canonical record kinds and execution invariants (9–35); intent and interpretation (41–99); chat inference (105–140); autonomy tiers (146–181); approvals, queue, coverage, overrides (187–300); work DAG and divergence (302–397); loops and budgets (401–488); messaging (492–557); effects (561–603); checkpoints and model I/O (609–656); undo (660–698); replay (702–713); recovery (717–742); verification (746–765); contradictions and deferred decisions (769–793). |
-| `spec/03-plugin-runtime.md` | Kernel invariants (9–35); six contracts and composition (43–291); scopes and scoped state (297–414); candidate validation, diff, activation, health, rollback (420–553); live arbitrary plugins (556–574); context projection (578–615); Nix compatibility (619–650); tools (654–849); search contract (850–872); model routing (876–960); bake-off (964–1007). |
-| `spec/04-security-deployment.md` | Security invariants (5–23); process identities (25–75); sandbox and writable roots (77–189); network residual (190–213); hard ceilings (215–287); broker (288–442); effect audit (443–506); deployment, ingress, watchdog, backup, host spike (507–605). |
-| `spec/05-interface-ingestion.md` | Interface/ingestion invariants (3–18); contradiction resolutions (20–34); source model and adapters (36–112); observation and coverage schemas (114–188); event/full scans, checkpoints, failures (190–280); Git handling (281–328); provider-neutral search/fetch (329–400). |
-| `spec/06-validation-plan.md` | Supporting harness detail only; §7 of this document is the sole normative validation authority. Verification contract and `EvidenceEnvelope` (§1), authority/conflict register (§2), invariants and zero-tolerance gates (§3), acceptance scenarios `AS-01`–`AS-12` (§4), reconciliation metrics (§5), poisoning `P-01`–`P-10` (§6), concurrency/approval `C-01`–`C-14` and `ApprovalBinding` (§7), replay/undo `R-01`–`R-07` and crash matrix (§8), CAS/backup `B-01`–`B-12` (§9), red team (§10), UI `U-01`–`U-10` (§11), cost/freshness (§12), spikes `S1`–`S6` (§13), tasks `T00`–`T20` (§14), and decision gates `DG-1`–`DG-8` (§15). Its identifier families are defined normatively in §7 of this document. |
+| `spec/00-requirements.md` | Normative requirements baseline, rebased. All conflicts are reconciled in its favor. Sections: product target, architecture and authority, record and state semantics, semantic memory and reconciliation, intent/approval/work, agent loops, replay and undo, self-modification, security and external effects, tools and providers, interface, persistence/freshness/backup, validation and deferred decisions. |
+| `spec/01-state-memory.md` (absorbed into `07`) | Pre-split draft of the record envelope, component versioning, canonicalization, authority classes, SQLite schema, append transaction, sequence/hash chain, desired/observed components, and work links. Not carried separately; §4.2–§4.4 are normative. |
+| `spec/02-agent-execution.md` (absorbed into `07`) | Pre-split draft of intent, autonomy, approvals, work, loops, effects, checkpoints, undo, replay, and recovery. Not carried separately; §4.5 and §4.7 are normative. |
+| `spec/03-plugin-runtime.md` (absorbed into `07`) | Pre-split draft of the plugin kernel, scopes, candidate validation, activation, context projection, tools, search, and model routing. Not carried separately; §4.8 and §4.9 are normative, with the executable lane now human-approved. |
+| `spec/05-interface-ingestion.md` (absorbed into `07`) | Pre-split draft of interface and ingestion invariants, the source model, observation and coverage, scans, Git handling, and search/fetch. Not carried separately; §4.11 is normative, reframed as an ingest batch contract. |
+| `spec/06-validation-plan.md` (deleted in the rebase) | Superseded early draft; deleted, not carried, and a source for nothing. §7 of this document is the sole normative validation authority. Historical description: Verification contract and `EvidenceEnvelope` (§1), authority/conflict register (§2), invariants and zero-tolerance gates (§3), acceptance scenarios `AS-01`–`AS-12` (§4), reconciliation metrics (§5), poisoning `P-01`–`P-10` (§6), concurrency/approval `C-01`–`C-14` and `ApprovalBinding` (§7), replay/undo `R-01`–`R-07` and crash matrix (§8), CAS/backup `B-01`–`B-12` (§9), red team (§10), UI `U-01`–`U-10` (§11), cost/freshness (§12), spikes `S1`–`S6` (§13), tasks `T00`–`T20` (§14), and decision gates `DG-1`–`DG-8` (§15). Its identifier families are defined normatively in §7 of this document. |
 | `research/22-research-synthesis.md` | Evidence landscape and gaps: state models (9–28, 57–69); blobs (71–81); memory (83–95); harness lessons (97–103); durability (105–114); self-modification (116–124); runtimes (126–132); interface (134–140); security (142–148); deployment (150–152); search (154–156); multimodal (158–160); contradicted assumptions (164–201); alternatives not followed (205–221); human questions (225–240); evidence gaps (244–262). |
 | `brainstorm/07-recommendation.md` | Architectural comparison (13–19), truth-first recommendation and authority classes (21–40), rejected centers (42–44), change conditions (46–51), assumptions (55–60), vertical-slice scope (62–70), not-doing list (72–80), and open questions (82–91). |
 
@@ -4648,10 +4546,10 @@ These cannot be resolved by further public-source reading alone:
 | Scoped approvals, global queue, constraint overrides | Requirements 60–64; approval and override contracts 864–1007; synthesis 225–240. |
 | Native ledger durability and `outcome_unknown` | Requirements 72–78; loops/effects 1181–1272; recovery 4.7.9; synthesis 105–114. |
 | Undo forest and replay separation | Requirements 82–88; undo/replay 4.7.7–4.7.8; synthesis 178–180. |
-| Live arbitrary plugins outside frozen trust root | Requirements 90–104; kernel invariants and candidates 4.8; synthesis 116–124. |
-| Unrestricted egress and explicit exfiltration residual | Requirements 108–118; security S-7 and §4.10.4; synthesis 142–148. |
-| Any credential enrollment with least-privilege guidance | Requirements 118; broker enrollment 4.10.6; synthesis 142–148. |
-| Programmable tool surface and runtime bake-off | Requirements 120–128; tools and bake-off 4.9; synthesis 126–132. |
+| Declarative changes live; executable candidates human-approved | Requirements: Self-modification; `07 §4.8.5`; synthesis 116–124. |
+| No NIC plus a closed channel set; capped search as the explicit residual | Requirements: Security and external effects; `04 §4`; `07 §4.10.4`. |
+| No provider credential in the VM; search key isolated in the Search VM | Requirements: Security and external effects; `04 §1` S-3; `07 §4.10.6`. |
+| Programmable tool surface on a fixed Monty runtime | Requirements: Tools and providers; `07 §4.9`; Monty evidence in `spikes/single-process/`. |
 | Stable web shell with AG-UI/A2UI/MCP Apps adapters | Requirements 130–138; interface contract 4.11.7; synthesis 134–140. |
 | Local SQLite plus OCI-layout CAS and ordered backup | Requirements 140–154; persistence 4.3 and backup 4.3.4; synthesis 71–81. |
 | Zero-tolerance gates and measured quality | Requirements 156–158; validation §7; synthesis 244–262. |
@@ -4661,8 +4559,8 @@ These cannot be resolved by further public-source reading alone:
 - The research synthesis reports no matched, independent memory benchmark. Claims about reconciliation quality are therefore design requirements, not validated performance claims.
 - No surveyed system provides calibrated confidence or reversible entity split; Kanbei's non-destructive design is a mitigation, not a proof of correctness.
 - Headlong, Dots, Duet, and Blitzy do not publish comparable outcome, retention, task-completion, or cost data. Their mechanisms inform patterns, not benchmarks.
-- The synthesis identifies no portable, signed execution-snapshot format and no head-to-head programmatic tool-use comparison across Monty, TypeScript, Lua, Bash, and full CPython. The bake-off exists to close that gap.
-- Independent security audit of the chosen sandbox/broker composition is absent. The host security spike and fail-closed posture are the required mitigations.
+- The synthesis identified no portable, signed execution-snapshot format and no head-to-head programmatic tool-use comparison. The bake-off that would have closed the language gap is retired: the deployment has one fixed runtime (Monty) and one fixed model, so a model-dependent comparison could not select anything. The gap is recorded, not closed.
+- Independent security audit of the chosen VM-and-channels composition is absent. The channel manifest, start verification, and fail-closed posture are the required mitigations.
 - A2UI renderer maturity, AG-UI-to-A2UI mapping, json-render catalog parity, and MCP Apps host support remain uncertain; interface adapters must declare versions and fail closed on unsupported combinations.
 
 ### 9.4 Citation convention

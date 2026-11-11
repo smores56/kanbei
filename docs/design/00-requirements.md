@@ -4,11 +4,13 @@ Status: resolved through research, brainstorming, and human grilling. This is th
 
 ## Product target
 
-Kanbei is a self-hosted, single-user, single-always-on-host agentic assistant. Its first vertical slice covers two selected projects plus Kanbei itself. Managed LLM and search APIs are allowed; the canonical state, orchestration, interface, and broker remain on the user's infrastructure.
+Kanbei is a self-hosted, single-user, always-thinking ledger agent. It runs in one NIC-less microVM on the owner's host, owns the RTX 3090, and performs all inference offline with llama.cpp and the owner's own weights. There is no managed LLM API and no general network path; the world reaches Kanbei only through six fixed channels (Inbox read-only, Vault read-only, Todo read-write size-capped, Chat over vsock, CSR over vsock, Search over vsock). Canonical state, orchestration, interface, and the enforcement boundary stay on the owner's infrastructure.
 
-The canonical acceptance journey is research to feature push: ingest a project, explore intent, approve a structural goal where required, execute nested deltas, reconcile external commits, add a useful tool/UI projection through self-modification, and preserve enough evidence for internal-state and presentation replay. World-state control, memory reconciliation, and self-modification must all be demonstrated at comparable depth.
+Kanbei's code enters the VM only through a human-merged `smores56/kanbei` commit pinned in nix-config's `flake.lock` and built by Nix into the VM image. Agents may open pull requests; no development worktree is ever mounted into the VM.
 
-The target repository label for later SDLC tracking is `smores56/kanbei`. Its code has not been inspected and must not be inspected under the current constraint. The only personal codebase inspected during research was `nix-config`.
+The canonical acceptance journey is life admin: ingest the owner's mail, calendar, finance, browser, photo metadata, phone data, and project changes; reconcile them into one inspectable ledger; advise on what needs attention; and maintain a human-owned todo list that Kanbei may read and write within a size cap. World-state control, memory reconciliation, and self-modification must all be demonstrated at comparable depth on that journey: one declarative change goes live, and one executable change waits for human approval before it activates.
+
+The target repository is `smores56/kanbei`. This document set is the rebase of the pre-split requirements baseline onto the deployed split design (SDLC #509); where the two disagree, this rebase governs.
 
 ## Architecture and authority
 
@@ -21,11 +23,13 @@ Use six kernel contracts:
 - Record: ECS-like append-only components.
 - Effect: scoped runtime activation, disposal, and compensation boundaries.
 - Projection: deterministic or explicitly asynchronous derived state with coverage watermarks.
-- Capability: mediated filesystem, process, network, model, and secret operations.
+- Capability: mediated channel, model, filesystem, process, and secret operations.
 - Loop: durable agent execution, subscriptions, and branches.
 - View: renderer-neutral catalogs, artifacts, and curation gestures.
 
 Records are canonical at rest. Loops are actor-like at runtime. Effects own resources, not authority. Projections own derived state. Capabilities own external authority. Views own presentation and are not canonical domain state.
+
+Authority is layered by plane. The host (kernel, root-only VM artifacts, network plumbing) and the human sit outside Kanbei's trust boundary. Inside the VM the frozen trust root holds the canonical append path and sequencer, the six-channel host surface and its code, the Monty host-call boundary and sandbox supervisor, the global ceiling governor, receipt verification, the activation/rollback supervisor, the audit sink, the startup verifier, and the minimal consent surface. Everything else — agents, declarative views, and executable candidates — is mutable and untrusted.
 
 ## Record and state semantics
 
@@ -61,7 +65,7 @@ Use human-owned declarative autonomy tiers: automatic, review-after, approval-re
 
 Present one global decision queue grouped by intent and deadline, deduplicating shared evidence and supporting individual or batch rulings. Approval binds to an exact interpretation/plan hash, subject, authorized scope, constraints, and expiry. Compliant child deltas may proceed without fresh approval.
 
-Agents have full discretion to reassess and override failed approval constraints with a recorded rationale. Approval constraints therefore express delegated intent, not a hard security boundary. Sandbox, broker, and global resource policies are separate hard human-owned boundaries.
+Agents have full discretion to reassess and override failed approval constraints with a recorded rationale. Approval constraints therefore express delegated intent, not a hard security boundary. The VM boundary, the channel policy, and global resource ceilings are separate hard human-owned boundaries.
 
 Nested work has one ownership parent and an arbitrary causal DAG. Completion requires evidence against acceptance criteria and required blockers; autonomy tier determines automatic, review-after, or approval-required promotion.
 
@@ -69,7 +73,7 @@ External changes are recorded immediately and reconciled autonomously without cl
 
 ## Agent loops and durability
 
-Use persistent self-triggering agent loops with event and timer wakeups, idle backoff, and policy-controlled concurrency. Do not require literal continuous model calls. Global spend, token, rate, and concurrency ceilings are hard; per-loop budgets are soft and support rationale-bearing overrides. Concrete limits are mandatory operator configuration informed by cost measurements.
+Use persistent self-triggering agent loops with event and timer wakeups, idle backoff, and policy-controlled concurrency. Do not require literal continuous model calls. GPU-lane occupancy, ingest volume, CAS growth, chat rate, and growth-bearing search budget ceilings are hard; per-loop budgets are soft and support rationale-bearing overrides. Concrete limits are mandatory operator configuration informed by measurement.
 
 Use ledger-backed canonical delegation, handoffs, decisions, and subscriptions. Direct streams are ephemeral optimizations whose outcomes are appended.
 
@@ -89,80 +93,87 @@ Use dependency-aware branch sets for cross-agent undo. Compute affected descenda
 
 ## Self-modification
 
-Initially allow live mutation of everything outside the frozen trust root, including arbitrary tools and plugins, as an experiment to be tightened if practice demonstrates unacceptable risk. Declarative context projections, UI, keybinds, themes, settings, tool wiring, and executable plugins all use versioned candidates.
+Declarative and executable changes follow different paths.
 
-The frozen trust root contains the canonical append/integrity path, sandbox supervisor, secret broker, global resource ceilings, receipt verification (including approval/tier/coverage checks), activation/rollback supervisor, audit sink, and a minimal read-only consent surface with its gesture endpoint. The consent surface renders canonical evidence, scope, and hashes independently of the mutable world UI. Agents may propose but cannot live-edit these components.
+Declarative changes — context filters, queries, budgets, summaries, disclosure rules, view catalogs, themes, keybinds, and settings — activate live at the next turn boundary, with the running turn pinned to the version it started with. They are versioned documents validated for schema, budget bounds, authorized sources, unknown component versions, total disclosure rules, no presentation of suspect or retracted records as current, and explicit fallback.
 
-Use a bespoke TypeScript plugin kernel, borrowing Cordis and DeepSeek Harness patterns without depending on either. Do not let their APIs define Kanbei's domain model.
+Executable changes — arbitrary tools, plugins, and executable projection code — never activate without a human. They are staged as immutable candidates carrying a dependency lock, a capability and dependency diff, a sandboxed dynamic conformance run under Monty with external capabilities denied, a state-migration dry run on shadow state, and a health plan. The candidate then waits in the decision queue for an approval receipt binding the candidate digest, capability diff, scope, and expiry. Approval flips one scope pointer atomically, runs health checks, and retains the previous candidate for rollback. An agent cannot approve its own candidate, and a candidate cannot remove the approval affordance.
 
-Activate mutable changes by staging each agent/plugin dependency scope, validating it, producing capability and dependency diffs, atomically flipping a scope pointer, running health checks, and retaining previous candidates for rollback. External effects are not rolled back by pointer flips.
+The frozen trust root contains the canonical append/integrity path and single sequencer, the six-channel host surface and its code (Inbox reader, Vault reader, Todo writer, Chat server, CSR handler, Search client), the Monty host-call boundary and the sandbox supervisor, the global resource ceilings and their governor, receipt verification (including approval/tier/coverage checks), the activation/rollback supervisor, the audit sink, the startup verifier that records the kernel generation, and a minimal read-only consent surface with its gesture endpoint. The consent surface renders canonical evidence, scope, and hashes independently of agent-authored views. Agents may propose but cannot live-edit these components; they change only through a human-merged commit built into a new image.
 
-Agents may edit declarative context filters, queries, budgets, summaries, and disclosure rules with next-turn activation. Executable projection code follows the same scoped candidate mechanism as other mutable code.
+Use a bespoke TypeScript plugin kernel, borrowing Cordis and DeepSeek Harness patterns without depending on either. Do not let their APIs define Kanbei's domain model. Agent-authored code runs under Monty, a Python-subset interpreter with no ambient filesystem, network, or subprocess access; host calls are explicit asynchronous stubs. Monty is a language-level boundary inside the VM and is never described as the security boundary: the VM and its channel set are.
 
-All canonical writes pass through the frozen append API. Mutable agents and plugins cannot open or mutate canonical SQLite directly. Mutable plugin state uses separate scoped stores.
+All canonical writes pass through the frozen append API. Mutable agents and plugins cannot open or mutate canonical SQLite directly. Mutable plugin state uses separate scoped stores under `/var/lib/kanbei/`.
 
-Frozen-kernel changes require human-approved Nix generations. Roll back code only when data remains readable; otherwise roll forward or branch from a verified checkpoint. Do not run destructive automatic down migrations.
+Frozen-root changes require human-approved Nix generations built from the pinned commit. Roll back code only when data remains readable; otherwise roll forward or branch from a verified checkpoint. Do not run destructive automatic down migrations.
 
 ## Security and external effects
 
-Assume hostile prompt injection with arbitrary agent/tool code, hostile dependencies, exfiltration attempts, sandbox escape attempts, and confused-deputy attacks. The host and human remain trusted.
+Assume hostile prompt injection with arbitrary agent and tool code, hostile dependencies, exfiltration attempts, and confused-deputy behavior in every ingest batch. The host and the human remain trusted; inside the VM, the agent process is the adversary.
 
-Allow read/write access only to selected project roots, scratch space, and agent-mutable Kanbei paths. Secrets and the frozen trust root are outside the mutable write boundary. Canonical storage is not agent-writable.
+The VM has no NIC, no user-mode networking, and no DNS. Its only device surface is the six channels. Kanbei therefore cannot exfiltrate except through the Search channel (capped, filtered, logged, and an accepted residual), the Chat channel (to the owner), the Todo channel (size-capped), or a VM escape.
 
-Unrestricted outbound network is accepted. Consequently, the design does not protect project-data confidentiality from malicious code; injected code can exfiltrate anything readable. This is an accepted residual that must be explicit.
+Reads are limited to the channel mounts: Inbox and Vault read-only, Todo read-write within its cap, plus per-agent scratch and agent-mutable state inside the VM. The frozen trust root and canonical storage are outside the mutable write boundary.
 
-Inter-agent isolation is for crash and resource containment, not a required security boundary. Prefer lightweight process, WASM, or microVM mechanisms only when operationally cheap. A container per agent is excluded.
+The Kanbei VM holds no provider credentials at all. The model is local and the only TinyFish key lives in the Search VM. Channel policy is the boundary; there is no credential-injection path, no broker, and no general-purpose HTTP client inside the VM. Credentialed work happens in the per-source ingest VMs, which hold only their own source's credentials, parse that source's hostile input, and emit age-encrypted batches to a host writer that the VM cannot write.
 
-The broker maps enrolled logical hostnames to real endpoints and injects credentials without exposing them to agent code. It is not an action-authorization layer and does not constrain methods, paths, or payloads. Never forward credentials across hosts or redirects. Redact known credential values from responses and logs where possible.
+Inter-agent isolation inside the VM is for crash and resource containment, not a security boundary. Monty bounds one program's time and memory; the VM contains the process tree.
 
-Any credential may be enrolled. Documentation strongly recommends least-privilege provider credentials and states that agents can exercise their full provider-side authority. Enrollment is a one-time human action; subsequent use is autonomous within hard broker policy.
+The capability set an agent can invoke is closed and derived from the channel manifest. A sandbox that starts with a weaker posture than declared is a start failure, not a runtime downgrade.
 
 ## Tools and providers
 
 Expose one programmable execution surface with search/list/describe discovery for versioned functions and documentation. Agents compose host calls in code and receive structured results. Direct per-tool schemas are not the default context cost.
 
-Select the agent-facing execution language through an identical-task bake-off covering Monty, TypeScript, Lua, Bash, and full CPython. Measure success, token use, latency, host-call behavior, snapshots, and operability inside the OS sandbox. Do not treat any in-process interpreter as the outer security boundary.
+Agent-authored code runs under Monty, fixed by decision: the same runtime for every agent, with host calls generated as typed stubs and no ambient capability. The control plane is TypeScript on Deno, fixed by decision; Deno permissions are an inner policy layer and the VM boundary is mandatory.
 
-Use TypeScript for the main control plane. Evaluate Node and Deno in a spike; the OS sandbox remains mandatory unless the threat model changes. Deno permissions may be an inner boundary, not an assumed replacement.
+Model routing is a single local provider behind a provider-neutral request/response contract: llama.cpp on the 3090 serving the owner's model, with human-owned task policies mapping task classes to lanes. Preserve exact post-redaction request/response evidence and record reasoning availability; there is no remote model, no fallback chain, and no provider credential.
 
-Use provider-neutral model routing with human-owned task policies and exact I/O capture. Use TinyFish behind a provider-neutral search/fetch contract. Preserve raw provider requests and responses as evidence, normalizing without requiring equivalent capabilities across providers.
+Search uses the provider-neutral search and fetch contract with TinyFish as the only adapter, called from the Search VM over the Search channel. A hit is a locator, not a capture; raw provider envelopes are evidence. Reported limits are applied as backpressure before the call.
 
 ## Interface and multimodal state
 
-Use a stable web shell with coordinated graph, delta timeline, and global decision views. Agents choose or generate contextual visualizations and chat inside that shell. Authoritative approval displays and gestures use the separate frozen minimal consent surface; mutable UI may deep-link to it but cannot supply its evidence or ruling payload. Do not build a TUI in the vertical slice; keep projections and catalogs renderer-neutral.
+Serve a static, human-owned web shell built by Nix from the pinned commit. Its CSP limits `connect-src` to the Kanbei API, `img-src` to `'self'` and `data:`, and `form-action` to `'self'`; there is no inline script, no remote font, and no remote media. Kanbei returns JSON only, and model text and declarative views render with no remote resources and no auto-linking, so a prompt-injected Kanbei cannot use the owner's browser as an exfiltration channel.
 
-Keep canonical events and graph semantics internal. Adapt runs to AG-UI, render ordinary A2UI catalogs, add custom graph components, and isolate arbitrary plugin artifacts with an MCP Apps-compatible sandboxed boundary.
+The shell carries coordinated graph, delta timeline, and global decision views. Agents may supply declarative view catalogs, themes, and contextual components; they cannot add code, new origins, remote references, or remove an anchor or decision affordance. Authoritative approval displays use the separate frozen consent surface, which the shell may deep-link to but cannot modify or supply evidence to. Do not build a TUI in the vertical slice; keep projections and catalogs renderer-neutral.
 
-Human graph edits are curation gestures that append merge, split, link, scope, correction, retraction, and promotion records. Agents receive the same versioned structured view specifications as renderers, plus derived screenshots/accessibility trees when useful. Human interactions become records.
+Keep canonical events and graph semantics internal. Adapt runs to AG-UI, render ordinary A2UI catalogs, add custom graph components, and isolate arbitrary artifacts inside the CSP-locked shell.
+
+Human graph edits are curation gestures that append merge, split, link, scope, correction, retraction, and promotion records. Agents receive the same versioned structured view specifications as renderers. Human interactions become records.
 
 Content-address arbitrary files. Provide provenance, previews, and derived OCR/text/metadata for text, code, images, screenshots, and PDFs. Store audio/video without requiring full semantic indexing initially. Canonical raw objects remain distinct from derived transcripts, OCR, embeddings, and thumbnails.
 
 ## Persistence, freshness, and backup
 
-Store all mutable Kanbei state under `~/.local/state/kanbei/`; trusted Nix configuration and secret material remain outside it. Add this path to the existing backup configuration when implementation lands.
+Store all mutable Kanbei state on the in-guest LUKS volume under `/var/lib/kanbei/`. The kernel, static UI, model weights, and fixtures are image content: Nix-built from the pinned commit, read-only at runtime, and never writable by agent code. No secret material is stored in the VM.
 
 Use SQLite for the canonical ledger and rebuildable SQL/FTS/graph indexes. Use one sequenced writer, JSON component payloads, and transactional metadata. Mutable plugins use separate scoped state.
 
-Use a local OCI-layout whole-object CAS behind a replaceable `BlobStore` contract. Publish bytes before manifest and ledger visibility. Enforce per-object and total admission limits, backpressure, and safe orphan reclamation. Defer chunk-level dedup.
+Use a local OCI-layout whole-object CAS behind a replaceable `BlobStore` contract. Publish bytes before manifest and ledger visibility. Enforce per-object and total admission limits, backpressure, and safe orphan reclamation. Defer chunk-level dedup. CAS growth is a hard ceiling and a freshness signal, not an unbounded consequence of ingest.
 
-Operational projections—work DAG, approvals, raw observation metadata, active configuration, and ledger status—provide strong read-your-writes and commit atomically with the ledger. Cheap indexes may join this class after measurement. Semantic projections expose exact coverage and pending work rather than pretending to be current.
+Operational projections — work DAG, approvals, raw observation metadata, active configuration, source heartbeats, and ledger status — provide strong read-your-writes and commit atomically with the ledger. Cheap indexes may join this class after measurement. Semantic projections expose exact coverage and pending work rather than pretending to be current.
+
+Every source carries a freshness heartbeat: the last batch sequence, batch time, and observed coverage. The UI labels a source stale past its window, and the host raises an alert when a heartbeat expires. Staleness is visible, never silent.
 
 Retain the ledger indefinitely by default. Logical retraction is normal; physical erasure is an exceptional epoch-producing operation covering derived artifacts and backups as far as possible. Leave automated retention policies open for later.
 
-Back up using an online SQLite point-in-time snapshot immediately before the normal filesystem backup. Copy that snapshot and immutable CAS files while GC is paused; normal ledger writes continue. Extra new blobs are harmless. Restore verifies every reference and rebuilds derived indexes.
+Back up the guest as an encrypted image. The disk is LUKS sealed to the VM's swtpm vTPM with an offline recovery key shown once; the host snapshots the frozen image ciphertext nightly and restic copies it to `/var/backup` and R2. Restore reimages the VM, unlocks with the vTPM or the recovery key, verifies the ledger checkpoint and every CAS reference, and rebuilds derived indexes. An online SQLite snapshot is taken before the image snapshot so the image contains a consistent ledger.
 
-Bind the UI to loopback and expose it through the existing Cloudflare Tunnel and Access conventions.
+`kanbei.sammohr.dev` is a Cloudflare private hostname route reachable only from devices running the WARP client. Gateway TLS decryption stays off and the Cloudflare root CA is never installed; TLS terminates in the VM over the Chat channel. A CAA record with `accounturi` limits who can issue certificates for the domain.
 
 ## Validation and deferred decisions
 
-Use zero-tolerance gates for secret exposure, canonical ledger bypass, silent external clobber, effects outside hard policy, missing required provenance, and known-retracted claims presented as current. Measure reconciliation quality, runtime task success, cost, latency, and UI usefulness; set concrete quality thresholds after baseline spikes.
+Use zero-tolerance gates for secret exposure, canonical ledger bypass, silent external clobber, effects outside hard policy, missing required provenance, known-retracted claims presented as current, approval-binding violations, trust-root mutation, channel leaks, remote requests from the UI shell, Todo cap violations, and stale heartbeats presented as current. Measure reconciliation quality, life-admin task success, lane latency, ingest freshness, and UI usefulness; set concrete quality thresholds after baseline spikes.
+
+A channel leak is any path that moves bytes outside the six channels: a NIC, a user-mode network, a DNS lookup, a host filesystem mount outside the declared classes, a virtiofs share not in the manifest, or an undeclared vsock port. It is a release-blocking defect, not a residual.
 
 Defer these decisions to explicit spikes:
 
-- Agent-facing execution language.
-- Node versus Deno.
-- Pure user-space deployment versus a dedicated-UID broker/sandbox helper.
-- Lightweight inter-agent isolation mechanism.
-- Concrete resource ceilings and quality thresholds.
+- Concrete resource ceilings: GPU lane occupancy, ingest volume, CAS growth, Todo bytes, chat rate, and search budget.
+- Freshness windows per source and the alert threshold.
+- DLP patterns and the judge's block rate for the Search channel.
+- What the vTPM seal binds to under microvm.nix direct kernel boot.
+- Exact Firecracker vsock and read-only secret-block-device behavior under microvm.nix.
+- A2UI/AG-UI exact pins and multi-decision interrupt grouping.
 
-The deployment spike must test user namespaces, same-UID process/ptrace isolation, Landlock, systemd user-manager directives, broker identity, resource controls, and recovery. A pure user-space model is desirable but cannot be assumed to protect broker secrets from same-UID malicious code.
+Placement, isolation, the agent-facing language, the TypeScript runtime, and the deployment plane are no longer open: Monty under a NIC-less VM with a Deno control plane, recorded in `08-implementation-plan.md`.
