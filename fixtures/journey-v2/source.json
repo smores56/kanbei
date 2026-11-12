@@ -1,0 +1,288 @@
+{
+  "dataset": "journey-v2",
+  "version": "1.0.0",
+  "recipient": "age1gyzseyvd0cumhe3svg3ey6x54lwfhmqvp2wf9dre8d0sycs5e3qscwpgqa",
+  "sealedBy": "deno run -A scripts/seal-journey-fixtures.ts",
+  "batches": [
+    {
+      "caseId": "tuta-mail-1",
+      "file": "batches/tuta-mail-1.age",
+      "origin": "tuta-mail",
+      "sequence": 1,
+      "producesAdvice": true,
+      "producedAt": "2026-11-11T00:00:00.000Z",
+      "scan": {
+        "mode": "event",
+        "scopeHash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "startedAt": "2026-11-10T23:59:50.000Z",
+        "completedAt": "2026-11-11T00:00:00.000Z"
+      },
+      "coverage": { "complete": true, "gaps": 0, "suppressed": 0 },
+      "suppressed": 0,
+      "entries": [
+        {
+          "resourceKey": "message/1",
+          "kind": "capture",
+          "locator": "imap://tuta/Mail/INBOX;uid=1",
+          "capturedAt": "2026-11-11T00:00:00.000Z",
+          "mediaType": "application/json",
+          "body": "{\"subject\":\"Lease renewal due 2026-12-01\",\"from\":\"landlord@example.invalid\",\"receivedAt\":\"2026-11-10T08:00:00Z\",\"renewalDate\":\"2026-12-01\",\"text\":\"The lease renewal is due for signature.\"}",
+          "evidence": { "adapter": "tuta-imap", "status": "ok" }
+        },
+        {
+          "resourceKey": "message/2",
+          "kind": "capture",
+          "locator": "imap://tuta/Mail/INBOX;uid=2",
+          "capturedAt": "2026-11-11T00:00:00.000Z",
+          "mediaType": "application/json",
+          "body": "{\"subject\":\"Home insurance renewal\",\"from\":\"insurer@example.invalid\",\"dueDate\":\"2026-11-30\"}",
+          "evidence": { "adapter": "tuta-imap", "status": "ok" }
+        }
+      ]
+    },
+    {
+      "caseId": "tuta-calendar-1",
+      "file": "batches/tuta-calendar-1.age",
+      "origin": "tuta-calendar",
+      "sequence": 1,
+      "producesAdvice": true,
+      "producedAt": "2026-11-11T00:01:00.000Z",
+      "scan": {
+        "mode": "full",
+        "scopeHash": "2222222222222222222222222222222222222222222222222222222222222222",
+        "startedAt": "2026-11-11T00:00:10.000Z",
+        "completedAt": "2026-11-11T00:01:00.000Z"
+      },
+      "coverage": { "complete": true, "gaps": 0, "suppressed": 0 },
+      "suppressed": 0,
+      "entries": [
+        {
+          "resourceKey": "event/1",
+          "kind": "capture",
+          "locator": "cal://tuta/calendar/event/1",
+          "capturedAt": "2026-11-11T00:01:00.000Z",
+          "mediaType": "application/json",
+          "body": "{\"summary\":\"Dentist appointment\",\"start\":\"2026-11-12T09:00:00Z\"}",
+          "evidence": { "adapter": "tuta-calendar", "status": "ok" }
+        }
+      ]
+    },
+    {
+      "caseId": "finance-1",
+      "file": "batches/finance-1.age",
+      "origin": "finance",
+      "sequence": 1,
+      "producesAdvice": true,
+      "producedAt": "2026-11-11T00:02:00.000Z",
+      "scan": {
+        "mode": "full",
+        "scopeHash": "3333333333333333333333333333333333333333333333333333333333333333",
+        "startedAt": "2026-11-11T00:01:10.000Z",
+        "completedAt": "2026-11-11T00:02:00.000Z"
+      },
+      "coverage": { "complete": false, "gaps": 1, "suppressed": 2 },
+      "suppressed": 2,
+      "entries": [
+        {
+          "resourceKey": "transaction/1",
+          "kind": "capture",
+          "locator": "simplefin://accounts/1/transactions/1",
+          "capturedAt": "2026-11-11T00:02:00.000Z",
+          "mediaType": "application/json",
+          "body": "{\"account\":\"checking\",\"amount\":-42.5,\"merchant\":\"Grocer\",\"dueDate\":\"2026-11-20\"}",
+          "evidence": { "adapter": "simplefin", "status": "ok" }
+        }
+      ]
+    },
+    {
+      "caseId": "immich-1",
+      "file": "batches/immich-1.age",
+      "origin": "immich",
+      "sequence": 1,
+      "producesAdvice": false,
+      "producedAt": "2026-11-11T00:03:00.000Z",
+      "scan": {
+        "mode": "full",
+        "scopeHash": "4444444444444444444444444444444444444444444444444444444444444444",
+        "startedAt": "2026-11-11T00:02:10.000Z",
+        "completedAt": "2026-11-11T00:03:00.000Z"
+      },
+      "coverage": { "complete": true, "gaps": 0, "suppressed": 0 },
+      "suppressed": 0,
+      "entries": [
+        {
+          "resourceKey": "asset/1",
+          "kind": "capture",
+          "locator": "immich://asset/asset-1",
+          "capturedAt": "2026-11-11T00:03:00.000Z",
+          "mediaType": "application/json",
+          "body": "{\"assetId\":\"asset-1\",\"takenAt\":\"2026-11-09T12:00:00Z\",\"mediaType\":\"image/jpeg\"}",
+          "evidence": { "adapter": "immich-api", "status": "ok" }
+        }
+      ]
+    },
+    {
+      "caseId": "brave-1",
+      "file": "batches/brave-1.age",
+      "origin": "brave",
+      "sequence": 1,
+      "producesAdvice": false,
+      "producedAt": "2026-11-11T00:04:00.000Z",
+      "scan": {
+        "mode": "full",
+        "scopeHash": "5555555555555555555555555555555555555555555555555555555555555555",
+        "startedAt": "2026-11-11T00:03:10.000Z",
+        "completedAt": "2026-11-11T00:04:00.000Z"
+      },
+      "coverage": { "complete": true, "gaps": 0, "suppressed": 0 },
+      "suppressed": 0,
+      "entries": [
+        {
+          "resourceKey": "bookmark/1",
+          "kind": "capture",
+          "locator": "https://example.invalid/article",
+          "capturedAt": "2026-11-11T00:04:00.000Z",
+          "mediaType": "application/json",
+          "body": "{\"url\":\"https://example.invalid/article\",\"title\":\"Reading list\"}",
+          "evidence": { "adapter": "brave-sync", "status": "ok" }
+        }
+      ]
+    },
+    {
+      "caseId": "phone-1",
+      "file": "batches/phone-1.age",
+      "origin": "phone",
+      "sequence": 1,
+      "producesAdvice": true,
+      "producedAt": "2026-11-11T00:05:00.000Z",
+      "scan": {
+        "mode": "full",
+        "scopeHash": "6666666666666666666666666666666666666666666666666666666666666666",
+        "startedAt": "2026-11-11T00:04:10.000Z",
+        "completedAt": "2026-11-11T00:05:00.000Z"
+      },
+      "coverage": { "complete": true, "gaps": 0, "suppressed": 0 },
+      "suppressed": 0,
+      "entries": [
+        {
+          "resourceKey": "sms/1",
+          "kind": "capture",
+          "locator": "sms://thread/1",
+          "capturedAt": "2026-11-11T00:05:00.000Z",
+          "mediaType": "application/json",
+          "body": "{\"kind\":\"sms\",\"from\":\"+15550100\",\"text\":\"Reminder: water filter change by 2026-11-25\"}",
+          "evidence": { "adapter": "sms-ie", "status": "ok" }
+        }
+      ]
+    },
+    {
+      "caseId": "git-1",
+      "file": "batches/git-1.age",
+      "origin": "git",
+      "sequence": 1,
+      "producesAdvice": false,
+      "producedAt": "2026-11-11T00:06:00.000Z",
+      "scan": {
+        "mode": "event",
+        "scopeHash": "7777777777777777777777777777777777777777777777777777777777777777",
+        "startedAt": "2026-11-11T00:05:50.000Z",
+        "completedAt": "2026-11-11T00:06:00.000Z"
+      },
+      "coverage": { "complete": true, "gaps": 0, "suppressed": 0 },
+      "suppressed": 0,
+      "entries": [
+        {
+          "resourceKey": "refs/heads/main",
+          "kind": "git.ref",
+          "locator": "refs/heads/main",
+          "capturedAt": "2026-11-11T00:06:00.000Z",
+          "mediaType": "application/json",
+          "body": "{\"ref\":\"refs/heads/main\",\"oldSha\":null,\"newSha\":\"6f1f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f\",\"forced\":false}",
+          "evidence": { "adapter": "git-ingest", "status": "ok" }
+        }
+      ]
+    },
+    {
+      "caseId": "git-2",
+      "file": "batches/git-2.age",
+      "origin": "git",
+      "sequence": 2,
+      "producesAdvice": false,
+      "producedAt": "2026-11-11T02:00:00.000Z",
+      "scan": {
+        "mode": "event",
+        "scopeHash": "7777777777777777777777777777777777777777777777777777777777777777",
+        "startedAt": "2026-11-11T01:59:50.000Z",
+        "completedAt": "2026-11-11T02:00:00.000Z"
+      },
+      "coverage": { "complete": true, "gaps": 0, "suppressed": 0 },
+      "suppressed": 0,
+      "entries": [
+        {
+          "resourceKey": "refs/heads/main",
+          "kind": "git.ref",
+          "locator": "refs/heads/main",
+          "capturedAt": "2026-11-11T02:00:00.000Z",
+          "mediaType": "application/json",
+          "body": "{\"ref\":\"refs/heads/main\",\"oldSha\":\"6f1f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f\",\"newSha\":\"7a2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b\",\"forced\":false}",
+          "evidence": { "adapter": "git-ingest", "status": "ok" }
+        }
+      ]
+    },
+    {
+      "caseId": "tuta-mail-3",
+      "file": "batches/tuta-mail-3.age",
+      "origin": "tuta-mail",
+      "sequence": 3,
+      "producesAdvice": false,
+      "producedAt": "2026-11-11T03:00:00.000Z",
+      "scan": {
+        "mode": "event",
+        "scopeHash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "startedAt": "2026-11-11T02:59:50.000Z",
+        "completedAt": "2026-11-11T03:00:00.000Z"
+      },
+      "coverage": { "complete": true, "gaps": 0, "suppressed": 0 },
+      "suppressed": 0,
+      "entries": [
+        {
+          "resourceKey": "message/3",
+          "kind": "capture",
+          "locator": "imap://tuta/Mail/INBOX;uid=3",
+          "capturedAt": "2026-11-11T03:00:00.000Z",
+          "mediaType": "application/json",
+          "body": "{\"subject\":\"Neighbourhood digest\",\"from\":\"friend@example.invalid\"}",
+          "evidence": { "adapter": "tuta-imap", "status": "ok" }
+        }
+      ]
+    },
+    {
+      "caseId": "tuta-mail-1-replay",
+      "file": "batches/tuta-mail-1-replay.age",
+      "origin": "tuta-mail",
+      "sequence": 1,
+      "producesAdvice": false,
+      "duplicateOf": "tuta-mail-1",
+      "producedAt": "2026-11-11T00:00:00.000Z",
+      "scan": {
+        "mode": "event",
+        "scopeHash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "startedAt": "2026-11-10T23:59:50.000Z",
+        "completedAt": "2026-11-11T00:00:00.000Z"
+      },
+      "coverage": { "complete": true, "gaps": 0, "suppressed": 0 },
+      "suppressed": 0,
+      "entries": [
+        {
+          "resourceKey": "message/1",
+          "kind": "capture",
+          "locator": "imap://tuta/Mail/INBOX;uid=1",
+          "capturedAt": "2026-11-11T00:00:00.000Z",
+          "mediaType": "application/json",
+          "body": "{\"subject\":\"Lease renewal due 2026-12-01\",\"from\":\"landlord@example.invalid\",\"receivedAt\":\"2026-11-10T08:00:00Z\",\"renewalDate\":\"2026-12-01\",\"text\":\"The lease renewal is due for signature.\"}",
+          "evidence": { "adapter": "tuta-imap", "status": "ok" }
+        }
+      ]
+    }
+  ]
+}

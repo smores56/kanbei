@@ -1,0 +1,34 @@
+{
+  "cases": [
+    {
+      "name": "allowed",
+      "reply": {
+        "verdict": "allowed",
+        "hits": [
+          {
+            "title": "Release notes",
+            "locator": "https://example.invalid/notes",
+            "text": "<p>Kanbei <b>released</b> &amp; verified.</p>",
+            "rank": 1
+          }
+        ]
+      }
+    },
+    {
+      "name": "dlp-blocked",
+      "reply": { "verdict": "blocked", "reason": "dlp", "detail": "digit run" }
+    },
+    {
+      "name": "judge-blocked",
+      "reply": { "verdict": "blocked", "reason": "judge" }
+    },
+    {
+      "name": "empty",
+      "reply": { "verdict": "allowed", "hits": [] }
+    },
+    {
+      "name": "error",
+      "reply": { "verdict": "blocked", "reason": "error" }
+    }
+  ]
+}

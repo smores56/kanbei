@@ -1,0 +1,26 @@
+{
+  "now": "2026-11-11T00:00:00.000Z",
+  "windowMs": 3600000,
+  "knownOrigins": ["tuta-mail", "finance"],
+  "heartbeats": [
+    {
+      "origin": "tuta-mail",
+      "sequence": 12,
+      "producedAt": "2026-11-10T22:59:59.000Z",
+      "receivedAt": "2026-11-10T22:59:59.000Z",
+      "coverage": { "complete": true, "gaps": 0, "suppressed": 0 },
+      "state": "stale"
+    }
+  ],
+  "receipts": [
+    {
+      "origin": "tuta-mail",
+      "batchDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "sequence": 12,
+      "receivedAt": "2026-11-10T22:59:59.000Z",
+      "entries": 3,
+      "publishedBytes": 900,
+      "coverage": { "complete": true, "gaps": 0, "suppressed": 0 }
+    }
+  ]
+}

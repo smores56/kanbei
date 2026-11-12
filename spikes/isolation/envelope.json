@@ -1,0 +1,64 @@
+{
+  "testId": "S3",
+  "invariantIds": [
+    "crash-isolation",
+    "hang-containment",
+    "oom-containment",
+    "fork-bomb-containment",
+    "cleanup-after-kill",
+    "orphan-reaping",
+    "ipc-round-trip",
+    "resource-ceilings",
+    "hosts-agent-workload"
+  ],
+  "fixtureVersion": "security-v1@1.0.0",
+  "canonicalHead": {
+    "seq": 0,
+    "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "sequenceRange": [
+    0,
+    0
+  ],
+  "environment": {
+    "hostFingerprint": "sha256:d7fc918265e4a6804df85b3bef219de76d069f7edaf7ac8af68fb9605c6d97c1",
+    "kernel": "linux-6.18.39",
+    "runtime": "deno@2.9.2",
+    "sandboxPosture": "unverified",
+    "brokerIdentity": "unconfigured"
+  },
+  "seeds": [
+    0
+  ],
+  "modelRecordings": [],
+  "artifacts": [
+    "sha256:48dcc60ad222c536a6dbdfb4b38fa6b6cc74e06034e51fa26187c30718373c28"
+  ],
+  "outcome": "inconclusive",
+  "metrics": {
+    "process-cgroup.checksPassed": 9,
+    "process-cgroup.checksFailed": 0,
+    "process-cgroup.coldStartP50Ms": 112.6506280000001,
+    "process-cgroup.coldStartP95Ms": 120.31674999999996,
+    "process-cgroup.ipcP50Ms": 0.19141100000001643,
+    "process-cgroup.ipcP95Ms": 0.2530709999998635,
+    "process-cgroup.rssPerAgentMib": 13.6611328125,
+    "process-cgroup.densityAtTarget": 0,
+    "wasm-instance.checksPassed": 5,
+    "wasm-instance.checksFailed": 2,
+    "wasm-instance.coldStartP50Ms": 93.75080600000001,
+    "wasm-instance.coldStartP95Ms": 96.71424499999921,
+    "wasm-instance.ipcP50Ms": 0.07360000000062428,
+    "wasm-instance.ipcP95Ms": 0.13083999999980733,
+    "wasm-instance.rssPerAgentMib": 21.189208984375,
+    "wasm-instance.densityAtTarget": 0,
+    "microvm.checksPassed": 0,
+    "microvm.checksFailed": 0
+  },
+  "acceptedResiduals": [
+    "outcome pass means DG-4 produced a recommendation; it does not mean every arm was measured cleanly",
+    "wasm-instance failed resource-ceilings and hosts-agent-workload, and is ineligible",
+    "microvm is blocked on a missing runtime and sealed guest image, so no check ran for it",
+    "the nine containment ids describe the process-cgroup arm; wasm-instance covers crash, hang, OOM, cleanup, and IPC only; microvm covers none"
+  ]
+}

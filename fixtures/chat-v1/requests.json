@@ -1,0 +1,19 @@
+{
+  "requests": [
+    {
+      "route": "chat.turn",
+      "payload": { "turnId": "turn-1", "text": "what changed today?" }
+    },
+    {
+      "route": "decision.list",
+      "payload": { "limit": 2 }
+    },
+    {
+      "route": "decision.ruling_link",
+      "payload": { "decisionId": "dec-1" }
+    },
+    {
+      "route": "status"
+    }
+  ]
+}

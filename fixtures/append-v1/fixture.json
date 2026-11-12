@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "dataset": "append-v1",
+  "cases": [
+    {
+      "name": "unknown-component-roundtrip",
+      "record": {
+        "recordId": "01J00000000000000000000000",
+        "components": {
+          "kanbei.test/unknown@1": {
+            "z": 1,
+            "a": ["preserve", "byte-identical"]
+          }
+        }
+      }
+    },
+    {
+      "name": "hash-chain-single-link",
+      "predecessor": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "payload": {
+        "recordId": "01J00000000000000000000001",
+        "components": {}
+      }
+    }
+  ]
+}

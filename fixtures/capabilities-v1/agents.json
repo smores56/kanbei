@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "agents": [
+    {
+      "agentId": "assistant",
+      "sandboxId": "sbx-assistant",
+      "capabilities": [
+        "channel.inbox.read",
+        "channel.vault.read",
+        "channel.todo.read",
+        "channel.todo.write",
+        "channel.chat.respond",
+        "channel.search.query"
+      ]
+    },
+    {
+      "agentId": "renewer",
+      "sandboxId": "sbx-renewer",
+      "capabilities": ["channel.inbox.read", "channel.csr.renew"]
+    }
+  ]
+}

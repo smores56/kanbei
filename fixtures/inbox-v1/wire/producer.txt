@@ -1,0 +1,11 @@
+This envelope was produced by the deployed host producer contract:
+
+  nix-config modules/lib/ingest/policy.py (PROTOCOL_VERSION, validate_batch)
+
+and sealed with `age -r <fixtures/ingest-v1 recipient>`. The reader must accept
+it without any reader-specific schema having produced it.
+
+`host-heartbeat-1.age` is the same contract's freshness envelope
+(`nix-config modules/lib/ingest/heartbeat.py` + `policy.validate_heartbeat`):
+`{v, kind:"heartbeat", generated_at, sources, host_sources}`. Sealed with the
+same ingest-v1 recipient by `scripts/seal-heartbeat-fixture.ts`.

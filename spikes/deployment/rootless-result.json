@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "task": "A2b",
+  "sandbox": {
+    "mechanism": "rootless user+PID+mount namespaces + mounted root + Landlock",
+    "uid": 1000,
+    "brokerPid": 321012,
+    "brokerSocket": "/dev/shm/kanbei-a2b-321003/broker.sock",
+    "processExit": 0,
+    "processSuccess": true,
+    "stderr": ""
+  },
+  "landing": {
+    "abi": 7,
+    "allowedRead": true,
+    "deniedReadBlocked": true,
+    "allowedWrite": true,
+    "deniedWriteBlocked": true,
+    "brokerFdBlocked": true,
+    "brokerSignalBlocked": true,
+    "brokerSocketReachable": true,
+    "systemdControlBlocked": true,
+    "procSelfRootBlocked": true,
+    "details": {
+      "deniedRead": "ERROR:PermissionDenied: Permission denied (os error 13): readfile '/denied/secre",
+      "brokerFd": "ERROR:NotFound: No such file or directory (os error 2): readfile '/proc/321012/f",
+      "procSelfRoot": "ERROR:NotFound: No such file or directory (os error 2): readfile '/proc/self/roo",
+      "brokerSocket": "ok"
+    }
+  },
+  "checks": {
+    "allowedRead": true,
+    "deniedReadBlocked": true,
+    "allowedWrite": true,
+    "deniedWriteBlocked": true,
+    "brokerFdBlocked": true,
+    "brokerSignalBlocked": true,
+    "brokerSocketReachable": true,
+    "systemdControlBlocked": true,
+    "procSelfRootBlocked": true
+  },
+  "verdict": "pass"
+}

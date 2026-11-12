@@ -1,0 +1,29 @@
+{
+  "v": 1,
+  "kind": "heartbeat",
+  "generated_at": "2026-11-11T00:00:00Z",
+  "sources": {
+    "cluster-digest": {
+      "stale": false,
+      "host": true,
+      "window_s": 3600,
+      "last_ok": "2026-11-10T23:59:00Z",
+      "age_s": 60
+    },
+    "finance": {
+      "stale": true,
+      "host": false,
+      "window_s": 86400,
+      "last_ok": "2026-11-09T00:00:00Z",
+      "age_s": 172800
+    },
+    "tuta-mail": {
+      "stale": false,
+      "host": false,
+      "window_s": 900,
+      "last_ok": "2026-11-10T23:55:00Z",
+      "age_s": 300
+    }
+  },
+  "host_sources": ["cluster-digest"]
+}

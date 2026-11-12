@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "task": "A5",
+  "status": "partially-signed-dg1-dg4-blocked",
+  "gates": [
+    {
+      "gate": "DG-1",
+      "status": "blocked",
+      "recommended": "none",
+      "blockers": [
+        "no live provider adapter or model trials",
+        "NEURALWATT_API_KEY",
+        "frozen OS-sandbox profile",
+        "FI-01 runtime/interpreter versions",
+        "FI-06 hardware fingerprint, timeouts, resource ceilings",
+        "lang-v1 is not a §7.0 registered dataset"
+      ],
+      "condition": "AMD-1 resolved the two-provider blocker pre-data; one NeuralWatt provider (deepseek-v4.1-flash, qwen-3.8-27b) is frozen in spikes/language/model-manifest.json and 0 of 9000 planned trials ran, so DG-1 stays blocked"
+    },
+    {
+      "gate": "DG-2",
+      "status": "closed",
+      "recommended": "deno@2.9.2",
+      "condition": "conditional; re-run after ledger sequencer and worker model exist; S1 envelope is blocked",
+      "selected": "deno@2.9.2"
+    },
+    {
+      "gate": "DG-3",
+      "status": "closed",
+      "recommended": "variant-E-rootless-sandbox-candidate",
+      "condition": "A2b pass; A2c shared store build/direct pass, nix shell/profile blocked; human choice pending",
+      "selected": "variant-E-rootless-sandbox"
+    },
+    {
+      "gate": "DG-4",
+      "status": "blocked",
+      "recommended": "process-cgroup",
+      "condition": "S3 re-run under DG-3 option E is complete and bound to security-v1@1.0.0 (testId S3, outcome pass); human sign-off is the only remaining DG-4 action; no security property claimed"
+    }
+  ],
+  "decisionsClosed": [
+    "DG-2",
+    "DG-3"
+  ],
+  "baselineFrozen": false,
+  "evidenceBindingGaps": [
+    "security-v1 is registered and sealed in this tree; the S3 re-run emits an EvidenceEnvelope bound to security-v1@1.0.0 (outcome pass)",
+    "A1's permission and fail-closed probes are bound via a second envelope, testId NODE-DENO-1-SECURITY, fixture security-v1@1.0.0, outcome pass; the A1 main NODE-DENO-1 envelope stays blocked on cost-v1",
+    "A2 now emits a DEP-1 envelope bound to security-v1@1.0.0 with outcome fail by design: pure user-space has no secret isolation; this is a finding, not a defect",
+    "A4 issued no envelope because all model cells are blocked",
+    "A3 emits an envelope as well (testId S3, outcome pass); A2b is a measurement record, not an EvidenceEnvelope"
+  ],
+  "operatorEnvelopeSchema": "src/spikes/gates/operator-envelope.ts",
+  "next": [
+    "human signs or amends DG-4",
+    "human provides NEURALWATT_API_KEY and a live adapter for DG-1 trials or blocks F4",
+    "human decides whether to accept the remaining evidence gaps: the A1 main envelope stays blocked on cost-v1 and the A2 DEP-1 outcome is fail by design"
+  ],
+  "crossGate": "S3 was re-run under DG-3 option E: the supervisor is the deployment user outside the rootless agent sandbox and owns the delegated cgroup root. DG-4 now needs human sign-off only; DG-3 variant D would still move the supervisor to a dedicated system unit.",
+  "a2b": {
+    "status": "pass",
+    "artifact": "spikes/deployment/rootless-result.json",
+    "report": "spikes/deployment/A2B-ROOTLESS-SANDBOX.md"
+  },
+  "a2c": {
+    "status": "pass",
+    "artifact": "spikes/deployment/nix-shared-result.json",
+    "report": "spikes/deployment/A2C-SHARED-NIX-STORE.md"
+  }
+}

@@ -1,0 +1,553 @@
+{
+  "schemaVersion": 3,
+  "spikeId": "S3",
+  "validationId": "ISO-1",
+  "dataset": "security-v1",
+  "generatedAt": "2026-11-11T19:32:29.834Z",
+  "host": {
+    "kernel": "linux-6.18.39",
+    "runtime": "deno@2.9.2",
+    "cpus": 32,
+    "totalMemoryBytes": 33551433728,
+    "cgroupVersion": "v2",
+    "cgroupControllers": [
+      "cpuset",
+      "cpu",
+      "io",
+      "memory",
+      "hugetlb",
+      "pids",
+      "rdma",
+      "misc",
+      "dmem"
+    ],
+    "userNamespaces": "available",
+    "landlockAbi": 7,
+    "cgroupNsdelegate": true,
+    "delegatedParent": "owned-by-uid",
+    "kvmDevice": "accessible",
+    "microvmRuntimes": [
+      "/run/current-system/sw/bin/microvm"
+    ],
+    "generalVmm": [],
+    "wasmEngine": "v8@14.9.207.2-rusty (core wasm, no WASI runtime on PATH)",
+    "privilegedOperations": false
+  },
+  "supervisor": {
+    "kind": "rootless-userns-chroot-landlock",
+    "uid": 1000,
+    "landlockAbi": 7,
+    "cgroupRoot": "/user.slice/user-1000.slice/user@1000.service/app.slice/run-p1826952-i1826953.service",
+    "delegatedBy": "systemd-run --user --property=Delegate=yes --property=DelegateSubgroup=supervisor",
+    "dependencies": [
+      "user systemd manager, used once to acquire a delegated cgroup root",
+      "unprivileged user+PID+mount namespaces with chroot and Landlock"
+    ]
+  },
+  "targetConcurrency": 16,
+  "security": {
+    "propertyClaimed": false,
+    "statement": "No security property is claimed for any arm. S3 (ISO-1) measures crash and resource containment only. No arm is evidence of a credential, approval, filesystem, network, or trust-root boundary; those remain owned by the OS sandbox, broker, and capability contracts.",
+    "excluded": [
+      "credential, approval, and trust-root boundaries (`ZT-01`, `ZT-11`, `ZT-13`), which remain owned by the broker, consent surface, and OS sandbox",
+      "filesystem, network, and process capability enforcement (`DEP-1`)",
+      "containment of malicious code that is already executing inside the agent; only crash and resource faults are measured",
+      "container-per-agent, which the requirement excludes"
+    ]
+  },
+  "arms": [
+    {
+      "arm": "process-cgroup",
+      "status": "measured",
+      "scope": "The nine containment ids, cold start, CPU, IPC, and density describe one Deno agent per rootless namespace, chroot, Landlock ruleset, and cgroup; no network, credential, or trust-root boundary is claimed",
+      "metrics": {
+        "coldStartMs": {
+          "p50Ms": 112.6506280000001,
+          "p95Ms": 120.31674999999996,
+          "maxMs": 120.31674999999996,
+          "samples": 5
+        },
+        "cpuWorkMs": 16.2,
+        "cpuWorkIterations": 2000000,
+        "ipcRoundTripMs": {
+          "p50Ms": 0.19141100000001643,
+          "p95Ms": 0.2530709999998635,
+          "maxMs": 5.967236999999841,
+          "samples": 200
+        },
+        "rssPerAgentBytes": 14324736,
+        "density": [
+          {
+            "agents": 1,
+            "outcome": "ok",
+            "readyMs": 103.4,
+            "totalRssBytes": 15646720,
+            "perAgentRssBytes": 15646720,
+            "failures": 0
+          },
+          {
+            "agents": 2,
+            "outcome": "ok",
+            "readyMs": 118.6,
+            "totalRssBytes": 29704192,
+            "perAgentRssBytes": 14852096,
+            "failures": 0
+          },
+          {
+            "agents": 4,
+            "outcome": "ok",
+            "readyMs": 135.8,
+            "totalRssBytes": 64536576,
+            "perAgentRssBytes": 16134144,
+            "failures": 0
+          },
+          {
+            "agents": 8,
+            "outcome": "ok",
+            "readyMs": 139,
+            "totalRssBytes": 119721984,
+            "perAgentRssBytes": 14965248,
+            "failures": 0
+          },
+          {
+            "agents": 16,
+            "outcome": "ok",
+            "readyMs": 169.4,
+            "totalRssBytes": 229195776,
+            "perAgentRssBytes": 14324736,
+            "failures": 0
+          },
+          {
+            "agents": 32,
+            "outcome": "ok",
+            "readyMs": 290.4,
+            "totalRssBytes": 434728960,
+            "perAgentRssBytes": 13585280,
+            "failures": 0
+          }
+        ]
+      },
+      "checks": [
+        {
+          "id": "crash-isolation",
+          "status": "pass",
+          "detail": "SIGKILL to agent host pid 1829689 (namespace pid 1): waiter exit code=137 signal=SIGKILL, cgroup populated=0=true; 2/2 peers still answered PING"
+        },
+        {
+          "id": "hang-containment",
+          "status": "pass",
+          "detail": "cgroup.kill on a spinning agent: populated=0 in 11 ms (limit 5000 ms), waiter exit code=137; peer answered PING"
+        },
+        {
+          "id": "oom-containment",
+          "status": "pass",
+          "detail": "memory.max=64 MiB, 128 MiB request: memory.events oom_kill=1, waiter exit code=137, cgroup populated=0=true after 27 ms; peer answered PING"
+        },
+        {
+          "id": "fork-bomb-containment",
+          "status": "pass",
+          "detail": "200 fork attempts with pids.max=16: FORKBOMB 28, pids.events max=6 (refusals observed), peak pids.current=16 (observation only; the kernel caps it at pids.max), marker processes before kill=7, after kill populated=0, cgroup.procs=0, marker survivors=0"
+        },
+        {
+          "id": "cleanup-after-kill",
+          "status": "pass",
+          "detail": "SIGKILL of agent host pid 1830283 (namespace pid 1, waiter code=137): orphan host pid 1830330 (namespace pid 28) confirmed gone; pids.current before kill=10, marker pids before kill=1, after kill populated=0, cgroup.procs=0, marker survivors=0, cgroup removed=true, host processes 567->567"
+        },
+        {
+          "id": "orphan-reaping",
+          "status": "pass",
+          "detail": "orphan host pid 1830480 (namespace pid 28) visible before the kill via cgroup membership (pids.current=10) and marker scan (1 pids); after the namespace init died: populated=0, cgroup.procs=0, marker survivors=0, orphan confirmed gone, host processes 567->567"
+        },
+        {
+          "id": "ipc-round-trip",
+          "status": "pass",
+          "detail": "PING/PONG over the supervisor pipe completed 200 times, p95 0.25 ms"
+        },
+        {
+          "id": "resource-ceilings",
+          "status": "pass",
+          "detail": "memory.max=134217728 pids.max=64 cpu.max=100000 100000 nofile=256 fsize=16777216"
+        },
+        {
+          "id": "hosts-agent-workload",
+          "status": "pass",
+          "detail": "agent reported `WORKLOAD ok`: read /etc/os-release, wrote and read /scratch/workload.txt, spawned true, and reached 127.0.0.1:9 with ECONNREFUSED"
+        }
+      ],
+      "operability": {
+        "hostDependencies": [
+          "user systemd manager, used once to acquire a delegated cgroup root",
+          "unprivileged user+PID+mount namespaces with chroot and Landlock"
+        ],
+        "requiresRoot": false,
+        "supervisorLoc": 838,
+        "packaging": "One process per agent inside a per-agent rootless namespace and chroot, under a delegated cgroup; the agent entrypoint is a TypeScript module run by deno",
+        "debuggability": "Host-side /proc and cgroup files; the agent pid is the namespace init and cgroup membership is the signal path. The agent sees no /sys and no systemd unit exists to inspect",
+        "limitations": [
+          "Agent, supervisor, and broker share one UID; isolation is namespace, chroot, Landlock, and cgroup, not UID-based",
+          "No seccomp policy and io_uring remains enabled, which Landlock does not cover",
+          "/sys is intentionally not mounted, which is what reverses SD-10: the agent cannot reach its own cgroup to raise its limits",
+          "Landlock covers path-based filesystem access only; network and signal policy stay outside this spike",
+          "Each agent pays user/PID/mount namespace setup, bind mounts, chroot, Landlock, and cgroup creation on the cold-start path",
+          "RLIMIT_AS is unusable for a V8 process because the runtime reserves large virtual ranges",
+          "Agent capabilities are inner Deno permissions only (`--allow-env`, `--allow-run`, `--allow-read=/etc`, `--allow-write=/scratch`, `--allow-net=127.0.0.1:9` here); the OS sandbox remains the real boundary"
+        ]
+      },
+      "notes": [
+        "cold start includes delegated-cgroup creation, user/PID/mount namespace setup, bind mounts, chroot, Landlock, and Deno module loading (5 samples after one warm-up)",
+        "density sweep at 1, 2, 4, 8, 16, 32 agents; per-agent RSS is the mean cgroup memory.current at all-ready"
+      ]
+    },
+    {
+      "arm": "wasm-instance",
+      "status": "measured",
+      "scope": "Crash, hang, OOM, cleanup, and IPC describe one WebAssembly instance inside one permission-less Deno worker; fork-bomb and orphan checks are not applicable because an instance cannot create processes, and filesystem, network, and process capability are absent",
+      "metrics": {
+        "coldStartMs": {
+          "p50Ms": 93.75080600000001,
+          "p95Ms": 96.71424499999921,
+          "maxMs": 96.71424499999921,
+          "samples": 5
+        },
+        "cpuWorkMs": 0.63,
+        "cpuWorkIterations": 2000000,
+        "ipcRoundTripMs": {
+          "p50Ms": 0.07360000000062428,
+          "p95Ms": 0.13083999999980733,
+          "maxMs": 1.3039339999995718,
+          "samples": 200
+        },
+        "rssPerAgentBytes": 22218496,
+        "density": [
+          {
+            "agents": 1,
+            "outcome": "ok",
+            "readyMs": 89.1,
+            "totalRssBytes": 0,
+            "perAgentRssBytes": 0,
+            "failures": 0
+          },
+          {
+            "agents": 2,
+            "outcome": "ok",
+            "readyMs": 120.3,
+            "totalRssBytes": 40689664,
+            "perAgentRssBytes": 20344832,
+            "failures": 0
+          },
+          {
+            "agents": 4,
+            "outcome": "ok",
+            "readyMs": 139.9,
+            "totalRssBytes": 87982080,
+            "perAgentRssBytes": 21995520,
+            "failures": 0
+          },
+          {
+            "agents": 8,
+            "outcome": "ok",
+            "readyMs": 201.3,
+            "totalRssBytes": 176705536,
+            "perAgentRssBytes": 22088192,
+            "failures": 0
+          },
+          {
+            "agents": 16,
+            "outcome": "ok",
+            "readyMs": 516.5,
+            "totalRssBytes": 355495936,
+            "perAgentRssBytes": 22218496,
+            "failures": 0
+          },
+          {
+            "agents": 32,
+            "outcome": "ok",
+            "readyMs": 856.8,
+            "totalRssBytes": 714162176,
+            "perAgentRssBytes": 22317568,
+            "failures": 0
+          },
+          {
+            "agents": 64,
+            "outcome": "ok",
+            "readyMs": 1736.6,
+            "totalRssBytes": 1428312064,
+            "perAgentRssBytes": 22317376,
+            "failures": 0
+          }
+        ]
+      },
+      "checks": [
+        {
+          "id": "crash-isolation",
+          "status": "pass",
+          "detail": "unreachable trap surfaced as RuntimeError: unreachable; peer instance answered; supervisor process stayed up"
+        },
+        {
+          "id": "hang-containment",
+          "status": "pass",
+          "detail": "infinite wasm loop blocked its worker until the supervisor terminated it in 0.0 ms; peer instance answered (instances cannot be preempted individually)"
+        },
+        {
+          "id": "oom-containment",
+          "status": "pass",
+          "detail": "requested 64 pages, memory.grow returned -1, instance stayed at 1 pages and kept serving requests"
+        },
+        {
+          "id": "fork-bomb-containment",
+          "status": "not-applicable",
+          "detail": "module imports 1 host function(s) and the worker runtime has no permissions (process spawn denied=true); a fork bomb has no reachable syscall"
+        },
+        {
+          "id": "cleanup-after-kill",
+          "status": "pass",
+          "detail": "8 workers terminated and the supervisor created a fresh instance afterwards; RSS peak 283.0 MiB, residual 165.1 MiB not returned to the OS"
+        },
+        {
+          "id": "orphan-reaping",
+          "status": "not-applicable",
+          "detail": "an instance cannot create processes; there is no orphan to reap"
+        },
+        {
+          "id": "ipc-round-trip",
+          "status": "pass",
+          "detail": "postMessage ping/pong completed 200 times, p95 0.13 ms"
+        },
+        {
+          "id": "resource-ceilings",
+          "status": "fail",
+          "detail": "linear memory is capped at 16 pages and growth is refused, but the runtime exposes no CPU-time or wall-clock ceiling and no fuel metering"
+        },
+        {
+          "id": "hosts-agent-workload",
+          "status": "fail",
+          "detail": "the reference agent needs filesystem, network, and process capability; this arm exposes one integer host import and no WASI runtime, so it cannot host the LANG-1 execution surface"
+        }
+      ],
+      "operability": {
+        "hostDependencies": [
+          "deno (V8 core wasm)"
+        ],
+        "requiresRoot": false,
+        "supervisorLoc": 250,
+        "packaging": "One worker and one WebAssembly instance per agent; module bytes are built in-process",
+        "debuggability": "No process or thread introspection; traps surface as RuntimeError, hangs need worker termination",
+        "limitations": [
+          "No WASI runtime on the host, so filesystem, network, and process capability are unreachable from an instance",
+          "Instances share the worker thread: no CPU preemption or fuel metering, so a hang is only bounded by terminating the worker",
+          "Worker RSS is not attributable per instance; density RSS is a process-level delta",
+          "Worker permission scoping (`deno: { permissions: \"none\" }`) needs the unstable `--unstable-worker-options` flag in Deno 2.9"
+        ]
+      },
+      "notes": [
+        "cold start includes V8 worker boot, module compilation, and instantiation (5 samples after one warm-up)",
+        "density sweep at 1, 2, 4, 8, 16, 32, 64 instances"
+      ]
+    },
+    {
+      "arm": "microvm",
+      "status": "inconclusive",
+      "scope": "No containment or density measurement ran; a runtime exists but no sealed guest image is available",
+      "blockedReason": "microvm runtimes present (/run/current-system/sw/bin/microvm) but no guest image is sealed for this spike",
+      "checks": [],
+      "operability": {
+        "hostDependencies": [
+          "/run/current-system/sw/bin/microvm",
+          "sealed guest kernel and initrd"
+        ],
+        "requiresRoot": false,
+        "supervisorLoc": 0,
+        "packaging": "One microVM per agent with a pre-built, sealed guest image",
+        "debuggability": "Serial console and guest agent only",
+        "limitations": [
+          "No guest image available, so nothing was measured"
+        ]
+      },
+      "notes": [
+        "Runtime present but the spike has no sealed guest image; no claim is made"
+      ]
+    }
+  ],
+  "matrix": [
+    {
+      "check": "crash-isolation",
+      "cells": {
+        "process-cgroup": "pass",
+        "wasm-instance": "pass",
+        "microvm": "not-run"
+      }
+    },
+    {
+      "check": "hang-containment",
+      "cells": {
+        "process-cgroup": "pass",
+        "wasm-instance": "pass",
+        "microvm": "not-run"
+      }
+    },
+    {
+      "check": "oom-containment",
+      "cells": {
+        "process-cgroup": "pass",
+        "wasm-instance": "pass",
+        "microvm": "not-run"
+      }
+    },
+    {
+      "check": "fork-bomb-containment",
+      "cells": {
+        "process-cgroup": "pass",
+        "wasm-instance": "not-applicable",
+        "microvm": "not-run"
+      }
+    },
+    {
+      "check": "cleanup-after-kill",
+      "cells": {
+        "process-cgroup": "pass",
+        "wasm-instance": "pass",
+        "microvm": "not-run"
+      }
+    },
+    {
+      "check": "orphan-reaping",
+      "cells": {
+        "process-cgroup": "pass",
+        "wasm-instance": "not-applicable",
+        "microvm": "not-run"
+      }
+    },
+    {
+      "check": "ipc-round-trip",
+      "cells": {
+        "process-cgroup": "pass",
+        "wasm-instance": "pass",
+        "microvm": "not-run"
+      }
+    },
+    {
+      "check": "resource-ceilings",
+      "cells": {
+        "process-cgroup": "pass",
+        "wasm-instance": "fail",
+        "microvm": "not-run"
+      }
+    },
+    {
+      "check": "hosts-agent-workload",
+      "cells": {
+        "process-cgroup": "pass",
+        "wasm-instance": "fail",
+        "microvm": "not-run"
+      }
+    }
+  ],
+  "recommendation": {
+    "decision": "DG-4",
+    "status": "no-selection",
+    "rule": "Eligible = status measured AND every containment check pass or not-applicable AND hosts-agent-workload pass AND density at target concurrency ok AND p95 cold start <= 500 ms AND per-agent RSS <= 64 MiB AND p95 IPC <= 25 ms AND no root requirement AND host dependencies <= 2. Among eligible arms, select the lowest p95 cold start, then the lowest per-agent RSS, then the lowest p95 IPC. No eligible arm means no selection; DG-4 stays open.",
+    "targetConcurrency": 16,
+    "eligible": [],
+    "ineligible": [
+      {
+        "arm": "process-cgroup",
+        "reason": "838 implementation lines exceed 700"
+      },
+      {
+        "arm": "wasm-instance",
+        "reason": "containment failed: resource-ceilings, hosts-agent-workload"
+      },
+      {
+        "arm": "microvm",
+        "reason": "status inconclusive: microvm runtimes present (/run/current-system/sw/bin/microvm) but no guest image is sealed for this spike"
+      }
+    ],
+    "rationale": [
+      "no arm satisfies the pre-registered gates; DG-4 stays open",
+      "process-cgroup: 838 implementation lines exceed 700",
+      "wasm-instance: containment failed: resource-ceilings, hosts-agent-workload",
+      "microvm: status inconclusive: microvm runtimes present (/run/current-system/sw/bin/microvm) but no guest image is sealed for this spike"
+    ]
+  },
+  "residuals": [
+    "No security property is claimed for any arm. This record covers crash and resource containment only.",
+    "Target concurrency 16 is a spike-local assumption; `LIM-1` sets the real operator ceiling, so density at any other count must be re-read from the sweep.",
+    "Agent, supervisor, and broker share one UID. Isolation is namespace, chroot, Landlock, and cgroup; it is not UID-based, so a same-UID host process outside the sandbox is not contained.",
+    "No seccomp policy is installed and io_uring remains enabled; Landlock does not mediate io_uring, so kernel attack surface remains.",
+    "`/sys` is intentionally not mounted inside the agent root and Landlock never grants it. That is what reverses `SD-10`: an agent cannot reach its own cgroup to raise `memory.max`, `pids.max`, or `cpu.max`.",
+    "Cold start now includes delegated-cgroup creation, user/PID/mount namespace setup, bind mounts, chroot, Landlock, and Deno module loading. A packaged binary would be faster; the comparison is same-host and same-runtime, not absolute.",
+    "WASM RSS is a process-level delta because worker isolates share one address space. Per-instance memory is the declared linear-memory cap, not measured RSS.",
+    "The WASM density row at one instance can read near-zero MiB because the process RSS delta is dominated by V8 heap reuse; the rows above one instance are the meaningful per-agent figures.",
+    "The microVM arm is blocked: no microVM runtime and no sealed guest image on this host. `DG-4` cannot select a microVM on this evidence.",
+    "Fork-bomb containment was probed with `pids.max=16` on a dedicated agent cgroup, not at the 64-task per-agent ceiling.",
+    "The one systemd call is the delegated cgroup acquisition in `main.ts`; the per-agent path uses cgroupfs and namespaces only, but the supervisor still runs under the deployment user manager.",
+    "Orphan and fork-bomb liveness is proved before the kill by cgroup membership, marker argv survival, and host process counts. The marker is the argv[0] of a resident bash because nix coreutils dispatches applets on argv[0] and would abort under `exec -a`."
+  ],
+  "evidence": {
+    "status": "emitted",
+    "envelope": {
+      "testId": "S3",
+      "invariantIds": [
+        "crash-isolation",
+        "hang-containment",
+        "oom-containment",
+        "fork-bomb-containment",
+        "cleanup-after-kill",
+        "orphan-reaping",
+        "ipc-round-trip",
+        "resource-ceilings",
+        "hosts-agent-workload"
+      ],
+      "fixtureVersion": "security-v1@1.0.0",
+      "canonicalHead": {
+        "seq": 0,
+        "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "sequenceRange": [
+        0,
+        0
+      ],
+      "environment": {
+        "hostFingerprint": "sha256:d7fc918265e4a6804df85b3bef219de76d069f7edaf7ac8af68fb9605c6d97c1",
+        "kernel": "linux-6.18.39",
+        "runtime": "deno@2.9.2",
+        "sandboxPosture": "unverified",
+        "brokerIdentity": "unconfigured"
+      },
+      "seeds": [
+        0
+      ],
+      "modelRecordings": [],
+      "artifacts": [
+        "sha256:48dcc60ad222c536a6dbdfb4b38fa6b6cc74e06034e51fa26187c30718373c28"
+      ],
+      "outcome": "inconclusive",
+      "metrics": {
+        "process-cgroup.checksPassed": 9,
+        "process-cgroup.checksFailed": 0,
+        "process-cgroup.coldStartP50Ms": 112.6506280000001,
+        "process-cgroup.coldStartP95Ms": 120.31674999999996,
+        "process-cgroup.ipcP50Ms": 0.19141100000001643,
+        "process-cgroup.ipcP95Ms": 0.2530709999998635,
+        "process-cgroup.rssPerAgentMib": 13.6611328125,
+        "process-cgroup.densityAtTarget": 0,
+        "wasm-instance.checksPassed": 5,
+        "wasm-instance.checksFailed": 2,
+        "wasm-instance.coldStartP50Ms": 93.75080600000001,
+        "wasm-instance.coldStartP95Ms": 96.71424499999921,
+        "wasm-instance.ipcP50Ms": 0.07360000000062428,
+        "wasm-instance.ipcP95Ms": 0.13083999999980733,
+        "wasm-instance.rssPerAgentMib": 21.189208984375,
+        "wasm-instance.densityAtTarget": 0,
+        "microvm.checksPassed": 0,
+        "microvm.checksFailed": 0
+      },
+      "acceptedResiduals": [
+        "outcome pass means DG-4 produced a recommendation; it does not mean every arm was measured cleanly",
+        "wasm-instance failed resource-ceilings and hosts-agent-workload, and is ineligible",
+        "microvm is blocked on a missing runtime and sealed guest image, so no check ran for it",
+        "the nine containment ids describe the process-cgroup arm; wasm-instance covers crash, hang, OOM, cleanup, and IPC only; microvm covers none"
+      ]
+    }
+  }
+}

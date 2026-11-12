@@ -1,0 +1,20 @@
+{
+  "task": "A6",
+  "status": "pre-registered",
+  "protocols": {
+    "S4": {
+      "dataset": "cost-v1@1.0.0",
+      "thresholds": "deferred-to-DG-6",
+      "preRegistration": "src/spikes/protocols/cost-v1.ts"
+    },
+    "S6": {
+      "dataset": "ui-v1@1.0.0",
+      "thresholds": "deferred-to-DG-6-and-DG-7",
+      "preRegistration": "src/spikes/protocols/ui-v1.ts"
+    }
+  },
+  "decisionsClosed": [],
+  "blockers": [
+    "DG-6 and DG-7 require measured baselines and human sign-off"
+  ]
+}

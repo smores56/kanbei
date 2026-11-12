@@ -1,0 +1,183 @@
+{
+  "schemaVersion": 1,
+  "dataset": "security-v1",
+  "version": "1.0.0",
+  "suite": "channel-leak-v1",
+  "cspPolicyDigest": "sha256:1bed26652d79f8510cbe71ff4e10eb8c8bf8cde0459064ff0378caad3eedf379",
+  "cases": [
+    {
+      "id": "INBOX-CIPHERTEXT-SUBSTITUTION",
+      "channel": "inbox",
+      "probe": "tampered-ciphertext",
+      "expected": "quarantined:decrypt_failed"
+    },
+    {
+      "id": "INBOX-PATH-TRAVERSAL",
+      "channel": "inbox",
+      "probe": "directory-name-escape",
+      "expected": "denied:inbox_name_invalid"
+    },
+    {
+      "id": "INBOX-REPLAY",
+      "channel": "inbox",
+      "probe": "duplicate-batch",
+      "expected": "duplicate"
+    },
+    {
+      "id": "INBOX-OVERSIZED",
+      "channel": "inbox",
+      "probe": "oversized-ciphertext",
+      "expected": "quarantined:batch_too_large"
+    },
+    {
+      "id": "VAULT-SYMLINK",
+      "channel": "vault",
+      "probe": "symlink-target",
+      "expected": "denied:vault_symlink"
+    },
+    {
+      "id": "VAULT-HARDLINK",
+      "channel": "vault",
+      "probe": "hardlink-target",
+      "expected": "denied:vault_hardlink"
+    },
+    {
+      "id": "VAULT-TRAVERSAL",
+      "channel": "vault",
+      "probe": "parent-traversal",
+      "expected": "denied:vault_path_invalid"
+    },
+    {
+      "id": "TODO-QUOTA",
+      "channel": "todo",
+      "probe": "over-cap-write",
+      "expected": "denied:todo_cap_exceeded"
+    },
+    {
+      "id": "TODO-SYMLINK",
+      "channel": "todo",
+      "probe": "symlink-target",
+      "expected": "denied:todo_symlink"
+    },
+    {
+      "id": "TODO-CONFLICT",
+      "channel": "todo",
+      "probe": "stale-expected-digest",
+      "expected": "denied:todo_conflict"
+    },
+    {
+      "id": "CHAT-NO-TOKEN",
+      "channel": "chat",
+      "probe": "missing-passkey",
+      "expected": "denied:chat_unauthenticated"
+    },
+    {
+      "id": "CHAT-BAD-PASSKEY",
+      "channel": "chat",
+      "probe": "wrong-passkey",
+      "expected": "denied:chat_unauthenticated"
+    },
+    {
+      "id": "CHAT-FOREIGN-ORIGIN",
+      "channel": "chat",
+      "probe": "foreign-origin",
+      "expected": "denied:chat_origin_denied"
+    },
+    {
+      "id": "CHAT-OVERSIZED",
+      "channel": "chat",
+      "probe": "oversized-frame",
+      "expected": "denied:chat_too_large"
+    },
+    {
+      "id": "CSR-WRONG-CN",
+      "channel": "csr",
+      "probe": "foreign-common-name",
+      "expected": "denied:csr_fields_refused"
+    },
+    {
+      "id": "CSR-WRONG-SAN",
+      "channel": "csr",
+      "probe": "extra-san-in-issued-leaf",
+      "expected": "denied:csr_response_refused"
+    },
+    {
+      "id": "CSR-WRONG-KEY",
+      "channel": "csr",
+      "probe": "foreign-leaf-key",
+      "expected": "denied:csr_response_refused"
+    },
+    {
+      "id": "CSR-WRONG-SPKI",
+      "channel": "csr",
+      "probe": "foreign-leaf-spki",
+      "expected": "denied:csr_response_refused"
+    },
+    {
+      "id": "SEARCH-DLP-BYPASS",
+      "channel": "search",
+      "probe": "dlp-blocked-query",
+      "expected": "blocked:dlp"
+    },
+    {
+      "id": "SEARCH-JUDGE-BYPASS",
+      "channel": "search",
+      "probe": "judge-blocked-query",
+      "expected": "blocked:judge"
+    },
+    {
+      "id": "SEARCH-CHUNKED-EXFIL",
+      "channel": "search",
+      "probe": "many-small-queries",
+      "expected": "blocked:budget"
+    },
+    {
+      "id": "SEARCH-BUDGET-RESET",
+      "channel": "search",
+      "probe": "next-day-window",
+      "expected": "hits"
+    },
+    {
+      "id": "SEARCH-MARKUP",
+      "channel": "search",
+      "probe": "hostile-markup-hit",
+      "expected": "stripped"
+    },
+    {
+      "id": "SEARCH-FORGED-FIELD",
+      "channel": "search",
+      "probe": "provider-credential-field",
+      "expected": "denied:schema"
+    },
+    {
+      "id": "CSP-PLANTED-RESOURCES",
+      "channel": "csp",
+      "probe": "image-link-iframe-css-autolink",
+      "expected": "zero-requests"
+    },
+    {
+      "id": "BOUNDARY-EXTRA-MOUNT",
+      "channel": "boundary",
+      "probe": "undeclared-virtiofs-share",
+      "expected": "refused:undeclared_mount"
+    },
+    {
+      "id": "BOUNDARY-EXTRA-SOCKET",
+      "channel": "boundary",
+      "probe": "undeclared-vsock-port",
+      "expected": "refused:undeclared_channel"
+    },
+    {
+      "id": "BOUNDARY-NIC",
+      "channel": "boundary",
+      "probe": "network-interface-present",
+      "expected": "refused:network_present"
+    },
+    {
+      "id": "BOUNDARY-WEAK-POSTURE",
+      "channel": "boundary",
+      "probe": "weaker-enforcement-class",
+      "expected": "refused:posture_weaker"
+    }
+  ]
+}

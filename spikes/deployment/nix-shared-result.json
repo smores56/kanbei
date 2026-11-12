@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "task": "A2c",
+  "sharedStore": "/home/smores/repos/github.com/smores56/kanbei/.worktrees/smores-kanbei-implementation/tmp/kanbei-shared-nix",
+  "sandbox": {
+    "processExit": 0,
+    "processSuccess": true,
+    "stderr": ""
+  },
+  "result": {
+    "abi": 7,
+    "build": {
+      "success": true,
+      "code": 0,
+      "stdout": "/nix/store/pa6rydwgjxxmmvdxap7qk9c85h8jbimy-hello-2.12.3",
+      "stderr": "unpacking 'https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst' into the Git cache..."
+    },
+    "shell": {
+      "success": true,
+      "code": 0,
+      "stdout": "Hello, world!",
+      "stderr": ""
+    },
+    "direct": {
+      "success": true,
+      "code": 0,
+      "stdout": "Hello, world!",
+      "stderr": ""
+    },
+    "run": {
+      "success": true,
+      "code": 0,
+      "stdout": "Hello, world!",
+      "stderr": ""
+    },
+    "profile": {
+      "success": true,
+      "code": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    "profileList": {
+      "success": true,
+      "code": 0,
+      "stdout": "{\"elements\":{\"hello\":{\"active\":true,\"attrPath\":\"legacyPackages.x86_64-linux.hello\",\"originalUrl\":\"flake:nixpkgs\",\"outputs\":null,\"priority\":5,\"storePaths\":[\"/nix/store/pa6rydwgjxxmmvdxap7qk9c85h8jbimy-hello-2.12.3\"],\"url\":\"https://releases.nixos.org/nixpkgs/nixpkgs-26.11pre1109744.4fe25e12eb9f/nixexprs.tar.zst?narHash=sha256-4/Yzr1fWTh/zBAR1tR84ZQ1Zhmor8AXwgD4AS7sPn60%3D\"}},\"version\":3}",
+      "stderr": ""
+    },
+    "profileExec": {
+      "success": true,
+      "code": 0,
+      "stdout": "Hello, world!",
+      "stderr": ""
+    },
+    "hello": true
+  },
+  "checks": {
+    "build": true,
+    "direct": true,
+    "shell": true,
+    "run": true,
+    "profile": true,
+    "profileList": true,
+    "profileExec": true,
+    "hello": true,
+    "hostStoreUnchanged": true,
+    "sharedStoreHasPath": true
+  },
+  "verdict": "pass"
+}

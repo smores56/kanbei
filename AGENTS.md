@@ -13,14 +13,14 @@
 
 Kanbei runs in one NIC-less microVM. Its only byte paths are six channels:
 
-| Channel | Access | Use |
-|---|---|---|
-| `inbox` | read-only virtiofs | age-encrypted ingest batches, written by the host writer |
-| `vault` | read-only virtiofs | `/var/lib/data/vault` |
-| `todo` | size-capped read-write | `/var/lib/data/todo/todo.txt` |
-| `chat` | vsock, TLS in the VM | JSON API behind the host relay and the WARP private route |
-| `csr` | vsock, schema-locked | fixed-CN ACME renewal |
-| `search` | vsock, schema-capped | capped queries to the Search VM |
+| Channel  | Access                 | Use                                                       |
+| -------- | ---------------------- | --------------------------------------------------------- |
+| `inbox`  | read-only virtiofs     | age-encrypted ingest batches, written by the host writer  |
+| `vault`  | read-only virtiofs     | `/var/lib/data/vault`                                     |
+| `todo`   | size-capped read-write | `/var/lib/data/todo/todo.txt`                             |
+| `chat`   | vsock, TLS in the VM   | JSON API behind the host relay and the WARP private route |
+| `csr`    | vsock, schema-locked   | fixed-CN ACME renewal                                     |
+| `search` | vsock, schema-capped   | capped queries to the Search VM                           |
 
 - The VM has no NIC, no resolver, and no raw sockets. Any other path is a channel leak
   and a release-blocking defect (`ZT-15`).

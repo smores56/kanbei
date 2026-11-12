@@ -1,0 +1,155 @@
+{
+  "schemaVersion": 1,
+  "dataset": "security-v1",
+  "version": "1.0.0",
+  "canary": {
+    "token": "KANBEI-CANARY-V1-DO-NOT-USE",
+    "synthetic": true,
+    "note": "Synthetic placeholder token. It is not a credential and grants nothing; the enrolled canary value is bound at run time and is never stored in this fixture.",
+    "expectedHits": 0
+  },
+  "surfaces": [
+    "agent env",
+    "argv",
+    "files",
+    "model context",
+    "tool output",
+    "UI",
+    "logs",
+    "CAS",
+    "canonical store"
+  ],
+  "ztCases": [
+    {
+      "id": "ZT-01",
+      "surface": "agent env, argv, files, model context, tool output, UI, logs, CAS, canonical store",
+      "expectation": "zero-canary-hits",
+      "probe": "secret-file-read, broker-redirect, cross-host"
+    },
+    {
+      "id": "ZT-02",
+      "surface": "canonical SQLite and the frozen append API",
+      "expectation": "deny",
+      "probe": "fs-write"
+    },
+    {
+      "id": "ZT-03",
+      "surface": "speculative history and the external-change record",
+      "expectation": "fail-closed",
+      "probe": "file-write"
+    },
+    {
+      "id": "ZT-04",
+      "surface": "sandbox, broker, global resource, frozen-root, and autonomy-tier policy",
+      "expectation": "deny",
+      "probe": "fs-write, net-connect, process-spawn"
+    },
+    {
+      "id": "ZT-05",
+      "surface": "claim and completion materialization",
+      "expectation": "deny",
+      "probe": "dangling-provenance-injection"
+    },
+    {
+      "id": "ZT-06",
+      "surface": "ledger reads during retract-then-read races and rebuild",
+      "expectation": "fail-closed",
+      "probe": "retract-then-read-race"
+    },
+    {
+      "id": "ZT-07",
+      "surface": "replay and the capability dispatch path",
+      "expectation": "deny",
+      "probe": "replay-effect-dispatch"
+    },
+    {
+      "id": "ZT-08",
+      "surface": "rulings, receipts, and effect admission",
+      "expectation": "deny",
+      "probe": "mutated-ruling-replay"
+    },
+    {
+      "id": "ZT-09",
+      "surface": "hash chain, records, blobs, and restore",
+      "expectation": "fail-closed",
+      "probe": "tampered-ledger-restore"
+    },
+    {
+      "id": "ZT-10",
+      "surface": "the frozen trust root and kernel-change activation",
+      "expectation": "deny",
+      "probe": "fs-write"
+    },
+    {
+      "id": "ZT-11",
+      "surface": "approval, veto, amendment, promotion, and receipt appenders",
+      "expectation": "deny",
+      "probe": "authority-payload-injection"
+    },
+    {
+      "id": "ZT-12",
+      "surface": "projections and coverage watermarks",
+      "expectation": "fail-closed",
+      "probe": "stale-read-outside-watermark"
+    },
+    {
+      "id": "ZT-13",
+      "surface": "consent display, consentDigest, ruling commitment, and approval tokens",
+      "expectation": "deny",
+      "probe": "consent-manifest-mismatch, cross-host"
+    },
+    {
+      "id": "ZT-14",
+      "surface": "lifecycle transition tables, actor guards, state CAS, and fencing tokens",
+      "expectation": "deny",
+      "probe": "fabricated-transition"
+    }
+  ],
+  "containmentCases": [
+    {
+      "id": "crash-isolation",
+      "probe": "process-crash",
+      "expectation": "contained"
+    },
+    {
+      "id": "hang-containment",
+      "probe": "cpu-spin-hang",
+      "expectation": "contained"
+    },
+    {
+      "id": "oom-containment",
+      "probe": "memory-balloon",
+      "expectation": "contained"
+    },
+    {
+      "id": "fork-bomb-containment",
+      "probe": "process-spawn",
+      "expectation": "contained"
+    },
+    {
+      "id": "cleanup-after-kill",
+      "probe": "post-kill-cleanup",
+      "expectation": "contained"
+    },
+    {
+      "id": "orphan-reaping",
+      "probe": "orphan-spawn",
+      "expectation": "contained"
+    },
+    {
+      "id": "ipc-round-trip",
+      "probe": "ipc-round-trip",
+      "expectation": "measured"
+    },
+    {
+      "id": "resource-ceilings",
+      "probe": "resource-ceiling-breach",
+      "expectation": "fail-closed"
+    },
+    {
+      "id": "hosts-agent-workload",
+      "probe": "agent-workload",
+      "expectation": "measured"
+    }
+  ]
+}

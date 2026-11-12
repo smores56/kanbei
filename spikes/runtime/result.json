@@ -1,0 +1,791 @@
+{
+  "schemaVersion": 1,
+  "protocol": "S1",
+  "decisionId": "NODE-DENO-1",
+  "preRegistration": {
+    "protocol": "S1",
+    "decisionId": "NODE-DENO-1",
+    "dataset": {
+      "id": "append-v1",
+      "version": "1.0.0"
+    },
+    "arms": {
+      "node": "node@24.21.0",
+      "deno": "deno@2.9.2"
+    },
+    "sample": {
+      "coldStartRuns": 11,
+      "warmStartIterations": 40,
+      "loopSamplerIntervalMs": 1,
+      "workerRuns": 5
+    },
+    "load": {
+      "appends": 1000,
+      "appendChunk": 1,
+      "readsPerChunk": 1
+    },
+    "hardFails": [
+      {
+        "id": "HF-CORRECTNESS",
+        "condition": "any SQLite correctness check reports pass=false",
+        "rationale": "A driver that returns wrong rows or loses a committed append cannot hold the canonical ledger."
+      },
+      {
+        "id": "HF-SINGLE-WRITER",
+        "condition": "a second connection commits while the first holds BEGIN IMMEDIATE, or a rejected concurrent write is visible afterwards, or the ledger cannot recover after the lock is released",
+        "rationale": "I-02 requires one sequencer; SQLite must refuse a concurrent writer and leave no partial row."
+      },
+      {
+        "id": "HF-INTEGRITY",
+        "condition": "PRAGMA integrity_check is not 'ok' after the load",
+        "rationale": "ZT-09 refuses a store whose integrity check cannot pass."
+      },
+      {
+        "id": "HF-DATA-LOSS",
+        "condition": "appends recorded in SQLite differ from appends issued",
+        "rationale": "I-01 forbids losing an acknowledged append."
+      },
+      {
+        "id": "HF-TAIL-LATENCY",
+        "condition": "event-loop lag p95 exceeds 250 ms during the append/read load",
+        "rationale": "The control plane arbitrates approvals and sandbox supervision on the same loop; a quarter-second tail starves those paths."
+      },
+      {
+        "id": "HF-APPEND-TAIL",
+        "condition": "append latency p95 exceeds 100 ms",
+        "rationale": "Append is the canonical write path; a 100 ms durable write tail is unusable interactively."
+      },
+      {
+        "id": "HF-ISOLATION",
+        "condition": "a crashing worker terminates the parent process or the crash is not observed by the parent",
+        "rationale": "Agent work runs off-loop; a worker crash must be a recoverable event, not a control-plane outage."
+      },
+      {
+        "id": "HF-SIGNAL",
+        "condition": "SIGTERM handler is not invoked, or shutdown takes longer than 3000 ms, or exit code is non-zero",
+        "rationale": "systemd stop must be graceful and observable for the supervisor contract."
+      },
+      {
+        "id": "HF-PERMISSION",
+        "condition": "an operation the runtime was told to deny succeeds",
+        "rationale": "Fail-closed is required (ZT-04); a permission model that fails open is worse than none."
+      }
+    ],
+    "compositeWeights": [
+      {
+        "id": "coldReady",
+        "weight": 0.25,
+        "rationale": "Control-plane restarts should not stall an approval queue."
+      },
+      {
+        "id": "peakRss",
+        "weight": 0.15,
+        "rationale": "The control plane shares a host with agents."
+      },
+      {
+        "id": "eventLoopP95",
+        "weight": 0.2,
+        "rationale": "Tail latency decides whether approvals and supervisor ticks meet their deadlines."
+      },
+      {
+        "id": "appendP95",
+        "weight": 0.2,
+        "rationale": "Canonical durable append latency."
+      },
+      {
+        "id": "warmStart",
+        "weight": 0.1,
+        "rationale": "The supervisor restarts components without a process restart."
+      },
+      {
+        "id": "workerStartup",
+        "weight": 0.1,
+        "rationale": "Per-task isolation cost."
+      }
+    ],
+    "thresholds": {
+      "eventLoopP95Ms": 250,
+      "appendP95Ms": 100,
+      "shutdownMs": 3000
+    },
+    "permissionExpectations": {
+      "node": [
+        "fs-write",
+        "process-spawn",
+        "fs-read-outside-scope"
+      ],
+      "deno": [
+        "fs-write",
+        "net-connect",
+        "process-spawn",
+        "fs-read-outside-scope"
+      ]
+    },
+    "decisionRule": "Hard fails disqualify an arm. If both arms are clean, the arm with the lower weighted composite cost wins when the relative margin is at least decisionMargin; otherwise the pre-registered tie-breakers are applied in order, and if they do not separate the arms the result is inconclusive. A blocked measurement yields inconclusive; no value is imputed.",
+    "nonInferiorityMargin": 0.2,
+    "decisionMargin": 0.1,
+    "tieBreakers": [
+      "lower peak RSS",
+      "lower cold start to ready",
+      "inner capability model present (Deno permissions) versus opt-in process flag"
+    ],
+    "frozenRevision": "a1-node-deno-1-prereg-v1"
+  },
+  "environment": {
+    "hostFingerprint": "sha256:e626bea75247a2aaaebaef3e951d5700b34ec2a7a965e7857bb853fecc66dd24",
+    "kernel": "linux-6.18.39",
+    "runtime": "deno@2.9.2",
+    "sandboxPosture": "unverified",
+    "brokerIdentity": "unconfigured"
+  },
+  "arms": {
+    "node": {
+      "runtime": "node",
+      "runtimeVersion": "v24.21.0",
+      "sqliteVersion": "3.53.3",
+      "boot": {
+        "coldReady": {
+          "count": 11,
+          "min": 379.653,
+          "max": 858.658,
+          "mean": 530.167,
+          "p50": 536.942,
+          "p95": 742.736
+        },
+        "coldStart": {
+          "count": 11,
+          "min": 391.597,
+          "max": 882.223,
+          "mean": 546.529,
+          "p50": 553.849,
+          "p95": 762.961
+        },
+        "warmStart": {
+          "count": 40,
+          "min": 16.831,
+          "max": 31.027,
+          "mean": 19.876,
+          "p50": 19.394,
+          "p95": 22.431
+        }
+      },
+      "memory": {
+        "rssAfterBoot": {
+          "count": 3,
+          "min": 144.289,
+          "max": 144.289,
+          "mean": 144.289,
+          "p50": 144.289,
+          "p95": 144.289
+        },
+        "rssAfterLoadBytes": 152875008,
+        "peakRssBytes": 153055232
+      },
+      "eventLoop": {
+        "count": 1081,
+        "min": -0.57,
+        "max": 17.724,
+        "mean": 3.423,
+        "p50": 2.364,
+        "p95": 6.411
+      },
+      "ledger": {
+        "appends": 1000,
+        "appendsPerSecond": 218,
+        "append": {
+          "count": 1000,
+          "min": 2.015,
+          "max": 18.647,
+          "mean": 4.584,
+          "p50": 5.312,
+          "p95": 7.228
+        },
+        "read": {
+          "count": 1000,
+          "min": 0.01,
+          "max": 0.204,
+          "mean": 0.024,
+          "p50": 0.018,
+          "p95": 0.051
+        },
+        "walMode": "wal",
+        "readYourWrites": true,
+        "hashChainValid": true
+      },
+      "correctness": [
+        {
+          "id": "wal-and-synchronous-full",
+          "pass": true,
+          "detail": "journal_mode=wal synchronous=2 foreign_keys=1"
+        },
+        {
+          "id": "foreign-key-enforcement",
+          "pass": true,
+          "detail": "rejected: FOREIGN KEY constraint failed"
+        },
+        {
+          "id": "transaction-rollback",
+          "pass": true,
+          "detail": "rows after rollback=0"
+        },
+        {
+          "id": "integer-pk-monotonic",
+          "pass": true,
+          "detail": "sequences=1,2,3,4,5"
+        },
+        {
+          "id": "read-your-writes",
+          "pass": true,
+          "detail": "read back {\"v\":1}"
+        },
+        {
+          "id": "wal-visible-across-connections",
+          "pass": true,
+          "detail": "second connection read {\"v\":2}"
+        },
+        {
+          "id": "text-roundtrip",
+          "pass": true,
+          "detail": "bytes=45"
+        },
+        {
+          "id": "wal-checkpoint",
+          "pass": true,
+          "detail": "busy=0 log=0 checkpointed=0"
+        },
+        {
+          "id": "integrity-check",
+          "pass": true,
+          "detail": "integrity_check=ok"
+        },
+        {
+          "id": "integrity-after-load",
+          "pass": true,
+          "detail": "integrity_check=ok rows=1000"
+        },
+        {
+          "id": "appends-preserved",
+          "pass": true,
+          "detail": "issued=1000 stored=1000"
+        }
+      ],
+      "singleWriter": {
+        "concurrentWriterCommitted": false,
+        "failClosed": true,
+        "recoveryOk": true,
+        "busyBlockedEventLoop": true,
+        "busyBlockMs": 252
+      },
+      "isolation": {
+        "workerStartupMs": 87.804,
+        "roundtrip": {
+          "count": 5,
+          "min": 0.075,
+          "max": 0.23,
+          "mean": 0.151,
+          "p50": 0.119,
+          "p95": 0.229
+        },
+        "crashObserved": true,
+        "parentSurvivedCrash": true
+      },
+      "signals": {
+        "handlerInvoked": true,
+        "shutdownMs": 20.8,
+        "exitCode": 0
+      },
+      "permissions": [
+        {
+          "id": "fs-write",
+          "denied": true,
+          "code": "ERR_ACCESS_DENIED",
+          "model": "node-process-flag"
+        },
+        {
+          "id": "net-connect",
+          "denied": false,
+          "code": "ECONNREFUSED",
+          "model": "node-process-flag"
+        },
+        {
+          "id": "process-spawn",
+          "denied": true,
+          "code": "ERR_ACCESS_DENIED",
+          "model": "node-process-flag"
+        },
+        {
+          "id": "fs-read-outside-scope",
+          "denied": true,
+          "code": "ERR_ACCESS_DENIED",
+          "model": "node-process-flag"
+        }
+      ],
+      "packaging": {
+        "runtimeBinaryBytes": 78241504,
+        "singleBinaryBytes": 0,
+        "singleBinaryStatus": "blocked",
+        "singleBinaryNote": "Node single executable requires a SEA blob plus postject injection, which this sandbox does not provide; pinned dependency closure is 53.969 MiB"
+      }
+    },
+    "deno": {
+      "runtime": "deno",
+      "runtimeVersion": "2.9.2",
+      "sqliteVersion": "3.53.2",
+      "boot": {
+        "coldReady": {
+          "count": 11,
+          "min": 267.014,
+          "max": 484.015,
+          "mean": 314.593,
+          "p50": 277.795,
+          "p95": 441.736
+        },
+        "coldStart": {
+          "count": 11,
+          "min": 276.27,
+          "max": 505.769,
+          "mean": 327.258,
+          "p50": 289.482,
+          "p95": 460.783
+        },
+        "warmStart": {
+          "count": 40,
+          "min": 22.226,
+          "max": 39.122,
+          "mean": 25.007,
+          "p50": 23.757,
+          "p95": 29.757
+        }
+      },
+      "memory": {
+        "rssAfterBoot": {
+          "count": 3,
+          "min": 103.648,
+          "max": 103.656,
+          "mean": 103.652,
+          "p50": 103.652,
+          "p95": 103.656
+        },
+        "rssAfterLoadBytes": 125063168,
+        "peakRssBytes": 125059072
+      },
+      "eventLoop": {
+        "count": 1074,
+        "min": 0.016,
+        "max": 19.347,
+        "mean": 5.833,
+        "p50": 5.859,
+        "p95": 8.487
+      },
+      "ledger": {
+        "appends": 1000,
+        "appendsPerSecond": 142,
+        "append": {
+          "count": 1000,
+          "min": 4.245,
+          "max": 20.143,
+          "mean": 7.053,
+          "p50": 6.712,
+          "p95": 9.377
+        },
+        "read": {
+          "count": 1000,
+          "min": 0.012,
+          "max": 0.261,
+          "mean": 0.031,
+          "p50": 0.023,
+          "p95": 0.067
+        },
+        "walMode": "wal",
+        "readYourWrites": true,
+        "hashChainValid": true
+      },
+      "correctness": [
+        {
+          "id": "wal-and-synchronous-full",
+          "pass": true,
+          "detail": "journal_mode=wal synchronous=2 foreign_keys=1"
+        },
+        {
+          "id": "foreign-key-enforcement",
+          "pass": true,
+          "detail": "rejected: FOREIGN KEY constraint failed"
+        },
+        {
+          "id": "transaction-rollback",
+          "pass": true,
+          "detail": "rows after rollback=0"
+        },
+        {
+          "id": "integer-pk-monotonic",
+          "pass": true,
+          "detail": "sequences=1,2,3,4,5"
+        },
+        {
+          "id": "read-your-writes",
+          "pass": true,
+          "detail": "read back {\"v\":1}"
+        },
+        {
+          "id": "wal-visible-across-connections",
+          "pass": true,
+          "detail": "second connection read {\"v\":2}"
+        },
+        {
+          "id": "text-roundtrip",
+          "pass": true,
+          "detail": "bytes=45"
+        },
+        {
+          "id": "wal-checkpoint",
+          "pass": true,
+          "detail": "busy=0 log=0 checkpointed=0"
+        },
+        {
+          "id": "integrity-check",
+          "pass": true,
+          "detail": "integrity_check=ok"
+        },
+        {
+          "id": "integrity-after-load",
+          "pass": true,
+          "detail": "integrity_check=ok rows=1000"
+        },
+        {
+          "id": "appends-preserved",
+          "pass": true,
+          "detail": "issued=1000 stored=1000"
+        }
+      ],
+      "singleWriter": {
+        "concurrentWriterCommitted": false,
+        "failClosed": true,
+        "recoveryOk": true,
+        "busyBlockedEventLoop": true,
+        "busyBlockMs": 252
+      },
+      "isolation": {
+        "workerStartupMs": 97.008,
+        "roundtrip": {
+          "count": 5,
+          "min": 0.118,
+          "max": 0.587,
+          "mean": 0.289,
+          "p50": 0.188,
+          "p95": 0.55
+        },
+        "crashObserved": true,
+        "parentSurvivedCrash": true
+      },
+      "signals": {
+        "handlerInvoked": true,
+        "shutdownMs": 8.771,
+        "exitCode": 0
+      },
+      "permissions": [
+        {
+          "id": "fs-write",
+          "denied": true,
+          "code": "NotCapable",
+          "model": "deno-inner"
+        },
+        {
+          "id": "net-connect",
+          "denied": true,
+          "code": "NotCapable",
+          "model": "deno-inner"
+        },
+        {
+          "id": "process-spawn",
+          "denied": true,
+          "code": "NotCapable",
+          "model": "deno-inner"
+        },
+        {
+          "id": "fs-read-outside-scope",
+          "denied": true,
+          "code": "NotCapable",
+          "model": "deno-inner"
+        }
+      ],
+      "packaging": {
+        "runtimeBinaryBytes": 142590496,
+        "singleBinaryBytes": 209082048,
+        "singleBinaryStatus": "measured",
+        "singleBinaryNote": "deno compile of the spike entrypoint"
+      }
+    }
+  },
+  "measurements": [
+    {
+      "id": "coldReady",
+      "label": "cold start to ready",
+      "unit": "ms",
+      "direction": "lower",
+      "node": 536.942,
+      "deno": 277.795,
+      "ratio": 1.9329,
+      "winner": "deno"
+    },
+    {
+      "id": "coldStart",
+      "label": "cold start to exit",
+      "unit": "ms",
+      "direction": "lower",
+      "node": 553.849,
+      "deno": 289.482,
+      "ratio": 1.9132,
+      "winner": "deno"
+    },
+    {
+      "id": "warmStart",
+      "label": "warm start (in-process bring-up)",
+      "unit": "ms",
+      "direction": "lower",
+      "node": 19.394,
+      "deno": 23.757,
+      "ratio": 0.8163,
+      "winner": "node"
+    },
+    {
+      "id": "rssAfterBoot",
+      "label": "RSS after boot",
+      "unit": "MiB",
+      "direction": "lower",
+      "node": 144.289,
+      "deno": 103.652,
+      "ratio": 1.3921,
+      "winner": "deno"
+    },
+    {
+      "id": "peakRss",
+      "label": "peak RSS",
+      "unit": "MiB",
+      "direction": "lower",
+      "node": 145.965,
+      "deno": 119.266,
+      "ratio": 1.2239,
+      "winner": "deno"
+    },
+    {
+      "id": "eventLoopP95",
+      "label": "event-loop lag p95 under load",
+      "unit": "ms",
+      "direction": "lower",
+      "node": 6.411,
+      "deno": 8.487,
+      "ratio": 0.7554,
+      "winner": "node"
+    },
+    {
+      "id": "appendP95",
+      "label": "durable append p95",
+      "unit": "ms",
+      "direction": "lower",
+      "node": 7.228,
+      "deno": 9.377,
+      "ratio": 0.7708,
+      "winner": "node"
+    },
+    {
+      "id": "readP95",
+      "label": "point read p95",
+      "unit": "ms",
+      "direction": "lower",
+      "node": 0.051,
+      "deno": 0.067,
+      "ratio": 0.7612,
+      "winner": "node"
+    },
+    {
+      "id": "appendThroughput",
+      "label": "durable append throughput",
+      "unit": "ops/s",
+      "direction": "higher",
+      "node": 218,
+      "deno": 142,
+      "ratio": 1.5352,
+      "winner": "node"
+    },
+    {
+      "id": "workerStartup",
+      "label": "worker startup",
+      "unit": "ms",
+      "direction": "lower",
+      "node": 87.804,
+      "deno": 97.008,
+      "ratio": 0.9051,
+      "winner": "node"
+    },
+    {
+      "id": "workerRoundtripP95",
+      "label": "worker round-trip p95",
+      "unit": "ms",
+      "direction": "lower",
+      "node": 0.229,
+      "deno": 0.55,
+      "ratio": 0.4164,
+      "winner": "node"
+    },
+    {
+      "id": "shutdown",
+      "label": "SIGTERM shutdown",
+      "unit": "ms",
+      "direction": "lower",
+      "node": 20.8,
+      "deno": 8.771,
+      "ratio": 2.3715,
+      "winner": "deno"
+    },
+    {
+      "id": "runtimeBinary",
+      "label": "runtime binary size",
+      "unit": "MiB",
+      "direction": "lower",
+      "node": 74.617,
+      "deno": 135.985,
+      "ratio": 0.5487,
+      "winner": "node"
+    }
+  ],
+  "hardFails": [],
+  "composite": {
+    "node": 1.2668,
+    "deno": 1.1572,
+    "margin": 0.0947
+  },
+  "decision": {
+    "value": "deno",
+    "rule": "tie-breaker: peak RSS",
+    "rationale": [
+      "composite margin 9.5% < 10%",
+      "peak RSS node=153055232 deno=125059072"
+    ]
+  },
+  "rejectedAlternative": {
+    "value": "node",
+    "reasons": [
+      "cold start to ready: 536.942ms versus 277.795ms (93.3% worse)",
+      "cold start to exit: 553.849ms versus 289.482ms (91.3% worse)",
+      "RSS after boot: 144.289MiB versus 103.652MiB (39.2% worse)",
+      "peak RSS: 145.965MiB versus 119.266MiB (22.4% worse)",
+      "SIGTERM shutdown: 20.8ms versus 8.771ms (137.1% worse)"
+    ]
+  },
+  "residualRisks": [
+    "environment: hostFingerprint=sha256:e626bea75247a2aaaebaef3e951d5700b34ec2a7a965e7857bb853fecc66dd24 kernel=linux-6.18.39 runtime=deno@2.9.2",
+    "sandbox posture is unverified: both arms ran with the operator's normal OS permissions, so the comparison is runtime-only and does not claim containment",
+    "warm start is app-layer bring-up inside one process (open database, prepare statements, insert and read), not a second process launch",
+    "the ledger workload writes to the repository tmp filesystem; a different filesystem changes absolute durable-append numbers, though both arms shared it",
+    "each arm contributed one full workload run; cold start is 11 runs per arm and the distributions are reported rather than a significance test",
+    "Node's permission model has no network capability, so network containment for the Node arm remains an OS-sandbox obligation"
+  ],
+  "blocked": [
+    {
+      "arm": "node",
+      "measurement": "packaging.single-binary",
+      "reason": "Node 24 ships single-executable applications only as a SEA blob injected with postject; that toolchain is not in this sandbox. The runtime binary and the pinned effect closure are measured instead."
+    }
+  ],
+  "unboundProbes": [
+    "S1 also cites `cost-v1`; the runtime arm binds `append-v1@1.0.0` for its ledger workload and does not consume the model/broker cost workload, which belongs to the LANG-1 arm (A4)"
+  ],
+  "envelope": {
+    "testId": "NODE-DENO-1",
+    "invariantIds": [],
+    "fixtureVersion": "append-v1@1.0.0",
+    "canonicalHead": {
+      "seq": 0,
+      "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "sequenceRange": [
+      0,
+      0
+    ],
+    "environment": {
+      "hostFingerprint": "sha256:e626bea75247a2aaaebaef3e951d5700b34ec2a7a965e7857bb853fecc66dd24",
+      "kernel": "linux-6.18.39",
+      "runtime": "deno@2.9.2",
+      "sandboxPosture": "unverified",
+      "brokerIdentity": "unconfigured"
+    },
+    "seeds": [
+      0
+    ],
+    "modelRecordings": [],
+    "artifacts": [
+      "sha256:09eb7719c18f7d6b9ec80a6ecbca1fc1f75df1f7357efdf9b455213242f49415"
+    ],
+    "outcome": "blocked",
+    "metrics": {
+      "compositeNode": 1.2668,
+      "compositeDeno": 1.1572,
+      "compositeMargin": 0.0947,
+      "hardFails": 0,
+      "node.coldReady": 536.942,
+      "deno.coldReady": 277.795,
+      "node.coldStart": 553.849,
+      "deno.coldStart": 289.482,
+      "node.warmStart": 19.394,
+      "deno.warmStart": 23.757,
+      "node.rssAfterBoot": 144.289,
+      "deno.rssAfterBoot": 103.652,
+      "node.peakRss": 145.965,
+      "deno.peakRss": 119.266,
+      "node.eventLoopP95": 6.411,
+      "deno.eventLoopP95": 8.487,
+      "node.appendP95": 7.228,
+      "deno.appendP95": 9.377,
+      "node.readP95": 0.051,
+      "deno.readP95": 0.067,
+      "node.appendThroughput": 218,
+      "deno.appendThroughput": 142,
+      "node.workerStartup": 87.804,
+      "deno.workerStartup": 97.008,
+      "node.workerRoundtripP95": 0.229,
+      "deno.workerRoundtripP95": 0.55,
+      "node.shutdown": 20.8,
+      "deno.shutdown": 8.771,
+      "node.runtimeBinary": 74.617,
+      "deno.runtimeBinary": 135.985
+    }
+  },
+  "securityEnvelope": {
+    "testId": "NODE-DENO-1-SECURITY",
+    "invariantIds": [
+      "fs-write",
+      "net-connect",
+      "process-spawn",
+      "fs-read-outside-scope"
+    ],
+    "fixtureVersion": "security-v1@1.0.0",
+    "canonicalHead": {
+      "seq": 0,
+      "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "sequenceRange": [
+      0,
+      0
+    ],
+    "environment": {
+      "hostFingerprint": "sha256:e626bea75247a2aaaebaef3e951d5700b34ec2a7a965e7857bb853fecc66dd24",
+      "kernel": "linux-6.18.39",
+      "runtime": "deno@2.9.2",
+      "sandboxPosture": "unverified",
+      "brokerIdentity": "unconfigured"
+    },
+    "seeds": [
+      0
+    ],
+    "modelRecordings": [],
+    "artifacts": [
+      "sha256:f866265d40e8743adf95309aa185cf683ce53e37c15d516464c8660bbfa576e8"
+    ],
+    "outcome": "pass",
+    "metrics": {
+      "expectedProbes": 4,
+      "nodeDeniedProbes": 3,
+      "denoDeniedProbes": 4
+    }
+  }
+}

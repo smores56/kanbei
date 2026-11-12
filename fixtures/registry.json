@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "datasets": [
+    {
+      "id": "journey-v2",
+      "version": "1.0.0",
+      "path": "fixtures/journey-v2"
+    },
+    {
+      "id": "append-v1",
+      "version": "1.0.0",
+      "path": "fixtures/append-v1"
+    },
+    {
+      "id": "cost-v1",
+      "version": "1.0.0",
+      "path": "fixtures/cost-v1"
+    },
+    {
+      "id": "ui-v1",
+      "version": "1.0.0",
+      "path": "fixtures/ui-v1"
+    },
+    {
+      "id": "security-v1",
+      "version": "1.0.0",
+      "path": "fixtures/security-v1"
+    },
+    {
+      "id": "ingest-v1",
+      "version": "1.0.0",
+      "path": "fixtures/ingest-v1"
+    }
+  ]
+}

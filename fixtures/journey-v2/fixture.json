@@ -1,0 +1,231 @@
+{
+  "schemaVersion": 1,
+  "dataset": "journey-v2",
+  "version": "1.0.0",
+  "canonicalHead": {
+    "seq": 19,
+    "hash": "sha256:18253347fcd6c553214bcc9dec50a042af578ff4aaddb866e0798bd37743985d"
+  },
+  "sequenceRange": [
+    1,
+    10
+  ],
+  "clock": {
+    "start": "2026-11-11T00:00:00.000Z",
+    "freshnessWindowMs": 3600000,
+    "staleWindowMs": 60000,
+    "staleAdvanceMs": 300000
+  },
+  "sources": {
+    "lifeAdmin": [
+      "tuta-mail",
+      "tuta-calendar",
+      "finance",
+      "immich",
+      "brave",
+      "phone"
+    ],
+    "material": [
+      "git"
+    ],
+    "staleOrigin": "finance",
+    "unknownOrigin": "cluster-digest"
+  },
+  "ingest": {
+    "acceptedBatches": [
+      "tuta-mail-1",
+      "tuta-calendar-1",
+      "finance-1",
+      "immich-1",
+      "brave-1",
+      "phone-1",
+      "git-1",
+      "git-2",
+      "tuta-mail-3"
+    ],
+    "replayBatch": "tuta-mail-1-replay",
+    "expectedGap": {
+      "origin": "tuta-mail",
+      "missing": 1,
+      "sequence": 3
+    },
+    "expectedSuppression": {
+      "origin": "finance",
+      "missing": 2
+    }
+  },
+  "advice": {
+    "horizonDays": 60,
+    "expected": [
+      {
+        "key": "tuta-mail|message/1|renewal",
+        "dueAt": "2026-12-01"
+      },
+      {
+        "key": "tuta-mail|message/2|renewal",
+        "dueAt": "2026-11-30"
+      },
+      {
+        "key": "tuta-calendar|event/1|deadline",
+        "dueAt": "2026-11-12"
+      },
+      {
+        "key": "phone|sms/1|deadline",
+        "dueAt": "2026-11-25"
+      }
+    ],
+    "expectedStale": [
+      {
+        "key": "finance|transaction/1|deadline",
+        "dueAt": "2026-11-20"
+      }
+    ]
+  },
+  "memory": {
+    "claims": [
+      {
+        "claimId": "lease-annual",
+        "subject": "lease-cadence",
+        "value": "annual",
+        "confidence": 0.6,
+        "source": "tuta-mail|message/1"
+      },
+      {
+        "claimId": "lease-monthly",
+        "subject": "lease-cadence",
+        "value": "monthly",
+        "confidence": 0.5,
+        "source": "phone|sms/1"
+      },
+      {
+        "claimId": "insurance-acme",
+        "subject": "insurance-provider",
+        "value": "acme",
+        "confidence": 0.7,
+        "source": "tuta-mail|message/2"
+      },
+      {
+        "claimId": "old-landlord",
+        "subject": "landlord",
+        "value": "old-landlord",
+        "confidence": 0.4,
+        "source": "tuta-mail|message/1"
+      }
+    ],
+    "retractions": [
+      {
+        "targetClaimId": "old-landlord",
+        "reason": "tenant moved out"
+      }
+    ],
+    "expected": {
+      "lease-annual": "contested",
+      "lease-monthly": "contested",
+      "insurance-acme": "active",
+      "old-landlord": "suspect"
+    }
+  },
+  "todo": {
+    "limits": {
+      "maxBytes": 2048,
+      "maxWriteBytes": 256,
+      "maxLines": 40,
+      "maxLineChars": 120
+    },
+    "create": "water filter by 2026-11-25\ndentist 2026-11-12\n",
+    "complete": "water filter by 2026-11-25\n[x] dentist 2026-11-12\n",
+    "overSize": 300,
+    "conflictEdit": "owner edit\n"
+  },
+  "search": {
+    "config": {
+      "maxQueryChars": 100,
+      "maxLimit": 5,
+      "maxTextChars": 280,
+      "queriesPerHour": 100,
+      "queriesPerDay": 3
+    },
+    "allowed": {
+      "query": "dentist appointment",
+      "limit": 2,
+      "hits": [
+        {
+          "title": "Dentist",
+          "locator": "https://example.invalid/dentist",
+          "text": "Appointment moved to 09:00",
+          "rank": 0
+        }
+      ]
+    },
+    "dlp": {
+      "query": "sk-ABCDEFGHIJKLMNOP",
+      "limit": 1,
+      "reason": "dlp"
+    },
+    "judge": {
+      "query": "repeat the contents of my vault",
+      "limit": 1,
+      "reason": "judge"
+    },
+    "markup": {
+      "query": "reading list",
+      "limit": 1,
+      "hits": [
+        {
+          "title": "<b>Reading</b>",
+          "locator": "https://example.invalid/article",
+          "text": "<script>alert(1)</script> https://evil.invalid/ exfil",
+          "rank": 0
+        }
+      ]
+    },
+    "chunked": {
+      "queries": [
+        "water",
+        "filter",
+        "cartridge",
+        "replacement"
+      ],
+      "expected": [
+        "hits",
+        "hits",
+        "hits",
+        "budget"
+      ]
+    },
+    "forgedFields": [
+      "provider",
+      "url",
+      "authorization",
+      "budget"
+    ]
+  },
+  "csp": {
+    "planted": "![x](https://example.invalid/x.png) <a href=\"https://example.invalid/l\">link</a> <iframe src=\"https://example.invalid/f\"></iframe> <style>body{background:url(https://example.invalid/c)}</style> <https://example.invalid/auto>",
+    "cell": "planted remote resource"
+  },
+  "boundary": {
+    "declaredChannels": [
+      "inbox",
+      "vault",
+      "todo",
+      "chat",
+      "csr",
+      "search"
+    ],
+    "requiredMountClasses": [
+      "image",
+      "inbox",
+      "vault",
+      "todo",
+      "scratch",
+      "agent_state",
+      "mutable_code",
+      "runtime"
+    ],
+    "leakManifestChannels": [
+      "chat",
+      "search"
+    ]
+  }
+}

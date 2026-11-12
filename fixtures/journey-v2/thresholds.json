@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "dataset": "journey-v2",
+  "version": "1.0.0",
+  "basis": "The sealed slice is exhaustively hand-labelled, so agreement is the threshold: a miss is a defect, not a tuning target. Population thresholds for DG-6 and DG-7 stay open and are not set here; changing this file is a fixture change with a new version.",
+  "advisory": { "precisionMin": 1, "recallMin": 1 },
+  "memory": { "precisionMin": 1, "recallMin": 1 },
+  "freshness": { "staleAsFreshMax": 0, "missingAsCurrentMax": 0 },
+  "todo": { "capViolationsMax": 0, "conflictOverwritesMax": 0 },
+  "search": { "blockedRecallMin": 1, "budgetOverrunsMax": 0, "forgedFieldsForwardedMax": 0 },
+  "channelLeaksMax": 0,
+  "cspRemoteRequestsMax": 0,
+  "deterministicDigests": true
+}

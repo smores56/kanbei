@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "providers": [
+    {
+      "provider": "neuralwatt",
+      "primary": "deepseek-v4.1-flash",
+      "smaller": "qwen-3.8-27b"
+    }
+  ]
+}

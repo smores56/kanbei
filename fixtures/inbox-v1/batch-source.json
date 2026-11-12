@@ -1,0 +1,24 @@
+{
+  "origin": "tuta-mail",
+  "sequence": 1,
+  "producedAt": "2026-11-11T00:00:00.000Z",
+  "scan": {
+    "mode": "event",
+    "scopeHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "startedAt": "2026-11-11T00:00:00.000Z",
+    "completedAt": "2026-11-11T00:00:01.000Z"
+  },
+  "entries": [
+    {
+      "resourceKey": "message/1",
+      "kind": "capture",
+      "locator": "fixture:message/1",
+      "capturedAt": "2026-11-11T00:00:00.000Z",
+      "mediaType": "application/json",
+      "bodyFile": "bodies/message-1.json",
+      "evidence": { "adapter": "fixture-v1" }
+    }
+  ],
+  "coverage": { "complete": true, "gaps": 0, "suppressed": 0 },
+  "suppressed": 0
+}

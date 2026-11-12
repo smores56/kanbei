@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "dataset": "cost-v1",
+  "version": "1.0.0",
+  "workloads": [
+    {
+      "id": "full-journey",
+      "description": "Run the canonical research-to-feature-push journey over two projects plus Kanbei.",
+      "fixture": "journey-v1",
+      "repetitions": 1,
+      "warm": false
+    },
+    {
+      "id": "idle",
+      "description": "No input after warmup; measure idle wakeups, RSS, CPU, and token spend.",
+      "durationSeconds": 1800,
+      "warm": true
+    },
+    {
+      "id": "fan-out-burst",
+      "description": "Admit a bounded fan-out of agent loops and measure queueing, concurrency, and ceilings.",
+      "concurrentLoops": 10,
+      "warm": true
+    },
+    {
+      "id": "reconciliation-backlog",
+      "description": "Apply a memory-v1 batch and measure catch-up, coverage lag, and suspect reads.",
+      "claims": 200,
+      "warm": true
+    },
+    {
+      "id": "external-conflict",
+      "description": "Inject an external commit that conflicts with a speculative branch.",
+      "fixture": "external-v1",
+      "warm": true
+    },
+    {
+      "id": "backup-restore",
+      "description": "Run an online snapshot, CAS copy with GC paused, restore, and derived rebuild.",
+      "fixture": "journey-v1",
+      "warm": true
+    }
+  ]
+}

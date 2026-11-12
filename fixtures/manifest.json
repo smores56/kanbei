@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "generatedBy": "deno task fixtures:seal",
+  "datasets": {
+    "journey-v2@1.0.0": {
+      "treeHash": "sha256:1b4b203e21f7da244c74dc664337d3d28292b06c63f95bb45279a7bc835fc946",
+      "files": {
+        "batches/brave-1.age": "sha256:6f75dfcaad8d6f3aa4349a79a17b643ed905823113cd4fa04cde27dfb3e0a854",
+        "batches/finance-1.age": "sha256:933ea2d7e07039dd2d7c468f1aafa3839c16298b95e10cb3272b74304f4aa0ce",
+        "batches/git-1.age": "sha256:227ef7f7fb9bd7e115024be1040fa87e66d1a6e2f2db2738c50876475cd774a2",
+        "batches/git-2.age": "sha256:537b76898b1e6a9b222dba91abef260a1e41b08a20e48bc09f68f6688c486c7a",
+        "batches/immich-1.age": "sha256:da3d8bc88b4c4d1a0abb4d5d43b44287cdf329a8e5b8f33c7a3fbf1baa3d1843",
+        "batches/phone-1.age": "sha256:b9d4f96e002f20960abaa15fe580814a56046ebaa7d4ef6ee69950a3506c74f6",
+        "batches/tuta-calendar-1.age": "sha256:4af90dc5a8a6de6dcb6b29388f63c62e03ef71d0c8f809b476ad43a697ed780d",
+        "batches/tuta-mail-1-replay.age": "sha256:1653e859cc9c4eaebaed16e6f9b4585eeb8ae5ff418d85a5c32a1e157b929d90",
+        "batches/tuta-mail-1.age": "sha256:1f272bf1e64e6e84165c23eb20e724540b3eb0392eeddc5b5591cbdb73bbd98c",
+        "batches/tuta-mail-3.age": "sha256:c85511aaa464cdd7757f8cd8def15f496ba45659cbbd1f4a22fb391665e21521",
+        "fixture.json": "sha256:bb6138ba75605bca7bb725e75bb9758977e1d58a30e1ebe610f0b88774187be5",
+        "keys/identity.txt": "sha256:b052a683f7ba5b57aabc5a599d659d3c4b2bac8b2dc78b6d9e6e7640611e4795",
+        "keys/recipient.txt": "sha256:55acdedb630b5606f9b21763cb788590581989a7c0b1cd39b124dc3b777fa2ab",
+        "source.json": "sha256:dfae3e0efaecbadbd7e5560f53b412e6d3597e7a74121ed704e1f8f6fc55669c",
+        "thresholds.json": "sha256:412ab9ae8c35179c613b7e99b386d0c9719c3ad65d117dce55979f816908fb2d"
+      }
+    },
+    "append-v1@1.0.0": {
+      "treeHash": "sha256:35c0caf6e59ab01c94fafff9785246c498a62616b8ddf25433c3c1d0879aa744",
+      "files": {
+        "fixture.json": "sha256:75f75ce5f0ae00f3e7f9abcc2713e82d1c9aebeff80d096cd39e2925e9895f9a"
+      }
+    },
+    "cost-v1@1.0.0": {
+      "treeHash": "sha256:d2f94e59665c3bf20b8222938e168575593071b93cb60497fcf80923c04a0a68",
+      "files": {
+        "workload.json": "sha256:388478999ce135dbb3672356ac806eb4a84d3232f166d4156405787ec437ad76"
+      }
+    },
+    "ui-v1@1.0.0": {
+      "treeHash": "sha256:c2b40166b9599e710046841fa0e1de03ab06394083e68efe806fd28e09b0b8a3",
+      "files": {
+        "questions.json": "sha256:61b3ab517fcb4f147078dbb1bf93d558f6b6cb4f04fa42d4aa34a015e1ca944b"
+      }
+    },
+    "security-v1@1.0.0": {
+      "treeHash": "sha256:a3a77a623b9dc060f4ba32f0bee0a1323da89f0aa5c6c6ae8b3bd10c0496dc01",
+      "files": {
+        "cases.json": "sha256:7ca6cfe54ed9da7bf27dfc5e1744fb96d9554451ae0eab3e230f32049b6d69ba",
+        "channel-probes.json": "sha256:209f52b8313404c60dd1b7113f91ff15aca6b44511f783bb1934b3e02aa6b41a"
+      }
+    },
+    "ingest-v1@1.0.0": {
+      "treeHash": "sha256:3d2476beffde8032f9f40375125982d1a38dfaf26b01f5ecc7e86ac34d36ea1b",
+      "files": {
+        "adversarial/brave-over-cap.age": "sha256:798eac21670122e20a18a628e03085bf287704f2e8a1d2190be07c5eca40ba49",
+        "adversarial/finance-truncated.age": "sha256:eb900b3f8236f98b05933ac532575f777bc09d83dd5d312f36694da71fa1ac65",
+        "adversarial/tuta-mail-2-duplicate.age": "sha256:35b2b93d2a9f9cd111264bd2648b1750578a8cefb7267cfd061068b69f4829f0",
+        "adversarial/tuta-mail-2.age": "sha256:6494a4e7a061fc7627ce1fdbec39fc9f71a5070132bf3631b88a511d66c87c0d",
+        "adversarial/tuta-mail-injected-prose.age": "sha256:c2f3aac2371f598f233e353eaf182f9e44955de7eab0bc0ad5f2a795fec40f35",
+        "adversarial/unknown-origin-1.age": "sha256:c882f21e17322183ec82b11617f5ee762ed651f7ffec555cf57901582b5a616f",
+        "batches/brave-1.age": "sha256:e573e2a84ec1e0eee98a186e21b59dde9ce334f221136c73fefe4f46c49d9fdc",
+        "batches/cluster-digest-1.age": "sha256:cb295d9b2b33156dc61163df328232a2d14b2376152e2dd2fbbab3bd0351f1d5",
+        "batches/finance-1.age": "sha256:5d4f2712bfd7e0a2df5677b3a9dc24ce577584d736984095cc5ae05f5de129c1",
+        "batches/git-1.age": "sha256:45ddf673271368f36ffad52b9ec0774d3ddb4117a20e6d1f9791cd30eacd43b3",
+        "batches/immich-1.age": "sha256:fcf6770b86a19a2c3add041751afbedcdf4462dd91e9d2eaa526e02b69fe94ea",
+        "batches/phone-1.age": "sha256:56c31f359ee1dd58637da5f5e0e57f261db309edc1ea703e841f1e44b4d87d8e",
+        "batches/tuta-calendar-1.age": "sha256:4d76f68b0f577cd71a0c3ffbfef86f391599ad389b63bc51036188d8e6374a2f",
+        "batches/tuta-mail-1.age": "sha256:bad0917c8f4a819ba946a54d96e83dacbed0917feab0302a63b6e0fbb1ea738c",
+        "keys/identity.txt": "sha256:b052a683f7ba5b57aabc5a599d659d3c4b2bac8b2dc78b6d9e6e7640611e4795",
+        "keys/recipient.txt": "sha256:55acdedb630b5606f9b21763cb788590581989a7c0b1cd39b124dc3b777fa2ab",
+        "source.json": "sha256:89897305a5e9b17223379188bcfad281d773ae9d3a2e36d3c91639044e934e2d"
+      }
+    }
+  }
+}

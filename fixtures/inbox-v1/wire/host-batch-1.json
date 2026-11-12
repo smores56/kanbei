@@ -1,0 +1,19 @@
+{
+  "v": 1,
+  "source": "tuta-mail",
+  "kind": "batch",
+  "seq": 7,
+  "sent_at": "2026-11-11T00:00:00Z",
+  "items": [
+    {
+      "id": "message-7",
+      "subject": "board meeting",
+      "body": "the board meets friday"
+    },
+    {
+      "id": "message-8",
+      "subject": "lunch",
+      "body": "lunch at noon"
+    }
+  ]
+}
