@@ -16,6 +16,10 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.9.2
+      # Inbox decryption tests shell out to age/age-keygen, so the runner needs
+      # the same binary the packaged image carries; without it every ciphertext
+      # case fails as decrypt_failed instead of testing the behaviour.
+      - run: sudo apt-get update && sudo apt-get install -y age
       - run: deno task verify
       # The red team suite is repeated as its own step so a channel-leak or CSP
       # regression is attributable without reading the whole verify log.
