@@ -64,3 +64,39 @@ lock creation and release leaves `<ledger>.lock` behind, and the next boot
 fails closed rather than risking two writers. Operator action is to remove that
 file after confirming no process holds the ledger. This is the safe direction
 for a canonical store.
+
+## Journey J2-CSP
+
+The step renders a planted document to inert `text/plain` and asserts the shipped
+policy bytes (`default-src 'none'`, no remote origin), but the browser that
+enforces the policy is the host-owned static shell in nix-config. The step also
+asserts statically that `src/ui/render.ts` has no fetch capability, and records
+this limit in the envelope's `acceptedResiduals`.
+
+## Journey J2-SEARCH
+
+Searchd's judge and DLP run in the Search VM and are not in this repo. The step
+drives the real `SearchClient` seam with a synthetic `SearchChannel` and asserts
+the client refuses a blocked verdict, strips markup, refuses forged fields, and
+enforces the persisted query ceiling. The judge itself is recorded as an
+accepted residual on the envelope.
+
+## Search budget store
+
+Admit stamps live in one file with an atomic replace and one in-process permit.
+A second writer on the same file would race; the deployment has one VM and one
+kernel, matching the ledger's single-writer assumption.
+
+## Vault realpath window
+
+The adapter resolves the real path, requires it under the real root, opens that
+path, and re-checks the opened inode against an lstat. A same-inode replacement
+between realpath and open is not observable, and Deno 2.9 exposes no
+`O_NOFOLLOW` per component; the lstat chain plus realpath is the closest the
+runtime allows.
+
+## Redteam evidence claims
+
+Each redteam case declares its denial evidence (`receipt`, `quarantine`, or
+`none`). Quarantine rows and receipts are read from the seam; cases that refuse
+before any record exists claim `none` and fail the run if they report one.

@@ -46,6 +46,7 @@ export interface WorldLedger {
   readonly recordCount: number
   readonly captureCount: number
   readonly headSeq: number
+  readonly headHash: string
 }
 
 export interface World {
@@ -185,6 +186,7 @@ export const runWorld = async (options: {
             recordCount: (yield* journal.records).length,
             captureCount: captures.length,
             headSeq: head.seq,
+            headHash: head.hash,
           },
         }
       }).pipe(

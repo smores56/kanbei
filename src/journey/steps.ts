@@ -89,6 +89,13 @@ export const stepIngest = async (context: StepContext): Promise<JourneyStepOutco
     "observation-ledger-divergence",
   )
   check(checks, world.ledger.recordCount === world.ledger.headSeq, "ledger-head-divergence")
+  // The envelope claims this head: prove it against the ledger the run built.
+  check(
+    checks,
+    world.ledger.headSeq === context.fixture.canonicalHead.seq &&
+      world.ledger.headHash === context.fixture.canonicalHead.hash,
+    `fixture-head-mismatch: ledger ${world.ledger.headSeq}@${world.ledger.headHash}`,
+  )
   check(checks, world.state.heartbeats.length === originsSeen.size, "heartbeat-count")
   check(
     checks,
@@ -534,6 +541,12 @@ export const stepSearch = async (context: StepContext): Promise<JourneyStepOutco
       forgedAccepted,
       calls: calls.map((query) => Object.keys(query).toSorted()),
     }),
+    // The judge and DLP run inside the Search VM; this step drives the client seam.
+    residuals: [
+      "searchd's judge and DLP run inside the Search VM and are not in this repo; " +
+      "this step asserts the VM client refuses a blocked verdict, strips markup, " +
+      "refuses forged fields, and enforces the persisted query ceiling",
+    ],
   }
 }
 
@@ -589,9 +602,23 @@ export const stepCsp = async (context: StepContext): Promise<JourneyStepOutcome>
     check(checks, text.includes("https://example.invalid/x.png"), "planted-url-not-inert")
   }
   check(checks, calls.length === 0, "remote-request-made")
+  // The render path has no fetch capability at all; assert that statically rather
+  // than trusting the synthetic network to observe a request that cannot exist.
+  const renderSource = await Deno.readTextFile(
+    new URL("../ui/render.ts", import.meta.url),
+  )
   check(
     checks,
-    shellResponseHeaders[CONTENT_SECURITY_POLICY_HEADER] === CONTENT_SECURITY_POLICY,
+    !/fetch\(|XMLHttpRequest|WebSocket|Deno\.(connect|listen)/u.test(renderSource),
+    "render-path-has-a-fetch-capability",
+  )
+  check(
+    checks,
+    shellResponseHeaders[CONTENT_SECURITY_POLICY_HEADER] === CONTENT_SECURITY_POLICY &&
+      CONTENT_SECURITY_POLICY.includes("default-src 'none'") &&
+      /base-uri 'none'/u.test(CONTENT_SECURITY_POLICY) &&
+      /form-action 'self'/u.test(CONTENT_SECURITY_POLICY) &&
+      /frame-ancestors 'none'/u.test(CONTENT_SECURITY_POLICY),
     "csp-header",
   )
   check(checks, CONTENT_SECURITY_POLICY.includes("default-src 'none'"), "csp-default")
@@ -609,6 +636,12 @@ export const stepCsp = async (context: StepContext): Promise<JourneyStepOutcome>
       text: Result.isSuccess(rendered) ? rendered.success.lines : [],
       requests: calls.length,
     }),
+    // The browser that would enforce the policy is the host-owned shell.
+    residuals: [
+      "the enforcing shell (static bundle and CSP header) is host-owned in nix-config; " +
+      "this step asserts the policy bytes, the inert text render, and the absence of a " +
+      "fetch capability on the render path",
+    ],
   }
 }
 

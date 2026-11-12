@@ -3,7 +3,7 @@ import { Effect } from "effect"
 import { CONTENT_SECURITY_POLICY } from "../../src/ui/csp.ts"
 import { sha256Text } from "../../src/evidence/digest.ts"
 import { loadCatalogue } from "./probes.ts"
-import { RECEIPT_REQUIRED, redteamReportText, runRedteam } from "./suite.ts"
+import { EVIDENCE_CLAIMS, redteamReportText, runRedteam } from "./suite.ts"
 
 Deno.test("every channel is attacked and every probe fails closed with its receipt", async () => {
   const report = await runRedteam(Deno.cwd())
@@ -17,8 +17,10 @@ Deno.test("every channel is attacked and every probe fails closed with its recei
   )
   for (const probeCase of report.cases) {
     assertEquals(probeCase.outcome, probeCase.expected, probeCase.id)
-    if (RECEIPT_REQUIRED.has(probeCase.channel)) {
-      assertEquals(probeCase.receipt, true, `${probeCase.id} has no receipt`)
+    const claim = EVIDENCE_CLAIMS[probeCase.id]
+    assertEquals(claim !== undefined, true, `${probeCase.id} has no evidence claim`)
+    if (claim === "receipt" || claim === "quarantine") {
+      assertEquals(probeCase.receipt, true, `${probeCase.id} has no ${claim} evidence`)
     }
   }
 })

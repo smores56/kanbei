@@ -198,6 +198,7 @@ export const runJourney = async (
           invariantIds: invariantIds[index] ?? [],
           fixture: reference,
           seeds: [index + 1],
+          residualsFrom: (outcome: JourneyStepOutcome) => outcome.residuals ?? [],
           body: (_snapshot, capture) =>
             Effect.gen(function* () {
               const outcome = yield* Effect.promise(() => step(context))

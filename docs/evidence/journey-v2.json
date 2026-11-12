@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "dataset": "journey-v2@1.0.0",
-  "fixtureTreeHash": "sha256:27d0077a649615e255ca59d4405123cc0386d46dca1ba0077f95fc28b44a87ad",
+  "fixtureTreeHash": "sha256:be06766d57c5b83fdc2e6c4d8018a0fe238cab3e3f5e0ae731d6bc913330f859",
   "thresholdBasis": "The sealed slice is exhaustively hand-labelled, so agreement is the threshold: a miss is a defect, not a tuning target. Population thresholds for DG-6 and DG-7 stay open and are not set here; changing this file is a fixture change with a new version.",
   "thresholds": {
     "schemaVersion": 1,

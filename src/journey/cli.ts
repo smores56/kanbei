@@ -23,15 +23,19 @@ const summary = [
 ].join("\n")
 
 if (check) {
-  const again = await runJourney(root)
-  if (again.report.runDigest !== report.runDigest) {
-    await Effect.runPromise(
-      Console.error("journey-v2: two runs on an unchanged head produced different digests"),
-    )
-    await Effect.runPromise(
-      Console.error(`first  ${report.runDigest}\nsecond ${again.report.runDigest}`),
-    )
-    Deno.exit(1)
+  // The pre-registered threshold decides whether the second run is required;
+  // it is not a decorative field.
+  if (report.thresholds.deterministicDigests) {
+    const again = await runJourney(root)
+    if (again.report.runDigest !== report.runDigest) {
+      await Effect.runPromise(
+        Console.error("journey-v2: two runs on an unchanged head produced different digests"),
+      )
+      await Effect.runPromise(
+        Console.error(`first  ${report.runDigest}\nsecond ${again.report.runDigest}`),
+      )
+      Deno.exit(1)
+    }
   }
   const recorded = await Deno.readTextFile(output).catch(() => "")
   if (recorded !== text) {

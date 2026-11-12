@@ -171,4 +171,6 @@ export type JourneyStepOutcome = {
   readonly checks: ReadonlyArray<string>
   readonly metrics: Readonly<Record<string, number>>
   readonly detail: Schema.Json
+  /** Residuals the step cannot close in this repo; they land on the envelope. */
+  readonly residuals?: ReadonlyArray<string>
 }

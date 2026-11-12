@@ -21,6 +21,8 @@ export interface EvidenceRun<A, E, R> {
   readonly body: (fixture: FixtureSnapshot, capture: EvidenceCapture) => Effect.Effect<A, E, R>
   readonly metrics?: Readonly<Record<string, number>>
   readonly acceptedResiduals?: ReadonlyArray<string>
+  /** Residuals a successful body declares; they land on the envelope. */
+  readonly residualsFrom?: (result: A) => ReadonlyArray<string>
 }
 
 interface Verdict {
@@ -88,6 +90,11 @@ export const runEvidence = <A, E, R>(
     const captured = yield* capture.snapshot
     const environment = yield* environmentProbe.fingerprint
     const verdict = classify(exit)
+    const declared = run.residualsFrom === undefined ? undefined : Exit.match(exit, {
+      onSuccess: (value) => run.residualsFrom?.(value) ?? [],
+      onFailure: () => undefined,
+    })
+    const residuals = declared ?? run.acceptedResiduals
 
     const candidate: EvidenceEnvelope = {
       testId: run.testId,
@@ -102,9 +109,7 @@ export const runEvidence = <A, E, R>(
       outcome: verdict.outcome,
       ...(verdict.failureClass === undefined ? {} : { failureClass: verdict.failureClass }),
       ...(run.metrics === undefined ? {} : { metrics: { ...run.metrics } }),
-      ...(run.acceptedResiduals === undefined
-        ? {}
-        : { acceptedResiduals: [...run.acceptedResiduals] }),
+      ...(residuals === undefined ? {} : { acceptedResiduals: [...residuals] }),
     }
 
     return yield* validate(candidate)

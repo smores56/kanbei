@@ -133,7 +133,8 @@ export const inboxProbes = async (
         traversal.reason === "name is not a base name"
           ? "denied:inbox_name_invalid"
           : `accepted:${traversal.reason}`,
-        true,
+        // Refused by the directory adapter before any receipt can exist.
+        false,
         traversal.reason,
       ),
     )
@@ -209,7 +210,8 @@ export const inboxProbes = async (
         world.poll.duplicates === 1 && world.poll.accepted === 1
           ? "duplicate"
           : `accepted:${world.poll.accepted};duplicates:${world.poll.duplicates}`,
-        world.poll.duplicates === 1,
+        // A duplicate is a poll outcome, not a receipt row.
+        false,
         JSON.stringify(world.poll),
       ),
     )
@@ -519,7 +521,15 @@ export const searchProbes = async (
       searchHarness((query) => Effect.succeed(options.reply(query)), options.overrides ?? {}),
     )
     const clock = await Effect.runPromise(mutableClock(start))
-    const observed = await onClient(harness, clock, options.run(clock))
+    const observed = await onClient(
+      harness,
+      clock,
+      Effect.gen(function* () {
+        const outcome = yield* options.run(clock)
+        const client = yield* SearchClient
+        return { ...outcome, receipts: (yield* client.receipts).length }
+      }),
+    )
     return { ...observed, calls: await Effect.runPromise(Ref.get(harness.calls)) }
   }
 
@@ -536,7 +546,7 @@ export const searchProbes = async (
     result(
       byId(catalogue, "SEARCH-DLP-BYPASS"),
       `blocked:${dlp.outcomes[0] ?? "none"}`,
-      dlp.outcomes[0] === "dlp",
+      dlp.receipts > 0,
       dlp.outcomes.join(","),
     ),
   )
@@ -553,7 +563,7 @@ export const searchProbes = async (
     result(
       byId(catalogue, "SEARCH-JUDGE-BYPASS"),
       `blocked:${judge.outcomes[0] ?? "none"}`,
-      judge.outcomes[0] === "judge",
+      judge.receipts > 0,
       judge.outcomes.join(","),
     ),
   )
@@ -577,7 +587,7 @@ export const searchProbes = async (
     result(
       byId(catalogue, "SEARCH-CHUNKED-EXFIL"),
       `blocked:${chunked.outcomes.at(-1) ?? "none"}`,
-      chunked.outcomes.at(-1) === "budget" && chunked.calls.length === 3,
+      chunked.receipts > 0 && chunked.outcomes.at(-1) === "budget" && chunked.calls.length === 3,
       `${chunked.outcomes.join(",")}; VM calls ${chunked.calls.length}`,
     ),
   )
@@ -601,7 +611,7 @@ export const searchProbes = async (
     result(
       byId(catalogue, "SEARCH-BUDGET-RESET"),
       reset.outcomes.at(-1) ?? "none",
-      reset.outcomes[1] === "budget" && reset.outcomes[2] === "hits",
+      reset.receipts > 0 && reset.outcomes[1] === "budget" && reset.outcomes[2] === "hits",
       reset.outcomes.join(","),
     ),
   )
@@ -631,7 +641,7 @@ export const searchProbes = async (
       markup.outcomes[0] === "hits" && !cleanText.includes("<") && !cleanText.includes("http")
         ? "stripped"
         : `unstripped:${cleanText}`,
-      true,
+      markup.receipts > 0,
       cleanText,
     ),
   )
@@ -657,7 +667,8 @@ export const searchProbes = async (
     result(
       byId(catalogue, "SEARCH-FORGED-FIELD"),
       forged.outcomes[0] === "schema" ? "denied:schema" : "accepted:forged",
-      forged.calls.length === 0,
+      // Nothing was queried, so no receipt exists; the call count is the evidence.
+      false,
       `${forged.outcomes.join(",")}; VM calls ${forged.calls.length}`,
     ),
   )
@@ -698,7 +709,8 @@ export const cspProbes = async (
     result(
       byId(catalogue, "CSP-PLANTED-RESOURCES"),
       ok ? "zero-requests" : "request-or-policy-drift",
-      true,
+      // The evidence is the zero-request synthetic network, not a receipt.
+      false,
       `requests ${calls.length}; policy ${policyDigest}`,
     ),
   ]
@@ -763,7 +775,7 @@ export const boundaryProbes = (
   return Promise.resolve(probes.map(([id, declared, posture]) => {
     const verdict = verifyStartup(declared, posture)
     const code = Result.isFailure(verdict) ? verdict.failure.code : "started"
-    return result(byId(catalogue, id), `refused:${code}`, true, code)
+    return result(byId(catalogue, id), `refused:${code}`, false, code)
   }))
 }
 
