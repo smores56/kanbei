@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "dataset": "journey-v2@1.0.0",
-  "fixtureTreeHash": "sha256:be06766d57c5b83fdc2e6c4d8018a0fe238cab3e3f5e0ae731d6bc913330f859",
+  "fixtureTreeHash": "sha256:1b4b203e21f7da244c74dc664337d3d28292b06c63f95bb45279a7bc835fc946",
   "thresholdBasis": "The sealed slice is exhaustively hand-labelled, so agreement is the threshold: a miss is a defect, not a tuning target. Population thresholds for DG-6 and DG-7 stay open and are not set here; changing this file is a fixture change with a new version.",
   "thresholds": {
     "schemaVersion": 1,
@@ -42,7 +42,7 @@
         "batchAccepted": 9,
         "batchDuplicates": 1,
         "observations": 10,
-        "ledgerRecords": 10,
+        "ledgerRecords": 19,
         "ledgerCaptures": 10,
         "receipts": 9,
         "heartbeats": 7,
@@ -51,7 +51,8 @@
       },
       "artifacts": [
         "sha256:544e6c9e7a822d62156c317a453038c9daeb23db6aa6a65beb5fe93597bd68a0"
-      ]
+      ],
+      "acceptedResiduals": []
     },
     {
       "testId": "J2-FRESHNESS",
@@ -66,7 +67,8 @@
       },
       "artifacts": [
         "sha256:8fe63defaca871bbd8fd86665736aaee7cdb9137dde5e0b05b01d90cab20baf7"
-      ]
+      ],
+      "acceptedResiduals": []
     },
     {
       "testId": "J2-ADVICE",
@@ -81,7 +83,8 @@
       },
       "artifacts": [
         "sha256:ee59818b760f0ed8a09d5b422eb51ae2c233e7f2d4597a4cb211eb0b297a33b2"
-      ]
+      ],
+      "acceptedResiduals": []
     },
     {
       "testId": "J2-MEMORY",
@@ -95,8 +98,9 @@
         "suspect": 1
       },
       "artifacts": [
-        "sha256:4a87881a70e00dd50ced430e769092644bd4b20500806ecb8ee45e3a91628fb9"
-      ]
+        "sha256:fb43ae05d728fe1b2c72b9504a271ebb5a1a10a199645a4bcae270a3d1df0d12"
+      ],
+      "acceptedResiduals": []
     },
     {
       "testId": "J2-TODO",
@@ -110,7 +114,8 @@
       },
       "artifacts": [
         "sha256:015753b1324148523327e218a1fb37b30ef9b5421001a7af0eaddff851ff1c13"
-      ]
+      ],
+      "acceptedResiduals": []
     },
     {
       "testId": "J2-SEARCH",
@@ -125,6 +130,9 @@
       },
       "artifacts": [
         "sha256:66eb0f512c9beb93ba454539bdaa4969a7c6e6ca61dd27f86b7dcb21e52a05a3"
+      ],
+      "acceptedResiduals": [
+        "searchd's judge and DLP run inside the Search VM and are not in this repo; this step asserts the VM client refuses a blocked verdict, strips markup, refuses forged fields, and enforces the persisted query ceiling"
       ]
     },
     {
@@ -137,6 +145,9 @@
       },
       "artifacts": [
         "sha256:7a73ef2b947740c7d96b818b90742b6c6631a8f1790deca4383bedb6946abd3c"
+      ],
+      "acceptedResiduals": [
+        "the enforcing shell (static bundle and CSP header) is host-owned in nix-config; this step asserts the policy bytes, the inert text render, and the absence of a fetch capability on the render path"
       ]
     },
     {
@@ -150,14 +161,15 @@
       },
       "artifacts": [
         "sha256:73540a68dc1da7c82455ab61db97ed926c684ac43c6b56093d2543ca0e6d3211"
-      ]
+      ],
+      "acceptedResiduals": []
     }
   ],
   "metrics": {
     "batchAccepted": 9,
     "batchDuplicates": 1,
     "observations": 10,
-    "ledgerRecords": 10,
+    "ledgerRecords": 19,
     "ledgerCaptures": 10,
     "receipts": 9,
     "heartbeats": 7,
@@ -192,7 +204,11 @@
     "channels": 6,
     "leakRefusals": 1
   },
+  "acceptedResiduals": [
+    "searchd's judge and DLP run inside the Search VM and are not in this repo; this step asserts the VM client refuses a blocked verdict, strips markup, refuses forged fields, and enforces the persisted query ceiling",
+    "the enforcing shell (static bundle and CSP header) is host-owned in nix-config; this step asserts the policy bytes, the inert text render, and the absence of a fetch capability on the render path"
+  ],
   "violations": [],
   "pass": true,
-  "runDigest": "sha256:d418f55454d90298b12f571d578c76502cc979d879c8ca77ae323ac7fedddb18"
+  "runDigest": "sha256:e530ec12a3a705dd0da767000cbf93a891bb2f50ce49e533e99719b7e414c40d"
 }

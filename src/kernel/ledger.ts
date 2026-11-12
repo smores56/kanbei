@@ -42,6 +42,7 @@ export const LedgerRecord = Schema.Struct({
   prev_hash: Schema.String,
   record_hash: Schema.String,
   components: Schema.Array(LedgerComponent),
+  /** The caller's idempotency key is stored only as a labeled hash. */
   idempotency_key: Schema.optional(Schema.String),
 })
 export type LedgerRecord = typeof LedgerRecord.Type
@@ -201,6 +202,13 @@ const authorityIssues = (request: LedgerAppendRequest): ReadonlyArray<string> =>
 
 const compareTypes = (left: string, right: string): number =>
   left < right ? -1 : left > right ? 1 : 0
+
+/**
+ * A caller's idempotency key often names a resource or a path. The ledger stores
+ * only this labeled hash, so the canonical record never quotes the caller's key.
+ */
+export const idempotencyKeyHash = (key: string): Effect.Effect<string> =>
+  sha256Labeled("kanbei.idempotency.v1", [key]).pipe(Effect.orDie)
 
 export const genesisHash = (epochId: string): Effect.Effect<string> =>
   sha256Labeled("kanbei.epoch.genesis.v1", [epochId, new Uint8Array(32)]).pipe(Effect.orDie)
@@ -469,15 +477,18 @@ export const ledgerLayer = (epochId: string): Layer.Layer<Ledger, never, LedgerS
             authorityComponent(request.authorityClass, request.principal),
           ].toSorted((left, right) => compareTypes(left.type, right.type))
           const digest = yield* requestDigest(components)
-          if (request.idempotencyKey !== undefined) {
-            const duplicate = state.idempotency[request.idempotencyKey]
+          const hashedKey = request.idempotencyKey === undefined
+            ? undefined
+            : yield* idempotencyKeyHash(request.idempotencyKey)
+          if (hashedKey !== undefined) {
+            const duplicate = state.idempotency[hashedKey]
             if (duplicate !== undefined) {
               const stored = yield* requestDigest(duplicate.components)
               if (stored !== digest) {
                 return yield* Effect.fail(
                   new LedgerError({
                     code: "idempotency_conflict",
-                    detail: `key ${request.idempotencyKey} was used for a different request`,
+                    detail: `key ${hashedKey} was used for a different request`,
                   }),
                 )
               }
@@ -496,9 +507,7 @@ export const ledgerLayer = (epochId: string): Layer.Layer<Ledger, never, LedgerS
             recorded_at_us: recordedAtUs,
             prev_hash,
             components,
-            ...(request.idempotencyKey === undefined
-              ? {}
-              : { idempotency_key: request.idempotencyKey }),
+            ...(hashedKey === undefined ? {} : { idempotency_key: hashedKey }),
           }
           const record_hash = yield* hashPreimage(preimage)
           const record: LedgerRecord = {
@@ -515,9 +524,9 @@ export const ledgerLayer = (epochId: string): Layer.Layer<Ledger, never, LedgerS
             records: [...state.records, record],
             head: { seq, hash: record_hash, epochId },
             integrity: Option.none(),
-            idempotency: request.idempotencyKey === undefined
+            idempotency: hashedKey === undefined
               ? state.idempotency
-              : { ...state.idempotency, [request.idempotencyKey]: record },
+              : { ...state.idempotency, [hashedKey]: record },
             recordedAtUs,
             recovery: state.recovery,
           })

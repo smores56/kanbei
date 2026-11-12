@@ -31,8 +31,8 @@ import {
 } from "./manifest.ts"
 import { CandidateConsentManifest as ConsentManifestSchema } from "./consent.ts"
 import { CasError, ContentStore } from "../kernel/cas.ts"
-import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema } from "effect"
-import { Ledger, LedgerError } from "../kernel/ledger.ts"
+import { Clock, Context, Data, Effect, Layer, Option, Ref, Result, Schema, Semaphore } from "effect"
+import { idempotencyKeyHash, Ledger, LedgerError } from "../kernel/ledger.ts"
 import { PointerError, PointerStore, ScopePointer } from "./pointer.ts"
 import { runValidation, ValidationReport } from "./validation.ts"
 import { parseViewDocument, validateViewDocument } from "../ui/validation.ts"
@@ -632,7 +632,7 @@ export const candidateSupervisorLayer: Layer.Layer<
         return { display, render: renderCandidateConsent(display) }
       })
 
-    const approve: CandidateSupervisor["approve"] = (candidateId, gesture) =>
+    const approveUnlocked: CandidateSupervisor["approve"] = (candidateId, gesture) =>
       Effect.gen(function* () {
         const verified = yield* verifySession(gesture.sessionId, gesture.origin)
         const candidate = yield* find(candidateId)
@@ -695,9 +695,17 @@ export const candidateSupervisorLayer: Layer.Layer<
           "human_gesture",
           verified.sessionId,
           "human_authority",
+          // One token mints at most one receipt, even if the check is retried.
+          `approval:${tokenHash}`,
         )
         return verdict.success
       })
+
+    // The consumed check and the append are one critical section: two concurrent
+    // gestures with the same token cannot both pass the check.
+    const approvalGate = yield* Semaphore.make(1)
+    const approve: CandidateSupervisor["approve"] = (candidateId, gesture) =>
+      approvalGate.withPermit(approveUnlocked(candidateId, gesture))
 
     const viewIssues = (
       candidate: CandidateRecord,
@@ -903,9 +911,10 @@ export const candidateSupervisorLayer: Layer.Layer<
       Effect.gen(function* () {
         const records = yield* Effect.result(ledger.records)
         if (Result.isFailure(records)) return Result.fail(mapFailure(records.failure))
-        const activation = records.success.find((record) =>
-          record.idempotency_key === current.activationReceipt
-        )
+        // Pointer receipts name the activation by its idempotency key, which the
+        // ledger stores hashed.
+        const receiptKey = yield* idempotencyKeyHash(current.activationReceipt)
+        const activation = records.success.find((record) => record.idempotency_key === receiptKey)
         const payload = activation === undefined
           ? undefined
           : componentPayload(activation, ACTIVATION_COMPONENT)

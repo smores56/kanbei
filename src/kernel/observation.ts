@@ -3,8 +3,8 @@
  * the ad-hoc writes in the inbox spike paths.
  */
 import { Effect, Schema } from "effect"
+import type { CasError, PublishedContent } from "./cas.ts"
 import { ContentStore } from "./cas.ts"
-import type { CasError } from "./cas.ts"
 import { Ledger } from "./ledger.ts"
 import type { LedgerError, LedgerRecord } from "./ledger.ts"
 
@@ -52,13 +52,12 @@ export interface PublishedCapture {
  * Publish order (`I-08`): bytes, then the manifest, then the ledger append that
  * references both. A crash before the append leaves only reclaimable content.
  */
-export const publishCapture = (
+export const publishCaptureFrom = (
+  published: PublishedContent,
   input: CaptureInput,
-): Effect.Effect<PublishedCapture, CasError | LedgerError, ContentStore | Ledger> =>
+): Effect.Effect<PublishedCapture, LedgerError, Ledger> =>
   Effect.gen(function* () {
-    const cas = yield* ContentStore
     const ledger = yield* Ledger
-    const published = yield* cas.publish(input.bytes, input.mediaType)
     const observation: CaptureObservation = {
       origin: input.origin,
       sequence: input.sequence,
@@ -81,6 +80,15 @@ export const publishCapture = (
       ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
     })
     return { record: appended.record, observation }
+  })
+
+export const publishCapture = (
+  input: CaptureInput,
+): Effect.Effect<PublishedCapture, CasError | LedgerError, ContentStore | Ledger> =>
+  Effect.gen(function* () {
+    const cas = yield* ContentStore
+    const published = yield* cas.publish(input.bytes, input.mediaType)
+    return yield* publishCaptureFrom(published, input)
   })
 
 const decodeObservation = (record: LedgerRecord): Effect.Effect<CaptureObservation> =>

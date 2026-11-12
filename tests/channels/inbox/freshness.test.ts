@@ -415,3 +415,25 @@ Deno.test("the freshness fixture reports its one-window-old source as stale", as
   assertEquals(stale?.state, "stale")
   assertEquals(Option.getOrThrow(stale?.lastSequence ?? Option.none()), 12)
 })
+
+Deno.test("an unparseable producer time is unknown, not current, and alerts", async () => {
+  const h = await Effect.runPromise(
+    harness(config(), {
+      heartbeats: [{ ...heartbeat("tuta-mail", 4, NOW), producedAt: "not-a-timestamp" }],
+      receipts: [receipt("tuta-mail", 4, 3)],
+    }),
+  )
+  const outcome = await onWatcher(
+    h,
+    NOW,
+    Effect.gen(function* () {
+      const watcher = yield* FreshnessWatcher
+      const freshness = yield* watcher.probe
+      return { freshness, alerts: yield* watcher.alerts }
+    }),
+  )
+  const source = outcome.freshness.sources[0]
+  assertEquals(source?.state, "unknown")
+  assertEquals(Option.isNone(source?.ageMs ?? Option.none()), true)
+  assertEquals(outcome.alerts.map((alert) => alert.kind), ["missing"])
+})

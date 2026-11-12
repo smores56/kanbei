@@ -93,13 +93,20 @@
               runHook preInstall
               mkdir -p $out/lib/kanbei $out/bin
               cp -r src deno.json deno.lock $out/lib/kanbei/
+              # Read roots are the deployed guest mounts (nix-config
+              # modules/nixos/kanbei-vm.nix): inbox and vault read-only virtiofs,
+              # the root-only secrets share, /etc/kanbei, the store, plus the
+              # writable roots (reading them is required to open a file for write).
               makeWrapper ${pkgs.deno}/bin/deno $out/bin/kanbei \
                 --add-flags "run --no-remote" \
-                --add-flags "--allow-read=/var/lib/kanbei,/var/lib/data,/var/lib/ingest,/run/kanbei,/etc/kanbei" \
-                --add-flags "--allow-write=/var/lib/kanbei,/run/kanbei" \
+                --add-flags "--allow-read=/mnt/kanbei/inbox,/mnt/kanbei/vault,/run/kanbei-secrets,/etc/kanbei,/nix/store,/mnt/kanbei/todo,/var/lib/kanbei,/run/kanbei" \
+                --add-flags "--allow-write=/mnt/kanbei/todo,/var/lib/kanbei,/run/kanbei" \
+                --add-flags "--allow-run=age" \
+                --add-flags "--allow-net=127.0.0.1" \
                 --add-flags "--allow-env=KANBEI_*" \
                 --add-flags "$out/lib/kanbei/src/main.ts" \
-                --set DENO_DIR ${denoDeps}/deno-dir
+                --set DENO_DIR ${denoDeps}/deno-dir \
+                --prefix PATH : ${pkgs.age}/bin
               runHook postInstall
             '';
             meta = {
@@ -114,9 +121,29 @@
         }
       );
 
-      checks = forAllSystems (pkgs: {
-        default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-      });
+      checks = forAllSystems (
+        pkgs:
+        let
+          kanbei = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        in
+        {
+          default = kanbei;
+          # The kernel shells out to age; a missing grant or PATH entry is only
+          # observable by running the packaged wrapper. Ciphertext goes on stdin
+          # because the wrapper's read roots are the VM mounts, not $TMPDIR.
+          age-decrypt-smoke = pkgs.runCommand "kanbei-age-decrypt-smoke" {
+            nativeBuildInputs = [ pkgs.age ];
+          } ''
+            export HOME=$TMPDIR
+            age-keygen -o $TMPDIR/identity.txt 2>/dev/null
+            recipient=$(age-keygen -y $TMPDIR/identity.txt)
+            printf '{"smoke":true,"v":1}' | age -r "$recipient" -o $TMPDIR/batch.age
+            got=$(${kanbei}/bin/kanbei decrypt-smoke --identity $TMPDIR/identity.txt < $TMPDIR/batch.age)
+            test "$got" = '{"smoke":true,"v":1}'
+            touch $out
+          '';
+        }
+      );
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
     };

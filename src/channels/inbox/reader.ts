@@ -4,15 +4,40 @@ import { sha256, sha256Text } from "../../evidence/digest.ts"
 import type { ContentDigest } from "../../kernel/blob-sink.ts"
 import { ContentStore } from "../../kernel/cas.ts"
 import { Ledger } from "../../kernel/ledger.ts"
-import { publishCapture } from "../../kernel/observation.ts"
+import { publishCaptureFrom } from "../../kernel/observation.ts"
+import type { PublishedContent } from "../../kernel/cas.ts"
 import { AgeDecryptor } from "./age.ts"
 import { InboxCheckpointStore } from "./checkpoint.ts"
 import type { InboxCheckpoint } from "./checkpoint.ts"
 import { InboxDirectory } from "./directory.ts"
 import { InboxQuarantineStore } from "./quarantine.ts"
 import { IngestBatchEnvelope } from "./schema.ts"
-import type { IngestBatchEnvelope as BatchEnvelope, OriginId, ScanCoverage } from "./schema.ts"
-import { hostEnvelopeToBatch, isHostEnvelope, parseHostEnvelope } from "./wire.ts"
+import type { IngestBatchEnvelope as BatchEnvelope, OriginId } from "./schema.ts"
+import {
+  appendBatchReceipt,
+  appendHostHeartbeat,
+  batchKey,
+  itemKey,
+  rebuildInboxState,
+} from "./receipts.ts"
+import { heartbeatState } from "./state.ts"
+import type {
+  CoverageReceipt,
+  GapRecord,
+  HeartbeatEntry,
+  Observation,
+  SourceHeartbeat,
+} from "./state.ts"
+import {
+  hostEnvelopeToBatch,
+  isHeartbeatEnvelope,
+  isHostEnvelope,
+  MAX_WIRE_ITEMS_PER_SOURCE,
+  parseHostEnvelope,
+  parseHostHeartbeat,
+} from "./wire.ts"
+
+export type { CoverageReceipt, GapRecord, Observation, SourceHeartbeat } from "./state.ts"
 
 export interface InboxLimits {
   readonly maxBatchBytes: number
@@ -42,37 +67,6 @@ export type QuarantineReason =
   | "credential_detected"
   | "publish_failed"
 
-export interface Observation {
-  readonly origin: OriginId
-  readonly sequence: number
-  readonly batchDigest: ContentDigest
-  readonly resourceKey: string
-  readonly kind: string
-  readonly locator: string
-  readonly capturedAt: string
-  readonly digest: ContentDigest
-  readonly bytes: number
-  readonly mediaType?: string
-}
-
-export interface CoverageReceipt {
-  readonly origin: OriginId
-  readonly batchDigest: ContentDigest
-  readonly sequence: number
-  readonly receivedAt: string
-  readonly entries: number
-  readonly publishedBytes: number
-  readonly coverage: ScanCoverage
-}
-
-export interface GapRecord {
-  readonly origin: OriginId
-  readonly kind: "gap" | "out_of_order" | "suppression"
-  readonly missing: number
-  readonly sequence: number
-  readonly detail: string
-}
-
 export interface QuarantineRecord {
   readonly name: string
   readonly reason: QuarantineReason
@@ -85,15 +79,6 @@ export interface SecurityEvent {
   readonly origin?: OriginId
   readonly name: string
   readonly detail: string
-}
-
-export interface SourceHeartbeat {
-  readonly origin: OriginId
-  readonly sequence: number
-  readonly producedAt: string
-  readonly receivedAt: string
-  readonly coverage: ScanCoverage
-  readonly state: "current" | "stale" | "unknown"
 }
 
 export interface InboxSnapshot {
@@ -129,14 +114,6 @@ export interface InboxReader {
 
 export const InboxReader = Context.Service<InboxReader>("kanbei/channel/inbox/Reader")
 
-interface HeartbeatEntry {
-  readonly origin: OriginId
-  readonly sequence: number
-  readonly producedAt: string
-  readonly receivedAt: string
-  readonly coverage: ScanCoverage
-}
-
 interface InboxState {
   readonly observations: ReadonlyArray<Observation>
   readonly receipts: ReadonlyArray<CoverageReceipt>
@@ -146,6 +123,7 @@ interface InboxState {
   readonly securityEvents: ReadonlyArray<SecurityEvent>
   readonly seenBatches: ReadonlySet<string>
   readonly seenItems: ReadonlySet<string>
+  readonly seenHeartbeats: ReadonlySet<string>
   readonly lastSequence: Readonly<Record<string, number>>
   readonly handled: ReadonlySet<string>
   readonly quarantineNames: ReadonlySet<string>
@@ -161,6 +139,7 @@ const emptyState: InboxState = {
   securityEvents: [],
   seenBatches: new Set(),
   seenItems: new Set(),
+  seenHeartbeats: new Set(),
   lastSequence: {},
   handled: new Set(),
   quarantineNames: new Set(),
@@ -171,6 +150,7 @@ const stateFromCheckpoint = (checkpoint: InboxCheckpoint): InboxState => ({
   ...emptyState,
   seenBatches: new Set(checkpoint.seenBatches),
   seenItems: new Set(checkpoint.seenItems),
+  seenHeartbeats: new Set(checkpoint.seenHeartbeats ?? []),
   lastSequence: { ...checkpoint.lastSequence },
   handled: new Set(checkpoint.handled),
   quarantineNames: new Set(Object.keys(checkpoint.quarantined)),
@@ -184,6 +164,7 @@ const checkpointFromState = (state: InboxState): InboxCheckpoint => ({
   ),
   seenBatches: [...state.seenBatches].toSorted(),
   seenItems: [...state.seenItems].toSorted(),
+  seenHeartbeats: [...state.seenHeartbeats].toSorted(),
   lastSequence: { ...state.lastSequence },
 })
 
@@ -191,10 +172,6 @@ interface InvalidBatch {
   readonly reason: QuarantineReason
   readonly detail: string
 }
-
-const batchKey = (origin: OriginId, digest: ContentDigest): string => `${origin}|${digest}`
-/** Items dedupe by origin and body: the same bytes in a new batch are one item. */
-const itemKey = (origin: OriginId, digest: ContentDigest): string => `${origin}|${digest}`
 
 const decodeBase64 = (value: string): Result.Result<Uint8Array, string> => {
   try {
@@ -220,16 +197,14 @@ const decodeJson = (plaintext: Uint8Array): Result.Result<unknown, InvalidBatch>
  * envelope (converted to the rich form) and the rich manifest+blobs envelope the
  * journey fixtures ship. Unknown versions and extra fields are refusals.
  */
-export const parseBatch = (
-  plaintext: Uint8Array,
+export const parseBatchJson = (
+  value: unknown,
   name: string,
 ): Effect.Effect<Result.Result<BatchEnvelope, InvalidBatch>> =>
   Effect.gen(function* () {
-    const json = decodeJson(plaintext)
-    if (Result.isFailure(json)) return Result.fail(json.failure)
-    if (isHostEnvelope(json.success)) {
+    if (isHostEnvelope(value)) {
       const host = yield* Effect.result(Effect.try({
-        try: () => parseHostEnvelope(json.success),
+        try: () => parseHostEnvelope(value),
         catch: (error) => error,
       }))
       if (Result.isFailure(host)) {
@@ -242,9 +217,19 @@ export const parseBatch = (
     }
     return Result.try({
       try: () =>
-        Schema.decodeUnknownSync(IngestBatchEnvelope, { onExcessProperty: "error" })(json.success),
+        Schema.decodeUnknownSync(IngestBatchEnvelope, { onExcessProperty: "error" })(value),
       catch: () => invalid(`manifest does not match the schema ( bytes)`),
     })
+  })
+
+export const parseBatch = (
+  plaintext: Uint8Array,
+  name: string,
+): Effect.Effect<Result.Result<BatchEnvelope, InvalidBatch>> =>
+  Effect.gen(function* () {
+    const json = decodeJson(plaintext)
+    if (Result.isFailure(json)) return Result.fail(json.failure)
+    return yield* parseBatchJson(json.success, name)
   })
 
 const CREDENTIAL_KEY =
@@ -322,11 +307,48 @@ const sequenceDelta = (
 
 const iso = (millis: number): string => new Date(millis).toISOString()
 
+/** A restart merges the checkpoint's watermark with the ledger's receipts. */
+const mergeLastSequence = (
+  left: Readonly<Record<string, number>>,
+  right: Readonly<Record<string, number>>,
+): Readonly<Record<string, number>> => {
+  const merged: Record<string, number> = { ...left }
+  for (const [origin, sequence] of Object.entries(right)) {
+    merged[origin] = Math.max(merged[origin] ?? 0, sequence)
+  }
+  return merged
+}
+
 const heartbeatAt = (entry: HeartbeatEntry, now: number, window: number): SourceHeartbeat => ({
   ...entry,
-  // Freshness is the producer's clock: a late delivery of an old batch is stale.
-  state: now - Date.parse(entry.producedAt) > window ? "stale" : "current",
+  // Freshness is the producer's clock: a late delivery of an old batch is stale,
+  // and an unparseable producer time is unknown rather than current.
+  state: heartbeatState(entry, now, window),
 })
+
+/**
+ * Reader admission per poll. Names are only a scheduling hint here; the file
+ * content still decides the origin, so a hostile name can only starve itself.
+ */
+const selectPollNames = <A extends { readonly name: string }>(
+  files: ReadonlyArray<A>,
+  origins: ReadonlyArray<OriginId>,
+  maxBatches: number,
+): ReadonlyArray<A> => {
+  const counts = new Map<string, number>()
+  const selected: Array<A> = []
+  for (const file of files.toSorted((left, right) => left.name.localeCompare(right.name))) {
+    if (selected.length >= maxBatches) break
+    const origin = origins.find((candidate) => file.name.startsWith(`${candidate}-`))
+    if (origin !== undefined) {
+      const used = counts.get(origin) ?? 0
+      if (used >= MAX_WIRE_ITEMS_PER_SOURCE) continue
+      counts.set(origin, used + 1)
+    }
+    selected.push(file)
+  }
+  return selected
+}
 
 const configIssues = (config: InboxConfig): ReadonlyArray<string> => {
   const issues: Array<string> = []
@@ -365,8 +387,23 @@ export const inboxReaderLayer = (
       const checkpoints = yield* InboxCheckpointStore
       const checkpoint = yield* checkpoints.load.pipe(Effect.orDie)
       const recorded = yield* quarantines.load.pipe(Effect.orDie)
+      // Receipts, heartbeats, gaps, and captures are canonical ledger records, so
+      // a restarted reader rebuilds them instead of forgetting every source.
+      const cas = yield* ContentStore
+      const ledger = yield* Ledger
+      const rebuilt = yield* rebuildInboxState().pipe(
+        Effect.provideService(ContentStore, cas),
+        Effect.provideService(Ledger, ledger),
+      )
       const state = yield* Ref.make<InboxState>({
         ...stateFromCheckpoint(checkpoint),
+        observations: rebuilt.observations,
+        receipts: rebuilt.receipts,
+        heartbeats: rebuilt.heartbeats,
+        gaps: rebuilt.gaps,
+        seenBatches: new Set([...checkpoint.seenBatches, ...rebuilt.seenBatches]),
+        seenItems: new Set([...checkpoint.seenItems, ...rebuilt.seenItems]),
+        lastSequence: mergeLastSequence(checkpoint.lastSequence, rebuilt.lastSequence),
         quarantined: recorded.map((entry) => ({
           name: entry.name,
           reason: entry.reason,
@@ -403,6 +440,117 @@ export const inboxReaderLayer = (
           yield* quarantines.record(entry).pipe(Effect.orDie)
         })
 
+      /**
+       * The host's own freshness envelope. It is admitted only for allowlisted
+       * sources, appended to the ledger before the reader reports on it, and
+       * deduped by generation time plus content digest, so a copied heartbeat
+       * file cannot refresh a source.
+       */
+      const processHeartbeat = (
+        name: string,
+        value: unknown,
+        ciphertextDigest: ContentDigest,
+      ): Effect.Effect<"accepted" | "quarantined" | "duplicate", never, Ledger> =>
+        Effect.gen(function* () {
+          const parsed = yield* Effect.result(Effect.try({
+            try: () => parseHostHeartbeat(value),
+            catch: () => invalid("heartbeat does not match the host schema"),
+          }))
+          if (Result.isFailure(parsed)) {
+            yield* quarantine(name, parsed.failure.reason, parsed.failure.detail, ciphertextDigest)
+            return "quarantined" as const
+          }
+          const envelope = parsed.success
+          const known = new Set<string>(config.allowedOrigins)
+          const unknown = Object.keys(envelope.sources)
+            .filter((source) => !known.has(source))
+            .toSorted()
+          if (unknown.length > 0) {
+            yield* quarantine(
+              name,
+              "source_not_allowed",
+              `heartbeat sources ${unknown.join(",")}`,
+              ciphertextDigest,
+            )
+            return "quarantined" as const
+          }
+          const unlistedHost = envelope.host_sources.filter((source) =>
+            !(source in envelope.sources)
+          )
+          if (unlistedHost.length > 0) {
+            yield* quarantine(
+              name,
+              "parse_failed",
+              `host sources outside the status map: ${unlistedHost.join(",")}`,
+              ciphertextDigest,
+            )
+            return "quarantined" as const
+          }
+          const digest = yield* sha256Text(
+            canonicalize(Schema.decodeUnknownSync(Schema.Json)(envelope)),
+          ).pipe(Effect.orDie)
+          const dedupe = `${envelope.generated_at}|${digest}`
+          const current = yield* Ref.get(state)
+          const duplicate = (): Effect.Effect<"duplicate"> =>
+            Ref.update(state, (previous) => ({
+              ...previous,
+              duplicates: previous.duplicates + 1,
+              handled: new Set([...previous.handled, name]),
+            })).pipe(Effect.as("duplicate" as const))
+          if (current.seenHeartbeats.has(dedupe)) return yield* duplicate()
+
+          const now = yield* Clock.currentTimeMillis
+          const heartbeats: ReadonlyArray<HeartbeatEntry> = [...config.allowedOrigins]
+            .filter((origin) => origin in envelope.sources)
+            .toSorted()
+            .flatMap((origin) => {
+              const status = envelope.sources[origin]
+              if (status === undefined) return []
+              return [{
+                origin,
+                kind: "host" as const,
+                sequence: 0,
+                // The source's basis is its last successful batch; a source with
+                // none has no producer time and stays unknown.
+                producedAt: status.last_ok ?? "",
+                generatedAt: envelope.generated_at,
+                receivedAt: iso(now),
+                // The host envelope carries freshness, not scan coverage; it never
+                // claims a complete scan.
+                coverage: { complete: false, gaps: 0, suppressed: 0 },
+                windowMs: status.window_s * 1000,
+                hostStale: status.stale,
+                ...(typeof status.last_ok === "string" ? { lastOk: status.last_ok } : {}),
+              }]
+            })
+          const appended = yield* appendHostHeartbeat({
+            generatedAt: envelope.generated_at,
+            digest,
+            heartbeats,
+          }).pipe(Effect.result)
+          if (Result.isFailure(appended)) {
+            yield* quarantine(
+              name,
+              "publish_failed",
+              "the heartbeat could not be appended",
+              ciphertextDigest,
+            )
+            return "quarantined" as const
+          }
+          if (appended.success) return yield* duplicate()
+          const origins = new Set(heartbeats.map((entry) => entry.origin))
+          yield* Ref.update(state, (previous) => ({
+            ...previous,
+            heartbeats: [
+              ...previous.heartbeats.filter((entry) => !origins.has(entry.origin)),
+              ...heartbeats,
+            ],
+            seenHeartbeats: new Set([...previous.seenHeartbeats, dedupe]),
+            handled: new Set([...previous.handled, name]),
+          }))
+          return "accepted" as const
+        })
+
       const processFile = (
         name: string,
         size: number,
@@ -429,7 +577,20 @@ export const inboxReaderLayer = (
             yield* quarantine(name, "batch_too_large", `plaintext ${plaintext.length} bytes`)
             return "quarantined" as const
           }
-          const parsed = yield* parseBatch(plaintext, name)
+          const decoded = decodeJson(plaintext)
+          if (Result.isFailure(decoded)) {
+            yield* quarantine(
+              name,
+              decoded.failure.reason,
+              decoded.failure.detail,
+              ciphertextDigest,
+            )
+            return "quarantined" as const
+          }
+          if (isHeartbeatEnvelope(decoded.success)) {
+            return yield* processHeartbeat(name, decoded.success, ciphertextDigest)
+          }
+          const parsed = yield* parseBatchJson(decoded.success, name)
           if (Result.isFailure(parsed)) {
             yield* quarantine(name, parsed.failure.reason, parsed.failure.detail, ciphertextDigest)
             return "quarantined" as const
@@ -445,7 +606,8 @@ export const inboxReaderLayer = (
             )
             return "quarantined" as const
           }
-          if (!Number.isInteger(manifest.sequence) || manifest.sequence < 1) {
+          // The host accepts `seq = 0`; anything negative or fractional is not a sequence.
+          if (!Number.isInteger(manifest.sequence) || manifest.sequence < 0) {
             yield* quarantine(name, "invalid_sequence", `sequence ${manifest.sequence}`)
             return "quarantined" as const
           }
@@ -453,10 +615,10 @@ export const inboxReaderLayer = (
           const current = yield* Ref.get(state)
           const key = batchKey(manifest.origin, manifest.batchDigest)
           if (current.seenBatches.has(key)) {
-            yield* Ref.update(state, (value) => ({
-              ...value,
-              duplicates: value.duplicates + 1,
-              handled: new Set([...value.handled, name]),
+            yield* Ref.update(state, (previous) => ({
+              ...previous,
+              duplicates: previous.duplicates + 1,
+              handled: new Set([...previous.handled, name]),
             }))
             return "duplicate" as const
           }
@@ -529,10 +691,10 @@ export const inboxReaderLayer = (
             ),
           ]
           if (findings.length > 0) {
-            yield* Ref.update(state, (value) => ({
-              ...value,
+            yield* Ref.update(state, (previous) => ({
+              ...previous,
               securityEvents: [
-                ...value.securityEvents,
+                ...previous.securityEvents,
                 {
                   kind: "credential_detected" as const,
                   origin: manifest.origin,
@@ -550,35 +712,31 @@ export const inboxReaderLayer = (
             return "quarantined" as const
           }
 
-          // Canonical order: bytes, manifest, ledger append. The ledger's
-          // idempotency key makes a crash-and-replay converge on one record.
-          const published = yield* Effect.forEach(
-            manifest.entries,
-            (entry) => {
-              const bytes = blobs.get(entry.body)
-              if (bytes === undefined) {
-                return Effect.fail(`entry ${entry.resourceKey} has no body`)
-              }
-              return publishCapture({
-                origin: manifest.origin,
-                sequence: manifest.sequence,
-                resourceKey: entry.resourceKey,
-                locator: entry.locator,
-                capturedAt: entry.capturedAt,
-                mediaType: entry.mediaType ?? "application/octet-stream",
-                bytes,
-                coverage: manifest.coverage,
-                idempotencyKey:
-                  `inbox:${manifest.origin}:${manifest.sequence}:${entry.resourceKey}:${entry.body}`,
-              }).pipe(Effect.mapError((error) => error.detail), Effect.asVoid)
+          // `07 §6.3.3`: bodies to the CAS, then one coverage receipt, and only
+          // then observations. A crash before the receipt leaves reclaimable
+          // bytes and no observation; the file is re-read and converges because
+          // every append carries an idempotency key.
+          const bodies = new Map<ContentDigest, Uint8Array>()
+          for (const entry of manifest.entries) {
+            const bytes = blobs.get(entry.body)
+            if (bytes !== undefined && !bodies.has(entry.body)) bodies.set(entry.body, bytes)
+          }
+          const published = new Map<ContentDigest, PublishedContent>()
+          const stored = yield* Effect.forEach(
+            [...bodies.entries()],
+            ([digest, bytes]) => {
+              const entry = manifest.entries.find((candidate) => candidate.body === digest)
+              return cas.publish(bytes, entry?.mediaType ?? "application/octet-stream").pipe(
+                Effect.map((content) => published.set(digest, content)),
+              )
             },
             { concurrency: 1 },
           ).pipe(Effect.result)
-          if (Result.isFailure(published)) {
+          if (Result.isFailure(stored)) {
             yield* quarantine(
               name,
               "publish_failed",
-              "publish failed before the ledger append",
+              "content-addressed bytes could not be published",
               ciphertextDigest,
             )
             return "quarantined" as const
@@ -602,7 +760,8 @@ export const inboxReaderLayer = (
           const batchGaps = [...delta.gaps, ...suppression]
           const seenItems = new Set(current.seenItems)
           const created = manifest.entries.flatMap((entry) => {
-            const item = itemKey(manifest.origin, entry.body)
+            // Distinct resource keys with identical bytes are distinct observations.
+            const item = itemKey(manifest.origin, entry.resourceKey, entry.body)
             if (seenItems.has(item)) return []
             seenItems.add(item)
             const bytes = blobs.get(entry.body)
@@ -632,6 +791,7 @@ export const inboxReaderLayer = (
           }
           const heartbeat: HeartbeatEntry = {
             origin: manifest.origin,
+            kind: "batch",
             sequence: manifest.sequence,
             producedAt: manifest.producedAt,
             receivedAt: iso(now),
@@ -642,20 +802,70 @@ export const inboxReaderLayer = (
               suppressed: manifest.suppressed,
             },
           }
-          yield* Ref.update(state, (value) => ({
-            ...value,
-            observations: [...value.observations, ...created],
-            receipts: [...value.receipts, receipt],
-            heartbeats: [
-              ...value.heartbeats.filter((entry) => entry.origin !== manifest.origin),
-              heartbeat,
-            ],
-            gaps: [...value.gaps, ...batchGaps],
-            seenBatches: new Set([...value.seenBatches, key]),
+          const receiptRecord = yield* appendBatchReceipt({
+            receipt,
+            heartbeat,
+            gaps: batchGaps,
+          }).pipe(Effect.result)
+          if (Result.isFailure(receiptRecord)) {
+            yield* quarantine(
+              name,
+              "publish_failed",
+              "the coverage receipt could not be appended",
+              ciphertextDigest,
+            )
+            return "quarantined" as const
+          }
+          const captures = yield* Effect.forEach(
+            created,
+            (observation) => {
+              const content = published.get(observation.digest)
+              if (content === undefined) {
+                return Effect.fail(`observation ${observation.resourceKey} has no published body`)
+              }
+              return publishCaptureFrom(content, {
+                origin: observation.origin,
+                sequence: observation.sequence,
+                resourceKey: observation.resourceKey,
+                locator: observation.locator,
+                capturedAt: observation.capturedAt,
+                mediaType: observation.mediaType ?? "application/octet-stream",
+                bytes: bodies.get(observation.digest) ?? new Uint8Array(),
+                coverage: manifest.coverage,
+                idempotencyKey:
+                  `inbox:${manifest.origin}:${manifest.sequence}:${observation.resourceKey}:${observation.digest}`,
+              }).pipe(Effect.mapError((error) => error.detail), Effect.asVoid)
+            },
+            { concurrency: 1 },
+          ).pipe(Effect.result)
+          if (Result.isFailure(captures)) {
+            yield* quarantine(
+              name,
+              "publish_failed",
+              "an observation could not be appended",
+              ciphertextDigest,
+            )
+            return "quarantined" as const
+          }
+          const receiptIsNew = !receiptRecord.success
+          yield* Ref.update(state, (previous) => ({
+            ...previous,
+            observations: [...previous.observations, ...created],
+            ...(receiptIsNew
+              ? {
+                receipts: [...previous.receipts, receipt],
+                gaps: [...previous.gaps, ...batchGaps],
+                heartbeats: [
+                  ...previous.heartbeats.filter((entry) => entry.origin !== manifest.origin),
+                  heartbeat,
+                ],
+              }
+              : {}),
+            seenBatches: new Set([...previous.seenBatches, key]),
             seenItems,
-            handled: new Set([...value.handled, name]),
-            duplicates: value.duplicates + duplicateItems,
-            lastSequence: { ...value.lastSequence, [manifest.origin]: delta.next },
+            handled: new Set([...previous.handled, name]),
+            duplicates: previous.duplicates + duplicateItems,
+            lastSequence: { ...previous.lastSequence, [manifest.origin]: delta.next },
           }))
           return "accepted" as const
         })
@@ -667,13 +877,15 @@ export const inboxReaderLayer = (
         const current = yield* Ref.get(state)
         // Select the next unprocessed files, not the first N names: handled and
         // quarantined files stay on disk but never occupy the poll window again.
-        const names = listing
-          .filter((file) => file.name.endsWith(".age"))
-          .filter((file) =>
-            !current.handled.has(file.name) && !current.quarantineNames.has(file.name)
-          )
-          .toSorted((left, right) => left.name.localeCompare(right.name))
-          .slice(0, config.limits.maxBatchesPerPoll)
+        const names = selectPollNames(
+          listing
+            .filter((file) => file.name.endsWith(".age"))
+            .filter((file) =>
+              !current.handled.has(file.name) && !current.quarantineNames.has(file.name)
+            ),
+          config.allowedOrigins,
+          config.limits.maxBatchesPerPoll,
+        )
         const outcomes = yield* Effect.forEach(
           names,
           (file) => processFile(file.name, file.size),

@@ -18,6 +18,14 @@ What exists instead:
   `POST /api/chat {message}`, bearer passkey session, `application/json` only,
   64 KiB body, 8000-character message, the host's status codes and
   `{"error": ...}` bodies, and the `{reply, lane}` success shape.
+- `src/channels/host.ts` composes every channel service and serves two declared
+  loopback listeners: the chat surface (`chatHandler`) and the health/status
+  surface (`statusHandler`, `GET /healthz` and `GET /status`). A channel that
+  cannot answer its readiness probe, or a listener that cannot bind, refuses the
+  boot; the status bind failure stops the chat listener again.
+- `src/adapters/http-listener.ts` binds with `Deno.serve`, which throws on
+  `AddrInUse` synchronously; `bootConfigFromEnv` refuses any listener host other
+  than `127.0.0.1`, so the packaging grant is `--allow-net=127.0.0.1`.
 - `src/adapters/chat-http-client.ts` is an HTTP/TLS client for the deployed
   authority, so a Deno caller never speaks the incompatible frame API.
 - The length-prefixed frame API remains only for spike/property tests and is
@@ -25,7 +33,10 @@ What exists instead:
 
 Residual: a Deno process cannot replace the Python TLS listener until Deno
 exposes server-side STARTTLS (or the relay moves the token into TLS). The
-deployed Python listener remains the authority.
+deployed Python listener remains the authority. Because the Deno listener is
+loopback-only inside the NIC-less guest, it treats that loopback hop as the
+already-authenticated relay boundary; `/api/chat` still requires a bearer
+passkey session, so the loopback hop alone never authorizes a turn.
 
 ## CSR chain signature
 
@@ -43,10 +54,29 @@ Residual: single-writer per VM only, matching the deployment.
 
 ## Total CAS accounting
 
-`ContentStore` enforces per-object and total caps. The total is read from the
-sink's `usage` before each publish; two concurrent `publish` calls can both pass
-the check and briefly exceed the cap. Residual: worst case is one object over
-the ceiling, never unbounded growth.
+`ContentStore` enforces per-object and total caps. The digest and manifest size
+are computed before the write, so a refused publish never makes its bytes
+visible; re-publishing an object the store already holds consumes no capacity.
+Two concurrent `publish` calls can still both read the same `usage` and both
+pass the check. Residual: the concurrent case can exceed the ceiling by one
+object, never unbounded growth.
+
+## Inbox durability
+
+Coverage receipts, batch heartbeats, host heartbeats, and gaps are canonical
+ledger records, and observations are capture records, so a restart rebuilds the
+reader's receipts/observations/heartbeats from the ledger instead of an empty
+state. Residual: the checkpoint still stores the file-handle set
+(`handled`/`seen*`) separately, so a crash after the receipt append but before
+the checkpoint write re-reads the file once; every append carries an idempotency
+key, so the replay converges on one record per batch.
+
+## Host heartbeat coverage
+
+The host heartbeat (`nix-config modules/lib/ingest/heartbeat.py`) carries
+freshness, not scan coverage. The reader records `coverage.complete = false` for
+a host heartbeat rather than inventing a complete scan, and a host heartbeat
+whose `generated_at` is older than its own window is stale.
 
 ## Inbox rich-manifest compatibility
 
@@ -56,6 +86,7 @@ envelope is converted to a manifest whose `encryption.recipient` is absent
 because the writer does not put it on the wire. Residual: the derived manifest
 is not byte-identical to a host-side manifest (the host writes only the
 envelope).
+
 
 ## Stale lock recovery
 

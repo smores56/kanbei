@@ -2,6 +2,7 @@ import { Clock, Context, Data, Effect, Layer, Option, Ref } from "effect"
 import type { CoverageReceipt, InboxReader, SourceHeartbeat } from "./reader.ts"
 import { InboxReader as InboxReaderTag } from "./reader.ts"
 import type { OriginId } from "./schema.ts"
+import { heartbeatState } from "./state.ts"
 
 export interface FreshnessConfig {
   /** Per-origin operator windows; an unlisted origin uses `defaultWindowMs`. */
@@ -156,13 +157,20 @@ const buildSource = (
     }
   }
   const windowMs = windowFor(config, origin)
-  // Producer time is the freshness watermark; delivery time only stands in when
-  // the producer did not state one.
-  const produced = Date.parse(heartbeat.producedAt)
-  const received = Date.parse(heartbeat.receivedAt)
-  const basis = Number.isFinite(produced) ? produced : received
-  const age = Number.isFinite(basis) ? Math.max(0, now - basis) : undefined
-  const state: FreshnessState = age === undefined || age > windowMs
+  // Producer time is the freshness watermark. A host heartbeat states its own
+  // verdict; an unparseable time is unknown instead of falling back to delivery
+  // time, which would present a broken producer as current.
+  const verdict = heartbeatState(heartbeat, now, windowMs)
+  const basisText = heartbeat.kind === "host"
+    ? heartbeat.lastOk ?? heartbeat.producedAt
+    : heartbeat.producedAt
+  const basis = Date.parse(basisText)
+  const age = verdict === "unknown" || !Number.isFinite(basis)
+    ? undefined
+    : Math.max(0, now - basis)
+  const state: FreshnessState = verdict === "unknown"
+    ? "unknown"
+    : verdict === "stale"
     ? "stale"
     : entries === 0
     ? "empty"

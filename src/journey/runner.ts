@@ -30,6 +30,8 @@ export interface JourneyStepReport {
   readonly checks: ReadonlyArray<string>
   readonly metrics: Readonly<Record<string, number>>
   readonly artifacts: ReadonlyArray<string>
+  /** Host-owned work this step cannot close, declared on the evidence envelope. */
+  readonly acceptedResiduals: ReadonlyArray<string>
   readonly failureClass?: string
 }
 
@@ -41,6 +43,8 @@ export interface JourneyReport {
   readonly thresholds: JourneyThresholds
   readonly steps: ReadonlyArray<JourneyStepReport>
   readonly metrics: Readonly<Record<string, number>>
+  /** Every residual the run accepted, deduped and sorted; never silent. */
+  readonly acceptedResiduals: ReadonlyArray<string>
   readonly violations: ReadonlyArray<string>
   readonly pass: boolean
   readonly runDigest: string
@@ -136,6 +140,8 @@ const evaluate = (
     const violations = thresholdViolations(metrics, thresholds)
     const failed = steps.filter((step) => step.outcome !== "pass")
     const pass = violations.length === 0 && failed.length === 0
+    const acceptedResiduals = [...new Set(steps.flatMap((step) => step.acceptedResiduals))]
+      .toSorted()
     const runDigest = yield* sha256Text(
       canonicalize(
         Schema.decodeUnknownSync(Schema.Json)({
@@ -146,9 +152,11 @@ const evaluate = (
             checks: [...step.checks].toSorted(),
             metrics: step.metrics,
             artifacts: step.artifacts,
+            acceptedResiduals: step.acceptedResiduals,
           })),
           thresholds,
           metrics,
+          acceptedResiduals,
           violations,
         }),
       ),
@@ -161,6 +169,7 @@ const evaluate = (
       thresholds,
       steps,
       metrics,
+      acceptedResiduals,
       violations,
       pass,
       runDigest,
@@ -224,6 +233,7 @@ export const runJourney = async (
       checks: outcome?.checks ?? [envelope.failureClass ?? "unknown"],
       metrics: outcome?.metrics ?? {},
       artifacts: envelope.artifacts,
+      acceptedResiduals: outcome?.residuals ?? [],
       ...(envelope.failureClass === undefined ? {} : { failureClass: envelope.failureClass }),
     }
   })

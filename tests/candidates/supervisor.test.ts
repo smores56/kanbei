@@ -4,7 +4,7 @@ import { CandidateError, CandidateSupervisor } from "../../src/candidates/superv
 import { rulingCommitmentOf } from "../../src/candidates/consent.ts"
 import { PointerError, PointerStore, ScopePointer } from "../../src/candidates/pointer.ts"
 import { pointerFileLayer } from "../../src/adapters/pointer-file.ts"
-import { Ledger } from "../../src/kernel/ledger.ts"
+import { idempotencyKeyHash, Ledger } from "../../src/kernel/ledger.ts"
 import {
   approveFor,
   artifact,
@@ -272,7 +272,11 @@ Deno.test("the activation receipt is appended after the pointer flip", async () 
       record.components.some((component) => component.type === "kb.activation/candidate@1.0.0")
     )
     assert(activation !== undefined, "the activation receipt must exist")
-    assertEquals(activation.idempotency_key, result.pointer.activationReceipt)
+    // The ledger stores only the labeled hash of the idempotency key.
+    assertEquals(
+      activation.idempotency_key,
+      await Effect.runPromise(idempotencyKeyHash(result.pointer.activationReceipt)),
+    )
     assert(
       activation.recorded_at_us >= result.pointer.activatedAtUs,
       "the receipt must not exist before the flip",

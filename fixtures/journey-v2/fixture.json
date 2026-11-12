@@ -3,8 +3,8 @@
   "dataset": "journey-v2",
   "version": "1.0.0",
   "canonicalHead": {
-    "seq": 10,
-    "hash": "sha256:fe65f0baeb95c96072e0298f8ea45cd1c2edb4b6c07063c3de9aedc6787e3288"
+    "seq": 19,
+    "hash": "sha256:18253347fcd6c553214bcc9dec50a042af578ff4aaddb866e0798bd37743985d"
   },
   "sequenceRange": [
     1,

@@ -126,21 +126,44 @@ export const contentStoreLayerWith = (
                 (error) => new CasError({ code: "store_failed", digest: "", detail: error.reason }),
               ),
             )
-            const digest = yield* sink.put(bytes).pipe(
+            // The digest and manifest size are known before the write, so the
+            // total cap is checked while nothing new is visible. A re-publish of
+            // bytes the store already holds consumes no capacity.
+            const digest = yield* sha256(bytes).pipe(
               Effect.mapError(
                 (error) => new CasError({ code: "store_failed", digest: "", detail: error.reason }),
               ),
             )
             const manifest: ContentManifest = { digest, size: bytes.length, mediaType }
             const encoded = manifestBytes(manifest)
-            if (used + bytes.length + encoded.length > config.maxTotalBytes) {
+            const total = used + bytes.length + encoded.length
+            if (total > config.maxTotalBytes) {
+              const present = yield* sink.read(digest).pipe(
+                Effect.mapError(
+                  (error) => new CasError({ code: "store_failed", digest, detail: error.reason }),
+                ),
+              )
+              if (Option.isNone(present)) {
+                return yield* Effect.fail(
+                  new CasError({
+                    code: "cap_exceeded",
+                    digest,
+                    detail: `${total} > total cap ${config.maxTotalBytes}`,
+                  }),
+                )
+              }
+            }
+            const stored = yield* sink.put(bytes).pipe(
+              Effect.mapError(
+                (error) => new CasError({ code: "store_failed", digest: "", detail: error.reason }),
+              ),
+            )
+            if (stored !== digest) {
               return yield* Effect.fail(
                 new CasError({
-                  code: "cap_exceeded",
+                  code: "tampered_blob",
                   digest,
-                  detail: `${
-                    used + bytes.length + encoded.length
-                  } > total cap ${config.maxTotalBytes}`,
+                  detail: `the sink stored the object as ${stored}`,
                 }),
               )
             }

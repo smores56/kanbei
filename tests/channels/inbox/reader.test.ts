@@ -141,7 +141,26 @@ Deno.test("a second file carrying the same batch is a duplicate, and neither fil
     assertEquals(outcome.second.duplicates, 1)
   })
 })
-Deno.test("a duplicate item inside one batch is deduplicated by item hash", async () => {
+Deno.test("a duplicate item inside one batch is deduplicated by (origin, resource key, body)", async () => {
+  await scenario(async (context) => {
+    const body = '{"subject":"same"}'
+    await write(
+      context.directory,
+      context.recipient,
+      "batch-1.age",
+      await buildBatch({
+        recipient: context.recipient,
+        bodies: [{ key: "message/1", text: body }, { key: "message/1", text: body }],
+      }),
+    )
+    const state = await withReader(context, pollOnce)
+    assertEquals(state.observations.length, 1)
+    assertEquals(state.duplicates, 1)
+    assertEquals(state.receipts[0]?.entries, 1)
+  })
+})
+
+Deno.test("distinct resource keys with identical bytes are distinct observations", async () => {
   await scenario(async (context) => {
     const body = '{"subject":"same"}'
     await write(
@@ -154,9 +173,12 @@ Deno.test("a duplicate item inside one batch is deduplicated by item hash", asyn
       }),
     )
     const state = await withReader(context, pollOnce)
-    assertEquals(state.observations.length, 1)
-    assertEquals(state.duplicates, 1)
-    assertEquals(state.receipts[0]?.entries, 1)
+    assertEquals(
+      state.observations.map((observation) => observation.resourceKey),
+      ["message/1", "message/2"],
+    )
+    assertEquals(state.duplicates, 0)
+    assertEquals(state.receipts[0]?.entries, 2)
   })
 })
 
@@ -401,7 +423,7 @@ Deno.test("the sealed host wire envelope parses as observations without a reader
   )
 })
 
-Deno.test("handled files and the last sequence survive a restart without replay", async () => {
+Deno.test("observations, receipts, and heartbeats survive a restart without replay", async () => {
   await scenario(async (context) => {
     await write(
       context.directory,
@@ -411,9 +433,16 @@ Deno.test("handled files and the last sequence survive a restart without replay"
     )
     const first = await withReader(context, pollOnce)
     assertEquals(first.observations.length, 1)
+    assertEquals(first.receipts.length, 1)
+    assertEquals(first.heartbeats.length, 1)
     const second = await withReader(context, pollOnce)
-    assertEquals(second.observations.length, 0)
-    assertEquals(second.receipts.length, 0)
+    // No replay: the file is handled and the ledger already holds the batch.
+    assertEquals(second.observations.length, 1)
+    assertEquals(second.receipts.length, 1)
+    assertEquals(second.heartbeats.length, 1)
+    assertEquals(second.heartbeats[0]?.origin, "tuta-mail")
+    assertEquals(second.receipts[0]?.sequence, 1)
+    assertEquals(second.receipts[0]?.entries, 1)
     const checkpoint = JSON.parse(
       await Deno.readTextFile(`${context.directory}/checkpoint.json`),
     ) as { handled: ReadonlyArray<string>; lastSequence: Readonly<Record<string, number>> }
@@ -484,16 +513,18 @@ Deno.test("a dead file cannot starve later batches even after a checkpoint loss"
     // The next window reaches the live batch instead of retrying the dead file.
     const advanced = await pollWith(inboxTestLayers(directory, config))
     assertEquals(advanced.poll.accepted, 1)
-    // A lost checkpoint must not re-admit the buried name ahead of the live batch.
+    // A lost checkpoint must not re-admit the buried name, and the ledger already
+    // holds the live batch, so the restarted poll admits nothing new.
     const restarted = await pollWith(
       inboxTestLayers(directory, config, {
         checkpoint: `${directory}/fresh-checkpoint.json`,
         quarantine: `${directory}/quarantine.json`,
       }),
     )
-    assertEquals(restarted.poll.accepted, 1)
+    assertEquals(restarted.poll.accepted, 0)
     assertEquals(restarted.state.quarantined.map((entry) => entry.name), ["a-dead.age"])
     assertEquals(restarted.state.observations.length, 1)
+    assertEquals(restarted.state.receipts.length, 1)
   })
 })
 

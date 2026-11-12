@@ -12,6 +12,8 @@ export const InboxCheckpoint = Schema.Struct({
   quarantined: Schema.Record(Schema.String, Schema.String),
   seenBatches: Schema.Array(Schema.String),
   seenItems: Schema.Array(Schema.String),
+  /** Optional so a checkpoint written before host heartbeats still loads. */
+  seenHeartbeats: Schema.optional(Schema.Array(Schema.String)),
   lastSequence: Schema.Record(Schema.String, Schema.Number),
 })
 export type InboxCheckpoint = typeof InboxCheckpoint.Type
@@ -22,6 +24,7 @@ export const emptyCheckpoint: InboxCheckpoint = {
   quarantined: {},
   seenBatches: [],
   seenItems: [],
+  seenHeartbeats: [],
   lastSequence: {},
 }
 

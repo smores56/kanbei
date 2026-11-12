@@ -58,7 +58,7 @@
     "lint:fix": "deno lint --fix && deno run -A npm:oxlint@1.92.0 -c .oxlintrc.json --fix --import-plugin --promise-plugin src tests",
     "typecheck": "deno check src tests scripts",
     "test": "deno test --allow-read --allow-write --allow-env --allow-run --allow-net --allow-sys tests",
-    "test:unit": "deno test --allow-read --allow-write --allow-env --allow-run --allow-net --allow-sys tests/adapters tests/candidates tests/channels tests/evidence tests/fixtures tests/journey tests/kernel tests/monty tests/redteam tests/supervisor tests/ui",
+    "test:unit": "deno test --allow-read --allow-write --allow-env --allow-run --allow-net --allow-sys tests/adapters tests/candidates tests/channels tests/evidence tests/fixtures tests/journey tests/kernel tests/monty tests/packaging tests/redteam tests/supervisor tests/ui",
     "verify": "deno task fmt:check && deno task lint && deno task typecheck && deno task test && deno task journey:check && deno task redteam:check",
     "verify:fix": "deno task fmt && deno task lint:fix && deno task typecheck && deno task test",
     "hooks:install": "git config core.hooksPath .githooks && chmod +x .githooks/pre-commit",

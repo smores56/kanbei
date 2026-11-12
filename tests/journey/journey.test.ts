@@ -54,3 +54,21 @@ Deno.test("the evidence envelopes bind the real ledger head and declare host res
     }
   }
 })
+
+Deno.test("the recorded report keeps every accepted residual, not just the envelope", async () => {
+  const { report } = await runJourney(Deno.cwd())
+  assertEquals(
+    report.acceptedResiduals.some((residual) => residual.includes("host-owned")),
+    true,
+  )
+  assertEquals(
+    report.acceptedResiduals.some((residual) => residual.includes("Search VM")),
+    true,
+  )
+  const recorded = JSON.parse(
+    await Deno.readTextFile(`${Deno.cwd()}/docs/evidence/journey-v2.json`),
+  ) as { readonly acceptedResiduals: ReadonlyArray<string> }
+  assertEquals(recorded.acceptedResiduals, report.acceptedResiduals)
+  const csp = report.steps.find((step) => step.testId === "J2-CSP")
+  assertEquals(csp?.acceptedResiduals.length, 1)
+})

@@ -1,6 +1,7 @@
 import { assertEquals } from "@std/assert"
 import { Effect, Layer } from "effect"
 import { fileBlobSinkLayer } from "../../src/adapters/blob-sink.ts"
+import { sha256 } from "../../src/evidence/digest.ts"
 import {
   CasError,
   ContentStore,
@@ -173,6 +174,15 @@ Deno.test("publish refuses a write that would exceed the total cap", async () =>
       ),
     )
     assertEquals(error.code, "cap_exceeded")
+    // The refused object never became visible: the cap is checked before the write.
+    const digest = await Effect.runPromise(sha256(encoder.encode("second")))
+    let visible = true
+    try {
+      Deno.statSync(blobPath(root, digest))
+    } catch {
+      visible = false
+    }
+    assertEquals(visible, false)
   })
 })
 
