@@ -57,6 +57,21 @@ export const appendBatchReceipt = (
       })
     ),
     Effect.map((result) => result.duplicate),
+    // A record written by an older build carries a wall-clock `receivedAt`, so an
+    // otherwise identical replay has the same key and a different payload. That is
+    // a duplicate for this caller, not a reason to kill the kernel.
+    Effect.catch((error) =>
+      error.code === "idempotency_conflict"
+        ? Effect.logWarning(
+          "inbox receipt already stored under a legacy payload; treating as duplicate",
+          {
+            origin: payload.receipt.origin,
+            sequence: payload.receipt.sequence,
+            batchDigest: payload.receipt.batchDigest,
+          },
+        ).pipe(Effect.as(true))
+        : Effect.fail(error)
+    ),
     Effect.orDie,
   )
 
@@ -74,6 +89,19 @@ export const appendHostHeartbeat = (
       })
     ),
     Effect.map((result) => result.duplicate),
+    // Same legacy-payload case as the receipt: the key is content-derived, so a
+    // stored record with a wall-clock `receivedAt` is the same heartbeat.
+    Effect.catch((error) =>
+      error.code === "idempotency_conflict"
+        ? Effect.logWarning(
+          "inbox heartbeat already stored under a legacy payload; treating as duplicate",
+          {
+            generatedAt: payload.generatedAt,
+            digest: payload.digest,
+          },
+        ).pipe(Effect.as(true))
+        : Effect.fail(error)
+    ),
     Effect.orDie,
   )
 
