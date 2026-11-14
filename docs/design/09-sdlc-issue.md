@@ -8,7 +8,7 @@ The design is a **truth-first canonical ledger with a deliberately narrow author
 
 **Artifact binding.** Design approval binds these exact artifacts:
 
-- `docs/design/07-technical-specification.md` — full specification, SHA-256 `6516f040b7b895277e7b42561c15019717668447fe4e1ed381d2405ea26c9de2`.
+- `docs/design/07-technical-specification.md` — full specification, SHA-256 `374c144f5a86acb27ce9741b24e379c6a3181f2183106553bb935ae3b2624728`.
 - `docs/design/04-security-deployment.md` — threat model, channels, sandbox, ceilings, and deployment, SHA-256 `a97c45e6e613fe6a36240f0b33bbf7612567825b460a34a6bdac237f6f3bb84f`.
 - `docs/design/08-implementation-plan.md` — full implementation plan, SHA-256 `186040322f785176c487d6bc35b943f7612fc88543b78132f17729690ad0b85b`.
 

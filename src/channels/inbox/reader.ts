@@ -462,21 +462,19 @@ export const inboxReaderLayer = (
           }
           const envelope = parsed.success
           const known = new Set<string>(config.allowedOrigins)
+          // A source the guest does not consume must not cost the whole
+          // envelope: the host publishes every ingest source in one heartbeat,
+          // and one stray id would otherwise leave every source unknown.
           const unknown = Object.keys(envelope.sources)
             .filter((source) => !known.has(source))
             .toSorted()
           if (unknown.length > 0) {
-            yield* quarantine(
-              name,
-              "source_not_allowed",
-              `heartbeat sources ${unknown.join(",")}`,
-              ciphertextDigest,
+            yield* Effect.logWarning(
+              `heartbeat ignores unknown sources: ${unknown.join(",")}`,
             )
-            return "quarantined" as const
           }
-          const unlistedHost = envelope.host_sources.filter((source) =>
-            !(source in envelope.sources)
-          )
+          const hostSources = envelope.host_sources.filter((source) => known.has(source))
+          const unlistedHost = hostSources.filter((source) => !(source in envelope.sources))
           if (unlistedHost.length > 0) {
             yield* quarantine(
               name,

@@ -129,7 +129,7 @@ Deno.test("a heartbeat whose host verdict is stale never presents the source cur
   })
 })
 
-Deno.test("a heartbeat naming a source outside the allowlist is quarantined", async () => {
+Deno.test("an unknown source in a heartbeat is ignored, not fatal to the envelope", async () => {
   await withTempDir("heartbeat-unknown", async (directory) => {
     await encryptFile(
       heartbeatJson({
@@ -140,8 +140,25 @@ Deno.test("a heartbeat naming a source outside the allowlist is quarantined", as
       `${directory}/heartbeat-1.age`,
     )
     const outcome = await run(directory, pollAll)
+    // One unknown key must not cost the fresher sources their verdict.
+    assertEquals(outcome.state.quarantined, [])
+    assertEquals(outcome.poll.accepted, 1)
+    assertEquals(outcome.state.heartbeats.map((entry) => entry.origin), ["tuta-mail"])
+    assertEquals(outcome.mail, "current")
+  })
+})
+
+Deno.test("a heartbeat made only of unknown sources is accepted as a no-op", async () => {
+  await withTempDir("heartbeat-all-unknown", async (directory) => {
+    await encryptFile(
+      heartbeatJson({ search: source(false, 900, "2026-11-10T23:55:00Z") }),
+      recipient,
+      `${directory}/heartbeat-1.age`,
+    )
+    const outcome = await run(directory, pollAll)
+    assertEquals(outcome.state.quarantined, [])
+    assertEquals(outcome.poll.accepted, 1)
     assertEquals(outcome.state.heartbeats, [])
-    assertEquals(outcome.state.quarantined.map((entry) => entry.reason), ["source_not_allowed"])
     assertEquals(outcome.mail, "unknown")
   })
 })
