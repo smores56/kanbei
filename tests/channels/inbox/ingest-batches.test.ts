@@ -2,7 +2,7 @@ import { assertEquals } from "@std/assert"
 import { Clock, Effect, Option, Schema } from "effect"
 import type { InboxConfig, InboxLimits } from "../../../src/channels/inbox/reader.ts"
 import { InboxReader } from "../../../src/channels/inbox/reader.ts"
-import { inboxTestLayers, testLimits } from "./support.ts"
+import { encryptFile, inboxTestLayers, testLimits } from "./support.ts"
 import { BlobSink } from "../../../src/kernel/blob-sink.ts"
 import { ContentStore } from "../../../src/kernel/cas.ts"
 import { Ledger } from "../../../src/kernel/ledger.ts"
@@ -232,4 +232,41 @@ Deno.test("freshness reports stale after the window and unknown without a heartb
   assertEquals(result.stale, "stale")
   assertEquals(Option.getOrThrow(result.beat).state, "stale")
   assertEquals(Option.getOrThrow(result.beat).sequence, 1)
+})
+
+Deno.test("the host's single tuta feed id is accepted when allowlisted", async () => {
+  await withTempDir("tuta-source", async (directory) => {
+    const recipient = "age1gyzseyvd0cumhe3svg3ey6x54lwfhmqvp2wf9dre8d0sycs5e3qscwpgqa"
+    await encryptFile(
+      JSON.stringify({
+        v: 1,
+        source: "tuta",
+        kind: "batch",
+        seq: 1,
+        sent_at: "2026-11-11T00:00:00Z",
+        items: [{ id: "m-1", subject: "hello" }],
+      }),
+      recipient,
+      `${directory}/batch-1.age`,
+    )
+    const config: InboxConfig = {
+      identityPath,
+      allowedOrigins: [...allOrigins, "tuta"],
+      limits,
+      freshnessWindowMs: 3_600_000,
+    }
+    const { layer } = inboxTestLayers(directory, config)
+    const state = await Effect.runPromise(
+      poll.pipe(
+        Effect.provide(layer),
+        Effect.provideService(
+          Clock.Clock,
+          makeClock({ now: Date.parse("2026-11-11T00:00:00.000Z") }),
+        ),
+      ),
+    )
+    assertEquals(state.result.accepted, 1)
+    assertEquals(state.result.quarantined, 0)
+    assertEquals(state.state.observations.map((entry) => entry.origin), ["tuta"])
+  })
 })

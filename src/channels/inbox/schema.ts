@@ -1,6 +1,10 @@
 import { Schema } from "effect"
 
 export const OriginId = Schema.Literals([
+  // `tuta` is the host ingest plane's one Tuta feed id: the bridge serves mail
+  // and calendar from a single secret, so the host writer emits one source.
+  // `tuta-mail`/`tuta-calendar` stay for fixtures and any future split.
+  "tuta",
   "tuta-mail",
   "tuta-calendar",
   "finance",

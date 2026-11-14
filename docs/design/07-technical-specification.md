@@ -3675,8 +3675,11 @@ Backup: the core produces an online SQLite snapshot and verifies its checkpoint;
 Kanbei does not fetch. Each origin has an ingest VM that holds that origin's credentials, parses its hostile input first, and writes one immutable age-encrypted batch. The batch contract is the whole adapter surface Kanbei sees; the adapter code lives in the ingest VM.
 
 ```ts
-type OriginId = "tuta-mail" | "tuta-calendar" | "finance" | "brave" | "immich"
+type OriginId = "tuta" | "tuta-mail" | "tuta-calendar" | "finance" | "brave" | "immich"
               | "phone" | "cluster-digest" | "git";
+// `tuta` is the host's single Tuta feed: one bridge and one secret serve mail and
+// calendar, so the host writer publishes one origin. `tuta-mail` and
+// `tuta-calendar` stay valid for a split feed and for fixtures.
 
 type IngestEntry = {
   resourceKey: string;           // stable logical key within the origin
