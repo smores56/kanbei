@@ -216,3 +216,44 @@ Deno.test("host-legal seq=0 is accepted and does not invent a gap", async () => 
     assertEquals(outcome.mail, "current")
   })
 })
+
+Deno.test("a heartbeat replayed after a lost checkpoint is a duplicate, not a conflict", async () => {
+  await withTempDir("heartbeat-replay", async (directory) => {
+    await encryptFile(
+      heartbeatJson({ "tuta-mail": source(false, 900, "2026-11-10T23:55:00Z") }),
+      recipient,
+      `${directory}/heartbeat-1.age`,
+    )
+    const first = await run(directory, pollAll)
+    assertEquals(first.poll.accepted, 1)
+    // A crash between the append and the checkpoint save loses the handled set,
+    // so the same file is polled again on the next boot.
+    await Deno.remove(`${directory}/checkpoint.json`)
+    const second = await run(directory, pollAll)
+    assertEquals(second.poll.duplicates, 1)
+    assertEquals(second.state.heartbeats.length, 1)
+  })
+})
+
+Deno.test("a batch replayed after a lost checkpoint is a duplicate, not a conflict", async () => {
+  await withTempDir("batch-replay", async (directory) => {
+    await encryptFile(
+      JSON.stringify({
+        v: 1,
+        source: "finance",
+        kind: "batch",
+        seq: 1,
+        sent_at: "2026-11-11T00:00:00Z",
+        items: [{ id: "f-1", amount: 1 }],
+      }),
+      recipient,
+      `${directory}/batch-1.age`,
+    )
+    const first = await run(directory, pollAll)
+    assertEquals(first.poll.accepted, 1)
+    await Deno.remove(`${directory}/checkpoint.json`)
+    const second = await run(directory, pollAll)
+    assertEquals(second.poll.duplicates, 1)
+    assertEquals(second.state.observations.length, 1)
+  })
+})
