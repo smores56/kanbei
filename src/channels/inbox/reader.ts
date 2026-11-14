@@ -438,6 +438,13 @@ export const inboxReaderLayer = (
           }))
           // Durable beside the checkpoint: a restarted reader must skip it too.
           yield* quarantines.record(entry).pipe(Effect.orDie)
+          // The record lives inside the guest, so without this line the host only
+          // ever sees a count and cannot tell a wrong key from a bad schema.
+          yield* Effect.logWarning("quarantined batch", {
+            file: name,
+            reason,
+            detail,
+          })
         })
 
       /**
